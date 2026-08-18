@@ -21,8 +21,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.config import ensure_dirs, load_env
+from applypilot.database import get_connection, get_stats, init_db
+from applypilot.eligibility import ELIGIBLE_SQL
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -221,22 +222,23 @@ class _StageTracker:
 
 # SQL to count pending work for each stage
 _PENDING_SQL: dict[str, str] = {
-    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
-    "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
+    "enrich": f"SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND {ELIGIBLE_SQL}",
+    "score":  f"SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL AND {ELIGIBLE_SQL}",
     "tailor": (
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
         "AND full_description IS NOT NULL "
         "AND tailored_resume_path IS NULL "
-        "AND COALESCE(tailor_attempts, 0) < 5"
+        f"AND COALESCE(tailor_attempts, 0) < 5 AND {ELIGIBLE_SQL}"
     ),
     "cover": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "AND company_name IS NOT NULL AND company_name != '' "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
-        "AND COALESCE(cover_attempts, 0) < 5"
+        f"AND COALESCE(cover_attempts, 0) < 5 AND {ELIGIBLE_SQL}"
     ),
     "pdf": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND tailored_resume_path LIKE '%.txt'"
+        f"AND tailored_resume_path LIKE '%.txt' AND {ELIGIBLE_SQL}"
     ),
 }
 

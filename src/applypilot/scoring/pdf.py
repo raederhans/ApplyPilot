@@ -5,11 +5,41 @@ and exports to PDF using headless Chromium via Playwright.
 """
 
 import logging
+from html import escape
 from pathlib import Path
 
-from applypilot.config import TAILORED_DIR
+from applypilot.config import TAILORED_DIR, load_profile
 
 log = logging.getLogger(__name__)
+
+SECTION_HEADERS = {
+    "SUMMARY",
+    "TECHNICAL SKILLS",
+    "EXPERIENCE",
+    "PROJECTS",
+    "EDUCATION",
+}
+SUMMARY_TAIL_MIN_WORDS = 5
+SKILL_TAIL_MIN_WORDS = 5
+
+
+def _tail_is_dense(line_word_counts: list[int], min_words: int) -> bool:
+    """Return whether a wrapped text block avoids an underfilled tail line."""
+    return len(line_word_counts) <= 1 or line_word_counts[-1] >= min_words
+
+
+def _summary_tail_is_dense(
+    line_word_counts: list[int], min_words: int = SUMMARY_TAIL_MIN_WORDS
+) -> bool:
+    """Return whether a wrapped summary avoids an orphaned tail line."""
+    return _tail_is_dense(line_word_counts, min_words)
+
+
+def _skill_tails_are_dense(
+    skill_line_word_counts: list[list[int]], min_words: int = SKILL_TAIL_MIN_WORDS
+) -> bool:
+    """Return whether every rendered Technical Skills row has a useful tail line."""
+    return all(_tail_is_dense(counts, min_words) for counts in skill_line_word_counts)
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -17,44 +47,43 @@ log = logging.getLogger(__name__)
 def parse_resume(text: str) -> dict:
     """Parse a structured text resume into sections.
 
-    Expects a format with header lines (name, title, location, contact)
+    Expects a format with header lines (name, optional title/location, contact)
     followed by ALL-CAPS section headers (SUMMARY, TECHNICAL SKILLS, etc.).
 
     Args:
         text: Full resume text.
 
     Returns:
-        {"name": str, "title": str, "location": str, "contact": str, "sections": dict}
+        A parsed resume including the source section order.
     """
     lines = [line.rstrip() for line in text.strip().split("\n")]
 
-    # Header: first few lines before SUMMARY
+    # Header: non-empty lines before the first recognized section.
     header_lines: list[str] = []
-    body_start = 0
+    body_start = len(lines)
     for i, line in enumerate(lines):
-        if line.strip().upper() == "SUMMARY":
+        if line.strip().upper() in SECTION_HEADERS:
             body_start = i
             break
         if line.strip():
             header_lines.append(line.strip())
 
-    name = header_lines[0] if len(header_lines) > 0 else ""
-    title = header_lines[1] if len(header_lines) > 1 else ""
-    # The header may have 3 or 4 lines depending on whether location is included
+    name = header_lines[0] if header_lines else ""
+    title = ""
     location = ""
     contact = ""
-    if len(header_lines) > 3:
-        location = header_lines[2]
-        contact = header_lines[3]
-    elif len(header_lines) > 2:
-        # Could be location or contact -- check for email/phone indicators
-        if "@" in header_lines[2] or "|" in header_lines[2]:
-            contact = header_lines[2]
-        else:
-            location = header_lines[2]
+    for header_line in header_lines[1:]:
+        is_contact = "@" in header_line or "|" in header_line
+        if is_contact:
+            contact = header_line
+        elif not title:
+            title = header_line
+        elif not location:
+            location = header_line
 
     # Split body into sections by ALL-CAPS headers
     sections: dict[str, str] = {}
+    section_order: list[str] = []
     current_section: str | None = None
     current_lines: list[str] = []
 
@@ -71,6 +100,7 @@ def parse_resume(text: str) -> dict:
             if current_section:
                 sections[current_section] = "\n".join(current_lines).strip()
             current_section = stripped
+            section_order.append(stripped)
             current_lines = []
         else:
             current_lines.append(line)
@@ -84,6 +114,7 @@ def parse_resume(text: str) -> dict:
         "location": location,
         "contact": contact,
         "sections": sections,
+        "section_order": section_order,
     }
 
 
@@ -122,7 +153,7 @@ def parse_entries(text: str) -> list[dict]:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith("- ") or stripped.startswith("\u2022 "):
+        if stripped.startswith(("- ", "\u2022 ")):
             if current:
                 current["bullets"].append(stripped[2:].strip())
         elif current is None or (
@@ -193,13 +224,30 @@ def build_html(resume: dict) -> str:
     # Education
     edu_html = ""
     if "EDUCATION" in sections:
-        edu_text = sections["EDUCATION"].strip()
+        edu_text = "<br>".join(
+            escape(line.strip())
+            for line in sections["EDUCATION"].splitlines()
+            if line.strip()
+        )
         edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
 
     # Summary
     summary_html = ""
     if "SUMMARY" in sections:
         summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
+
+    section_html = {
+        "SUMMARY": summary_html,
+        "TECHNICAL SKILLS": skills_html,
+        "EXPERIENCE": exp_html,
+        "PROJECTS": proj_html,
+        "EDUCATION": edu_html,
+    }
+    fallback_order = ["SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"]
+    requested_order = resume.get("section_order") or fallback_order
+    rendered_sections = "\n".join(
+        section_html[name] for name in requested_order if section_html.get(name)
+    )
 
     # Contact line parsing
     contact = resume["contact"]
@@ -208,6 +256,7 @@ def build_html(resume: dict) -> str:
 
     # Location line (may be empty)
     location_html = f'<div class="location">{resume["location"]}</div>' if resume["location"] else ""
+    title_html = f'<div class="title">{resume["title"]}</div>' if resume["title"] else ""
 
     return f"""<!DOCTYPE html>
 <html>
@@ -276,11 +325,13 @@ body {{
     font-size: 9.5pt;
     color: #333;
     line-height: 1.4;
+    text-wrap: pretty;
 }}
 .skill-row {{
     font-size: 9.5pt;
     margin: 0;
     line-height: 1.35;
+    text-wrap: pretty;
 }}
 .skill-cat {{
     font-weight: 600;
@@ -318,22 +369,23 @@ li {{
 <body>
 <div class="header">
     <div class="name">{resume['name']}</div>
-    <div class="title">{resume['title']}</div>
+    {title_html}
     {location_html}
     <div class="contact">{contact_html}</div>
 </div>
-{summary_html}
-{skills_html}
-{exp_html}
-{proj_html}
-{edu_html}
+{rendered_sections}
 </body>
 </html>"""
 
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
 
-def render_pdf(html: str, output_path: str) -> None:
+def render_pdf(
+    html: str,
+    output_path: str,
+    summary_tail_min_words: int = SUMMARY_TAIL_MIN_WORDS,
+    skill_tail_min_words: int = SKILL_TAIL_MIN_WORDS,
+) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
 
     Args:
@@ -344,8 +396,67 @@ def render_pdf(html: str, output_path: str) -> None:
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
+        page = browser.new_page(viewport={"width": 816, "height": 1056})
+        page.emulate_media(media="print")
         page.set_content(html, wait_until="networkidle")
+        summary_line_word_counts = page.eval_on_selector(
+            ".summary",
+            """el => {
+                const node = el.firstChild;
+                if (!node) return [];
+                const lines = new Map();
+                for (const match of node.textContent.matchAll(/\\S+/g)) {
+                    const range = document.createRange();
+                    range.setStart(node, match.index);
+                    range.setEnd(node, match.index + match[0].length);
+                    const top = Math.round(range.getBoundingClientRect().top);
+                    lines.set(top, (lines.get(top) || 0) + 1);
+                }
+                return Array.from(lines.values());
+            }""",
+        )
+        if not _summary_tail_is_dense(summary_line_word_counts, summary_tail_min_words):
+            browser.close()
+            raise ValueError(
+                "Summary has an underfilled rendered tail line: "
+                f"{summary_line_word_counts[-1]} words; minimum {summary_tail_min_words}."
+            )
+        skill_rows = page.eval_on_selector_all(
+            ".skill-row",
+            """elements => elements.map((el, index) => {
+                const lines = new Map();
+                const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = walker.nextNode())) {
+                    for (const match of node.textContent.matchAll(/\\S+/g)) {
+                        const range = document.createRange();
+                        range.setStart(node, match.index);
+                        range.setEnd(node, match.index + match[0].length);
+                        const top = Math.round(range.getBoundingClientRect().top);
+                        lines.set(top, (lines.get(top) || 0) + 1);
+                    }
+                }
+                return {
+                    index,
+                    lineWordCounts: Array.from(lines.values()),
+                    text: el.textContent.trim(),
+                };
+            })""",
+        )
+        skill_line_word_counts = [row["lineWordCounts"] for row in skill_rows]
+        if not _skill_tails_are_dense(skill_line_word_counts, skill_tail_min_words):
+            failed_row = next(
+                row
+                for row in skill_rows
+                if not _tail_is_dense(row["lineWordCounts"], skill_tail_min_words)
+            )
+            browser.close()
+            raise ValueError(
+                "Technical Skills row "
+                f"{failed_row['index'] + 1} has an underfilled rendered tail line: "
+                f"{failed_row['lineWordCounts'][-1]} words; minimum "
+                f"{skill_tail_min_words}."
+            )
         page.pdf(
             path=output_path,
             format="Letter",
@@ -385,7 +496,21 @@ def convert_to_pdf(
 
     out = output_path or text_path.with_suffix(".pdf")
     out = Path(out)
-    render_pdf(html, str(out))
+    layout = load_profile().get("tailoring", {}).get("resume_layout", {})
+    summary_tail_min_words = int(
+        layout.get("summary_min_rendered_tail_words", SUMMARY_TAIL_MIN_WORDS)
+        or SUMMARY_TAIL_MIN_WORDS
+    )
+    skill_tail_min_words = int(
+        layout.get("technical_skill_min_rendered_tail_words", SKILL_TAIL_MIN_WORDS)
+        or SKILL_TAIL_MIN_WORDS
+    )
+    render_pdf(
+        html,
+        str(out),
+        summary_tail_min_words=summary_tail_min_words,
+        skill_tail_min_words=skill_tail_min_words,
+    )
     log.info("PDF generated: %s", out)
     return out
 
@@ -433,7 +558,7 @@ def batch_convert(limit: int = 50) -> int:
         try:
             convert_to_pdf(f)
             converted += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one bad artifact must not stop the batch
             log.error("Failed to convert %s: %s", f.name, e)
 
     log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)

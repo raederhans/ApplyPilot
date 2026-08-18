@@ -8,9 +8,12 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import multiprocessing
 import sqlite3
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from jobspy import scrape_jobs
 
@@ -58,11 +61,54 @@ def parse_proxy(proxy_str: str) -> dict:
 
 # -- Retry wrapper -----------------------------------------------------------
 
-def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0):
-    """Call scrape_jobs with retry on transient failures."""
+def _scrape_to_files(kwargs: dict, result_path: str, error_path: str) -> None:
+    """Child-process target used to make third-party scraping terminable."""
+    try:
+        scrape_jobs(**kwargs).to_pickle(result_path)
+    except BaseException as exc:  # Child must report every failure to the parent.
+        Path(error_path).write_text(f"{type(exc).__name__}: {exc}", encoding="utf-8")
+
+
+def _scrape_once_with_timeout(kwargs: dict, timeout_seconds: float):
+    """Run one JobSpy request in a process that can be terminated on timeout."""
+    with tempfile.TemporaryDirectory(prefix="applypilot-jobspy-") as temp_dir:
+        result_path = Path(temp_dir) / "result.pkl"
+        error_path = Path(temp_dir) / "error.txt"
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_scrape_to_files,
+            args=(kwargs, str(result_path), str(error_path)),
+            daemon=True,
+        )
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            raise TimeoutError(f"JobSpy query exceeded {timeout_seconds:.0f}s wall-clock timeout")
+        if error_path.exists():
+            raise RuntimeError(error_path.read_text(encoding="utf-8"))
+        if not result_path.exists():
+            raise RuntimeError(f"JobSpy subprocess exited with code {process.exitcode} without a result")
+
+        import pandas as pd
+
+        return pd.read_pickle(result_path)
+
+
+def _scrape_with_retry(
+    kwargs: dict,
+    max_retries: int = 2,
+    backoff: float = 5.0,
+    timeout_seconds: float = 150.0,
+):
+    """Call scrape_jobs with bounded retries and a per-attempt wall-clock timeout."""
     for attempt in range(max_retries + 1):
         try:
-            return scrape_jobs(**kwargs)
+            return _scrape_once_with_timeout(kwargs, timeout_seconds)
         except Exception as e:
             err = str(e).lower()
             transient = any(k in err for k in ("timeout", "429", "proxy", "connection", "reset", "refused"))
@@ -165,17 +211,37 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        from applypilot.eligibility import evaluate_job_eligibility
+        eligibility_status, eligibility_reason = evaluate_job_eligibility({
+            "title": title,
+            "description": description,
+            "full_description": full_description,
+        })
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                "INSERT INTO jobs (url, title, salary, description, location, company_name, source_site, "
+                "site, strategy, discovered_at, "
+                "full_description, application_url, detail_scraped_at, eligibility_status, "
+                "eligibility_reason, eligibility_evaluated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, salary, description, location_str, company, site_label, site_label,
+                 strategy, now,
+                 full_description, apply_url, detail_scraped_at, eligibility_status,
+                 eligibility_reason, now),
             )
             new += 1
         except sqlite3.IntegrityError:
+            # A repeat crawl can repair employer/source metadata that older
+            # ApplyPilot versions discarded without overwriting richer data.
+            conn.execute(
+                "UPDATE jobs SET "
+                "company_name = COALESCE(NULLIF(company_name, ''), ?), "
+                "source_site = COALESCE(NULLIF(source_site, ''), ?), "
+                "site = COALESCE(NULLIF(site, ''), ?) "
+                "WHERE url = ?",
+                (company, site_label, site_label, url),
+            )
             existing += 1
 
     conn.commit()
@@ -228,7 +294,11 @@ def _run_one_search(
         if "linkedin" in other_sites:
             kwargs["linkedin_fetch_description"] = True
         try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
+            df = _scrape_with_retry(
+                kwargs,
+                max_retries=max_retries,
+                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
+            )
             all_dfs.append(df)
         except Exception as e:
             log.error("[%s] (non-gd): %s", label, e)
@@ -249,7 +319,11 @@ def _run_one_search(
         if proxy_config:
             gd_kwargs["proxies"] = [proxy_config["jobspy"]]
         try:
-            gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
+            gd_df = _scrape_with_retry(
+                gd_kwargs,
+                max_retries=max_retries,
+                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
+            )
             all_dfs.append(gd_df)
         except Exception as e:
             log.error("[%s] (glassdoor): %s", label, e)
@@ -328,7 +402,7 @@ def search_jobs(
         kwargs["linkedin_fetch_description"] = True
 
     try:
-        df = scrape_jobs(**kwargs)
+        df = _scrape_with_retry(kwargs, max_retries=2, timeout_seconds=150)
     except Exception as e:
         log.error("JobSpy search failed: %s", e)
         return {"error": str(e), "total": 0, "new": 0, "existing": 0}
@@ -375,6 +449,7 @@ def _full_crawl(
     queries = search_cfg.get("queries", [])
     locs = search_cfg.get("locations", [])
     defaults = search_cfg.get("defaults", {})
+    max_retries = int(defaults.get("max_retries", max_retries))
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
 
@@ -460,15 +535,24 @@ def run_discovery(cfg: dict | None = None) -> dict:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
+    # The shipped search schema and onboarding wizard use ``boards`` plus a
+    # top-level ``country``. Keep the older spellings working for existing
+    # installations, but make the current schema authoritative.
+    normalized_cfg = dict(cfg)
+    defaults = dict(cfg.get("defaults", {}))
+    if cfg.get("country") and not defaults.get("country_indeed"):
+        defaults["country_indeed"] = cfg["country"]
+    normalized_cfg["defaults"] = defaults
+
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
-    results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
-    hours_old = cfg.get("defaults", {}).get("hours_old", 72)
+    sites = cfg.get("boards") or cfg.get("sites")
+    results_per_site = defaults.get("results_per_site", 100)
+    hours_old = defaults.get("hours_old", 72)
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
 
     return _full_crawl(
-        search_cfg=cfg,
+        search_cfg=normalized_cfg,
         tiers=tiers,
         locations=locations,
         sites=sites,

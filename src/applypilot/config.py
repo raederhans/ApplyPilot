@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 from pathlib import Path
+from urllib.parse import urlparse
 
 # User data directory — all user-specific files live here
 APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
@@ -31,7 +32,7 @@ CONFIG_DIR = PACKAGE_DIR / "config"
 
 
 def get_chrome_path() -> str:
-    """Auto-detect Chrome/Chromium executable path, cross-platform.
+    """Auto-detect a supported Chromium browser executable.
 
     Override with CHROME_PATH environment variable.
     """
@@ -43,6 +44,9 @@ def get_chrome_path() -> str:
 
     if system == "Windows":
         candidates = [
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe",
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Microsoft/Edge/Application/msedge.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/Application/msedge.exe",
             Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
             Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
             Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
@@ -64,20 +68,27 @@ def get_chrome_path() -> str:
             return str(c)
 
     # Fall back to PATH search
-    for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "chrome"):
+    for name in ("msedge", "microsoft-edge", "google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "chrome"):
         found = shutil.which(name)
         if found:
             return found
 
     raise FileNotFoundError(
-        "Chrome/Chromium not found. Install Chrome or set CHROME_PATH environment variable."
+        "Edge/Chrome/Chromium not found. Install a Chromium browser or set CHROME_PATH."
     )
 
 
 def get_chrome_user_data() -> Path:
-    """Default Chrome user data directory, cross-platform."""
+    """Return the source browser profile directory when profile cloning is enabled."""
+    env_path = os.environ.get("CHROME_USER_DATA_DIR")
+    if env_path:
+        return Path(env_path)
+
     system = platform.system()
     if system == "Windows":
+        browser_path = Path(get_chrome_path()).name.lower()
+        if browser_path == "msedge.exe":
+            return Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data"
         return Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
     elif system == "Darwin":
         return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
@@ -120,6 +131,154 @@ def load_sites_config() -> dict:
     if not path.exists():
         return {}
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def _host_matches(host: str, candidate: str) -> bool:
+    """Return whether ``host`` is exactly or is a subdomain of ``candidate``."""
+    normalized_host = host.lower().strip(".")
+    normalized_candidate = candidate.lower().strip(".")
+    return bool(normalized_host and normalized_candidate) and (
+        normalized_host == normalized_candidate
+        or normalized_host.endswith(f".{normalized_candidate}")
+    )
+
+
+def _normalise_site_name(value: str | None) -> str:
+    """Normalise a source-site label for a policy match without guessing it."""
+    return " ".join((value or "").casefold().split())
+
+
+def load_portal_policies() -> list[dict]:
+    """Load opt-in portal controls from the package site registry.
+
+    Portal policies are separate from searchable sites so an application rule
+    cannot accidentally enable automated discovery for that portal.
+    """
+    policies = load_sites_config().get("portal_policies", [])
+    if not isinstance(policies, list):
+        return []
+    return [policy for policy in policies if isinstance(policy, dict)]
+
+
+def get_portal_policy(
+    url: str | None = None,
+    *,
+    source_site: str | None = None,
+    site: str | None = None,
+) -> dict | None:
+    """Return the configured portal policy for a URL or recorded source.
+
+    The source-site fallback is intentional. A JobStreet listing that opens an
+    employer's ATS is still governed by JobStreet's manual-only policy until a
+    candidate explicitly takes over that external application themselves.
+    """
+    host = (urlparse(url or "").hostname or "").lower()
+    source_names = {
+        _normalise_site_name(value)
+        for value in (source_site, site)
+        if _normalise_site_name(value)
+    }
+
+    for policy in load_portal_policies():
+        domains = policy.get("domains", [])
+        if isinstance(domains, str):
+            domains = [domains]
+        if host and any(
+            _host_matches(host, domain)
+            for domain in domains
+            if isinstance(domain, str)
+        ):
+            return policy
+
+        policy_names = policy.get("site_names", [])
+        if isinstance(policy_names, str):
+            policy_names = [policy_names]
+        names = {
+            _normalise_site_name(value)
+            for value in policy_names
+            if isinstance(value, str) and _normalise_site_name(value)
+        }
+        if source_names.intersection(names):
+            return policy
+    return None
+
+
+def portal_application_gate(
+    url: str | None = None,
+    *,
+    source_site: str | None = None,
+    site: str | None = None,
+    preview_only: bool,
+) -> str | None:
+    """Return a human-action requirement, or ``None`` when browser use is allowed.
+
+    Unknown or malformed modes fail closed for a matching portal. This helper
+    intentionally decides only browser access; it never treats a portal record
+    as evidence that an application was submitted.
+    """
+    policy = get_portal_policy(url, source_site=source_site, site=site)
+    if policy is None:
+        return None
+
+    name = str(policy.get("name") or "configured portal")
+    mode = str(policy.get("application_mode") or "").casefold()
+    if mode == "manual_only":
+        return f"{name} requires a candidate-operated manual application."
+
+    domains = policy.get("domains", [])
+    if isinstance(domains, str):
+        domains = [domains]
+    host = (urlparse(url or "").hostname or "").lower()
+    if (
+        policy.get("external_application_mode") == "manual_reconfirm"
+        and host
+        and domains
+        and not any(
+            _host_matches(host, domain)
+            for domain in domains
+            if isinstance(domain, str)
+        )
+    ):
+        return (
+            f"{name} handed off to an external ATS; the candidate must reconfirm and continue manually."
+        )
+
+    if mode == "review_only":
+        if preview_only:
+            return None
+        return (
+            f"{name} permits only a visible fill-only review; "
+            "the candidate must submit manually."
+        )
+    return f"{name} has an unrecognised application policy and is manual-only."
+
+
+def portal_discovery_gate(
+    url: str | None = None,
+    *,
+    source_site: str | None = None,
+    site: str | None = None,
+) -> str | None:
+    """Return why a listing must not be fetched by the automated detail crawler.
+
+    Candidate-provided listings remain welcome in the local database. This
+    guard prevents a later generic enrichment run from silently turning that
+    local intake into scripted portal access.
+    """
+    policy = get_portal_policy(url, source_site=source_site, site=site)
+    if policy is None:
+        return None
+
+    name = str(policy.get("name") or "configured portal")
+    mode = str(policy.get("discovery_mode") or "").casefold()
+    if mode == "authorized_import_only":
+        return (
+            f"{name} listings must come from an authorised export or "
+            "candidate-provided CSV; automated portal enrichment is disabled."
+        )
+    if mode == "manual_only":
+        return f"{name} requires candidate-operated browsing; automated portal enrichment is disabled."
+    return f"{name} has an unrecognised discovery policy and is excluded from automated enrichment."
 
 
 def is_manual_ats(url: str | None) -> bool:
@@ -180,6 +339,21 @@ def load_env():
     load_dotenv()
 
 
+def has_llm_provider() -> bool:
+    """Return whether a usable configured LLM provider is available."""
+    if any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")):
+        return True
+
+    local_url = os.environ.get("LLM_URL", "")
+    if not local_url:
+        return False
+
+    host = (urlparse(local_url).hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    return bool(os.environ.get("LLM_API_KEY"))
+
+
 # ---------------------------------------------------------------------------
 # Tier system — feature gating by installed dependencies
 # ---------------------------------------------------------------------------
@@ -206,7 +380,7 @@ def get_tier() -> int:
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = has_llm_provider()
     if not has_llm:
         return 1
 
@@ -238,15 +412,15 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not has_llm_provider():
+        missing.append("LLM provider — set Gemini, OpenAI, DeepSeek, or a local OpenAI-compatible endpoint")
     if required >= 3:
         if not shutil.which("claude"):
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
         try:
             get_chrome_path()
         except FileNotFoundError:
-            missing.append("Chrome/Chromium — install or set CHROME_PATH")
+            missing.append("Edge/Chrome/Chromium — install or set CHROME_PATH")
 
     _console.print(
         f"\n[red]'{feature}' requires {TIER_LABELS.get(required, f'Tier {required}')} (Tier {required}).[/red]\n"

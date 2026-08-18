@@ -7,6 +7,7 @@ profile and resume file.
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -52,20 +53,46 @@ def _parse_score_response(response: str) -> dict:
     """
     score = 0
     keywords = ""
-    reasoning = response
+    reasoning = response.strip()
+
+    if not reasoning:
+        return {
+            "score": 0,
+            "keywords": "",
+            "reasoning": "Empty LLM response; the model may need a larger output-token budget.",
+        }
+
+    # Accept a JSON object when an OpenAI-compatible model chooses to return one
+    # despite the requested line-oriented format.
+    try:
+        json_text = response.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", json_text, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            json_text = fenced.group(1)
+        payload = json.loads(json_text)
+        if isinstance(payload, dict) and "score" in payload:
+            parsed_score = max(1, min(10, int(payload["score"])))
+            return {
+                "score": parsed_score,
+                "keywords": str(payload.get("keywords", "")),
+                "reasoning": str(payload.get("reasoning", "")),
+            }
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
 
     for line in response.split("\n"):
         line = line.strip()
-        if line.startswith("SCORE:"):
+        normalized = re.sub(r"^[#*\-\s]+", "", line)
+        if re.match(r"(?i)^score\s*:", normalized):
             try:
-                score = int(re.search(r"\d+", line).group())
+                score = int(re.search(r"\d+", normalized).group())
                 score = max(1, min(10, score))
             except (AttributeError, ValueError):
                 score = 0
-        elif line.startswith("KEYWORDS:"):
-            keywords = line.replace("KEYWORDS:", "").strip()
-        elif line.startswith("REASONING:"):
-            reasoning = line.replace("REASONING:", "").strip()
+        elif re.match(r"(?i)^keywords\s*:", normalized):
+            keywords = re.split(r":", normalized, maxsplit=1)[1].strip()
+        elif re.match(r"(?i)^reasoning\s*:", normalized):
+            reasoning = re.split(r":", normalized, maxsplit=1)[1].strip()
 
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
@@ -82,7 +109,8 @@ def score_job(resume_text: str, job: dict) -> dict:
     """
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {job.get('company_name') or 'Unknown employer'}\n"
+        f"SOURCE BOARD: {job.get('source_site') or job.get('site') or 'Unknown'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
@@ -94,8 +122,30 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
-        return _parse_score_response(response)
+        # Reasoning-capable models can consume a small token budget before
+        # emitting the requested structured answer, leaving `content` empty.
+        # Scoring is a short structured task. A large generation budget caused
+        # reasoning models to spend minutes on a three-line answer during the
+        # broad real-network experiment.
+        max_tokens = int(os.environ.get("APPLYPILOT_SCORE_MAX_TOKENS", "1024"))
+        response = client.chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            thinking={"type": "disabled"},
+        )
+        result = _parse_score_response(response)
+        if result["score"] == 0 and not response.strip():
+            meta = dict(getattr(client, "last_response_meta", {}) or {})
+            if meta:
+                result["reasoning"] += (
+                    " Response metadata: "
+                    f"finish_reason={meta.get('finish_reason')}, "
+                    f"content_chars={meta.get('content_chars')}, "
+                    f"reasoning_chars={meta.get('reasoning_chars')}, "
+                    f"completion_tokens={meta.get('completion_tokens')}."
+                )
+        return result
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
@@ -113,9 +163,11 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+    from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
+    refresh_job_eligibility(conn)
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        query = f"SELECT * FROM jobs WHERE full_description IS NOT NULL AND {ELIGIBLE_SQL}"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
@@ -152,13 +204,24 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
 
-    # Write scores to DB
+    # Write scores to DB. Provider/parser failures remain NULL so they are
+    # distinguishable from a genuine low score and can be retried later.
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
+        if r["score"] == 0:
+            conn.execute(
+                "UPDATE jobs SET fit_score = NULL, scored_at = NULL, "
+                "score_status = 'failed', score_error = ?, "
+                "score_attempts = COALESCE(score_attempts, 0) + 1 WHERE url = ?",
+                (r["reasoning"], r["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
+                "score_status = 'scored', score_error = NULL, "
+                "score_attempts = COALESCE(score_attempts, 0) + 1 WHERE url = ?",
+                (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            )
     conn.commit()
 
     elapsed = time.time() - t0

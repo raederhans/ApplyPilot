@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
@@ -35,7 +39,7 @@ VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 def _bootstrap() -> None:
     """Common setup: load env, create dirs, init DB."""
-    from applypilot.config import load_env, ensure_dirs
+    from applypilot.config import ensure_dirs, load_env
     from applypilot.database import init_db
 
     load_env()
@@ -147,9 +151,19 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Browser-agent model override."),
+    agent_backend: Optional[str] = typer.Option(
+        None,
+        "--agent-backend",
+        help="Browser-agent CLI: codex or claude. Defaults to APPLYPILOT_APPLY_BACKEND.",
+    ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    manual_captcha_relay: bool = typer.Option(
+        False,
+        "--manual-captcha-relay",
+        help="Pause visible Edge for applicant-completed CAPTCHA, then resume the agent.",
+    ),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -158,10 +172,11 @@ def apply(
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Prepare one application, or submit under workspace policy/one-off authorization."""
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import PROFILE_PATH as _profile_path
+    from applypilot.config import get_chrome_path
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -184,10 +199,53 @@ def apply(
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 
+    if dry_run:
+        if not url:
+            console.print("[red]--dry-run requires one explicit --url.[/red]")
+            raise typer.Exit(code=1)
+    if manual_captcha_relay and (
+        dry_run or not url or continuous or headless or workers != 1 or limit not in (None, 1)
+    ):
+        console.print(
+            "[red]Manual CAPTCHA relay requires submission mode, one exact URL, "
+            "one visible worker, and limit 1.[/red]"
+        )
+        raise typer.Exit(code=1)
+        if continuous or headless or workers != 1 or (limit not in (None, 1)):
+            console.print(
+                "[red]Fill-only review requires a visible browser, one worker, one URL, and limit 1.[/red]"
+            )
+            raise typer.Exit(code=1)
+
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
+    backend = (agent_backend or os.environ.get("APPLYPILOT_APPLY_BACKEND", "claude")).strip().lower()
+    if backend not in {"codex", "claude"}:
+        console.print("[red]--agent-backend must be codex or claude.[/red]")
+        raise typer.Exit(code=1)
+    effective_model = model or (
+        os.environ.get("APPLYPILOT_CODEX_MODEL", "gpt-5.6-sol")
+        if backend == "codex"
+        else os.environ.get("APPLYPILOT_CLAUDE_MODEL", "opus")
+    )
+
+    # Check 1: the selected browser-agent CLI and a visible browser are required.
+    import shutil
+
+    backend_binary = shutil.which("codex.exe") or shutil.which("codex") if backend == "codex" else shutil.which("claude")
+    try:
+        get_chrome_path()
+        has_browser = True
+    except FileNotFoundError:
+        has_browser = False
+    if not backend_binary or not has_browser:
+        missing = []
+        if not backend_binary:
+            missing.append(f"{backend} CLI")
+        if not has_browser:
+            missing.append("Edge/Chrome/Chromium")
+        console.print(f"[red]Browser apply is missing: {', '.join(missing)}.[/red]")
+        raise typer.Exit(code=1)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -197,37 +255,57 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: Submission needs an approved cover letter. A fill-only preview
+    # can proceed with a validated resume and leave an optional letter blank.
     if not (gen and url):
         conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-        ).fetchone()[0]
+        if dry_run:
+            ready = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+                "AND tailor_status = 'machine_validated' AND applied_at IS NULL "
+                "AND eligibility_status != 'ineligible'"
+            ).fetchone()[0]
+        else:
+            ready = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+                "AND tailor_status = 'machine_validated' "
+                "AND ((cover_letter_path IS NOT NULL AND cover_letter_status = 'human_approved') "
+                "OR cover_letter_status = 'not_required') AND applied_at IS NULL"
+            ).fetchone()[0]
         if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
-            )
+            if dry_run:
+                console.print("[red]No machine-validated tailored resume is ready for preview.[/red]")
+            else:
+                console.print(
+                    "[red]No submission-ready materials.[/red]\n"
+                    "Prepare a cover letter, review it, then run [bold]approve-cover --url URL[/bold]."
+                )
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, model=effective_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        if backend == "claude":
+            console.print("\n[bold]Run manually:[/bold]")
+            console.print(
+                f"  claude --model {effective_model} "
+                f"--mcp-config {mcp_path} "
+                f"--permission-mode bypassPermissions < {prompt_file}"
+            )
+        else:
+            console.print(
+                "\n[dim]Codex MCP isolation is assembled by ApplyPilot at runtime; "
+                "use apply --dry-run --url URL instead of copying a partial command.[/dim]"
+            )
         return
 
     from applypilot.apply.launcher import main as apply_main
@@ -237,9 +315,11 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Backend:  {backend}")
+    console.print(f"  Model:    {effective_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    console.print(f"  CAPTCHA:  {'manual relay' if manual_captcha_relay else 'stop on blocker'}")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -249,11 +329,56 @@ def apply(
         target_url=url,
         min_score=min_score,
         headless=headless,
-        model=model,
+        model=effective_model,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        agent_backend=backend,
+        manual_captcha_relay=manual_captcha_relay,
     )
+
+
+@app.command("browser-session")
+def browser_session(
+    url: str = typer.Option(
+        "https://www.linkedin.com/login",
+        "--url",
+        help="HTTPS page to open in the dedicated persistent browser profile.",
+    ),
+    worker: int = typer.Option(0, "--worker", help="Browser worker profile number."),
+) -> None:
+    """Open the dedicated visible browser for one-time interactive login."""
+    _bootstrap()
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        console.print("[red]--url must be an absolute HTTPS URL.[/red]")
+        raise typer.Exit(code=1)
+    if worker != 0:
+        console.print("[red]Only worker 0 is supported by the local browser-session workflow.[/red]")
+        raise typer.Exit(code=1)
+    if os.environ.get("APPLYPILOT_BROWSER_PROFILE_MODE", "").lower() != "persistent":
+        console.print(
+            "[red]browser-session requires "
+            "APPLYPILOT_BROWSER_PROFILE_MODE=persistent.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    from applypilot.apply.chrome import cleanup_worker, launch_chrome
+
+    console.print("\n[bold blue]Opening persistent ApplyPilot browser session[/bold blue]")
+    console.print(f"  Worker:  {worker}")
+    console.print(f"  URL:     {url}")
+    console.print("  Close this dedicated browser window after completing the login.")
+
+    process = launch_chrome(worker, headless=False, start_url=url)
+    try:
+        while process.poll() is None:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Closing browser session...[/yellow]")
+    finally:
+        cleanup_worker(worker, process)
 
 
 @app.command()
@@ -273,6 +398,7 @@ def status() -> None:
     summary.add_column("Count", justify="right")
 
     summary.add_row("Total jobs discovered", str(stats["total"]))
+    summary.add_row("Excluded: citizen/PR only", str(stats["excluded_ineligible"]))
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
@@ -322,6 +448,165 @@ def status() -> None:
     console.print()
 
 
+@app.command("prepare-cover")
+def prepare_cover(
+    url: str = typer.Option(..., "--url", help="Exact discovered job URL."),
+    company: str = typer.Option(..., "--company", help="Verified employer name."),
+    validation: str = typer.Option("strict", "--validation", help="strict, normal, or lenient."),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
+) -> None:
+    """Score and generate a cover letter for one exact, eligible job."""
+    _bootstrap()
+    from applypilot.single_job import prepare_cover_letter_for_url
+
+    result = prepare_cover_letter_for_url(url, company, validation, resume)
+    console.print_json(data=result)
+
+
+@app.command("import-job")
+def import_job(
+    url: str = typer.Option(..., "--url", help="Exact HTTPS job URL."),
+    title: str = typer.Option(..., "--title", help="Verified job title."),
+    company: str = typer.Option(..., "--company", help="Verified employer name."),
+    location: str = typer.Option("Singapore", "--location", help="Verified job location."),
+    site: str = typer.Option("linkedin", "--site", help="Source job board."),
+) -> None:
+    """Register one exact job URL for enrichment and review."""
+    _bootstrap()
+    from applypilot.single_job import import_exact_job
+
+    result = import_exact_job(url, title, company, location, site)
+    console.print_json(data=result)
+
+
+@app.command("import-listings")
+def import_listings(
+    file: Path = typer.Option(  # noqa: B008
+        ..., "--file", exists=True, dir_okay=False, help="Candidate-provided listing CSV."
+    ),
+    portal: str | None = typer.Option(
+        None,
+        "--portal",
+        help="JobStreet Singapore or InternSG when the CSV has no portal column.",
+    ),
+) -> None:
+    """Import a local JobStreet or InternSG listing export without web access."""
+    _bootstrap()
+    from applypilot.single_job import import_portal_listings
+
+    result = import_portal_listings(file, portal)
+    console.print_json(data=result)
+
+
+@app.command("rekey-email-job")
+def rekey_email_job_command(
+    url: str = typer.Option(..., "--url", help="Existing generic HTTPS careers URL."),
+    reference: str = typer.Option(
+        ...,
+        "--reference",
+        help="Stable lowercase role/date slug used only for ApplyPilot tracking.",
+    ),
+    title: str = typer.Option(..., "--title", help="Verified job title."),
+    company: str = typer.Option(..., "--company", help="Verified employer name."),
+    description_file: Path = typer.Option(
+        ...,
+        "--description-file",
+        exists=True,
+        dir_okay=False,
+        help="UTF-8 file containing the candidate-provided job description.",
+    ),
+    location: str = typer.Option("Singapore", "--location", help="Verified location."),
+) -> None:
+    """Repair a generic careers-page key for one direct-email application."""
+    _bootstrap()
+    from applypilot.single_job import rekey_email_job
+
+    result = rekey_email_job(
+        url=url,
+        reference=reference,
+        title=title,
+        company=company,
+        description=description_file.read_text(encoding="utf-8"),
+        location=location,
+    )
+    console.print_json(data=result)
+
+
+@app.command("portal-list")
+def portal_list(
+    portal: str | None = typer.Option(None, "--portal", help="JobStreet Singapore or InternSG."),
+    limit: int = typer.Option(100, "--limit", min=1, max=500, help="Maximum listings to show."),
+) -> None:
+    """Show JobStreet and InternSG listings already imported to the local database."""
+    _bootstrap()
+    from applypilot.single_job import list_portal_listings
+
+    rows = list_portal_listings(portal, limit)
+    table = Table(title="Imported portal listings", show_header=True, header_style="bold magenta")
+    table.add_column("Portal")
+    table.add_column("Title", max_width=42)
+    table.add_column("Company", max_width=32)
+    table.add_column("Location", max_width=22)
+    table.add_column("Description")
+    table.add_column("Eligibility")
+    table.add_column("Apply status")
+    for row in rows:
+        table.add_row(
+            str(row.get("source_site") or "?"),
+            str(row.get("title") or "?"),
+            str(row.get("company_name") or "?"),
+            str(row.get("location") or "?"),
+            "yes" if row.get("full_description") else "needs authorised text",
+            str(row.get("eligibility_status") or "unknown"),
+            str(row.get("apply_status") or "not started"),
+        )
+    console.print(table)
+    console.print(f"[dim]{len(rows)} listing(s) shown.[/dim]")
+
+
+@app.command("score-job")
+def score_job_command(
+    url: str = typer.Option(..., "--url", help="Exact enriched job URL."),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
+) -> None:
+    """Score one exact eligible job against one explicit resume source."""
+    _bootstrap()
+    from applypilot.single_job import score_exact_job_for_url
+
+    result = score_exact_job_for_url(url, resume)
+    console.print_json(data=result)
+
+
+@app.command("approve-cover")
+def approve_cover(
+    url: str = typer.Option(..., "--url", help="Exact discovered job URL."),
+    approved_by: str = typer.Option("user", "--approved-by", help="Human reviewer label."),
+) -> None:
+    """Mark the current machine-validated cover letter as human-approved."""
+    _bootstrap()
+    from applypilot.single_job import approve_cover_letter_for_url
+
+    result = approve_cover_letter_for_url(url, approved_by=approved_by)
+    console.print_json(data=result)
+
+
+@app.command("mark-cover-not-required")
+def mark_cover_not_required(
+    url: str = typer.Option(..., "--url", help="Exact successfully previewed job URL."),
+    verified_by: str = typer.Option(
+        "browser_preview",
+        "--verified-by",
+        help="Audit label for the form inspection that found no cover-letter field.",
+    ),
+) -> None:
+    """Mark an exact previewed form as not requiring a cover letter."""
+    _bootstrap()
+    from applypilot.single_job import mark_cover_letter_not_required_for_url
+
+    result = mark_cover_letter_not_required_for_url(url, verified_by=verified_by)
+    console.print_json(data=result)
+
+
 @app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""
@@ -336,9 +621,14 @@ def dashboard() -> None:
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
+
     from applypilot.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        PROFILE_PATH,
+        RESUME_PATH,
+        RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH,
+        get_chrome_path,
+        load_env,
     )
 
     load_env()
@@ -382,6 +672,7 @@ def doctor() -> None:
     import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
@@ -389,11 +680,14 @@ def doctor() -> None:
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+    elif has_deepseek:
+        model = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+        results.append(("LLM API key", ok_mark, f"DeepSeek ({model})"))
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+                        "Set GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY in the local .env"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
@@ -404,13 +698,13 @@ def doctor() -> None:
         results.append(("Claude Code CLI", fail_mark,
                         "Install from https://claude.ai/code (needed for auto-apply)"))
 
-    # Chrome
+    # Chromium browser
     try:
         chrome_path = get_chrome_path()
-        results.append(("Chrome/Chromium", ok_mark, chrome_path))
+        results.append(("Edge/Chrome/Chromium", ok_mark, chrome_path))
     except FileNotFoundError:
-        results.append(("Chrome/Chromium", fail_mark,
-                        "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
+        results.append(("Edge/Chrome/Chromium", fail_mark,
+                        "Install Edge/Chrome or set CHROME_PATH (needed for auto-apply)"))
 
     # Node.js / npx (for Playwright MCP)
     npx_bin = shutil.which("npx")
@@ -423,7 +717,12 @@ def doctor() -> None:
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")
     if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
+        captcha_mode = os.environ.get("APPLYPILOT_CAPTCHA_MODE", "manual_relay")
+        results.append((
+            "CapSolver API key",
+            ok_mark,
+            f"configured; mode={captcha_mode}; validity/balance not tested",
+        ))
     else:
         results.append(("CapSolver API key", "[dim]optional[/dim]",
                         "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
@@ -440,7 +739,7 @@ def doctor() -> None:
     console.print()
 
     # Tier summary
-    from applypilot.config import get_tier, TIER_LABELS
+    from applypilot.config import TIER_LABELS, get_tier
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 

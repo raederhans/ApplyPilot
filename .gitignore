@@ -5,6 +5,11 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Runtime artifacts
 *.db

@@ -11,8 +11,9 @@ normal  -- banned words = warnings only; fabrication/structure = errors (default
 lenient -- banned words ignored; only fabrication and required structure checked
 """
 
-import re
 import logging
+import re
+from difflib import SequenceMatcher
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +97,79 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+def _flatten_tailored_output(data: dict) -> str:
+    """Flatten only applicant-facing fields, excluding JD/evidence metadata."""
+    values: list[str] = []
+    for key in ("title", "summary", "education"):
+        values.append(str(data.get(key, "")))
+    skills = data.get("skills", {})
+    if isinstance(skills, dict):
+        values.extend(str(value) for value in skills.values())
+    for key in ("experience", "projects"):
+        entries = data.get(key, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            values.extend(str(entry.get(field, "")) for field in ("header", "subtitle"))
+            values.extend(str(item) for item in entry.get("bullets", []))
+    return "\n".join(values)
+
+
+def _numeric_claims(text: str) -> set[str]:
+    """Return normalized numeric tokens used in factual claims."""
+    return {
+        token.replace(",", "").lstrip("~").rstrip(".").casefold()
+        for token in re.findall(r"(?<![A-Za-z])~?\d[\d,.]*(?:%|\+)?", text)
+    }
+
+
+def _claim_stems(text: str) -> set[str]:
+    """Return coarse lexical stems for conservative JD-contamination checks."""
+    stems: set[str] = set()
+    for token in re.findall(r"[a-z]+", text.casefold()):
+        if len(token) < 5:
+            continue
+        if token.endswith("ies") and len(token) > 6:
+            token = token[:-3] + "y"
+        elif token.endswith("ing") and len(token) > 7:
+            token = token[:-3]
+        elif token.endswith("ed") and len(token) > 6:
+            token = token[:-2]
+        elif token.endswith("es") and len(token) > 6:
+            token = token[:-2]
+        elif token.endswith("s") and len(token) > 5:
+            token = token[:-1]
+        stems.add(token)
+    return stems
+
+
+def _source_role_for_company(original_text: str, company: str) -> str:
+    """Extract the role line immediately following a preserved company."""
+    lines = [line.strip() for line in original_text.splitlines() if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        if company.casefold() not in line.casefold():
+            continue
+        role_line = lines[index + 1]
+        date_match = re.search(
+            r"(?=(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})",
+            role_line,
+            flags=re.IGNORECASE,
+        )
+        return (role_line[:date_match.start()] if date_match else role_line).strip(" |\t")
+    return ""
+
+
+def validate_json_fields(
+    data: dict,
+    profile: dict,
+    mode: str = "normal",
+    original_text: str = "",
+    job_description: str = "",
+    job_title: str = "",
+    target_company: str = "",
+) -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -114,11 +187,30 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    for key in ("title", "summary", "skills", "experience", "education", "evidence_map"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    source_has_projects = bool(
+        re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", original_text)
+    )
+    if source_has_projects and not data.get("projects"):
+        errors.append("Selected source contains projects, but the tailored output dropped all projects.")
+    if "projects" not in data:
+        data["projects"] = []
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
+
+    # A target heading can describe the function, but it must not silently
+    # promote the candidate beyond the seniority advertised by the JD.
+    seniority_terms = {"senior", "lead", "principal", "manager", "director", "head"}
+    output_title_terms = set(re.findall(r"[a-z]+", str(data.get("title", "")).casefold()))
+    job_title_terms = set(re.findall(r"[a-z]+", job_title.casefold()))
+    invented_seniority = sorted((output_title_terms & seniority_terms) - job_title_terms)
+    if job_title and invented_seniority:
+        errors.append(
+            "Target heading adds seniority absent from the job title: "
+            + ", ".join(invented_seniority)
+        )
 
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
@@ -131,6 +223,23 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
                 continue
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
+        if original_text:
+            source_tokens = set(re.findall(r"[a-z0-9+#.]+", original_text.casefold()))
+            generic_skill_tokens = {
+                "and", "analysis", "analytics", "data", "design", "engineering",
+                "modeling", "models", "systems", "tools", "workflow", "workflows",
+            }
+            output_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9+#.]+", skills_text.casefold())
+                if len(token) >= 3 and token not in generic_skill_tokens
+            }
+            new_skill_tokens = sorted(output_tokens - source_tokens)
+            if new_skill_tokens:
+                errors.append(
+                    "Skills section adds tokens absent from the selected source resume: "
+                    + ", ".join(new_skill_tokens[:8])
+                )
 
     # Experience: preserved companies must be present (always enforced)
     resume_facts = profile.get("resume_facts", {})
@@ -144,6 +253,23 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             )
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
+                continue
+            if original_text:
+                source_role = _source_role_for_company(original_text, company)
+                matching_entries = [
+                    entry
+                    for entry in data["experience"]
+                    if company.casefold() in str(entry.get("header", "")).casefold()
+                ]
+                matching_blob = " ".join(
+                    f"{entry.get('header', '')} {entry.get('subtitle', '')}"
+                    for entry in matching_entries
+                ).casefold()
+                if source_role and source_role.casefold() not in matching_blob:
+                    errors.append(
+                        f"Experience title for '{company}' does not preserve the selected "
+                        f"source role exactly: {source_role}"
+                    )
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
@@ -154,15 +280,153 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
+    # The target employer may be named in a target-facing summary, but it
+    # cannot appear inside prior experience/project history unless the source
+    # already contains it. This catches direct JD-to-history contamination.
+    if target_company and target_company.casefold() not in original_text.casefold():
+        history_blob = " ".join(
+            str(value)
+            for section in (data.get("experience", []), data.get("projects", []))
+            if isinstance(section, list)
+            for entry in section
+            if isinstance(entry, dict)
+            for value in (
+                entry.get("header", ""),
+                entry.get("subtitle", ""),
+                " ".join(str(item) for item in entry.get("bullets", [])),
+            )
+        )
+        if target_company.casefold() in history_blob.casefold():
+            errors.append(
+                f"Target company '{target_company}' was copied into candidate history."
+            )
+
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
     if preserved_school:
         edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+        schools = [school.strip() for school in preserved_school.split(";") if school.strip()]
+        for school in schools:
+            if school.casefold() not in edu.casefold():
+                errors.append(f"Education '{school}' missing")
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
+
+    # A summary is entirely candidate-facing, so JD-only action/domain words
+    # are especially likely to be accidental JD-to-history contamination.
+    # Target-title terms and ordinary connective/recruiting language are
+    # excluded; specific claim terms must already be grounded in the source.
+    if original_text and job_description:
+        sensitive_claim_terms = {
+            "adoption", "banking", "behavior", "campaign", "churn", "clinical",
+            "conversion", "customer", "engagement", "experiment", "financial",
+            "growth", "healthcare", "insurance", "interview", "logistic",
+            "manufactur", "marketing", "medical", "monetization", "pharmaceutical",
+            "retention", "revenue", "sale", "semiconductor",
+        }
+        source_stems = _claim_stems(original_text)
+        jd_stems = _claim_stems(job_description)
+        title_stems = _claim_stems(job_title)
+        summary_stems = _claim_stems(str(data.get("summary", "")))
+        jd_only_summary_claims = sorted(
+            ((summary_stems & jd_stems) & sensitive_claim_terms)
+            - source_stems
+            - title_stems
+        )
+        if jd_only_summary_claims:
+            errors.append(
+                "Summary imports JD-only claim terms absent from the selected source: "
+                + ", ".join(jd_only_summary_claims[:8])
+            )
+
+        # A single source trial/pilot/experiment must not become a track record
+        # merely through pluralization in the summary.
+        summary_lower = str(data.get("summary", "")).casefold()
+        source_lower = original_text.casefold()
+        inflated_plural_events = [
+            noun
+            for noun in ("trial", "pilot", "experiment")
+            if re.search(rf"\b{noun}s\b", summary_lower)
+            and not re.search(rf"\b{noun}s\b", source_lower)
+            and re.search(rf"\b{noun}\b", source_lower)
+        ]
+        if inflated_plural_events:
+            errors.append(
+                "Summary pluralizes a single source event: "
+                + ", ".join(inflated_plural_events)
+            )
+
+    # Evidence mapping is part of the generation contract. Quotes must be
+    # copied verbatim from the selected resume, and at least two mapped JD
+    # requirements must be reflected in the applicant-facing output.
+    evidence_map = data.get("evidence_map", [])
+    grounded_requirements: list[str] = []
+    normalized_source = re.sub(r"\s+", " ", original_text).strip().casefold()
+    jd_tokens = set(re.findall(r"[a-z0-9+#.]+", job_description.casefold()))
+    if not isinstance(evidence_map, list):
+        errors.append("evidence_map must be a list.")
+    else:
+        for item in evidence_map[:5]:
+            if not isinstance(item, dict):
+                continue
+            requirement = str(item.get("requirement", "")).strip()
+            quote = str(item.get("source_quote", "")).strip()
+            support_level = str(item.get("support_level", "")).strip().casefold()
+            if support_level not in {"direct", "transferable", "gap"}:
+                errors.append(
+                    "Each evidence_map item needs support_level direct, transferable, or gap."
+                )
+                continue
+            if support_level == "gap":
+                if quote:
+                    errors.append("Gap evidence_map items must use an empty source_quote.")
+                continue
+            quote_grounded = (
+                len(quote.split()) >= 6
+                and re.sub(r"\s+", " ", quote).strip().casefold() in normalized_source
+            )
+            requirement_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9+#.]+", requirement.casefold())
+                if len(token) >= 3
+            }
+            requirement_in_jd = not job_description or bool(requirement_tokens & jd_tokens)
+            if quote_grounded and requirement and requirement_in_jd:
+                grounded_requirements.append(requirement)
+        if len(grounded_requirements) < 2:
+            errors.append(
+                "Tailoring evidence map contains fewer than 2 JD-grounded, source-verified mappings."
+            )
+        else:
+            output_tokens = set(
+                re.findall(r"[a-z0-9+#.]+", _flatten_tailored_output(data).casefold())
+            )
+            covered = sum(
+                bool(
+                    {
+                        token
+                        for token in re.findall(r"[a-z0-9+#.]+", requirement.casefold())
+                        if len(token) >= 4
+                    }
+                    & output_tokens
+                )
+                for requirement in grounded_requirements
+            )
+            if covered < 2:
+                errors.append(
+                    f"Tailored resume explicitly addresses only {covered} grounded JD priorities."
+                )
+
+    if original_text:
+        new_numbers = sorted(
+            _numeric_claims(_flatten_tailored_output(data)) - _numeric_claims(original_text)
+        )
+        if new_numbers:
+            errors.append(
+                "Tailored resume adds numeric claims absent from the selected source: "
+                + ", ".join(new_numbers[:8])
+            )
 
     # LLM self-talk is always an error regardless of mode (indicates broken output)
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
@@ -207,17 +471,24 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         "SUMMARY": ["summary", "professional summary", "profile"],
         "TECHNICAL SKILLS": ["technical skills", "skills", "tech stack", "core skills", "technologies"],
         "EXPERIENCE": ["experience", "work experience", "professional experience"],
-        "PROJECTS": ["projects", "personal projects", "key projects", "selected projects"],
         "EDUCATION": ["education", "academic background"],
     }
+    if not original_text or re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", original_text):
+        section_variants["PROJECTS"] = [
+            "projects", "personal projects", "key projects", "selected projects"
+        ]
     for section, variants in section_variants.items():
         if not any(v in text_lower for v in variants):
             errors.append(f"Missing required section: {section} (or variant)")
 
     # 2. Check name preserved (warn, don't error -- we can inject it)
-    full_name = personal.get("full_name", "")
-    if full_name and full_name.lower() not in text_lower:
-        warnings.append(f"Name '{full_name}' missing -- will be injected")
+    display_name = (
+        personal.get("preferred_display_name")
+        or personal.get("preferred_name")
+        or personal.get("full_name", "")
+    )
+    if display_name and display_name.casefold() not in text_lower:
+        warnings.append(f"Name '{display_name}' missing -- will be injected")
 
     # 3. Check companies preserved
     for company in resume_facts.get("preserved_companies", []):
@@ -226,13 +497,18 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 4. Check projects preserved
     for project in resume_facts.get("preserved_projects", []):
-        if project.lower() not in text_lower:
+        source_has_project = not original_text or any(
+            line.strip().casefold().startswith(project.casefold())
+            for line in original_text.splitlines()
+        )
+        if source_has_project and project.casefold() not in text_lower:
             warnings.append(f"Project '{project}' not found -- may have been renamed")
 
     # 5. Check school preserved
     preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school and preserved_school.lower() not in text_lower:
-        errors.append(f"Education '{preserved_school}' missing")
+    for school in [school.strip() for school in preserved_school.split(";") if school.strip()]:
+        if school.casefold() not in text_lower:
+            errors.append(f"Education '{school}' missing")
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")
@@ -241,6 +517,35 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         warnings.append("Email missing -- will be injected")
     if phone and phone not in text:
         warnings.append("Phone missing -- will be injected")
+
+    layout = profile.get("tailoring", {}).get("resume_layout", {})
+    if layout.get("header_contact_immediately_after_name", False):
+        header_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.upper() in REQUIRED_SECTIONS:
+                break
+            if stripped:
+                header_lines.append(stripped)
+        if len(header_lines) != 2 or "@" not in header_lines[1]:
+            errors.append(
+                "Resume header must place the contact line immediately after the name "
+                "without a target-job-title line."
+            )
+
+    min_final_sentence_words = int(layout.get("summary_min_final_sentence_words", 0) or 0)
+    summary_match = re.search(
+        r"(?ims)^\s*SUMMARY\s*$\s*(.*?)(?=^\s*[A-Z][A-Z ]{3,}\s*$)", text
+    )
+    if min_final_sentence_words and summary_match:
+        summary = re.sub(r"\s+", " ", summary_match.group(1)).strip()
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", summary) if part.strip()]
+        final_sentence_words = len(re.findall(r"\b[\w+#./-]+\b", sentences[-1])) if sentences else 0
+        if final_sentence_words < min_final_sentence_words:
+            errors.append(
+                "Summary ends with an undersized sentence "
+                f"({final_sentence_words} words; minimum {min_final_sentence_words})."
+            )
 
     # 7. Scan TECHNICAL SKILLS section for fabricated tools
     skills_start = text_lower.find("technical skills")
@@ -260,7 +565,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             if len(fake) <= 2:
                 continue
             if fake in text_lower and fake not in original_lower:
-                warnings.append(f"New tool/skill appeared: '{fake}' (not in original)")
+                errors.append(f"New tool/skill appeared: '{fake}' (not in original)")
 
     # 9. Em dashes (should be auto-fixed by sanitize_text, but safety net)
     if "\u2014" in text or "\u2013" in text:
@@ -284,6 +589,36 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         if count > 1:
             errors.append(f"Section '{section_name}' appears {count} times.")
 
+    # 13. Repeated bullets are a hard failure; they usually indicate padding
+    # or a retry artifact and waste scarce resume space.
+    bullets = [
+        re.sub(r"\s+", " ", line[2:]).strip()
+        for line in text.splitlines()
+        if line.strip().startswith("- ") and len(line.split()) >= 8
+    ]
+    repeated_pairs: list[tuple[int, int]] = []
+    for left in range(len(bullets)):
+        normalized_left = re.sub(r"[^a-z0-9 ]", "", bullets[left].casefold())
+        for right in range(left + 1, len(bullets)):
+            normalized_right = re.sub(r"[^a-z0-9 ]", "", bullets[right].casefold())
+            if normalized_left == normalized_right or SequenceMatcher(
+                None, normalized_left, normalized_right
+            ).ratio() >= 0.9:
+                repeated_pairs.append((left + 1, right + 1))
+    if repeated_pairs:
+        errors.append(f"Repeated or near-duplicate resume bullets: {repeated_pairs[:3]}")
+
+    words = len(text.split())
+    if original_text and re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", original_text):
+        if words > 950:
+            warnings.append(f"Project resume is {words} words; review whether all content is decisive.")
+        elif words < 250:
+            warnings.append(f"Project resume is only {words} words; verify that decisive evidence was retained.")
+    elif words > 700:
+        warnings.append(f"No-project resume is {words} words; review whether it still fits one readable page.")
+    elif words < 250:
+        warnings.append(f"No-project resume is only {words} words; verify that it is not under-evidenced.")
+
     return {
         "passed": len(errors) == 0,
         "errors": errors,
@@ -293,15 +628,22 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
-def validate_cover_letter(text: str, mode: str = "normal") -> dict:
+def validate_cover_letter(
+    text: str,
+    mode: str = "normal",
+    expected_signoff: str | None = None,
+    company_name: str | None = None,
+    evidence_plan: dict | None = None,
+    surface: str = "formal",
+    expected_current_title: str | None = None,
+    expected_current_company: str | None = None,
+) -> dict:
     """Programmatic validation of a cover letter.
 
     Args:
         text: The cover letter text to validate.
         mode: Validation strictness — "strict", "normal", or "lenient".
-              strict  → banned words are errors (trigger retries); word limit enforced
-              normal  → banned words are warnings; word limit is soft (+25 words)
-              lenient → banned words ignored; word count not checked
+              Strictness affects style checks, not a fixed word-count gate.
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -324,13 +666,22 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
             else:  # normal
                 warnings.append(msg)
 
-    # 3. Word count
+    # 3. Length guidance. Only obvious truncation blocks persistence; the
+    # preferred range is advisory and varies by target surface.
     words = len(text.split())
-    if mode == "strict" and words > 250:
-        errors.append(f"Too long ({words} words). Max 250.")
-    elif mode == "normal" and words > 275:
-        warnings.append(f"Long ({words} words). Target 250.")
-    # lenient: no word count check
+    guidance = {
+        "formal": (300, 450),
+        "ats": (250, 400),
+        "short_answer": (120, 200),
+        "linkedin": (60, 120),
+    }.get(surface)
+    if words < 80:
+        errors.append(f"Appears incomplete or truncated ({words} words).")
+    elif guidance and (words < guidance[0] or words > guidance[1]):
+        warnings.append(
+            f"Length is {words} words; typical {surface} guidance is "
+            f"{guidance[0]}-{guidance[1]}, not a hard limit."
+        )
 
     # 4. LLM self-talk — always an error regardless of mode
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
@@ -341,5 +692,121 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     stripped = text.strip()
     if not stripped.lower().startswith("dear"):
         errors.append("Must start with 'Dear Hiring Manager,'")
+
+    # 6. Formal letters need enough paragraph structure to carry a JD response,
+    # but three versus four paragraphs is an editorial choice.
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", stripped) if block.strip()]
+    body_blocks = [
+        block for block in blocks
+        if not block.lower().startswith("dear")
+        and not block.lower().startswith(("sincerely", "regards", "best regards"))
+        and (expected_signoff is None or block != expected_signoff)
+        and len(block.split()) >= 10
+    ]
+    if surface in {"formal", "ats"} and len(body_blocks) < 3:
+        errors.append(f"Needs at least 3 substantive body paragraphs; found {len(body_blocks)}.")
+
+    # 7. When the caller knows the profile name, require the complete sign-off.
+    if expected_signoff and not stripped.endswith(expected_signoff):
+        errors.append(f"Must end with the configured sign-off: {expected_signoff}")
+
+    # 8. Repetition checks catch accidental copy/paste and common LLM padding.
+    sentences = [
+        re.sub(r"\s+", " ", sentence).strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(body_blocks))
+        if len(sentence.split()) >= 7
+    ]
+    repeated_pairs: list[tuple[int, int]] = []
+    for left in range(len(sentences)):
+        normalized_left = re.sub(r"[^a-z0-9 ]", "", sentences[left].casefold())
+        for right in range(left + 1, len(sentences)):
+            normalized_right = re.sub(r"[^a-z0-9 ]", "", sentences[right].casefold())
+            if normalized_left == normalized_right or SequenceMatcher(
+                None, normalized_left, normalized_right
+            ).ratio() >= 0.88:
+                repeated_pairs.append((left + 1, right + 1))
+    if repeated_pairs:
+        errors.append(f"Repeated or near-duplicate sentences: {repeated_pairs[:3]}")
+
+    openers = [
+        " ".join(re.findall(r"[a-z0-9]+", block.casefold())[:4])
+        for block in body_blocks
+    ]
+    repeated_openers = sorted({opener for opener in openers if opener and openers.count(opener) > 1})
+    if repeated_openers:
+        errors.append(f"Repeated paragraph openers: {', '.join(repeated_openers[:3])}")
+
+    # 9. A statement about the candidate's current role is an identity fact, not
+    # a stylistic paraphrase. If the letter chooses to mention it, require the
+    # exact configured title in the same sentence. This catches plausible but
+    # false titles inferred from a resume heading or target role.
+    if expected_current_title:
+        current_role_cue = re.compile(
+            r"\b(?:i\s+)?currently\s+(?:hold|serve|work|am\s+employed)\b"
+            r"|\bmy\s+current\s+(?:role|position)\b",
+            flags=re.IGNORECASE,
+        )
+        current_role_segments = [
+            segment.strip()
+            for segment in re.split(r"(?<=[.!?])\s+|\n+", text)
+            if current_role_cue.search(segment)
+        ]
+        expected_title_normalized = re.sub(
+            r"\s+", " ", expected_current_title
+        ).strip().casefold()
+        for segment in current_role_segments:
+            segment_normalized = re.sub(r"\s+", " ", segment).strip().casefold()
+            if expected_title_normalized not in segment_normalized:
+                errors.append(
+                    "Current-role statement does not use the configured title exactly: "
+                    f"{expected_current_title}."
+                )
+                break
+
+            if expected_current_company and re.search(r"\bat\b", segment, flags=re.IGNORECASE):
+                company_tokens = {
+                    token
+                    for token in re.findall(r"[a-z0-9]+", expected_current_company.casefold())
+                    if len(token) > 3 and token not in {"company", "design", "planning"}
+                }
+                segment_tokens = set(re.findall(r"[a-z0-9]+", segment_normalized))
+                if company_tokens and not company_tokens.intersection(segment_tokens):
+                    errors.append(
+                        "Current-role statement names an employer but does not match the "
+                        f"configured current company: {expected_current_company}."
+                    )
+                    break
+
+    # 10. Require a company anchor and at least two JD-priority responses. This
+    # is deliberately a grounding gate, not a full semantic fact checker.
+    if company_name and company_name.casefold() != "unknown employer":
+        company_tokens = [
+            token for token in re.findall(r"[a-z0-9]+", company_name.casefold())
+            if len(token) > 2
+        ]
+        if company_tokens and not any(token in text_lower for token in company_tokens):
+            errors.append(f"Missing company-specific reference to {company_name}.")
+
+    if evidence_plan:
+        grounded = [
+            item for item in evidence_plan.get("requirements", [])
+            if item.get("source_quote") and item.get("evidence_summary")
+        ]
+        letter_tokens = set(re.findall(r"[a-z0-9+#.]+", text_lower))
+        covered = 0
+        for item in grounded:
+            requirement_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9+#.]+", item.get("requirement", "").casefold())
+                if len(token) >= 4
+            }
+            if requirement_tokens.intersection(letter_tokens):
+                covered += 1
+        if len(grounded) < 2:
+            errors.append("JD evidence plan contains fewer than 2 grounded mappings.")
+        elif covered < 2:
+            errors.append(
+                f"Letter explicitly addresses only {covered} grounded JD priorities; needs at least 2."
+            )
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

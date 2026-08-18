@@ -3,6 +3,42 @@
 # Use {location_encoded} placeholder for location (URL-encoded).
 # Use {query_encoded} placeholder for search terms (URL-encoded).
 
+# ── Singapore portal policies ─────────────────────────────────────────────
+#
+# These are application controls, not discovery targets. They deliberately do
+# not appear in `sites:` below: a portal policy must never turn a protected
+# job board into a scripted crawler.
+#
+# `manual_only` blocks ApplyPilot browser actions, including a fill-only
+# preview. `review_only` permits one visible fill-only preview but never lets
+# ApplyPilot submit. Assessment, verification, CAPTCHA, and employer-site
+# hand-offs are always for the applicant to complete personally.
+portal_policies:
+  - name: "JobStreet Singapore"
+    domains:
+      - "jobstreet.com"
+    site_names:
+      - "JobStreet"
+      - "JobStreet Singapore"
+    # Listings may enter the local job list only through an authorised export,
+    # feed, or candidate-provided CSV. ApplyPilot never queries JobStreet.
+    discovery_mode: "authorized_import_only"
+    application_mode: "manual_only"
+    assessment_mode: "employer_invited_manual_only"
+    external_application_mode: "manual_reconfirm"
+    submitted_evidence: "candidate-visible confirmation page or receipt"
+
+  - name: "InternSG"
+    domains:
+      - "internsg.com"
+    site_names:
+      - "InternSG"
+    discovery_mode: "manual_only"
+    application_mode: "review_only"
+    assessment_mode: "employer_invited_manual_only"
+    external_application_mode: "manual_reconfirm"
+    submitted_evidence: "candidate-visible confirmation page or receipt"
+
 # ── Manual-Only ATS Domains ──────────────────────────────────────────────
 # These ATS platforms have unsolvable CAPTCHAs. Jobs routing through them
 # are flagged as "manual" during apply — bot skips, user applies by hand.

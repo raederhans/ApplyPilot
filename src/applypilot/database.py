@@ -7,7 +7,7 @@ without migration ordering issues.
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.config import DB_PATH
@@ -66,13 +66,16 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     so it won't destroy existing data.
 
     Schema columns by stage:
-      - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
+      - Discovery:  url, title, salary, description, location, company_name,
+                    source_site, site (legacy source alias), strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
       - Scoring:    fit_score, score_reasoning, scored_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
-      - Cover:      cover_letter_path, cover_letter_at, cover_attempts
+      - Cover:      cover_letter_path, cover_letter_at, cover_attempts,
+                    cover_letter_status, cover_letter_approved_at
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
-                   agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
+                   apply_retry_blocked, apply_retry_reason, agent_id,
+                   last_attempted_at, apply_duration_ms, apply_task_id,
                    verification_confidence
 
     Args:
@@ -95,6 +98,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             salary                TEXT,
             description           TEXT,
             location              TEXT,
+            company_name          TEXT,
+            source_site           TEXT,
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
@@ -114,17 +119,29 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
             tailor_attempts       INTEGER DEFAULT 0,
+            tailor_status         TEXT,
+            tailor_error          TEXT,
+            tailor_source_resume_path TEXT,
+            tailor_report_path    TEXT,
 
             -- Cover letter stage
             cover_letter_path     TEXT,
             cover_letter_at       TEXT,
             cover_attempts        INTEGER DEFAULT 0,
+            cover_letter_status   TEXT,
+            cover_letter_error    TEXT,
+            cover_letter_approved_at TEXT,
+            cover_letter_approved_by TEXT,
+            cover_letter_source_resume_path TEXT,
+            cover_letter_evidence_sources TEXT,
 
             -- Application stage
             applied_at            TEXT,
             apply_status          TEXT,
             apply_error           TEXT,
             apply_attempts        INTEGER DEFAULT 0,
+            apply_retry_blocked   INTEGER DEFAULT 0,
+            apply_retry_reason    TEXT,
             agent_id              TEXT,
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
@@ -135,7 +152,31 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn.commit()
 
     # Run migrations for any columns added after initial schema
-    ensure_columns(conn)
+    added_columns = ensure_columns(conn)
+    if "apply_retry_blocked" in added_columns:
+        conn.execute("""
+            UPDATE jobs
+            SET apply_retry_blocked = CASE
+                    WHEN apply_status != 'applied' AND apply_attempts >= 99 THEN 1
+                    ELSE 0
+                END,
+                apply_retry_reason = CASE
+                    WHEN apply_status != 'applied' AND apply_attempts >= 99
+                    THEN COALESCE(apply_error, 'legacy_permanent_failure')
+                    ELSE NULL
+                END,
+                apply_attempts = CASE
+                    WHEN apply_attempts >= 99 THEN apply_attempts - 99
+                    ELSE apply_attempts
+                END
+        """)
+    # ``site`` historically stored the discovery board. Preserve that value as
+    # source metadata, but never guess an employer name from it.
+    conn.execute(
+        "UPDATE jobs SET source_site = site "
+        "WHERE (source_site IS NULL OR source_site = '') AND site IS NOT NULL"
+    )
+    conn.commit()
 
     return conn
 
@@ -150,6 +191,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
+    "company_name": "TEXT",
+    "source_site": "TEXT",
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
@@ -166,20 +209,40 @@ _ALL_COLUMNS: dict[str, str] = {
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
     "tailor_attempts": "INTEGER DEFAULT 0",
+    "tailor_status": "TEXT",
+    "tailor_error": "TEXT",
+    "tailor_source_resume_path": "TEXT",
+    "tailor_report_path": "TEXT",
     # Cover letter
     "cover_letter_path": "TEXT",
     "cover_letter_at": "TEXT",
     "cover_attempts": "INTEGER DEFAULT 0",
+    "cover_letter_status": "TEXT",
+    "cover_letter_error": "TEXT",
+    "cover_letter_approved_at": "TEXT",
+    "cover_letter_approved_by": "TEXT",
+    "cover_letter_source_resume_path": "TEXT",
+    "cover_letter_evidence_sources": "TEXT",
     # Application
     "applied_at": "TEXT",
     "apply_status": "TEXT",
     "apply_error": "TEXT",
     "apply_attempts": "INTEGER DEFAULT 0",
+    "apply_retry_blocked": "INTEGER DEFAULT 0",
+    "apply_retry_reason": "TEXT",
     "agent_id": "TEXT",
     "last_attempted_at": "TEXT",
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Scoring failures must not be represented as real zero scores.
+    "score_status": "TEXT",
+    "score_error": "TEXT",
+    "score_attempts": "INTEGER DEFAULT 0",
+    # Deterministic hard-eligibility screening
+    "eligibility_status": "TEXT",
+    "eligibility_reason": "TEXT",
+    "eligibility_evaluated_at": "TEXT",
 }
 
 
@@ -237,90 +300,103 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     if conn is None:
         conn = get_connection()
 
+    from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
+    refresh_job_eligibility(conn)
+
     stats: dict = {}
 
     # Total jobs
-    stats["total"] = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    stats["total"] = conn.execute(
+        f"SELECT COUNT(*) FROM jobs WHERE {ELIGIBLE_SQL}"
+    ).fetchone()[0]
+    stats["excluded_ineligible"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE eligibility_status = 'ineligible'"
+    ).fetchone()[0]
 
     # By site breakdown
     rows = conn.execute(
-        "SELECT site, COUNT(*) as cnt FROM jobs GROUP BY site ORDER BY cnt DESC"
+        f"SELECT COALESCE(source_site, site), COUNT(*) as cnt FROM jobs WHERE {ELIGIBLE_SQL} "
+        "GROUP BY COALESCE(source_site, site) ORDER BY cnt DESC"
     ).fetchall()
     stats["by_site"] = [(row[0], row[1]) for row in rows]
 
     # Enrichment stage
     stats["pending_detail"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["with_description"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["detail_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     # Scoring stage
     stats["scored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["unscored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND fit_score IS NULL"
+        f"WHERE full_description IS NOT NULL AND fit_score IS NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     # Score distribution
     dist_rows = conn.execute(
         "SELECT fit_score, COUNT(*) as cnt FROM jobs "
-        "WHERE fit_score IS NOT NULL "
+        f"WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL} "
         "GROUP BY fit_score ORDER BY fit_score DESC"
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
 
     # Tailoring stage
     stats["tailored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        f"AND tailor_status='machine_validated' AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
+        f"AND tailored_resume_path IS NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["tailor_exhausted"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(tailor_attempts, 0) >= 5 "
-        "AND tailored_resume_path IS NULL"
+        f"AND tailored_resume_path IS NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     # Cover letter stage
     stats["with_cover_letter"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["cover_exhausted"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(cover_attempts, 0) >= 5 "
-        "AND (cover_letter_path IS NULL OR cover_letter_path = '')"
+        f"AND (cover_letter_path IS NULL OR cover_letter_path = '') AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     # Application stage
     stats["applied"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["apply_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
+        "AND tailor_status = 'machine_validated' "
+        "AND ((cover_letter_path IS NOT NULL AND cover_letter_status = 'human_approved') "
+        "OR cover_letter_status = 'not_required') "
         "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
+        f"AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     return stats
@@ -339,7 +415,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
+    from applypilot.eligibility import evaluate_job_eligibility
     new = 0
     existing = 0
 
@@ -348,11 +425,16 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         if not url:
             continue
         try:
+            eligibility_status, eligibility_reason = evaluate_job_eligibility(job)
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, company_name, source_site, "
+                "site, strategy, discovered_at, "
+                "eligibility_status, eligibility_reason, eligibility_evaluated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), job.get("company_name") or job.get("company"),
+                 site, site, strategy, now, eligibility_status,
+                 eligibility_reason, now),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -380,6 +462,9 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if conn is None:
         conn = get_connection()
 
+    from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
+    refresh_job_eligibility(conn)
+
     conditions = {
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
@@ -390,15 +475,20 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             "fit_score >= ? AND full_description IS NOT NULL "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
-        "tailored": "tailored_resume_path IS NOT NULL",
+        "tailored": (
+            "tailored_resume_path IS NOT NULL AND tailor_status='machine_validated'"
+        ),
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            "AND tailor_status = 'machine_validated' "
+            "AND ((cover_letter_path IS NOT NULL AND cover_letter_status = 'human_approved') "
+            "OR cover_letter_status = 'not_required')"
         ),
         "applied": "applied_at IS NOT NULL",
     }
 
     where = conditions.get(stage, "1=1")
+    where += f" AND {ELIGIBLE_SQL}"
     params: list = []
 
     if "?" in where and min_score is not None:

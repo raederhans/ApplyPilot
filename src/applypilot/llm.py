@@ -4,6 +4,7 @@ Unified LLM client for ApplyPilot.
 Auto-detects provider from environment:
   GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
+  DEEPSEEK_API_KEY -> DeepSeek OpenAI-compatible API
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
@@ -29,6 +30,7 @@ def _detect_provider() -> tuple[str, str, str]:
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
@@ -46,6 +48,13 @@ def _detect_provider() -> tuple[str, str, str]:
             openai_key,
         )
 
+    if deepseek_key and not local_url:
+        return (
+            os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
+            model_override or "deepseek-v4-pro",
+            deepseek_key,
+        )
+
     if local_url:
         return (
             local_url.rstrip("/"),
@@ -55,7 +64,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set GEMINI_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -88,10 +97,12 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        request_timeout = float(os.environ.get("APPLYPILOT_LLM_TIMEOUT_SECONDS", str(_TIMEOUT)))
+        self._client = httpx.Client(timeout=request_timeout)
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self.last_response_meta: dict = {}
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -151,6 +162,9 @@ class LLMClient:
         messages: list[dict],
         temperature: float,
         max_tokens: int,
+        response_format: dict | None = None,
+        thinking: dict | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Call the OpenAI-compatible endpoint."""
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -163,6 +177,12 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_format:
+            payload["response_format"] = response_format
+        if thinking and self.model.casefold().startswith("deepseek"):
+            payload["thinking"] = thinking
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
@@ -177,11 +197,23 @@ class LLMClient:
 
         return self._handle_compat_response(resp)
 
-    @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _handle_compat_response(self, resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        usage = data.get("usage") or {}
+        self.last_response_meta = {
+            "finish_reason": choice.get("finish_reason"),
+            "content_chars": len(content),
+            "reasoning_chars": len(reasoning),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+        return content
 
     # -- public API ---------------------------------------------------------
 
@@ -190,6 +222,9 @@ class LLMClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        response_format: dict | None = None,
+        thinking: dict | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Send a chat completion request and return the assistant message text."""
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
@@ -199,15 +234,23 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
-        for attempt in range(_MAX_RETRIES):
+        max_retries = max(1, int(os.environ.get("APPLYPILOT_LLM_MAX_RETRIES", str(_MAX_RETRIES))))
+        for attempt in range(max_retries):
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
-                return self._chat_compat(messages, temperature, max_tokens)
+                return self._chat_compat(
+                    messages,
+                    temperature,
+                    max_tokens,
+                    response_format=response_format,
+                    thinking=thinking,
+                    reasoning_effort=reasoning_effort,
+                )
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
@@ -228,7 +271,7 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                if resp.status_code in (429, 503) and attempt < max_retries - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
@@ -246,18 +289,18 @@ class LLMClient:
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
                         "Tip: Gemini free tier = 15 RPM. Consider a paid account "
                         "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
+                        resp.status_code, wait, attempt + 1, max_retries,
                     )
                     time.sleep(wait)
                     continue
                 raise
 
             except httpx.TimeoutException:
-                if attempt < _MAX_RETRIES - 1:
+                if attempt < max_retries - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
+                        wait, attempt + 1, max_retries,
                     )
                     time.sleep(wait)
                     continue

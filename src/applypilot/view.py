@@ -18,7 +18,8 @@ from pathlib import Path
 from rich.console import Console
 
 from applypilot.config import APP_DIR, DB_PATH
-from applypilot.database import get_connection
+from applypilot.database import init_db
+from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
 
 console = Console()
 
@@ -34,19 +35,20 @@ def generate_dashboard(output_path: str | None = None) -> str:
     """
     out = Path(output_path) if output_path else APP_DIR / "dashboard.html"
 
-    conn = get_connection()
+    conn = init_db()
+    refresh_job_eligibility(conn)
 
     # Stats
-    total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {ELIGIBLE_SQL}").fetchone()[0]
     ready = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
+        f"WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
     scored = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
     high_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
+        f"SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 AND {ELIGIBLE_SQL}"
     ).fetchone()[0]
 
     # Score distribution
@@ -54,32 +56,33 @@ def generate_dashboard(output_path: str | None = None) -> str:
     if scored:
         rows = conn.execute(
             "SELECT fit_score, COUNT(*) FROM jobs "
-            "WHERE fit_score IS NOT NULL "
+            f"WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL} "
             "GROUP BY fit_score ORDER BY fit_score DESC"
         ).fetchall()
         for r in rows:
             score_dist[r[0]] = r[1]
 
     # Site stats
-    site_stats = conn.execute("""
-        SELECT site,
+    site_stats = conn.execute(f"""
+        SELECT COALESCE(source_site, site) AS source_site,
                COUNT(*) as total,
                SUM(CASE WHEN fit_score >= 7 THEN 1 ELSE 0 END) as high_fit,
                SUM(CASE WHEN fit_score BETWEEN 5 AND 6 THEN 1 ELSE 0 END) as mid_fit,
                SUM(CASE WHEN fit_score < 5 AND fit_score IS NOT NULL THEN 1 ELSE 0 END) as low_fit,
                SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) as unscored,
                ROUND(AVG(fit_score), 1) as avg_score
-        FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
+        FROM jobs WHERE {ELIGIBLE_SQL} GROUP BY COALESCE(source_site, site) ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
     # All scored jobs (5+), ordered by score desc
-    jobs = conn.execute("""
-        SELECT url, title, salary, description, location, site, strategy,
+    jobs = conn.execute(f"""
+        SELECT url, title, salary, description, location, company_name,
+               COALESCE(source_site, site) AS source_site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, cover_letter_status
         FROM jobs
-        WHERE fit_score >= 5
-        ORDER BY fit_score DESC, site, title
+        WHERE fit_score >= 5 AND {ELIGIBLE_SQL}
+        ORDER BY fit_score DESC, company_name, title
     """).fetchall()
 
     # Color map per site
@@ -111,7 +114,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     # Site stats rows
     site_rows = ""
     for s in site_stats:
-        site = s["site"] or "?"
+        site = s["source_site"] or "?"
         color = colors.get(site, "#6b7280")
         avg = s["avg_score"] or 0
         site_rows += f"""
@@ -150,8 +153,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
         url = escape(j["url"] or "")
         salary = escape(j["salary"] or "")
         location = escape(j["location"] or "")
-        site = escape(j["site"] or "")
-        site_color = colors.get(j["site"] or "", "#6b7280")
+        company = escape(j["company_name"] or "Unknown employer")
+        site = escape(j["source_site"] or "")
+        site_color = colors.get(j["source_site"] or "", "#6b7280")
         apply_url = escape(j["application_url"] or "")
 
         # Parse keywords and reasoning from score_reasoning
@@ -165,6 +169,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         desc_len = len(j["full_description"] or "")
 
         meta_parts = []
+        meta_parts.append(f'<span class="meta-tag">{company}</span>')
         meta_parts.append(
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
         )
@@ -179,7 +184,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
 
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
+        <div class="job-card" data-score="{score}" data-site="{escape(j['source_site'] or '')}" data-location="{location.lower()}">
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
@@ -318,7 +323,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <button class="filter-btn" onclick="filterScore(8)">8+ Excellent</button>
   <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
-  <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
+  <input type="text" class="search-input" placeholder="Filter by title, company, source..." oninput="filterText(this.value)">
 </div>
 
 <div class="score-section">

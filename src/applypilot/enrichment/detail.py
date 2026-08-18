@@ -15,8 +15,9 @@ import logging
 import re
 import sqlite3
 import time
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -352,6 +353,29 @@ def extract_apply_url_deterministic(page) -> str | None:
     return None
 
 
+def sanitize_application_url(job_url: str, application_url: str | None) -> str | None:
+    """Reject authentication/navigation links that are not application targets."""
+    if not application_url or not str(application_url).strip():
+        return None
+    candidate = urljoin(job_url, str(application_url).strip())
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+
+    hostname = parsed.hostname.casefold()
+    path = parsed.path.casefold().rstrip("/")
+    if hostname == "linkedin.com" or hostname.endswith(".linkedin.com"):
+        blocked_prefixes = (
+            "/login",
+            "/signup",
+            "/authwall",
+            "/checkpoint",
+        )
+        if any(path == prefix or path.startswith(prefix + "/") for prefix in blocked_prefixes):
+            return None
+    return candidate
+
+
 def extract_description_deterministic(page) -> str | None:
     """Try known CSS patterns for the job description block."""
     for sel in DESCRIPTION_SELECTORS:
@@ -644,6 +668,12 @@ def scrape_site_batch(
                 log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
 
                 result = scrape_detail_page(page, url)
+                result["application_url"] = sanitize_application_url(
+                    url,
+                    result.get("application_url"),
+                )
+                if result.get("full_description") and not result.get("application_url"):
+                    result["status"] = "partial"
                 stats["processed"] += 1
 
                 tier = result.get("tier_used")
@@ -705,7 +735,7 @@ def _run_detail_scraper(
     skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
     where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
     rows = conn.execute(
-        f"SELECT url, title, site FROM jobs {where} ORDER BY site"
+        f"SELECT url, title, source_site, site FROM jobs {where} ORDER BY site"
     ).fetchall()
 
     if not rows:
@@ -713,13 +743,28 @@ def _run_detail_scraper(
         return {"processed": 0, "ok": 0, "partial": 0, "error": 0}
 
     site_jobs: dict[str, list[tuple]] = {}
+    skipped_manual = 0
+    now = datetime.now(UTC).isoformat()
     for row in rows:
-        url, title, site = row[0], row[1], row[2]
+        url, title, source_site, site = row[0], row[1], row[2], row[3]
         if sites and site not in sites:
             continue
+        portal_gate = config.portal_discovery_gate(
+            url, source_site=source_site, site=site
+        )
+        if portal_gate:
+            conn.execute(
+                "UPDATE jobs SET detail_error=?, detail_scraped_at=? WHERE url=?",
+                (portal_gate, now, url),
+            )
+            skipped_manual += 1
+            continue
         site_jobs.setdefault(site, []).append((url, title))
+    conn.commit()
 
     log.info("Pending: %d jobs across %d sites (workers=%d)", len(rows), len(site_jobs), workers)
+    if skipped_manual:
+        log.info("Skipped %d portal listing(s) that require human or authorised-source intake.", skipped_manual)
     for site, jobs in site_jobs.items():
         log.info("  %s: %d jobs", site, len(jobs))
 
@@ -730,7 +775,14 @@ def _run_detail_scraper(
     order = [s for s in known_order if s in site_jobs]
     order += [s for s in sorted(site_jobs.keys()) if s not in order]
 
-    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    total_stats: dict = {
+        "processed": 0,
+        "ok": 0,
+        "partial": 0,
+        "error": 0,
+        "skipped_manual": skipped_manual,
+        "tiers": {1: 0, 2: 0, 3: 0},
+    }
 
     def _merge_stats(stats: dict) -> None:
         for k in ("processed", "ok", "partial", "error"):
@@ -816,16 +868,27 @@ def stream_detail(
         while True:
             skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
             rows = conn.execute(
-                "SELECT url, title, site FROM jobs "
+                "SELECT url, title, source_site, site FROM jobs "
                 f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
                 "ORDER BY site LIMIT 200"
             ).fetchall()
 
             if rows:
                 site_jobs: dict[str, list[tuple]] = {}
+                now = datetime.now(UTC).isoformat()
                 for row in rows:
-                    url, title, site = row[0], row[1], row[2]
+                    url, title, source_site, site = row[0], row[1], row[2], row[3]
+                    portal_gate = config.portal_discovery_gate(
+                        url, source_site=source_site, site=site
+                    )
+                    if portal_gate:
+                        conn.execute(
+                            "UPDATE jobs SET detail_error=?, detail_scraped_at=? WHERE url=?",
+                            (portal_gate, now, url),
+                        )
+                        continue
                     site_jobs.setdefault(site, []).append((url, title))
+                conn.commit()
 
                 for site, jobs in site_jobs.items():
                     delay = SITE_DELAYS.get(site, 2.0)
