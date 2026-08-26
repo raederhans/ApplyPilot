@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from applypilot import config as _config
 from applypilot.config import load_profile
@@ -192,11 +192,10 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
     log.info("Scoring %d jobs sequentially...", len(jobs))
     t0 = time.time()
-    completed = 0
     errors = 0
     results: list[dict] = []
 
-    for job in jobs:
+    for completed, job in enumerate(jobs, start=1):
         try:
             source_path, routing = select_resume_source(job, profile)
             resume_text = read_resume_source(source_path)
@@ -213,8 +212,6 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
                 "resume_routing": None,
             }
         result["url"] = job["url"]
-        completed += 1
-
         if result["score"] == 0:
             errors += 1
 
@@ -227,7 +224,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
     # Write scores to DB. Provider/parser failures remain NULL so they are
     # distinguishable from a genuine low score and can be retried later.
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     for r in results:
         if r["score"] == 0:
             conn.execute(

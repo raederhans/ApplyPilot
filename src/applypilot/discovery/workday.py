@@ -14,7 +14,7 @@ import sqlite3
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 
 import yaml
@@ -178,7 +178,7 @@ def search_employer(
     reject_locs: list[str] | None = None,
 ) -> list[dict]:
     """Search an employer, paginate through all results, optionally filter by location."""
-    log.info("%s: searching \"%s\"...", employer["name"], search_text)
+    log.info('%s: searching "%s"...', employer["name"], search_text)
 
     all_jobs: list[dict] = []
     offset = 0
@@ -203,9 +203,13 @@ def search_employer(
 
         for j in postings:
             loc = j.get("locationsText", "")
-            if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs):
-                    continue
+            if (
+                location_filter
+                and accept_locs is not None
+                and reject_locs is not None
+                and not _location_ok(loc, accept_locs, reject_locs)
+            ):
+                continue
 
             all_jobs.append({
                 "title": j.get("title", ""),
@@ -259,13 +263,11 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
     """Fetch full description + apply URL for each job sequentially."""
     log.info("%s: fetching details for %d jobs...", employer["name"], len(jobs))
 
-    completed = 0
     errors = 0
     t0 = time.time()
 
-    for job in jobs:
+    for completed, job in enumerate(jobs, start=1):
         _fetch_one_detail(employer, job)
-        completed += 1
         if "detail_error" in job:
             errors += 1
 
@@ -289,7 +291,7 @@ def store_results(
     excluded_titles: list[str] | None = None,
 ) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     excluded = 0
     excluded_titles = excluded_titles or []
     grouped: dict[str, list[dict]] = {}
@@ -444,13 +446,11 @@ def scrape_employers(
                              search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
     else:
         # Sequential mode (default)
-        completed = 0
-        for key in valid_keys:
+        for completed, key in enumerate(valid_keys, start=1):
             result = _process_one(
                 key, employers, search_text,
                 location_filter, accept_locs, reject_locs, excluded_titles,
             )
-            completed += 1
             total_new += result["new"]
             total_existing += result["existing"]
             total_found += result["found"]
@@ -522,7 +522,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     grand_found = 0
 
     for i, query in enumerate(queries, 1):
-        log.info("Query %d/%d: \"%s\"", i, len(queries), query)
+        log.info('Query %d/%d: "%s"', i, len(queries), query)
         result = scrape_employers(
             search_text=query,
             employers=employers,

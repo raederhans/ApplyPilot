@@ -12,13 +12,13 @@ import multiprocessing
 import sqlite3
 import tempfile
 import time
-from datetime import datetime, timezone
+import warnings
+from datetime import UTC, datetime
 from pathlib import Path
-
-from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.optional_dependencies import require_jobboards
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def parse_proxy(proxy_str: str) -> dict:
                 "password": passwd,
             },
         }
-    elif len(parts) == 2:
+    if len(parts) == 2:
         host, port = parts
         return {
             "host": host,
@@ -52,11 +52,10 @@ def parse_proxy(proxy_str: str) -> dict:
             "jobspy": f"{host}:{port}",
             "playwright": {"server": f"http://{host}:{port}"},
         }
-    else:
-        raise ValueError(
-            f"Proxy format not recognized: {proxy_str}. "
-            f"Expected: host:port:user:pass or host:port"
-        )
+    raise ValueError(
+        f"Proxy format not recognized: {proxy_str}. "
+        f"Expected: host:port:user:pass or host:port"
+    )
 
 
 # -- Retry wrapper -----------------------------------------------------------
@@ -64,6 +63,7 @@ def parse_proxy(proxy_str: str) -> dict:
 def _scrape_to_files(kwargs: dict, result_path: str, error_path: str) -> None:
     """Child-process target used to make third-party scraping terminable."""
     try:
+        scrape_jobs = require_jobboards().scrape_jobs
         scrape_jobs(**kwargs).to_pickle(result_path)
     except BaseException as exc:  # Child must report every failure to the parent.
         Path(error_path).write_text(f"{type(exc).__name__}: {exc}", encoding="utf-8")
@@ -148,12 +148,15 @@ def store_jobspy_results(
     excluded_titles: list[str] | None = None,
 ) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     excluded = 0
     excluded_titles = excluded_titles or []
     grouped: dict[str, list[dict]] = {}
 
-    for _, row in df.iterrows():
+    # DataFrame.iterrows constructs one Series per row and dominates ingestion
+    # time for larger result sets. A record conversion preserves the existing
+    # dynamic-column behavior while doing the column work in pandas once.
+    for row in df.to_dict(orient="records"):
         url = str(row.get("job_url", ""))
         if not url or url == "nan":
             continue
@@ -305,7 +308,7 @@ def _run_one_search(
         return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
 
     import pandas as pd
-    import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
@@ -316,10 +319,16 @@ def _run_one_search(
 
     # Filter by location before storing
     before = len(df)
-    df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
-    ), axis=1)]
+    locations = df["location"].tolist() if "location" in df.columns else [""] * len(df)
+    location_mask = [
+        _location_ok(
+            str(location) if str(location) != "nan" else None,
+            accept_locs,
+            reject_locs,
+        )
+        for location in locations
+    ]
+    df = df.loc[location_mask]
     filtered = before - len(df)
 
     conn = get_connection()
@@ -351,7 +360,7 @@ def search_jobs(
 
     proxy_config = parse_proxy(proxy) if proxy else None
 
-    log.info("Search: \"%s\" in %s | sites=%s | remote=%s", query, location, sites, remote_only)
+    log.info('Search: "%s" in %s | sites=%s | remote=%s', query, location, sites, remote_only)
 
     kwargs = {
         "site_name": sites,
@@ -453,15 +462,12 @@ def _full_crawl(
     total_new = 0
     total_existing = 0
     total_errors = 0
-    completed = 0
-
-    for s in searches:
+    for completed, s in enumerate(searches, start=1):
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map, excluded_titles,
         )
-        completed += 1
         total_new += result["new"]
         total_existing += result["existing"]
         total_errors += result["errors"]
@@ -507,6 +513,11 @@ def run_discovery(cfg: dict | None = None) -> dict:
     if not cfg:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
+
+    # Validate the optional capability once before expanding the search matrix.
+    # Without this boundary, one missing dependency would spawn and fail a
+    # separate child process for every configured query/location pair.
+    require_jobboards()
 
     # The shipped search schema and onboarding wizard use ``boards`` plus a
     # top-level ``country``. Keep the older spellings working for existing

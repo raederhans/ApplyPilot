@@ -9,7 +9,6 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import typer
@@ -26,7 +25,7 @@ logging.basicConfig(
 
 app = typer.Typer(
     name="applypilot",
-    help="AI-powered end-to-end job application pipeline.",
+    help="Local-first, evidence-driven job application workspace.",
     no_args_is_help=True,
 )
 radar_app = typer.Typer(
@@ -99,8 +98,7 @@ def _build_standing_authorization_manifest(
             max(configured_cap, configured_cap * 2),
         )
     )
-    if configured_candidate_cap < submission_cap:
-        configured_candidate_cap = submission_cap
+    configured_candidate_cap = max(configured_candidate_cap, submission_cap)
     candidate_cap = 1 if target_url else min(submission_cap * 2, configured_candidate_cap)
     ttl_minutes = int(policy.get("standing_authorization_ttl_minutes", 120))
     minimum_fit_score = max(1, min(int(min_score), 10))
@@ -207,7 +205,7 @@ def _assert_discovery_storage_path(path: Path, root: Path, label: str) -> None:
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"[bold]applypilot[/bold] {__version__}")
+        console.print(f"[bold]ApplyPilot Local[/bold] {__version__}")
         raise typer.Exit()
 
 
@@ -225,7 +223,7 @@ def main(
         is_eager=True,
     ),
 ) -> None:
-    """ApplyPilot — AI-powered end-to-end job application pipeline."""
+    """ApplyPilot Local — evidence-driven discovery, preparation, and application."""
     _assert_discovery_only_command(ctx.invoked_subcommand, {"sync-linkedin-applied", "radar"})
 
 
@@ -364,7 +362,7 @@ def review_readiness(
 
 @app.command("sync-linkedin-applied")
 def sync_linkedin_applied(
-    file: Path = typer.Option(  # noqa: B008
+    file: Path = typer.Option(
         ...,
         "--file",
         exists=True,
@@ -391,7 +389,7 @@ def sync_linkedin_applied(
 
 @app.command("reconcile-receipts")
 def reconcile_receipts(
-    file: Path = typer.Option(  # noqa: B008
+    file: Path = typer.Option(
         ...,
         "--file",
         exists=True,
@@ -539,7 +537,7 @@ def radar_queries(
 
 @radar_app.command("collect")
 def radar_collect(
-    company: list[str] | None = typer.Option(  # noqa: B008
+    company: list[str] | None = typer.Option(
         None,
         "--company",
         help="Company ID to collect; repeat to select multiple. Defaults to all active sources.",
@@ -678,7 +676,7 @@ def radar_collect(
 
 @radar_app.command("import-leads")
 def radar_import_leads(
-    file: Path = typer.Option(..., "--file", exists=True, dir_okay=False),  # noqa: B008
+    file: Path = typer.Option(..., "--file", exists=True, dir_okay=False),
     source_id: str = typer.Option("linkedin-content-manual", "--source-id"),
 ) -> None:
     """Import a candidate-reviewed JSON/CSV lead file without creating jobs."""
@@ -776,7 +774,7 @@ def radar_import_leads(
 @radar_app.command("report")
 def radar_report(
     hours: int = typer.Option(24, "--hours", min=1, max=24 * 31),
-    output: Path | None = typer.Option(None, "--output", dir_okay=False),  # noqa: B008
+    output: Path | None = typer.Option(None, "--output", dir_okay=False),
     require_applied_snapshot: str | None = typer.Option(
         None,
         "--require-applied-snapshot",
@@ -842,7 +840,7 @@ def radar_report(
 
 @app.command()
 def run(
-    stages: Optional[list[str]] = typer.Argument(
+    stages: list[str] | None = typer.Argument(
         None,
         help=(
             "Pipeline stages to run. "
@@ -870,7 +868,7 @@ def run(
 
     from applypilot.pipeline import run_pipeline
 
-    stage_list = stages if stages else ["all"]
+    stage_list = stages or ["all"]
 
     # Validate stage names
     for s in stage_list:
@@ -911,10 +909,10 @@ def run(
 
 @app.command("authorize-batch")
 def authorize_batch(
-    urls: list[str] = typer.Option(  # noqa: B008
+    urls: list[str] = typer.Option(
         ..., "--url", help="Exact prepared job URL; repeat for a batch."
     ),
-    output: Path | None = typer.Option(None, "--output", dir_okay=False),  # noqa: B008
+    output: Path | None = typer.Option(None, "--output", dir_okay=False),
     expires_hours: int = typer.Option(24, "--expires-hours", min=1, max=168),
 ) -> None:
     """Record the initial approval for one exact, short-lived application batch."""
@@ -1064,14 +1062,14 @@ def authorize_batch(
 
 @app.command("finalize-batch")
 def finalize_batch(
-    authorization_file: Path = typer.Option(  # noqa: B008
+    authorization_file: Path = typer.Option(
         ...,
         "--authorization-file",
         exists=True,
         dir_okay=False,
         help="Initial exact-job batch authorization manifest.",
     ),
-    output: Path | None = typer.Option(None, "--output", dir_okay=False),  # noqa: B008
+    output: Path | None = typer.Option(None, "--output", dir_okay=False),
     ttl_minutes: int = typer.Option(120, "--ttl-minutes", min=1, max=240),
 ) -> None:
     """Record one final authorization covering every exact job in a prepared batch."""
@@ -1118,7 +1116,7 @@ def finalize_batch(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(
+    limit: int | None = typer.Option(
         None,
         "--limit",
         "-l",
@@ -1126,8 +1124,8 @@ def apply(
     ),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(6, "--min-score", help="Minimum fit score for job selection."),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Browser-agent model override."),
-    agent_backend: Optional[str] = typer.Option(
+    model: str | None = typer.Option(None, "--model", "-m", help="Browser-agent model override."),
+    agent_backend: str | None = typer.Option(
         None,
         "--agent-backend",
         help="Browser-agent CLI: codex or claude. Defaults to APPLYPILOT_APPLY_BACKEND.",
@@ -1140,15 +1138,15 @@ def apply(
         help="Deprecated compatibility flag; visible CAPTCHA always hard-pauses for review.",
     ),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
-    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
-    authorization_file: Path | None = typer.Option(  # noqa: B008
+    url: str | None = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    authorization_file: Path | None = typer.Option(
         None,
         "--authorization-file",
         exists=True,
         dir_okay=False,
         help="Short-lived exact-job batch authorization manifest.",
     ),
-    final_authorization_file: Path | None = typer.Option(  # noqa: B008
+    final_authorization_file: Path | None = typer.Option(
         None,
         "--final-authorization-file",
         exists=True,
@@ -1156,9 +1154,9 @@ def apply(
         help="One final authorization bound to the exact initial batch manifest.",
     ),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
-    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
-    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
-    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
+    mark_applied: str | None = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
+    mark_failed: str | None = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
+    fail_reason: str | None = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
@@ -1559,7 +1557,7 @@ def prepare_cover(
     url: str = typer.Option(..., "--url", help="Exact discovered job URL."),
     company: str = typer.Option(..., "--company", help="Verified employer name."),
     validation: str = typer.Option("strict", "--validation", help="strict, normal, or lenient."),
-    resume: Optional[str] = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
+    resume: str | None = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
 ) -> None:
     """Score and generate a cover letter for one exact, eligible job."""
     _bootstrap()
@@ -1581,7 +1579,7 @@ def import_job(
     company: str = typer.Option(..., "--company", help="Verified employer name."),
     location: str = typer.Option("Singapore", "--location", help="Verified job location."),
     site: str = typer.Option("linkedin", "--site", help="Source job board."),
-    description_file: Path | None = typer.Option(  # noqa: B008
+    description_file: Path | None = typer.Option(
         None,
         "--description-file",
         exists=True,
@@ -1614,7 +1612,7 @@ def import_job(
 
 @app.command("import-listings")
 def import_listings(
-    file: Path = typer.Option(  # noqa: B008
+    file: Path = typer.Option(
         ..., "--file", exists=True, dir_okay=False, help="Candidate-provided listing CSV."
     ),
     portal: str | None = typer.Option(
@@ -1763,7 +1761,7 @@ def resume_route_command(
 @app.command("score-job")
 def score_job_command(
     url: str = typer.Option(..., "--url", help="Exact enriched job URL."),
-    resume: Optional[str] = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
+    resume: str | None = typer.Option(None, "--resume", help="Exact .txt or .docx resume source."),
 ) -> None:
     """Score one exact eligible job against one explicit resume source."""
     _bootstrap()
@@ -1893,16 +1891,16 @@ def doctor() -> None:
     else:
         results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
 
-    # jobspy (discovery dep installed separately)
+    # JobSpy is an optional capability rather than a core import dependency.
     try:
-        import jobspy  # noqa: F401
+        from applypilot.optional_dependencies import require_jobboards
+
+        require_jobboards()
         results.append(("python-jobspy", ok_mark, "Job board scraping available"))
-    except ImportError:
-        results.append(("python-jobspy", warn_mark,
-                        "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
+    except RuntimeError as exc:
+        results.append(("python-jobspy", warn_mark, str(exc)))
 
     # --- Tier 2 checks ---
-    import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
@@ -1962,7 +1960,7 @@ def doctor() -> None:
 
     # --- Render results ---
     console.print()
-    console.print("[bold]ApplyPilot Doctor[/bold]\n")
+    console.print("[bold]ApplyPilot Local Doctor[/bold]\n")
 
     col_w = max(len(r[0]) for r in results) + 2
     for check, status, note in results:

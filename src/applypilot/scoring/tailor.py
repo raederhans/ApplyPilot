@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
@@ -986,7 +986,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 if validated_txt_path.exists():
                     stale_path = rejected_dir / (
                         f"{prefix}_PREVIOUSLY_VALIDATED_"
-                        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.txt"
+                        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.txt"
                     )
                     validated_txt_path.replace(stale_path)
                     report["quarantined_previous_path"] = str(stale_path)
@@ -1073,7 +1073,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         )
 
     # Persist to DB: only fully machine-validated outputs become downstream inputs.
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     for r in results:
         if r["status"] == "machine_validated":
             attempt_increment = 0 if r.get("resume_library_decision") == "reuse_exact" else 1

@@ -38,7 +38,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
-        pass
+        log.debug("Unable to reconfigure console encoding", exc_info=True)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
@@ -127,7 +127,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 body = response.text()
                 try:
                     data = json.loads(body)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     data = None
                 captured_responses.append({
                     "url": rurl,
@@ -136,7 +136,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                     "data": data,
                 })
             except Exception:
-                pass
+                log.debug("Unable to capture API response from %s", rurl, exc_info=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -153,16 +153,16 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             try:
                 data = json.loads(el.inner_text())
                 intel["json_ld"].append(data)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                log.debug("Ignoring malformed JSON-LD on %s", url, exc_info=True)
 
         # 2. __NEXT_DATA__
         next_data = page.query_selector("script#__NEXT_DATA__")
         if next_data:
             try:
                 intel["next_data"] = json.loads(next_data.inner_text())
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                log.debug("Ignoring malformed __NEXT_DATA__ on %s", url, exc_info=True)
 
         # 3. data-testid attributes
         intel["data_testids"] = page.evaluate("""
@@ -280,7 +280,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 summary["type"] = "object"
                 summary["keys"] = list(data.keys())[:20]
 
-                def _explore_nested(obj, path_prefix, depth=0):
+                def _explore_nested(obj, path_prefix, output, depth=0):
                     if depth > 3 or not isinstance(obj, dict):
                         return
                     for key in list(obj.keys())[:15]:
@@ -306,10 +306,10 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                                         "keys": list(subval.keys())[:15],
                                         "sample": {k: str(v)[:150] for k, v in list(subval.items())[:8]},
                                     }
-                            summary[f"nested_{path}"] = info
+                            output[f"nested_{path}"] = info
                         elif isinstance(val, dict) and depth < 3:
-                            _explore_nested(val, path, depth + 1)
-                _explore_nested(data, "")
+                            _explore_nested(val, path, output, depth + 1)
+                _explore_nested(data, "", summary)
         intel["api_responses"].append(summary)
 
     return intel
@@ -442,7 +442,7 @@ def format_strategy_briefing(intel: dict) -> str:
     if intel["data_testids"]:
         sections.append(f"\nDATA-TESTID ATTRIBUTES: {len(intel['data_testids'])} elements")
         for dt in intel["data_testids"][:15]:
-            text_preview = dt['text'].replace('\n', ' ')[:60]
+            text_preview = dt["text"].replace("\n", " ")[:60]
             sections.append(f"  <{dt['tag']} data-testid=\"{dt['testid']}\"> {text_preview}")
     else:
         sections.append("\nDATA-TESTID: none found")
@@ -632,7 +632,7 @@ def ask_llm(prompt: str) -> tuple[str, float, dict]:
 def extract_json(text: str) -> dict:
     """Extract JSON from LLM response, handling think tags and code fences."""
     if "<think>" in text:
-        after = text.split("</think>")[-1].strip()
+        after = text.rsplit("</think>", maxsplit=1)[-1].strip()
         if after:
             text = after
     if "```json" in text:
@@ -640,12 +640,12 @@ def extract_json(text: str) -> dict:
     elif "```" in text:
         text = text.split("```")[1].split("```")[0]
     text = text.strip()
-    text = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', text)
+    text = re.sub(r'\\([^"\\\/bfnrtu])', r"\1", text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    while text.endswith("}") or text.endswith("]"):
+    while text.endswith(("}", "]")):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -690,9 +690,9 @@ def resolve_json_path(data, path: str):
                 current = current[part]
         if isinstance(current, (str, int, float)):
             return str(current) if not isinstance(current, str) else current
-        elif isinstance(current, dict):
+        if isinstance(current, dict):
             return current.get("name", current.get("text", str(current)[:100]))
-        elif isinstance(current, list):
+        if isinstance(current, list):
             if current and isinstance(current[0], dict):
                 return ", ".join(str(item.get("name", item.get("text", ""))) for item in current[:3])
             return ", ".join(str(x) for x in current[:3])
@@ -776,7 +776,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
         log.error("LLM_ERROR in Phase 2: %s", e)
         return {}, []
 
-    log.info("Phase 2 LLM: %d chars, %.1fs", meta['response_chars'], elapsed)
+    log.info("Phase 2 LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
 
     try:
         selectors = extract_json(raw)

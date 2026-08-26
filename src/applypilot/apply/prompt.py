@@ -898,7 +898,7 @@ def build_prompt(job: dict, tailored_resume: str,
     if (job.get("source_site") or job.get("site") or "").casefold() == "linkedin" and linkedin_resume:
         resume_step = (
             f"6. In LinkedIn Easy Apply, first select the already-uploaded resume whose visible filename "
-            f"contains \"{linkedin_resume}\" when it is available. Verify the selected filename. "
+            f'contains "{linkedin_resume}" when it is available. Verify the selected filename. '
             "If clicking the resume radio/control only focuses a download button or leaves the prior resume "
             "selected, click the visible filename or resume card once and verify that the Selected marker moves. "
             "Do not remove or re-upload it, even when FILES also contains a newly tailored PDF. If the configured "

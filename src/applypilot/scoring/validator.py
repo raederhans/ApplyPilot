@@ -79,9 +79,7 @@ def _build_skills_set(profile: dict) -> set[str]:
     boundary = profile.get("skills_boundary", {})
     allowed: set[str] = set()
     for category in boundary.values():
-        if isinstance(category, list):
-            allowed.update(s.lower().strip() for s in category)
-        elif isinstance(category, set):
+        if isinstance(category, (list, set)):
             allowed.update(s.lower().strip() for s in category)
     return allowed
 
@@ -135,9 +133,7 @@ def _claim_stems(text: str) -> set[str]:
             token = token[:-3] + "y"
         elif token.endswith("ing") and len(token) > 7:
             token = token[:-3]
-        elif token.endswith("ed") and len(token) > 6:
-            token = token[:-2]
-        elif token.endswith("es") and len(token) > 6:
+        elif (token.endswith("ed") and len(token) > 6) or (token.endswith("es") and len(token) > 6):
             token = token[:-2]
         elif token.endswith("s") and len(token) > 5:
             token = token[:-1]
@@ -271,14 +267,12 @@ def validate_json_fields(
                         f"source role exactly: {source_role}"
                     )
         for entry in data["experience"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            all_text_parts.extend(entry.get("bullets", []))
 
     # Projects: collect bullets
     if isinstance(data["projects"], list):
         for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            all_text_parts.extend(entry.get("bullets", []))
 
     # The target employer may be named in a target-facing summary, but it
     # cannot appear inside prior experience/project history unless the source

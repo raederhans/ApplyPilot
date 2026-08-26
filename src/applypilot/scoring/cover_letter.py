@@ -11,7 +11,7 @@ import os
 import re
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -318,7 +318,7 @@ def _parse_evidence_plan_response(response: str) -> dict:
         raise CoverLetterValidationError(
             "JD evidence planning returned an empty model response; no artifact may be persisted."
         )
-    if text.startswith("{") or text.startswith("```json"):
+    if text.startswith(("{", "```json")):
         return _parse_json_object(text)
 
     requirements: list[dict] = []
@@ -601,12 +601,10 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         len(jobs), min_score,
     )
     t0 = time.time()
-    completed = 0
     results: list[dict] = []
     error_count = 0
 
-    for job in jobs:
-        completed += 1
+    for completed, job in enumerate(jobs, start=1):
         try:
             primary_path = Path(job["tailored_resume_path"]).resolve()
             if not primary_path.exists():
@@ -676,7 +674,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
     # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     saved = 0
     for r in results:
         if r.get("path"):

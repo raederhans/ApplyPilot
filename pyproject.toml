@@ -1,12 +1,20 @@
 [project]
-name = "applypilot"
-version = "0.3.0"
-description = "AI-powered end-to-end job application pipeline"
+name = "applypilot-local"
+version = "0.4.0"
+description = "Local-first, evidence-driven job application workspace"
 readme = "README.md"
 license = "AGPL-3.0-only"
 requires-python = ">=3.11"
-authors = [{name = "Pickle-Pixel"}]
-keywords = ["job-search", "automation", "ai", "resume", "apply", "job-application"]
+authors = [{name = "Pickle-Pixel and ApplyPilot Local contributors"}]
+maintainers = [{name = "raederhans"}]
+keywords = [
+    "job-search",
+    "automation",
+    "ai",
+    "resume",
+    "local-first",
+    "job-application",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -26,23 +34,46 @@ dependencies = [
     "pypdf>=5.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
-    "pandas>=2.0",
-    ]
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+jobboards = [
+    "python-jobspy==1.1.82; python_version < '3.13'",
+]
+dev = [
+    "build>=1.2",
+    "pandas>=2.0",
+    "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.16,<0.17",
+]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
-Repository = "https://github.com/Pickle-Pixel/ApplyPilot"
-Issues = "https://github.com/Pickle-Pixel/ApplyPilot/issues"
+Homepage = "https://github.com/raederhans/ApplyPilot"
+Repository = "https://github.com/raederhans/ApplyPilot"
+Issues = "https://github.com/raederhans/ApplyPilot/issues"
+Changelog = "https://github.com/raederhans/ApplyPilot/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+# Use an explicit source-release boundary so local research notes, experiments,
+# receipts, and other untracked workspace files can never enter an sdist.
+only-include = [
+    "src",
+    "tests",
+    ".env.example",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "NOTICE.md",
+    "SECURITY.md",
+    "profile.example.json",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/applypilot"]
@@ -53,3 +84,16 @@ artifacts = ["src/applypilot/config/*.yaml"]
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+"src/applypilot/cli.py" = ["B008"]  # Typer declares options in function defaults.
+# These integration boundaries isolate failures per provider or candidate so one
+# external error does not abort the rest of a discovery or scoring batch.
+"src/applypilot/discovery/jobspy.py" = ["BLE001"]
+"src/applypilot/discovery/smartextract.py" = ["BLE001"]
+"src/applypilot/discovery/workday.py" = ["BLE001"]
+"src/applypilot/enrichment/detail.py" = ["BLE001"]
+"src/applypilot/pipeline.py" = ["BLE001"]
+"src/applypilot/scoring/cover_letter.py" = ["BLE001", "TRY004"]
+"src/applypilot/scoring/scorer.py" = ["BLE001"]
+"src/applypilot/scoring/tailor.py" = ["BLE001"]

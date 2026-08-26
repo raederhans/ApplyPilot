@@ -50,9 +50,9 @@ def _pdf_page_text_spans(pdf_path: str | Path) -> list[float]:
     for page in PdfReader(str(pdf_path)).pages:
         y_positions: list[float] = []
 
-        def collect_text_position(text, _cm, tm, _font, _font_size) -> None:
+        def collect_text_position(text, _cm, tm, _font, _font_size, positions=y_positions) -> None:
             if text.strip():
-                y_positions.append(float(tm[5]))
+                positions.append(float(tm[5]))
 
         page.extract_text(visitor_text=collect_text_position)
         spans.append(
@@ -198,9 +198,8 @@ def parse_entries(text: str) -> list[dict]:
             current = {"title": stripped, "subtitle": "", "bullets": []}
         elif current and not current["subtitle"]:
             current["subtitle"] = stripped
-        else:
-            if current:
-                current["bullets"].append(stripped)
+        elif current:
+            current["bullets"].append(stripped)
 
     if current:
         entries.append(current)

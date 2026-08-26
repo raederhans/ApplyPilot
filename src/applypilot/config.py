@@ -93,10 +93,9 @@ def get_chrome_user_data() -> Path:
         if browser_path == "msedge.exe":
             return Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data"
         return Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
-    elif system == "Darwin":
+    if system == "Darwin":
         return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-    else:
-        return Path.home() / ".config" / "google-chrome"
+    return Path.home() / ".config" / "google-chrome"
 
 
 def ensure_dirs():

@@ -383,6 +383,7 @@ def test_discovery_accepts_shipped_board_and_country_fields(monkeypatch) -> None
         captured.update(kwargs)
         return {"new": 0}
 
+    monkeypatch.setattr(jobspy, "require_jobboards", lambda: object())
     monkeypatch.setattr(jobspy, "_full_crawl", fake_full_crawl)
 
     result = jobspy.run_discovery(
