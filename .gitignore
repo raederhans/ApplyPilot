@@ -13,6 +13,8 @@ credentials/
 
 # Runtime artifacts
 .artifacts/
+.playwright-cli/
+output/
 *.db
 tailored_resumes/
 cover_letters/

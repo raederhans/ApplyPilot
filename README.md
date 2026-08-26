@@ -37,31 +37,38 @@ distribution and product identity are `ApplyPilot Local`.
 | Resume library | Content-addressed artifacts, subtype routing, validation state, and hard-gap review |
 | Application runtime | Explicit authorization manifests, readiness decisions, isolated browser workers, manual takeover |
 | Receipt reconciliation | Exact job/company/title matching, decisive confirmation evidence, idempotent status updates |
-| Local status | SQLite-backed application history, unanswered questions, source observations, and dashboards |
+| Opportunity workbench | Local browser UI for eligible roles, fit evidence, source quality, and verified form links |
+| Local status | SQLite-backed application history, unanswered questions, source observations, and terminal dashboards |
 
 ## Installation
 
-ApplyPilot Local currently installs from this repository. Python 3.11 or 3.12
-is recommended for the complete workflow; the core and official radar also run
-on Python 3.13.
+Python 3.11 or 3.12 is recommended for the complete workflow; the core and
+official radar also run on Python 3.13. The quickest released installation is
+an isolated command-line app managed by `pipx`:
 
 ```bash
-git clone https://github.com/raederhans/ApplyPilot.git
-cd ApplyPilot
-python -m venv .venv
+pipx install applypilot-local
+```
 
-# Windows
-.venv\Scripts\python -m pip install -e .
+Until the first tagged PyPI release, install the current repository directly:
 
-# macOS/Linux
-.venv/bin/python -m pip install -e .
+```bash
+pipx install "git+https://github.com/raederhans/ApplyPilot.git"
+```
+
+An extracted GitHub release bundle or source checkout also includes a guided,
+cross-platform installer. It bootstraps `pipx`, verifies a bundled wheel when
+present, and never copies local profiles, credentials, resumes, or databases:
+
+```bash
+python install.py
 ```
 
 The broad third-party job-board connector is intentionally optional because
 its upstream package currently pins an older NumPy line:
 
 ```bash
-python -m pip install -e ".[jobboards]"  # Python 3.11-3.12
+python install.py --with-jobboards  # Python 3.11-3.12
 ```
 
 Then initialize and verify the local workspace:
@@ -155,11 +162,16 @@ submission. Review [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 python -m pip install -e ".[dev]"
 ruff check src
 pytest -q
-python -m build
+python scripts/build_release.py
 ```
 
-CI runs lint, the complete test suite, and package build checks on pushes and
-pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository conventions.
+The release builder audits archive contents and metadata, creates wheel and
+source distributions under `dist/python/`, produces a verified install bundle,
+and writes SHA-256 checksums. On Windows, `--no-isolation` is available when an
+antivirus aggressively scans temporary PEP 517 build environments. CI runs
+lint, the complete test suite, and these package checks on pushes and pull
+requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository conventions and
+[docs/product-core.md](docs/product-core.md) for the product and frontend boundary.
 
 ## License and provenance
 
