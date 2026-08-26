@@ -12,6 +12,7 @@ credentials/
 *.pfx
 
 # Runtime artifacts
+.artifacts/
 *.db
 tailored_resumes/
 cover_letters/

@@ -36,6 +36,22 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     internsg = config.get_portal_policy("https://www.internsg.com/job-apply/123/")
     assert internsg is not None
     assert internsg["application_mode"] == "review_only"
+
+    career_axis = config.get_portal_policy(
+        "https://careeraxis.ntu.edu.sg/students/jobs/882308"
+    )
+    assert career_axis is not None
+    assert career_axis["application_mode"] == "standing_authorized"
+    assert career_axis["discovery_mode"] == "visible_agent_browse"
+    assert "bounded visible agent browsing" in config.portal_discovery_gate(
+        "https://careeraxis.ntu.edu.sg/students/jobs/882308"
+    )
+    assert config.get_portal_policy(
+        "https://careers.example.com/apply/123", source_site="Career Axis"
+    ) == career_axis
+    assert config.portal_application_gate(
+        "https://careers.example.com/apply/123", source_site="Career Axis", preview_only=False
+    ) is None
     assert config.portal_application_gate(
         "https://www.internsg.com/job-apply/123/", preview_only=True
     ) is None

@@ -1,0 +1,62 @@
+[
+  {
+    "id": "greenhouse-product",
+    "url": "https://careers.example.test/jobs/product-operations-intern",
+    "application_url": "https://boards.greenhouse.io/example/jobs/1001",
+    "title": "Product Operations Intern",
+    "company_name": "Example Product",
+    "site": "greenhouse",
+    "source_site": "official_careers",
+    "full_description": "Support product operations, analyse adoption metrics, and coordinate launches.",
+    "eligibility_status": "eligible",
+    "fit_score": 8
+  },
+  {
+    "id": "lever-data",
+    "url": "https://careers.example.test/jobs/data-analyst",
+    "application_url": "https://jobs.lever.co/example/1002",
+    "title": "Data Analyst",
+    "company_name": "Example Data",
+    "site": "lever",
+    "source_site": "official_careers",
+    "full_description": "Use SQL and Python to build decision dashboards.",
+    "eligibility_status": "eligible",
+    "fit_score": 8
+  },
+  {
+    "id": "ashby-ai-unknown",
+    "url": "https://careers.example.test/jobs/ai-implementation",
+    "application_url": "https://jobs.ashbyhq.com/example/1003",
+    "title": "AI Implementation Associate",
+    "company_name": "Example AI",
+    "site": "ashby",
+    "source_site": "official_careers",
+    "full_description": "Deploy and evaluate AI workflows for customers.",
+    "eligibility_status": "needs_review",
+    "fit_score": 9
+  },
+  {
+    "id": "workday-presales",
+    "url": "https://careers.example.test/jobs/presales",
+    "application_url": "https://example.wd5.myworkdayjobs.com/en-US/Careers/job/1004",
+    "title": "Pre-sales Associate",
+    "company_name": "Example Cloud",
+    "site": "workday",
+    "source_site": "official_careers",
+    "full_description": "Present technical solutions to prospective customers.",
+    "eligibility_status": "eligible",
+    "fit_score": 8
+  },
+  {
+    "id": "spatial-expired",
+    "url": "https://careers.example.test/jobs/spatial",
+    "application_url": "https://careers.example.test/jobs/spatial/apply",
+    "title": "GIS Analyst",
+    "company_name": "Example Spatial",
+    "site": "custom",
+    "source_site": "official_careers",
+    "full_description": "Analyse transportation and spatial data.",
+    "eligibility_status": "ineligible",
+    "fit_score": 9
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "leads": [
+    {
+      "source_url": "https://www.linkedin.com/posts/example-ai-hiring-1",
+      "title": "AI Solutions Consultant",
+      "company_id": "example_ai",
+      "location": "Singapore",
+      "subtracks": ["ai_solutions"]
+    },
+    {
+      "source_url": "https://www.linkedin.com/posts/example-product-hiring-2",
+      "title": "Product Manager",
+      "company_id": "example_product",
+      "location": "Singapore",
+      "subtracks": ["product_management"]
+    },
+    {
+      "source_url": "https://www.linkedin.com/posts/example-planning-hiring-3",
+      "title": "Transport Planner",
+      "company_id": "example_planning",
+      "location": "Singapore",
+      "subtracks": ["transport_planning"]
+    }
+  ]
+}

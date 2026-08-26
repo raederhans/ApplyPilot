@@ -45,30 +45,12 @@ def _load_location_filter(search_cfg: dict | None = None):
     if search_cfg is None:
         search_cfg = config.load_search_config()
 
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.get_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
+    return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -300,13 +282,22 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
 
 # -- DB storage --------------------------------------------------------------
 
-def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
+def store_results(
+    conn: sqlite3.Connection,
+    jobs: list[dict],
+    employers: dict,
+    excluded_titles: list[str] | None = None,
+) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
-    new = 0
-    existing = 0
+    excluded = 0
+    excluded_titles = excluded_titles or []
+    grouped: dict[str, list[dict]] = {}
 
     for job in jobs:
+        if config.title_is_excluded(job.get("title"), excluded_titles):
+            excluded += 1
+            continue
         url = job.get("apply_url", "")
         if not url:
             emp = employers.get(job.get("employer_key", ""), {})
@@ -322,21 +313,28 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         detail_error = job.get("detail_error")
 
         site = job.get("employer_name", "Corporate")
-        strategy = "workday_api"
+        grouped.setdefault(site, []).append({
+            "url": url,
+            "title": job.get("title"),
+            "salary": None,
+            "description": short_desc,
+            "location": job.get("location"),
+            "company_name": site,
+            "full_description": full_description,
+            "application_url": url,
+            "detail_scraped_at": detail_scraped_at,
+            "detail_error": detail_error,
+        })
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            existing += 1
-
-    conn.commit()
+    from applypilot.database import store_jobs
+    new = 0
+    existing = 0
+    for site, prepared_jobs in grouped.items():
+        added, duplicates = store_jobs(conn, prepared_jobs, site, "workday_api")
+        new += added
+        existing += duplicates
+    if excluded:
+        log.info("Filtered %d corporate jobs by excluded title", excluded)
     return new, existing
 
 
@@ -347,6 +345,7 @@ def _process_one(
     location_filter: bool,
     accept_locs: list[str],
     reject_locs: list[str],
+    excluded_titles: list[str],
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
@@ -373,7 +372,7 @@ def _process_one(
         log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
 
     conn = get_connection()
-    new, existing = store_results(conn, jobs, employers)
+    new, existing = store_results(conn, jobs, employers, excluded_titles)
     log.info("%s: %d new, %d already in DB", emp["name"], new, existing)
 
     return {"employer": emp["name"], "query": search_text,
@@ -390,6 +389,7 @@ def scrape_employers(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    excluded_titles: list[str] | None = None,
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -404,6 +404,8 @@ def scrape_employers(
         accept_locs = []
     if reject_locs is None:
         reject_locs = []
+    if excluded_titles is None:
+        excluded_titles = []
 
     # Ensure DB schema
     init_db()
@@ -423,7 +425,7 @@ def scrape_employers(
             futures = {
                 pool.submit(
                     _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
+                    location_filter, accept_locs, reject_locs, excluded_titles,
                 ): key
                 for key in valid_keys
             }
@@ -446,7 +448,7 @@ def scrape_employers(
         for key in valid_keys:
             result = _process_one(
                 key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
+                location_filter, accept_locs, reject_locs, excluded_titles,
             )
             completed += 1
             total_new += result["new"]
@@ -493,6 +495,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+    excluded_titles = config.get_excluded_title_patterns(search_cfg)
 
     # Default to tier 1-2 queries for workday scraping
     max_tier = search_cfg.get("workday_max_tier", 2)
@@ -526,6 +529,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            excluded_titles=excluded_titles,
             workers=workers,
         )
         grand_new += result["new"]

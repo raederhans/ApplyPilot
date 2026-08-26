@@ -39,6 +39,23 @@ portal_policies:
     external_application_mode: "manual_reconfirm"
     submitted_evidence: "candidate-visible confirmation page or receipt"
 
+  - name: "NTU Career Axis"
+    domains:
+      - "careeraxis.ntu.edu.sg"
+    site_names:
+      - "CareerAxis"
+      - "Career Axis"
+      - "NTU Career Axis"
+    # Career Axis is an NTU-authenticated source. An agent may search it in a
+    # visible, user-authenticated browser with candidate-selected keywords and
+    # import each exact opportunity; do not turn it into a generic crawler. The user's
+    # standing ApplyPilot authorization covers ordinary forms and its external
+    # employer-ATS hand-offs after the usual live safety checks pass.
+    discovery_mode: "visible_agent_browse"
+    application_mode: "standing_authorized"
+    external_application_mode: "continue_when_authorized"
+    submitted_evidence: "exact job/company confirmation page or receipt"
+
 # ── Manual-Only ATS Domains ──────────────────────────────────────────────
 # These ATS platforms have unsolvable CAPTCHAs. Jobs routing through them
 # are flagged as "manual" during apply — bot skips, user applies by hand.

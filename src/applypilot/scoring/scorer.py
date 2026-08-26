@@ -12,11 +12,18 @@ import re
 import time
 from datetime import datetime, timezone
 
-from applypilot.config import RESUME_PATH, load_profile
+from applypilot import config as _config
+from applypilot.config import load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.scoring.tailor import select_resume_source
 
 log = logging.getLogger(__name__)
+
+# Kept as a public compatibility alias for callers that historically patched
+# this value. Scoring now selects a per-job source through ``select_resume_source``.
+RESUME_PATH = _config.RESUME_PATH
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -161,7 +168,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
-    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    profile = load_profile()
     conn = get_connection()
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
     refresh_job_eligibility(conn)
@@ -190,7 +197,21 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     results: list[dict] = []
 
     for job in jobs:
-        result = score_job(resume_text, job)
+        try:
+            source_path, routing = select_resume_source(job, profile)
+            resume_text = read_resume_source(source_path)
+            result = score_job(resume_text, job)
+            result["source_resume_path"] = str(source_path)
+            result["resume_routing"] = routing
+        except Exception as exc:
+            log.error("Resume routing failed for job '%s': %s", job.get("title", "?"), exc)
+            result = {
+                "score": 0,
+                "keywords": "",
+                "reasoning": f"Resume routing failed: {exc}",
+                "source_resume_path": None,
+                "resume_routing": None,
+            }
         result["url"] = job["url"]
         completed += 1
 
@@ -212,15 +233,23 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             conn.execute(
                 "UPDATE jobs SET fit_score = NULL, scored_at = NULL, "
                 "score_status = 'failed', score_error = ?, "
-                "score_attempts = COALESCE(score_attempts, 0) + 1 WHERE url = ?",
-                (r["reasoning"], r["url"]),
+                "score_attempts = COALESCE(score_attempts, 0) + 1, "
+                "tailor_source_resume_path = ? WHERE url = ?",
+                (r["reasoning"], r.get("source_resume_path"), r["url"]),
             )
         else:
             conn.execute(
                 "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
                 "score_status = 'scored', score_error = NULL, "
-                "score_attempts = COALESCE(score_attempts, 0) + 1 WHERE url = ?",
-                (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+                "score_attempts = COALESCE(score_attempts, 0) + 1, "
+                "tailor_source_resume_path = ? WHERE url = ?",
+                (
+                    r["score"],
+                    f"{r['keywords']}\n{r['reasoning']}",
+                    now,
+                    r["source_resume_path"],
+                    r["url"],
+                ),
             )
     conn.commit()
 

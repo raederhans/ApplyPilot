@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -37,6 +38,7 @@ def import_exact_job(
     site: str = "linkedin",
     description: str | None = None,
     strategy: str = "exact_url",
+    application_url: str | None = None,
 ) -> dict:
     """Register one user-selected job URL for review or normal enrichment.
 
@@ -47,6 +49,9 @@ def import_exact_job(
         raise ValueError("url, title, company, and site are required.")
     if not re.match(r"^https://", url, flags=re.IGNORECASE):
         raise ValueError("url must be an absolute HTTPS URL.")
+    application_target = str(application_url or url).strip()
+    if not re.match(r"^https://", application_target, flags=re.IGNORECASE):
+        raise ValueError("application_url must be an absolute HTTPS URL.")
     if not str(strategy).strip():
         raise ValueError("strategy is required.")
 
@@ -99,7 +104,7 @@ def import_exact_job(
             strategy.strip(),
             description_text or None,
             description_text or None,
-            url,
+            application_target,
             now if description_text else None,
             now,
             eligibility_status,
@@ -130,6 +135,7 @@ def import_exact_job(
         "location": result["location"],
         "site": result["site"],
         "strategy": result["strategy"],
+        "application_url": result["application_url"],
         "eligibility_status": result["eligibility_status"],
         "eligibility_reason": result["eligibility_reason"],
         "needs_enrichment": not bool(result.get("full_description")),
@@ -351,8 +357,9 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
     if score["score"] == 0:
         conn.execute(
             "UPDATE jobs SET fit_score=NULL, scored_at=NULL, score_status='failed', "
-            "score_error=?, score_attempts=COALESCE(score_attempts,0)+1 WHERE url=?",
-            (score["reasoning"], url),
+            "score_error=?, score_attempts=COALESCE(score_attempts,0)+1, "
+            "tailor_source_resume_path=? WHERE url=?",
+            (score["reasoning"], str(selected_resume), url),
         )
         conn.commit()
         raise RuntimeError(f"LLM scoring failed: {score['reasoning']}")
@@ -360,11 +367,13 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
     conn.execute(
         "UPDATE jobs SET fit_score=?, score_reasoning=?, scored_at=?, "
         "score_status='scored', score_error=NULL, "
-        "score_attempts=COALESCE(score_attempts,0)+1 WHERE url=?",
+        "score_attempts=COALESCE(score_attempts,0)+1, "
+        "tailor_source_resume_path=? WHERE url=?",
         (
             score["score"],
             f"{score['keywords']}\n{score['reasoning']}",
             now,
+            str(selected_resume),
             url,
         ),
     )
@@ -381,6 +390,249 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
         "score_reasoning": score["reasoning"],
         "scored_at": now,
     }
+
+
+def _write_json_atomic(path: Path, payload: dict, token: str) -> None:
+    """Write JSON beside its destination, then atomically promote it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{token}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _quarantine_revalidation_pdf(path: Path, label: str, token: str) -> Path | None:
+    """Move a PDF out of the upload path so old manifests fail closed."""
+    if not path.is_file():
+        return None
+    rejected_dir = path.parent / "rejected"
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+    destination = rejected_dir / f"{path.stem}_{label}_{token}.pdf"
+    path.replace(destination)
+    return destination
+
+
+def revalidate_tailored_resume_for_url(url: str) -> dict:
+    """Fail-closed revalidation and atomic PDF promotion for one exact job."""
+    conn = get_connection()
+    job: dict | None = None
+    tailored_path: Path | None = None
+    source_path: Path | None = None
+    report_path: Path | None = None
+    final_pdf: Path | None = None
+    temporary_pdf: Path | None = None
+    previous_pdf: Path | None = None
+    shared_artifact = False
+    token = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    try:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE url=? OR application_url=?", (url, url)
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError(f"Expected one exact tailored job, found {len(rows)}: {url}")
+        job = dict(rows[0])
+        raw_tailored_path = str(job.get("tailored_resume_path") or "").strip()
+        raw_source_path = str(job.get("tailor_source_resume_path") or "").strip()
+        if not raw_tailored_path:
+            raw_report_path = str(job.get("tailor_report_path") or "").strip()
+            recoverable_statuses = {
+                "failed_validation",
+                "failed_judge",
+                "failed_render",
+                "failed_revalidation",
+            }
+            if raw_report_path and str(job.get("tailor_status") or "") in recoverable_statuses:
+                existing_report_path = Path(raw_report_path).expanduser().resolve()
+                report_stem = existing_report_path.name.removesuffix("_REPORT.json")
+                rejected_path = (
+                    existing_report_path.parent
+                    / "rejected"
+                    / f"{report_stem}_REJECTED.txt"
+                )
+                inferred_tailored_path = existing_report_path.with_name(
+                    f"{report_stem}.txt"
+                )
+                if rejected_path.is_file():
+                    inferred_tailored_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(rejected_path, inferred_tailored_path)
+                    raw_tailored_path = str(inferred_tailored_path)
+                    conn.execute(
+                        "UPDATE jobs SET tailored_resume_path=? WHERE url=?",
+                        (raw_tailored_path, job["url"]),
+                    )
+                    conn.commit()
+            if not raw_tailored_path:
+                raise ValueError("tailored_resume_path is required for revalidation")
+        if not raw_source_path:
+            raise ValueError("tailor_source_resume_path is required for revalidation")
+        tailored_path = Path(raw_tailored_path).expanduser().resolve()
+        source_path = Path(raw_source_path).expanduser().resolve()
+        report_path = Path(
+            str(
+                job.get("tailor_report_path")
+                or tailored_path.with_name(tailored_path.stem + "_REPORT.json")
+            )
+        ).expanduser().resolve()
+        final_pdf = tailored_path.with_suffix(".pdf")
+
+        shared_artifact_root = (config.APP_DIR / "resume-library" / "artifacts").resolve()
+        try:
+            tailored_path.relative_to(shared_artifact_root)
+        except ValueError:
+            pass
+        else:
+            shared_artifact = True
+            raise ValueError(
+                "A shared content-addressed resume artifact is immutable. "
+                "Create and validate a new job-specific variant instead of revalidating it in place."
+            )
+
+        # Remove the previously authorized bytes from the upload path first.
+        # A concurrent or stale manifest therefore cannot keep using them while
+        # the content is being re-audited.
+        previous_pdf = _quarantine_revalidation_pdf(final_pdf, "PRE_REVALIDATION", token)
+        conn.execute(
+            "UPDATE jobs SET tailor_status='revalidating', "
+            "tailor_error='revalidation_in_progress', tailor_report_path=NULL, "
+            "tailored_at=NULL, tailor_attempts=COALESCE(tailor_attempts,0)+1 "
+            "WHERE url=?",
+            (job["url"],),
+        )
+        conn.commit()
+
+        if not tailored_path.is_file():
+            raise FileNotFoundError(f"Tailored resume text not found: {tailored_path}")
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Tailoring source resume not found: {source_path}")
+
+        from applypilot.scoring.pdf import convert_to_pdf
+        from applypilot.scoring.tailor import judge_tailored_resume
+        from applypilot.scoring.validator import validate_tailored_resume
+
+        profile = load_profile()
+        tailored_text = tailored_path.read_text(encoding="utf-8")
+        source_text = read_resume_source(source_path)
+        deterministic = validate_tailored_resume(
+            tailored_text,
+            profile,
+            original_text=source_text,
+        )
+        judge = None
+        status = "failed_validation"
+        error = "; ".join(deterministic.get("errors", [])) or "validation failed"
+        pdf_path = None
+        if deterministic.get("passed"):
+            judge = judge_tailored_resume(
+                source_text,
+                tailored_text,
+                str(job.get("title") or ""),
+                profile,
+                job_description=str(job.get("full_description") or ""),
+            )
+            if judge.get("passed"):
+                temporary_pdf = final_pdf.with_name(
+                    f".{final_pdf.stem}.{token}.tmp.pdf"
+                )
+                try:
+                    rendered_path = Path(
+                        convert_to_pdf(tailored_path, output_path=temporary_pdf)
+                    )
+                    if rendered_path.resolve() != temporary_pdf.resolve():
+                        raise ValueError("PDF renderer returned an unexpected output path")
+                    if not temporary_pdf.is_file() or temporary_pdf.stat().st_size <= 0:
+                        raise ValueError("PDF renderer did not produce a non-empty file")
+                    os.replace(temporary_pdf, final_pdf)
+                    temporary_pdf = None
+                    pdf_path = str(final_pdf)
+                    status = "machine_validated"
+                    error = None
+                except Exception as exc:  # noqa: BLE001 - render boundary must fail closed
+                    if temporary_pdf is not None:
+                        _quarantine_revalidation_pdf(
+                            temporary_pdf, "FAILED_RENDER", token
+                        )
+                        temporary_pdf = None
+                    status = "failed_render"
+                    error = f"Render: {exc}"
+            else:
+                status = "failed_judge"
+                error = f"Judge: {judge.get('issues') or 'no PASS verdict'}"
+
+        report = {
+            "status": status,
+            "source_resume_path": str(source_path),
+            "full_validator": deterministic,
+            "judge": judge,
+            "render_error": (
+                error.removeprefix("Render: ")
+                if error and status == "failed_render"
+                else None
+            ),
+            "quarantined_previous_pdf_path": (
+                str(previous_pdf) if previous_pdf is not None else None
+            ),
+            "revalidated_at": datetime.now(UTC).isoformat(),
+        }
+        _write_json_atomic(report_path, report, token)
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            "UPDATE jobs SET tailor_status=?, tailor_error=?, tailor_report_path=?, "
+            "tailored_at=? WHERE url=?",
+            (
+                status,
+                error,
+                str(report_path),
+                now if status == "machine_validated" else None,
+                job["url"],
+            ),
+        )
+        conn.commit()
+        return {
+            "url": job["url"],
+            "status": status,
+            "tailored_resume_path": str(tailored_path),
+            "pdf_path": pdf_path,
+            "report_path": str(report_path),
+            "error": error,
+        }
+    except Exception as exc:  # noqa: BLE001 - revalidation boundary must fail closed
+        error = f"Revalidation: {type(exc).__name__}: {exc}"
+        if not shared_artifact and final_pdf is not None and final_pdf.is_file():
+            try:
+                _quarantine_revalidation_pdf(final_pdf, "FAILED_REVALIDATION", token)
+            except OSError:
+                pass
+        if temporary_pdf is not None and temporary_pdf.is_file():
+            try:
+                _quarantine_revalidation_pdf(
+                    temporary_pdf, "FAILED_REVALIDATION", token
+                )
+            except OSError:
+                pass
+        if job is not None:
+            try:
+                conn.execute(
+                    "UPDATE jobs SET tailor_status='failed_revalidation', "
+                    "tailor_error=?, tailor_report_path=NULL, tailored_at=NULL "
+                    "WHERE url=?",
+                    (error, job["url"]),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - preserve the original failure result
+                conn.rollback()
+        return {
+            "url": job["url"] if job is not None else url,
+            "status": "failed_revalidation",
+            "tailored_resume_path": (
+                str(tailored_path) if tailored_path is not None else None
+            ),
+            "pdf_path": None,
+            "report_path": None,
+            "error": error,
+        }
+    finally:
+        conn.close()
 
 
 def prepare_cover_letter_for_url(
@@ -581,11 +833,14 @@ def mark_cover_letter_not_required_for_url(
 ) -> dict:
     """Record that an exact, successfully previewed form has no cover-letter field."""
     conn = get_connection()
-    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
-    if row is None:
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE url = ? OR application_url = ?", (url, url)
+    ).fetchall()
+    if len(rows) != 1:
         conn.close()
-        raise ValueError(f"No discovered job matches URL: {url}")
-    job = dict(row)
+        raise ValueError(f"Expected one exact discovered job for URL, found {len(rows)}: {url}")
+    job = dict(rows[0])
+    job_url = str(job["url"])
     if job.get("eligibility_status") == "ineligible":
         conn.close()
         raise ValueError("Hard-excluded jobs cannot advance to application readiness.")
@@ -600,12 +855,12 @@ def mark_cover_letter_not_required_for_url(
     conn.execute(
         "UPDATE jobs SET cover_letter_status='not_required', cover_letter_error=NULL, "
         "cover_letter_approved_at=?, cover_letter_approved_by=? WHERE url=?",
-        (now, verified_by, url),
+        (now, verified_by, job_url),
     )
     conn.commit()
     conn.close()
     return {
-        "url": url,
+        "url": job_url,
         "status": "not_required",
         "verified_at": now,
         "verified_by": verified_by,

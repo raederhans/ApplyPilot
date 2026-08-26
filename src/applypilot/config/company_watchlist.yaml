@@ -1,0 +1,178 @@
+# Official-company radar registry.  `active` means a source has a stable,
+# documented structured endpoint and may be polled with read-only GETs.  Other
+# companies stay visible for manual/authorised discovery until their endpoint
+# is verified; they are never silently scraped by the radar.
+companies:
+  - id: databricks
+    name: Databricks
+    provider: greenhouse
+    board: databricks
+    career_url: https://www.databricks.com/company/careers/open-positions
+    cadence: daily
+    track_tags: [data_bi_decision, ai_implementation, product_consulting]
+    active: true
+
+  - id: cloudflare
+    name: Cloudflare
+    provider: greenhouse
+    board: cloudflare
+    career_url: https://www.cloudflare.com/careers/jobs/
+    cadence: daily
+    track_tags: [ai_implementation, product_consulting, pre_sales]
+    active: true
+
+  - id: stripe
+    name: Stripe
+    provider: greenhouse
+    board: stripe
+    career_url: https://stripe.com/jobs/search
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, pre_sales]
+    active: true
+
+  - id: nvidia
+    name: NVIDIA
+    provider: jobposting_jsonld
+    career_url: https://www.nvidia.com/en-sg/about-nvidia/careers/
+    cadence: daily
+    track_tags: [ai_implementation, data_bi_decision, product_consulting]
+    active: false
+    activation_note: Verify public job-page JSON-LD coverage before enabling.
+
+  - id: grab
+    name: Grab
+    provider: rss
+    feed_url: https://www.grab.careers/en/jobs/xml/?rss=true
+    career_url: https://www.grab.careers/en/locations/singapore/
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation]
+    active: true
+
+  - id: openai
+    name: OpenAI
+    provider: ashby
+    board: openai
+    career_url: https://openai.com/careers/search/
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: true
+
+  - id: anthropic
+    name: Anthropic
+    provider: greenhouse
+    board: anthropic
+    career_url: https://www.anthropic.com/careers/jobs
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: true
+
+  - id: mongodb
+    name: MongoDB
+    provider: greenhouse
+    board: mongodb
+    career_url: https://www.mongodb.com/company/careers/see-jobs
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: true
+
+  - id: datadog
+    name: Datadog
+    provider: greenhouse
+    board: datadog
+    career_url: https://careers.datadoghq.com/
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: true
+
+  - id: st_engineering
+    name: ST Engineering
+    provider: rss
+    feed_url: https://careers.stengg.com/services/rss/category/?catid=4630410
+    career_url: https://careers.stengg.com/go/STE-Jobs/4630410/
+    coverage_mode: latest_only
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, spatial]
+    active: true
+
+  - id: palantir
+    name: Palantir
+    provider: lever
+    site: palantir
+    career_url: https://www.palantir.com/careers/
+    cadence: weekly
+    track_tags: [product_consulting, data_bi_decision, ai_implementation]
+    active: false
+    activation_note: Public Lever endpoint is healthy but currently has no Singapore listings.
+
+  - id: wise
+    name: Wise
+    provider: greenhouse
+    board: wise
+    career_url: https://www.wise.jobs/
+    cadence: weekly
+    track_tags: [product_consulting, data_bi_decision]
+    active: false
+    activation_note: Public Greenhouse endpoint is healthy but currently has no Singapore listings.
+
+  - id: google
+    name: Google
+    provider: jobposting_jsonld
+    career_url: https://www.google.com/about/careers/applications/locations/sing/
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation]
+    active: false
+    activation_note: Prefer user-authorised job alerts until a stable public endpoint is verified.
+
+  - id: microsoft
+    name: Microsoft
+    provider: jobposting_jsonld
+    career_url: https://careers.microsoft.com/v2/global/en/locations/singapore.html
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.
+
+  - id: amazon
+    name: Amazon
+    provider: jobposting_jsonld
+    career_url: https://www.amazon.jobs/content/en/locations/singapore
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation, pre_sales]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.
+
+  - id: bytedance
+    name: ByteDance
+    provider: jobposting_jsonld
+    career_url: https://jobs.bytedance.com/en/position
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.
+
+  - id: servicenow
+    name: ServiceNow
+    provider: jobposting_jsonld
+    career_url: https://careers.servicenow.com/jobs/?country=Singapore
+    cadence: daily
+    track_tags: [product_consulting, ai_implementation, pre_sales]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.
+
+  - id: salesforce
+    name: Salesforce
+    provider: jobposting_jsonld
+    career_url: https://careers.salesforce.com/en/our-locations/asia-pacific/singapore/
+    cadence: daily
+    track_tags: [product_consulting, ai_implementation, pre_sales]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.
+
+  - id: esri_singapore
+    name: Esri Singapore
+    provider: jobposting_jsonld
+    career_url: https://esrisingapore.com.sg/about/careers/our-people
+    cadence: weekly
+    track_tags: [spatial, product_consulting, pre_sales]
+    active: false
+    activation_note: Verify public detail-page structured data before enabling.

@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -203,6 +203,271 @@ def _validate_preview_audit(output: str) -> str | None:
     return None
 
 
+def _validate_submission_evidence(output: str) -> dict | None:
+    """Return structured visible-confirmation evidence, or fail closed."""
+    marker = re.search(r"SUBMISSION_EVIDENCE\s*:?\s*", output)
+    if not marker:
+        return None
+    payload = output[marker.end():].lstrip()
+    try:
+        evidence, _ = json.JSONDecoder().raw_decode(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    receipt_visible = evidence.get("receipt_visible") is True
+    applied_badge_visible = evidence.get("applied_badge_visible") is True
+    confirmation_text = str(evidence.get("confirmation_text") or "").strip()
+    confirmation_url = evidence.get("confirmation_url")
+    if not (receipt_visible or applied_badge_visible) or not confirmation_text:
+        return None
+    if confirmation_url is not None and not isinstance(confirmation_url, str):
+        return None
+    return {
+        "receipt_visible": receipt_visible,
+        "applied_badge_visible": applied_badge_visible,
+        "confirmation_text": confirmation_text,
+        "confirmation_url": str(confirmation_url or "").strip(),
+    }
+
+
+_RESULT_LINE = re.compile(
+    r"^RESULT:(READY_TO_SUBMIT|PREVIEWED|APPLIED|SUBMISSION_UNCERTAIN|"
+    r"COVER_NOT_REQUIRED|COVER_LETTER_REQUIRED|EXPIRED|CAPTCHA|LOGIN_ISSUE|FAILED)(?::([^\r\n]+))?$"
+)
+
+
+def _parse_result_line(output: str) -> tuple[str, str | None] | None:
+    """Parse exactly one standalone RESULT line, rejecting prose and duplicates."""
+    if len(re.findall(r"RESULT:", output)) != 1:
+        return None
+    result_lines = [line.strip() for line in output.splitlines() if "RESULT:" in line]
+    if len(result_lines) != 1:
+        return None
+    match = _RESULT_LINE.fullmatch(result_lines[0])
+    if match is None:
+        return None
+    return match.group(1), (match.group(2) or "").strip() or None
+
+
+def _result_status(marker: str, reason: str | None) -> str:
+    if marker == "FAILED":
+        return f"failed:{reason or 'unknown'}"
+    return marker.lower()
+
+
+def _interpret_agent_output(
+    output: str,
+    *,
+    dry_run: bool,
+    submission_phase: str,
+) -> tuple[str, dict | None]:
+    """Fail closed on phase-inappropriate, duplicated, or malformed results."""
+    parsed = _parse_result_line(output)
+    if parsed is None:
+        status = (
+            "submission_uncertain"
+            if submission_phase == "submit" and not dry_run
+            else "failed:invalid_result_marker"
+        )
+        return status, None
+
+    marker, reason = parsed
+    blockers = {"EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "FAILED"}
+    if dry_run:
+        if marker == "PREVIEWED":
+            audit_error = _validate_preview_audit(output)
+            return (
+                (f"failed:{audit_error}", None)
+                if audit_error
+                else ("previewed", None)
+            )
+        if marker in blockers:
+            return _result_status(marker, reason), None
+        if marker in {"APPLIED", "SUBMISSION_UNCERTAIN"}:
+            return "submission_uncertain", None
+        return "failed:invalid_preview_result", None
+
+    if submission_phase == "prepare":
+        if marker == "READY_TO_SUBMIT":
+            return "ready_to_submit", None
+        if marker == "COVER_NOT_REQUIRED":
+            return "cover_not_required", None
+        if marker == "COVER_LETTER_REQUIRED":
+            return "cover_letter_required", None
+        if marker in blockers:
+            return _result_status(marker, reason), None
+        # A claimed submission during prepare may already have caused the
+        # external side effect, so never classify it as an ordinary retry.
+        if marker in {"APPLIED", "SUBMISSION_UNCERTAIN"}:
+            return "submission_uncertain", None
+        return "failed:invalid_prepare_result", None
+
+    if submission_phase == "submit":
+        if marker == "APPLIED":
+            evidence = _validate_submission_evidence(output)
+            return ("applied", evidence) if evidence else ("submission_uncertain", None)
+        if marker == "SUBMISSION_UNCERTAIN":
+            return "submission_uncertain", None
+        # Once the submit turn starts, READY, blockers, and any other legal but
+        # phase-inappropriate marker cannot prove whether the click happened.
+        return "submission_uncertain", None
+
+    return "failed:invalid_submission_phase", None
+
+
+def _parse_unanswered_questions(output: str) -> list[dict] | None:
+    """Parse the compact unresolved-question record emitted by the browser agent."""
+    marker = re.search(r"UNANSWERED_QUESTIONS\s*:\s*", output)
+    if not marker:
+        return None
+    payload = output[marker.end():].lstrip()
+    try:
+        value, _ = json.JSONDecoder().raw_decode(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _submission_rate_status(
+    conn, profile: dict, now: datetime | None = None
+) -> tuple[bool, float, str]:
+    """Return whether another submission may start and any short cooldown."""
+    policy = profile.get("submission_policy", {})
+    hourly_max = int(policy.get("maximum_verified_submissions_per_rolling_hour", 15))
+    minimum_gap = float(policy.get("minimum_seconds_between_verified_submissions", 20))
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    cutoff = (current - timedelta(hours=1)).isoformat()
+    rows = conn.execute(
+        "SELECT applied_at FROM jobs WHERE applied_at IS NOT NULL AND applied_at >= ? "
+        "ORDER BY applied_at DESC",
+        (cutoff,),
+    ).fetchall()
+    if hourly_max > 0 and len(rows) >= hourly_max:
+        return False, 0.0, "rolling_hour_submission_cap"
+    if rows and minimum_gap > 0:
+        try:
+            latest = datetime.fromisoformat(rows[0]["applied_at"])
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=UTC)
+            remaining = minimum_gap - (current - latest).total_seconds()
+            if remaining > 0:
+                return True, remaining, "minimum_submission_gap"
+        except (TypeError, ValueError):
+            logger.warning("Ignoring an invalid applied_at timestamp for rate limiting")
+    return True, 0.0, "ready"
+
+
+def _application_fact_value(profile: dict, key: str) -> object | None:
+    """Return the newest confirmed profile fact for one stable key."""
+    for fact in reversed(profile.get("application_facts", [])):
+        if isinstance(fact, dict) and str(fact.get("key") or "").strip() == key:
+            return fact.get("value")
+    return None
+
+
+def _yes_no_value(value: object) -> bool | None:
+    text = str(value or "").strip().casefold()
+    if re.match(r"^(?:yes|true)\b", text):
+        return True
+    if re.match(r"^(?:no|false|none|not applicable|n/?a)\b", text):
+        return False
+    return None
+
+
+def _selected_matches_boolean(selected: object, expected: bool) -> bool:
+    text = " ".join(str(selected or "").strip().casefold().split())
+    if expected:
+        return bool(re.match(r"^(?:yes|true)\b", text))
+    return bool(
+        re.match(r"^(?:no|false|none|neither|not applicable|n/?a)\b", text)
+        or "none of the above" in text
+        or "citizen of a different country" in text
+    )
+
+
+def _work_authorization_answers(profile: dict, job: dict) -> tuple[bool, bool] | None:
+    """Return (authorized, sponsorship-needed) for a clearly classified role."""
+    policy = profile.get("work_authorization", {}).get("form_answer_policy", {})
+    job_text = " ".join(
+        str(job.get(field) or "").casefold()
+        for field in ("title", "full_description", "application_readiness_reason")
+    )
+    branch = None
+    if "intern" in job_text:
+        if "non-credit" in job_text or "part-time" in job_text:
+            branch = policy.get("non_credit_internship")
+        branch = branch or policy.get("programme_credit_bearing_internship")
+    elif any(term in job_text for term in ("full-time", "full time", "permanent")):
+        branch = policy.get("post_graduation_full_time")
+    if not isinstance(branch, dict):
+        return None
+    authorized = _yes_no_value(branch.get("legally_authorized"))
+    sponsorship = _yes_no_value(branch.get("requires_sponsorship"))
+    if authorized is None or sponsorship is None:
+        return None
+    return authorized, sponsorship
+
+
+def _expected_screening_answer(
+    question: object, profile: dict, job: dict
+) -> tuple[str, bool] | None:
+    """Map common legal/screening questions to confirmed, contextual facts."""
+    text = " ".join(str(question or "").casefold().split())
+    if not text:
+        return None
+
+    if re.search(r"\bf[\s-]?1\b|\bcpt\b|\bopt\b", text):
+        expected = _yes_no_value(_application_fact_value(profile, "f1_student_status"))
+        return ("f1_student_status", expected) if expected is not None else None
+    if re.search(r"\bu\.?s\.? person\b|\bunited states person\b", text):
+        expected = _yes_no_value(
+            _application_fact_value(profile, "united_states_person_status")
+        )
+        return ("united_states_person_status", expected) if expected is not None else None
+
+    work_answers = _work_authorization_answers(profile, job)
+    if re.search(r"sponsor|sponsorship", text) and work_answers is not None:
+        return "requires_sponsorship", work_answers[1]
+    if re.search(
+        r"(?:authori[sz]ed|legal(?:ly)? (?:eligible|entitled)|right) to work",
+        text,
+    ) and work_answers is not None:
+        return "legally_authorized_to_work", work_answers[0]
+
+    company = re.sub(r"[^a-z0-9]+", " ", str(job.get("company_name") or "").casefold()).strip()
+    employer_question = re.search(r"\b(previously|ever)\b.*\b(worked|employed)\b", text)
+    if employer_question and (not company or company in re.sub(r"[^a-z0-9]+", " ", text)):
+        preserved = {
+            re.sub(r"[^a-z0-9]+", " ", str(name).casefold()).strip()
+            for name in profile.get("resume_facts", {}).get("preserved_companies", [])
+        }
+        return "previously_worked_for_target_employer", company in preserved
+
+    if re.search(r"non[ -]?compete|non[ -]?solicitation|contractual .*restrict|legal .*restrict", text):
+        value = _application_fact_value(
+            profile, "employment_or_non_compete_restrictions"
+        ) or profile.get("screening", {}).get("employment_or_non_compete_restrictions")
+        expected = _yes_no_value(value)
+        return ("employment_or_non_compete_restrictions", expected) if expected is not None else None
+    if re.search(r"criminal|convict", text):
+        value = _application_fact_value(
+            profile, "criminal_convictions_to_disclose"
+        ) or profile.get("screening", {}).get("criminal_convictions_to_disclose")
+        expected = _yes_no_value(value)
+        return ("criminal_convictions_to_disclose", expected) if expected is not None else None
+    if "background check" in text:
+        expected = _yes_no_value(
+            profile.get("screening", {}).get("willing_to_complete_background_check")
+        )
+        return ("background_check", expected) if expected is not None else None
+    return None
+
+
 def _archive_worker_evidence(
     worker_dir: Path,
     job: dict,
@@ -214,6 +479,8 @@ def _archive_worker_evidence(
         "final-preview.png",
         "pre-submit-review.png",
         "submission-confirmation.png",
+        "submission-confirmation-observer.png",
+        "submission-confirmation-observer-attempt-2.png",
         "captcha-blocked.png",
     )
     sources = [worker_dir / name for name in evidence_names if (worker_dir / name).is_file()]
@@ -242,6 +509,8 @@ def _visible_captcha_overlay(page) -> bool:
         try:
             title = (iframe.get_attribute("title") or "").casefold()
             source = (iframe.get_attribute("src") or "").casefold()
+            if not iframe.is_visible():
+                continue
             box = iframe.bounding_box()
             if (
                 box
@@ -277,8 +546,38 @@ def _captcha_response_present(page) -> bool:
     return False
 
 
+def _visible_verification_gate(page) -> bool:
+    """Detect a visible CAPTCHA or email/OTP gate without reading its value."""
+    if _visible_captcha_overlay(page):
+        return True
+    try:
+        return bool(page.evaluate(
+            r"""() => {
+              const visible = (el) => {
+                const style = getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  el.getClientRects().length > 0;
+              };
+              const verification = /security code|verification code|one[- ]time (?:code|password)|\botp\b|verify (?:your )?email|email verification|验证码|校验码|验证邮箱/i;
+              const inputs = [...document.querySelectorAll('input')].filter(visible);
+              const codeInputs = inputs.filter((el) => {
+                const maxLength = Number(el.maxLength || 0);
+                return maxLength === 1 || /otp|verification|security.?code/i.test(
+                  `${el.name || ''} ${el.id || ''} ${el.autocomplete || ''}`
+                );
+              });
+              if (codeInputs.length < 4) return false;
+              return [...document.querySelectorAll('form,section,dialog,[role="dialog"]')]
+                .filter(visible).some((el) => verification.test(el.innerText || ''));
+            }"""
+        ))
+    except Exception:
+        logger.debug("Unable to inspect a verification gate", exc_info=True)
+        return False
+
+
 def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> list[str]:
-    """Validate a browser snapshot before any final application submission."""
+    """Return browser-observed attention signals for the next agent turn."""
     issues: list[str] = []
     expected_url = job.get("application_url") or job.get("url") or ""
     actual_url = snapshot.get("url", "")
@@ -290,7 +589,7 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
         if expected.netloc.casefold() != actual.netloc.casefold() or expected_path != actual_path:
             issues.append("unexpected_application_url")
 
-    if snapshot.get("captcha_visible") and not snapshot.get("captcha_token_present"):
+    if snapshot.get("captcha_visible"):
         issues.append("visible_captcha")
 
     issues.extend(
@@ -298,14 +597,31 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
         for label in snapshot.get("required_unfilled", [])
     )
 
-    if snapshot.get("resume_field_present") and not snapshot.get("resume_uploaded"):
-        issues.append("resume_not_uploaded")
+    issues.extend(
+        f"sensitive_required_unknown:{label[:80]}"
+        for label in snapshot.get("sensitive_required_unknown", [])
+    )
+
+    if snapshot.get("assessment_visible"):
+        issues.append("assessment_present")
+
+    if "resume_field_present" in snapshot:
+        if not snapshot.get("resume_field_present"):
+            issues.append("resume_state_unconfirmed")
+        elif not snapshot.get("resume_uploaded"):
+            issues.append("resume_not_uploaded")
 
     personal = profile.get("personal", {})
     legal_name = personal.get("full_name", "").strip().casefold()
     for value in snapshot.get("full_name_values", []):
         if legal_name and value.strip().casefold() != legal_name:
             issues.append("legal_name_mismatch")
+            break
+
+    expected_email = personal.get("email", "").strip().casefold()
+    for value in snapshot.get("email_values", []):
+        if expected_email and value.strip().casefold() != expected_email:
+            issues.append("email_mismatch")
             break
 
     for value in snapshot.get("current_location_values", []):
@@ -340,11 +656,36 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
         if expected is not None and selected != ("yes" if expected else "no"):
             issues.append(f"hard_answer_mismatch:{key}")
 
+        generic_expected = _expected_screening_answer(text, profile, job)
+        if generic_expected is not None:
+            generic_key, generic_value = generic_expected
+            if not _selected_matches_boolean(selected, generic_value):
+                issues.append(f"hard_answer_mismatch:{generic_key}")
+
     for field in snapshot.get("select_fields", []):
         text = field.get("text", "").casefold()
         selected = field.get("selected", "").strip().casefold()
         if "currently based" in text and "legal right to work" in text and selected != "singapore":
             issues.append("work_location_selection_not_singapore")
+        generic_expected = _expected_screening_answer(text, profile, job)
+        if generic_expected is not None:
+            generic_key, generic_value = generic_expected
+            if not _selected_matches_boolean(selected, generic_value):
+                issues.append(f"hard_answer_mismatch:{generic_key}")
+
+    readiness_text = str(job.get("application_readiness_reason") or "").casefold()
+    non_credit_part_time = "non-credit" in readiness_text or "part-time" in readiness_text
+    weekly_limit = profile.get("availability", {}).get(
+        "non_credit_internship_hours_per_week_max"
+    )
+    if non_credit_part_time and isinstance(weekly_limit, (int, float)):
+        for field in snapshot.get("text_fields", []):
+            text = str(field.get("text") or "").casefold()
+            if not re.search(r"hours? (?:per|a) week|weekly hours?", text):
+                continue
+            match = re.search(r"\d+(?:\.\d+)?", str(field.get("value") or ""))
+            if match and float(match.group()) > float(weekly_limit):
+                issues.append("non_credit_hours_exceed_confirmed_limit")
 
     if snapshot.get("submit_control_count", 0) < 1:
         issues.append("submit_control_missing")
@@ -354,7 +695,7 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
 def _audit_live_pre_submit_page(
     port: int, worker_id: int, job: dict
 ) -> tuple[str | None, dict]:
-    """Read and validate the visible application form without changing it."""
+    """Observe the visible form without changing it or deciding whether to proceed."""
     from playwright.sync_api import sync_playwright
 
     profile = config.load_profile()
@@ -380,7 +721,7 @@ def _audit_live_pre_submit_page(
                 return ((node && node.innerText) || el.getAttribute('aria-label') || el.name || '')
                   .replace(/\s+/g, ' ').trim().slice(0, 500);
               };
-              const required = (el) => el.required || /[✱*]/.test(labelText(el));
+              const required = (el) => el.required || el.getAttribute('aria-required') === 'true' || /[✱*]/.test(labelText(el));
               const responseSelector =
                 'textarea[name*="captcha" i],textarea[name*="recaptcha" i],input[name*="captcha" i],input[name*="recaptcha" i]';
               const responseFields = [...document.querySelectorAll(responseSelector)];
@@ -388,9 +729,12 @@ def _audit_live_pre_submit_page(
                 'input:not([type=hidden]):not([type=radio]):not([type=checkbox]):not([type=file]):not([type=submit]):not([type=button]), textarea, select'
               )].filter((el) => visible(el) && !el.matches(responseSelector));
               const requiredUnfilled = [];
+              const sensitiveRequiredUnknown = [];
               const fullNameValues = [];
+              const emailValues = [];
               const currentLocationValues = [];
               const selectFields = [];
+              const textFields = [];
               for (const el of inputs) {
                 const text = labelText(el);
                 const value = el.tagName === 'SELECT'
@@ -399,21 +743,43 @@ def _audit_live_pre_submit_page(
                 if (required(el) && (!value || /^(select|choose)(\.\.\.)?$/i.test(value))) {
                   requiredUnfilled.push(text);
                 }
+                if (
+                  required(el) &&
+                  /work (authorization|authorisation)|right to work|visa|sponsorship|citizenship|legal identity|passport|national id/i.test(text) &&
+                  (!value || /^(select|choose|unknown|not sure|prefer not)(\.\.\.)?$/i.test(value))
+                ) sensitiveRequiredUnknown.push(text);
                 if (/\b(full|legal) name\b/i.test(text) && !/preferred|display/i.test(text)) {
                   fullNameValues.push(value);
                 }
+                if (el.type === 'email' || /\bemail(?: address)?\b/i.test(text)) emailValues.push(value);
                 if (/current location/i.test(text)) currentLocationValues.push(value);
                 if (el.tagName === 'SELECT') selectFields.push({text, selected: value});
+                else textFields.push({text, value});
               }
+              const nearbyUploadText = (el) => {
+                let node = el;
+                for (let depth = 0; node && node !== document.body && depth < 7; depth += 1) {
+                  const text = (node.innerText || '').replace(/\s+/g, ' ').trim();
+                  if (/\.pdf\b|uploaded|replace|remove|download/i.test(text)) return text;
+                  node = node.parentElement;
+                }
+                return '';
+              };
               const fileFields = [...document.querySelectorAll('input[type=file]')]
                 .map((el) => ({
                   text: labelText(el),
+                  nearby_text: nearbyUploadText(el),
                   count: el.files ? el.files.length : 0
                 }));
-              const resumeFields = fileFields.filter((f) => /resume|cv/i.test(f.text));
+              const resumeFields = fileFields.filter((f) => /\bresume\b|\bcv\b/i.test(f.text));
+              const resumeCards = [...document.querySelectorAll(
+                '[data-qa*="resume" i],[data-testid*="resume" i],[class*="resume" i],[aria-label*="resume" i],[aria-label*="cv" i]'
+              )].filter(visible).map((el) => (el.innerText || el.getAttribute('aria-label') || '').trim());
               const resumeUploaded = resumeFields.some((f) =>
-                f.count > 0 || /success|uploaded|replace|remove|\.pdf/i.test(f.text)
-              );
+                f.count > 0 || /success|uploaded|replace|remove|\.pdf/i.test(
+                  `${f.text} ${f.nearby_text}`
+                )
+              ) || resumeCards.some((text) => /\b[^\s]+\.pdf\b|uploaded|replace|remove|download/i.test(text));
               const radios = [...document.querySelectorAll('input[type=radio]')].filter(visible);
               const seen = new Set();
               const radioQuestions = [];
@@ -431,41 +797,78 @@ def _audit_live_pre_submit_page(
                 }
                 const text = labelText(radio);
                 if (required(radio) && !checked) requiredUnfilled.push(text);
+                if (
+                  required(radio) && !checked &&
+                  /work (authorization|authorisation)|right to work|visa|sponsorship|citizenship|legal identity|passport|national id/i.test(text)
+                ) sensitiveRequiredUnknown.push(text);
                 radioQuestions.push({text, selected});
+              }
+              const requiredChecks = [...document.querySelectorAll('input[type=checkbox]')]
+                .filter((el) => visible(el) && required(el));
+              for (const checkbox of requiredChecks) {
+                if (!checkbox.checked) requiredUnfilled.push(labelText(checkbox));
               }
               const submitControls = [...document.querySelectorAll('button,input[type=submit]')]
                 .filter((el) => visible(el) && /submit|send application|finish|complete application/i.test(
                   (el.innerText || el.value || el.getAttribute('aria-label') || '').trim()
                 ));
-              const captchaVisible = [...document.querySelectorAll('iframe')].some((el) => {
+              const captchaCandidates = [...document.querySelectorAll(
+                'iframe,[class*="turnstile" i],[id*="turnstile" i],[class*="hcaptcha" i],[class*="recaptcha" i],[data-sitekey]'
+              )].map((el) => {
                 const rect = el.getBoundingClientRect();
-                const marker = `${el.title || ''} ${el.src || ''}`.toLowerCase();
-                return rect.width >= 200 && rect.height >= 150 && marker.includes('captcha');
+                const style = getComputedStyle(el);
+                const marker = `${el.title || ''} ${el.src || ''} ${el.id || ''} ${el.className || ''}`.toLowerCase();
+                return {
+                  marker: marker.slice(0, 240),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                  display: style.display,
+                  visibility: style.visibility,
+                  opacity: style.opacity,
+                  aria_hidden: el.getAttribute('aria-hidden') || '',
+                  visible: visible(el) && rect.width >= 80 && rect.height >= 40 &&
+                    /captcha|turnstile|challenge/.test(marker)
+                };
               });
+              const captchaVisible = captchaCandidates.some((candidate) => candidate.visible);
+              const visibleText = document.body ? document.body.innerText : '';
+              const assessmentVisible = /\b(complete|take|start) (an? )?(online |coding |video )?assessment\b|\bcoding assessment\b|\bonline assessment\b/i.test(visibleText);
               return {
                 url: location.href,
                 required_unfilled: requiredUnfilled,
-                resume_field_present: resumeFields.length > 0,
+                sensitive_required_unknown: sensitiveRequiredUnknown,
+                resume_field_present: resumeFields.length > 0 || resumeCards.length > 0,
                 resume_uploaded: resumeUploaded,
                 full_name_values: fullNameValues,
+                email_values: emailValues,
                 current_location_values: currentLocationValues,
                 select_fields: selectFields,
+                text_fields: textFields,
                 radio_questions: radioQuestions,
                 submit_control_count: submitControls.length,
+                assessment_visible: assessmentVisible,
                 captcha_visible: captchaVisible,
+                captcha_candidates: captchaCandidates,
                 captcha_token_present: responseFields.some((el) => (el.value || '').trim().length > 0)
               };
             }"""
         )
         issues = _validate_pre_submit_snapshot(snapshot, profile, job)
         report = {
-            "status": "passed" if not issues else "failed",
+            "status": "clear" if not issues else "attention",
             "issues": issues,
+            "advisory_only": False,
+            "submission_gate": True,
             "required_unfilled_count": len(snapshot.get("required_unfilled", [])),
             "resume_field_present": snapshot.get("resume_field_present", False),
             "resume_uploaded": snapshot.get("resume_uploaded", False),
             "submit_control_count": snapshot.get("submit_control_count", 0),
             "captcha_token_present": snapshot.get("captcha_token_present", False),
+            "captcha_candidates": snapshot.get("captcha_candidates", []),
+            "assessment_visible": snapshot.get("assessment_visible", False),
+            "sensitive_required_unknown_count": len(
+                snapshot.get("sensitive_required_unknown", [])
+            ),
         }
         report_path = (
             config.APPLY_WORKER_DIR / f"worker-{worker_id}" / "pre-submit-audit.json"
@@ -483,12 +886,285 @@ def _audit_live_pre_submit_page(
         playwright.stop()
 
 
-def _wait_for_manual_captcha(
-    port: int, worker_id: int, timeout_seconds: int = 600
-) -> bool:
-    """Keep Edge alive until the applicant clears the visible CAPTCHA."""
+def _classify_post_submit_observation(observation: dict) -> str:
+    """Classify the browser state after a final action without guessing success.
+
+    A visible receipt is success. A visible verification gate or deterministic
+    field validation rejection proves the application is not yet submitted and
+    must not be collapsed into the retry-blocking ``submission_uncertain`` state.
+    """
+    if observation.get("confirmed") is True:
+        return "confirmed"
+    if (
+        observation.get("verification_visible") is True
+        or observation.get("captcha_visible") is True
+    ):
+        return "verification_required"
+    if int(observation.get("validation_error_count") or 0) > 0:
+        if int(observation.get("manual_validation_error_count") or 0) > 0:
+            return "validation_blocked_manual"
+        if int(observation.get("repairable_validation_error_count") or 0) > 0:
+            return "validation_blocked_repairable"
+        return "validation_blocked_manual"
+    return "uncertain"
+
+
+def _observe_post_submit_page(
+    port: int, worker_id: int, job: dict, attempt: int = 1
+) -> dict:
+    """Independently observe visible post-submit state through the existing CDP browser."""
     from playwright.sync_api import sync_playwright
 
+    playwright = sync_playwright().start()
+    try:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        pages = [page for context in browser.contexts for page in context.pages]
+        if not pages:
+            return {"confirmed": False, "reason": "post_submit_no_page"}
+        page = pages[-1]
+        observed = page.evaluate(
+            r"""() => {
+              const visible = (el) => {
+                const style = getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  el.getClientRects().length > 0;
+              };
+              const strongReceipt = /your application has been submitted|application (?:was |has been )?(?:successfully )?submitted|thank you for (?:applying|submitting your application)|we (have )?received your application|申请已提交|投递成功|申请成功/i;
+              const exactBadge = /^(applied|已申请|已投递)$/i;
+              const submitLabel = /submit|send application|finish|complete application|提交申请|投递/i;
+              const verificationText = /security code|verification code|one[- ]time (?:code|password)|\botp\b|verify (?:your )?email|email verification|验证码|校验码|验证邮箱/i;
+              const unsafeRepairText = /video|audio|record(?:ing)?|camera|microphone|passport|national id|identity document|bank account|credit card|tax id|ssn|nric|身份证|护照|银行卡|录音|录像|摄像头|麦克风/i;
+              const candidates = [...document.querySelectorAll(
+                '[role="status"],[aria-live],[data-qa*="confirm" i],[data-testid*="confirm" i],[class*="confirmation" i],[class*="success" i]'
+              )].filter(visible).map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+              const lines = (document.body ? document.body.innerText : '').split(/\n+/)
+                .map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+              const receiptText = [...candidates, ...lines].find((text) => strongReceipt.test(text)) || '';
+              const badgeText = [...document.querySelectorAll('button,a,span,div')]
+                .filter(visible).map((el) => (el.innerText || '').replace(/\s+/g, ' ').trim())
+                .find((text) => exactBadge.test(text)) || '';
+              const context = (el) => el.closest(
+                'li,fieldset,[data-qa*="field" i],[data-testid*="field" i],[class*="application-field" i],[class*="question" i],[class*="field" i]'
+              ) || el.parentElement;
+              const labelText = (el) => {
+                const node = context(el);
+                return ((node && node.innerText) || el.getAttribute('aria-label') || el.name || '')
+                  .replace(/\s+/g, ' ').trim().slice(0, 500);
+              };
+              const controls = [...document.querySelectorAll('input:not([type=hidden]),textarea,select')]
+                .filter(visible);
+              const validationErrors = [];
+              const seenErrors = new Set();
+              const seenMessages = new Set();
+              for (const el of controls) {
+                let described = '';
+                const describedBy = (el.getAttribute('aria-describedby') || '').trim().split(/\s+/).filter(Boolean);
+                if (describedBy.length) {
+                  described = describedBy.map((id) => {
+                    const node = document.getElementById(id);
+                    return node ? (node.innerText || node.textContent || '') : '';
+                  }).join(' ').replace(/\s+/g, ' ').trim();
+                }
+                const nativeInvalid = Boolean(el.willValidate && !el.validity.valid);
+                const ariaInvalid = el.getAttribute('aria-invalid') === 'true';
+                const message = (el.validationMessage || described || '').replace(/\s+/g, ' ').trim();
+                if (!nativeInvalid && !ariaInvalid && !message) continue;
+                const label = labelText(el);
+                const key = `${el.name || el.id || label}|${message}`;
+                if (seenErrors.has(key)) continue;
+                seenErrors.add(key);
+                if (message) seenMessages.add(message);
+                const type = el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName.toLowerCase());
+                const optionalClaimed = /\boptional\b|可选|非必填/i.test(label);
+                const repairable = !unsafeRepairText.test(`${label} ${message}`) &&
+                  !['file', 'password'].includes(type);
+                validationErrors.push({
+                  label: label.slice(0, 240),
+                  message: message.slice(0, 240),
+                  field_type: type,
+                  optional_claimed: optionalClaimed,
+                  repairable
+                });
+              }
+              for (const alert of [...document.querySelectorAll('[role="alert"],[aria-live="assertive"]')].filter(visible)) {
+                const message = (alert.innerText || alert.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!message || !/required|invalid|error|please (?:enter|select|complete|provide|upload)|必填|无效|错误|请选择|请填写/i.test(message)) continue;
+                if (seenMessages.has(message)) continue;
+                const key = `alert|${message}`;
+                if (seenErrors.has(key)) continue;
+                seenErrors.add(key);
+                validationErrors.push({
+                  label: 'page validation alert',
+                  message: message.slice(0, 240),
+                  field_type: 'unknown',
+                  optional_claimed: /\boptional\b|可选|非必填/i.test(message),
+                  repairable: false
+                });
+              }
+              const submitControls = [...document.querySelectorAll('button,input[type=submit],input[type=button]')]
+                .filter((el) => visible(el) && submitLabel.test(
+                  (el.innerText || el.value || el.getAttribute('aria-label') || '').trim()
+                ));
+              const captchaVisible = [...document.querySelectorAll(
+                'iframe,[class*="turnstile" i],[id*="turnstile" i],[class*="hcaptcha" i],[class*="recaptcha" i],[data-sitekey]'
+              )].filter(visible).some((el) => {
+                const rect = el.getBoundingClientRect();
+                const marker = `${el.title || ''} ${el.src || ''} ${el.id || ''} ${el.className || ''}`.toLowerCase();
+                return rect.width >= 80 && rect.height >= 40 && /captcha|turnstile|challenge/.test(marker);
+              });
+              const codeInputs = controls.filter((el) => {
+                const maxLength = Number(el.maxLength || 0);
+                return maxLength === 1 || /otp|verification|security.?code/i.test(`${el.name || ''} ${el.id || ''} ${el.autocomplete || ''}`);
+              });
+              const verificationVisible = captchaVisible ||
+                (codeInputs.length >= 4 && verificationText.test(document.body ? document.body.innerText : '')) ||
+                [...document.querySelectorAll('form,section,dialog,[role="dialog"]')]
+                  .filter(visible).some((el) => verificationText.test(el.innerText || ''));
+              const repairableCount = validationErrors.filter((item) => item.repairable).length;
+              const manualCount = validationErrors.length - repairableCount;
+              return {
+                current_url: location.href,
+                page_title: document.title || '',
+                receipt_visible: Boolean(receiptText),
+                applied_badge_visible: Boolean(badgeText),
+                confirmation_text: receiptText || badgeText,
+                form_visible: [...document.querySelectorAll('form')].some(visible),
+                submit_control_count: submitControls.length,
+                validation_errors: validationErrors.slice(0, 12),
+                validation_error_count: validationErrors.length,
+                repairable_validation_error_count: repairableCount,
+                manual_validation_error_count: manualCount,
+                verification_visible: verificationVisible,
+                captcha_visible: captchaVisible
+              };
+            }"""
+        )
+        screenshot = (
+            config.APPLY_WORKER_DIR
+            / f"worker-{worker_id}"
+            / (
+                "submission-confirmation-observer.png"
+                if attempt == 1
+                else f"submission-confirmation-observer-attempt-{attempt}.png"
+            )
+        )
+        try:
+            page.screenshot(path=str(screenshot), full_page=True)
+            observed["screenshot_path"] = str(screenshot)
+        except Exception:
+            logger.exception("Post-submit screenshot capture failed")
+            observed["screenshot_path"] = None
+        observed["confirmed"] = bool(
+            observed.get("receipt_visible") or observed.get("applied_badge_visible")
+        )
+        observed["disposition"] = _classify_post_submit_observation(observed)
+        observed["job_url"] = job.get("url")
+        return observed
+    except Exception as exc:
+        logger.exception("Post-submit browser observation failed")
+        return {
+            "confirmed": False,
+            "reason": f"post_submit_observer_error:{type(exc).__name__}",
+        }
+    finally:
+        playwright.stop()
+
+
+def _submission_evidence_consistent(model: dict | None, observer: dict) -> bool:
+    """Require independent visible confirmation that agrees with the model claim."""
+    if not model or observer.get("confirmed") is not True:
+        return False
+    receipt_agrees = (
+        model.get("receipt_visible") is True
+        and observer.get("receipt_visible") is True
+    )
+    badge_agrees = (
+        model.get("applied_badge_visible") is True
+        and observer.get("applied_badge_visible") is True
+    )
+    if not (receipt_agrees or badge_agrees):
+        return False
+
+    model_text = " ".join(
+        re.sub(
+            r"[^\w]+", " ", str(model.get("confirmation_text") or "").casefold()
+        ).split()
+    )
+    observed_text = " ".join(
+        re.sub(
+            r"[^\w]+", " ", str(observer.get("confirmation_text") or "").casefold()
+        ).split()
+    )
+    if not model_text or model_text not in observed_text:
+        return False
+
+    claimed_url = str(model.get("confirmation_url") or "").strip().rstrip("/")
+    current_url = str(observer.get("current_url") or "").strip().rstrip("/")
+    return not claimed_url or claimed_url == current_url
+
+
+def _reserve_manifest_submission(manifest: dict | None, job: dict) -> tuple[bool, str]:
+    """Re-authorize current job bytes and atomically reserve the batch slot."""
+    if manifest is None:
+        return False, "authorization_manifest_required"
+    try:
+        expires_at = datetime.fromisoformat(str(manifest.get("expires_at") or ""))
+        if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at:
+            return False, "authorization_manifest_expired"
+        from applypilot.apply.authorization import authorize_job
+        from applypilot.database import reserve_batch_submission
+
+        if authorize_job(manifest, job) is None:
+            return False, "authorization_manifest_job_mismatch"
+        reserved = reserve_batch_submission(
+            str(manifest.get("batch_id") or ""),
+            str(job.get("url") or ""),
+            int(manifest.get("max_submissions") or 0),
+        )
+        if reserved is not True:
+            return False, "authorization_batch_reservation_denied"
+        return True, "reserved"
+    except Exception as exc:
+        logger.exception("Batch submission reservation failed")
+        return False, f"authorization_batch_reservation_error:{type(exc).__name__}"
+
+
+def _update_submission_ledger(
+    manifest: dict | None,
+    job: dict,
+    status: str,
+    evidence: dict | None = None,
+) -> bool:
+    if manifest is None:
+        return True
+    try:
+        from applypilot.database import update_batch_submission_status
+
+        update_batch_submission_status(
+            str(manifest.get("batch_id") or ""),
+            str(job.get("url") or ""),
+            status,
+            evidence=evidence,
+        )
+        return True
+    except Exception:
+        logger.exception("Batch submission ledger update failed")
+        return False
+
+
+def _wait_for_manual_captcha(
+    port: int, worker_id: int, timeout_seconds: int | None = None
+) -> bool:
+    """Keep Edge alive until the applicant clears a visible verification gate."""
+    from playwright.sync_api import sync_playwright
+
+    if timeout_seconds is None:
+        timeout_seconds = int(
+            config.load_profile().get("submission_policy", {}).get(
+                "manual_intervention_timeout_seconds", 1800
+            )
+        )
+    timeout_seconds = max(60, min(timeout_seconds, 3600))
     marker = config.LOG_DIR / f"manual-captcha-relay-worker-{worker_id}.json"
     marker.write_text(
         json.dumps(
@@ -500,8 +1176,18 @@ def _wait_for_manual_captcha(
         ),
         encoding="utf-8",
     )
-    add_event(f"[W{worker_id}] MANUAL CAPTCHA: Edge is waiting for the applicant")
-    update_state(worker_id, status="captcha", last_action="waiting for manual CAPTCHA")
+    add_event(f"[W{worker_id}] MANUAL VERIFICATION: Edge is waiting for the applicant")
+    update_state(worker_id, status="captcha", last_action="waiting for manual verification")
+    try:
+        if platform.system() == "Windows":
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        else:
+            console = Console()
+            console.print("\a", end="")
+    except Exception:
+        logger.debug("Could not emit manual-intervention alert", exc_info=True)
 
     playwright = sync_playwright().start()
     try:
@@ -511,7 +1197,7 @@ def _wait_for_manual_captcha(
         while time.monotonic() < deadline and not _stop_event.is_set():
             pages = [page for context in browser.contexts for page in context.pages]
             solved = any(_captcha_response_present(page) for page in pages)
-            visible = not solved and any(_visible_captcha_overlay(page) for page in pages)
+            visible = not solved and any(_visible_verification_gate(page) for page in pages)
             if visible:
                 clear_polls = 0
             else:
@@ -521,7 +1207,7 @@ def _wait_for_manual_captcha(
                         json.dumps({"status": "solved_by_applicant", "port": port}),
                         encoding="utf-8",
                     )
-                    add_event(f"[W{worker_id}] Manual CAPTCHA cleared; resuming agent")
+                    add_event(f"[W{worker_id}] Manual verification cleared; resuming agent")
                     return True
             if _stop_event.wait(2):
                 break
@@ -638,52 +1324,73 @@ def _build_agent_command(
 # Database operations
 # ---------------------------------------------------------------------------
 
-def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0, preview_only: bool = False) -> dict | None:
+def acquire_job(target_url: str | None = None, min_score: int = 6,
+                worker_id: int = 0, preview_only: bool = False,
+                authorization_manifest: dict | None = None,
+                exclude_urls: set[str] | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        exclude_urls: Exact job URLs already attempted in this command.
 
     Returns:
         Job dict or None if the queue is empty.
     """
     conn = get_connection()
+    excluded = {str(url) for url in (exclude_urls or set()) if str(url)}
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
     refresh_job_eligibility(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
 
+        try:
+            submission_policy = config.load_profile().get("submission_policy", {})
+        except FileNotFoundError:
+            submission_policy = {}
+        allow_runtime_cover = bool(
+            submission_policy.get("allow_runtime_cover_letter_discovery", False)
+        )
+        allow_runtime_readiness = bool(
+            submission_policy.get("allow_runtime_readiness_review", False)
+        )
+
         if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
             material_clause = """
                   AND tailored_resume_path IS NOT NULL
                   AND tailor_status = 'machine_validated'
             """
-            if not preview_only:
+            if not preview_only and not allow_runtime_cover:
                 material_clause += """
                   AND (
-                    (cover_letter_path IS NOT NULL AND cover_letter_status = 'human_approved')
+                    (cover_letter_path IS NOT NULL AND cover_letter_status IN ('human_approved', 'agent_validated'))
                     OR cover_letter_status = 'not_required'
                   )
                 """
-            row = conn.execute(f"""
-                SELECT url, title, company_name, source_site, site, application_url,
-                       tailored_resume_path, tailor_status, fit_score, location, full_description,
-                       cover_letter_path, cover_letter_status
+            target_match = "(url = ? OR application_url = ?)"
+            target_params = (target_url, target_url)
+            rows = conn.execute(f"""
+                SELECT *
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                WHERE {target_match}
                   {material_clause}
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
+                  AND COALESCE(apply_retry_blocked, 0) = 0
                   AND eligibility_status != 'ineligible'
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, target_params).fetchall()
+            if excluded:
+                rows = [candidate for candidate in rows if candidate["url"] not in excluded]
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
             params: list = [min_score]
+            excluded_clause = ""
+            if excluded:
+                excluded_placeholders = ",".join("?" * len(excluded))
+                excluded_clause = f"AND url NOT IN ({excluded_placeholders})"
+                params.extend(sorted(excluded))
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -693,27 +1400,61 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             if blocked_patterns:
                 url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, company_name, source_site, site, application_url,
-                       tailored_resume_path, tailor_status, fit_score, location, full_description,
-                       cover_letter_path, cover_letter_status
+            rows = conn.execute(f"""
+                SELECT *
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND tailor_status = 'machine_validated'
-                  AND (
-                    (cover_letter_path IS NOT NULL AND cover_letter_status = 'human_approved')
-                    OR cover_letter_status = 'not_required'
-                  )
+                  {"" if allow_runtime_cover else "AND ((cover_letter_path IS NOT NULL AND cover_letter_status IN ('human_approved', 'agent_validated')) OR cover_letter_status = 'not_required')"}
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND COALESCE(apply_retry_blocked, 0) = 0
                   AND fit_score >= ?
                   AND {ELIGIBLE_SQL}
+                  {excluded_clause}
                   {site_clause}
                   {url_clauses}
                 ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
+
+        row = None
+        if authorization_manifest is None:
+            row = rows[0] if rows else None
+        else:
+            from applypilot.apply.authorization import authorize_job
+            from applypilot.apply.decision import evaluate
+
+            minimum_fit_score = max(1, min(int(min_score), 10))
+
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(authorization_manifest.get("expires_at") or "")
+                )
+            except ValueError:
+                expires_at = datetime.min.replace(tzinfo=UTC)
+            if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at:
+                rows = []
+
+            for candidate in rows:
+                candidate_job = dict(candidate)
+                candidate_job["application_url"] = (
+                    candidate_job.get("application_url") or candidate_job.get("url")
+                )
+                candidate_decision = evaluate(
+                    candidate_job,
+                    minimum_fit_score=minimum_fit_score,
+                    allow_runtime_readiness=allow_runtime_readiness,
+                    allow_runtime_cover_letter=allow_runtime_cover,
+                )
+                if candidate_decision.get("decision") != "ready_to_apply":
+                    continue
+                try:
+                    authorized = authorize_job(authorization_manifest, candidate_job)
+                except (KeyError, PermissionError, RuntimeError, ValueError):
+                    continue
+                if authorized is not None:
+                    row = candidate
+                    break
 
         if not row:
             conn.rollback()
@@ -786,7 +1527,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None,
+                evidence: dict | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(UTC).isoformat()
@@ -795,9 +1537,50 @@ def mark_result(url: str, status: str, error: str | None = None,
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_retry_blocked = 0, apply_retry_reason = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = 'visible_confirmation',
+                           application_evidence = ?, application_recorded_at = ?,
+                           submission_observation_json = ?, submission_observed_at = ?
             WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+        """, (
+            now,
+            duration_ms,
+            task_id,
+            json.dumps(evidence or {}, ensure_ascii=False),
+            now,
+            json.dumps(evidence or {}, ensure_ascii=False),
+            now,
+            url,
+        ))
+    elif status == "submission_uncertain":
+        observation = {
+            "submit_clicked": True,
+            "receipt_visible": False,
+            "applied_badge_visible": False,
+            "note": error or "final submission was attempted without visible confirmation",
+        }
+        if evidence:
+            observation.update(evidence)
+        conn.execute("""
+            UPDATE jobs SET apply_status = 'submission_uncertain', applied_at = NULL,
+                           apply_error = NULL, agent_id = NULL,
+                           apply_retry_blocked = 1,
+                           apply_retry_reason = 'submission_uncertain_requires_review',
+                           apply_attempts = COALESCE(apply_attempts, 0) + 1,
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = 'browser_observation_pending',
+                           application_evidence = 'submit_clicked_without_visible_confirmation',
+                           application_recorded_at = ?,
+                           submission_observation_json = ?, submission_observed_at = ?
+            WHERE url = ?
+        """, (
+            duration_ms,
+            task_id,
+            now,
+            json.dumps(observation, ensure_ascii=False),
+            now,
+            url,
+        ))
     elif status == "previewed":
         conn.execute("""
             UPDATE jobs SET apply_status = 'previewed', applied_at = NULL,
@@ -836,11 +1619,67 @@ def release_lock(url: str) -> None:
     conn.commit()
 
 
+def _mark_runtime_cover_not_required(job: dict) -> dict:
+    """Persist an ATS observation that this exact form has no required cover letter."""
+    conn = get_connection()
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "UPDATE jobs SET cover_letter_status='not_required', cover_letter_error=NULL, "
+        "cover_letter_approved_at=?, cover_letter_approved_by='runtime_form_observation' "
+        "WHERE url=?",
+        (now, job["url"]),
+    )
+    conn.commit()
+    refreshed = conn.execute("SELECT * FROM jobs WHERE url=?", (job["url"],)).fetchone()
+    if refreshed is None:
+        raise ValueError("Exact job disappeared while recording cover-letter discovery")
+    return dict(refreshed)
+
+
+def _prepare_runtime_cover_letter(job: dict) -> dict:
+    """Generate, validate, render, and approve one cover letter under standing policy."""
+    policy = config.load_profile().get("submission_policy", {})
+    if not policy.get("allow_agent_validated_cover_letter", False):
+        raise PermissionError("Standing policy does not allow agent-validated cover letters")
+
+    from applypilot.scoring.pdf import convert_to_pdf
+    from applypilot.single_job import prepare_cover_letter_for_url
+
+    text_path = Path(str(job.get("cover_letter_path") or ""))
+    if job.get("cover_letter_status") != "machine_validated" or not text_path.is_file():
+        report = prepare_cover_letter_for_url(
+            str(job["url"]),
+            str(job.get("company_name") or "").strip(),
+            validation_mode="strict",
+            resume_path=str(job.get("tailored_resume_path") or ""),
+        )
+        text_path = Path(str(report["text_path"]))
+    pdf_path = text_path.with_suffix(".pdf")
+    if not pdf_path.is_file():
+        convert_to_pdf(text_path, output_path=pdf_path)
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"Validated cover-letter PDF was not rendered: {pdf_path}")
+
+    conn = get_connection()
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "UPDATE jobs SET cover_letter_path=?, cover_letter_status='agent_validated', "
+        "cover_letter_error=NULL, cover_letter_approved_at=?, "
+        "cover_letter_approved_by='standing_policy_agent' WHERE url=?",
+        (str(text_path), now, job["url"]),
+    )
+    conn.commit()
+    refreshed = conn.execute("SELECT * FROM jobs WHERE url=?", (job["url"],)).fetchone()
+    if refreshed is None:
+        raise ValueError("Exact job disappeared while preparing its cover letter")
+    return dict(refreshed)
+
+
 # ---------------------------------------------------------------------------
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
-def gen_prompt(target_url: str, min_score: int = 7,
+def gen_prompt(target_url: str, min_score: int = 6,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
@@ -903,9 +1742,12 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
-                           apply_retry_blocked = 0, apply_retry_reason = NULL
+                           apply_retry_blocked = 0, apply_retry_reason = NULL,
+                           verification_confidence = 'manual_visual_confirmation',
+                           application_evidence = 'manually_marked_applied',
+                           application_recorded_at = ?
             WHERE url = ?
-        """, (now, url))
+        """, (now, now, url))
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
@@ -928,8 +1770,9 @@ def reset_failed() -> int:
                        apply_attempts = 0, apply_retry_blocked = 0,
                        apply_retry_reason = NULL, agent_id = NULL
         WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
+          OR (apply_status IS NOT NULL AND apply_status NOT IN (
+              'applied', 'in_progress', 'submission_uncertain'
+          ))
     """)
     conn.commit()
     return cursor.rowcount
@@ -949,7 +1792,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
-        'applied', 'expired', 'captcha', 'login_issue',
+        'applied', 'submission_uncertain', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
     # Read tailored resume text
@@ -1157,11 +2000,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             duration_ms = int((time.time() - start) * 1000)
             elapsed = int(time.time() - start)
             add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-            update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-            return "failed:timeout", duration_ms
+            uncertain = submission_phase == "submit" and not dry_run
+            status = "submission_uncertain" if uncertain else "failed"
+            update_state(worker_id, status=status, last_action=f"TIMEOUT ({elapsed}s)")
+            return ("submission_uncertain" if uncertain else "failed:timeout"), duration_ms
 
         if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
+            status = "submission_uncertain" if submission_phase == "submit" and not dry_run else "skipped"
+            return status, int((time.time() - start) * 1000)
 
         if final_message_path and final_message_path.exists():
             final_text = final_message_path.read_text(encoding="utf-8").strip()
@@ -1170,6 +2016,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
+
+        unanswered = _parse_unanswered_questions(output)
+        if unanswered is not None:
+            from applypilot.database import record_unanswered_questions
+            record_unanswered_questions(job["url"], unanswered)
 
         ts = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"agent_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
@@ -1189,9 +2040,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
-
         auth_markers = (
             "failed to authenticate",
             "oauth access token has been revoked",
@@ -1200,69 +2048,54 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         )
         if any(marker in output.casefold() for marker in auth_markers):
             add_event(f"[W{worker_id}] AUTHENTICATION FAILED ({elapsed}s)")
-            update_state(worker_id, status="failed", last_action="authentication failed")
-            return "failed:authentication", duration_ms
+            uncertain = submission_phase == "submit" and not dry_run
+            status = "submission_uncertain" if uncertain else "failed:authentication"
+            update_state(
+                worker_id,
+                status="submission_uncertain" if uncertain else "failed",
+                last_action="authentication failed",
+            )
+            return status, duration_ms
 
-        for result_status in [
-            "READY_TO_SUBMIT",
-            "PREVIEWED",
-            "APPLIED",
-            "EXPIRED",
-            "CAPTCHA",
-            "LOGIN_ISSUE",
-        ]:
-            if f"RESULT:{result_status}" in output:
-                if result_status == "PREVIEWED" and dry_run:
-                    audit_error = _validate_preview_audit(output)
-                    if audit_error:
-                        add_event(f"[W{worker_id}] FAILED ({elapsed}s): {audit_error[:30]}")
-                        update_state(
-                            worker_id,
-                            status="failed",
-                            last_action=f"FAILED: {audit_error[:25]}",
-                        )
-                        return f"failed:{audit_error}", duration_ms
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
-
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
-
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        status, evidence = _interpret_agent_output(
+            output,
+            dry_run=dry_run,
+            submission_phase=submission_phase,
+        )
+        if evidence is not None:
+            job["_agent_submission_evidence"] = evidence
+        display_status = status.split(":", 1)[0]
+        add_event(f"[W{worker_id}] {display_status.upper()} ({elapsed}s): {job['title'][:30]}")
+        update_state(
+            worker_id,
+            status=display_status,
+            last_action=f"{display_status.upper()} ({elapsed}s)",
+        )
+        return status, duration_ms
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        uncertain = submission_phase == "submit" and not dry_run
+        update_state(
+            worker_id,
+            status="submission_uncertain" if uncertain else "failed",
+            last_action=f"TIMEOUT ({elapsed}s)",
+        )
+        return ("submission_uncertain" if uncertain else "failed:timeout"), duration_ms
     except Exception as e:  # noqa: BLE001
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        uncertain = submission_phase == "submit" and not dry_run
+        update_state(
+            worker_id,
+            status="submission_uncertain" if uncertain else "failed",
+            last_action=f"ERROR: {str(e)[:25]}",
+        )
+        return (
+            "submission_uncertain" if uncertain else f"failed:{str(e)[:100]}"
+        ), duration_ms
     finally:
         if watchdog is not None:
             watchdog.cancel()
@@ -1277,15 +2110,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 PERMANENT_FAILURES: set[str] = {
-    "expired", "captcha", "login_issue",
+    "expired",
     "not_eligible_location", "not_eligible_salary",
-    "already_applied", "account_required",
+    "already_applied",
     "not_a_job_application", "unsafe_permissions",
-    "unsafe_verification", "sso_required",
+    "unsafe_verification",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "assessment", "assessment_required",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+PERMANENT_PREFIXES: tuple[str, ...] = (
+    "site_blocked", "cloudflare", "blocked_by",
+    "manual_review_required:submission_validation",
+    "assessment",
+    "unsafe_verification",
+)
 
 
 def _is_permanent_failure(result: str) -> bool:
@@ -1304,15 +2143,17 @@ def _is_permanent_failure(result: str) -> bool:
 
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
-                min_score: int = 7, headless: bool = False,
+                min_score: int = 6, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
                 agent_backend: str = "claude",
-                manual_captcha_relay: bool = False) -> tuple[int, int]:
-    """Run jobs sequentially until limit is reached or queue is empty.
+                manual_captcha_relay: bool = False,
+                authorization_manifest: dict | None = None,
+                attempted_urls: set[str] | None = None) -> tuple[int, int]:
+    """Run jobs until the confirmed-success target is reached or the queue is empty.
 
     Args:
         worker_id: Numeric worker identifier.
-        limit: Max jobs to process (0 = continuous).
+        limit: Confirmed submissions to achieve for a real run; preview jobs for dry-run (0 = continuous).
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
@@ -1328,19 +2169,38 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    profile = config.load_profile()
+    run_attempted_urls = attempted_urls if attempted_urls is not None else set()
 
     while not _stop_event.is_set():
-        if not continuous and jobs_done >= limit:
+        target_progress = jobs_done if dry_run else applied
+        if not continuous and target_progress >= limit:
             break
 
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
+
+        if not dry_run:
+            allowed, cooldown, rate_reason = _submission_rate_status(
+                get_connection(), profile
+            )
+            if not allowed:
+                add_event(f"[W{worker_id}] Rate limit reached: {rate_reason}")
+                update_state(worker_id, status="done", last_action=rate_reason)
+                break
+            if cooldown > 0:
+                add_event(f"[W{worker_id}] Submission cooldown: {cooldown:.0f}s")
+                update_state(worker_id, status="idle", last_action="submission cooldown")
+                if _stop_event.wait(timeout=cooldown):
+                    break
 
         job = acquire_job(
             target_url=target_url,
             min_score=min_score,
             worker_id=worker_id,
             preview_only=dry_run,
+            authorization_manifest=authorization_manifest,
+            exclude_urls=run_attempted_urls,
         )
         if not job:
             if not continuous:
@@ -1358,11 +2218,23 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        run_attempted_urls.add(str(job["url"]))
 
         chrome_proc = None
+        submission_started = False
+        verification_relay_used = False
+        cover_material_resolved = False
+        ledger_reserved = False
+        submission_evidence: dict | None = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            start_url = str(job.get("application_url") or job["url"])
+            chrome_proc = launch_chrome(
+                worker_id,
+                port=port,
+                headless=headless,
+                start_url=start_url,
+            )
 
             submission_phase = "submit" if dry_run else "prepare"
             result, duration_ms = run_job(
@@ -1376,58 +2248,104 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 submission_phase=submission_phase,
             )
 
-            relay_round = 0
             while True:
-                if result == "captcha" and manual_captcha_relay and relay_round < 3:
-                    relay_round += 1
-                    evidence_dir = (
-                        config.LOG_DIR
-                        / f"captcha-relay-{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}-r{relay_round}"
-                    )
-                    evidence_dir.mkdir(parents=True, exist_ok=True)
-                    worker_artifacts = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
-                    for artifact in worker_artifacts.glob("*.png"):
-                        shutil.copy2(artifact, evidence_dir / artifact.name)
-                    if not _wait_for_manual_captcha(port, worker_id):
-                        result = "failed:manual_captcha_timeout"
+                if result in {"cover_not_required", "cover_letter_required"}:
+                    if cover_material_resolved:
+                        result = "failed:cover_material_discovery_loop"
                         break
-                    result, resumed_duration = run_job(
-                        job,
-                        port=port,
-                        worker_id=worker_id,
-                        model=model,
-                        dry_run=dry_run,
-                        agent_backend=agent_backend,
-                        manual_captcha_relay=True,
-                        resume_existing_page=True,
-                        submission_phase=submission_phase,
-                    )
-                    duration_ms += resumed_duration
-                    continue
+                    cover_material_resolved = True
+                    try:
+                        if result == "cover_not_required":
+                            job = _mark_runtime_cover_not_required(job)
+                            add_event(f"[W{worker_id}] ATS confirmed no cover letter is required")
+                        else:
+                            add_event(f"[W{worker_id}] ATS requires a cover letter; generating it")
+                            update_state(
+                                worker_id,
+                                status="preparing_material",
+                                last_action="generating validated cover letter",
+                            )
+                            job = _prepare_runtime_cover_letter(job)
+                        result, resumed_duration = run_job(
+                            job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase="prepare",
+                        )
+                        duration_ms += resumed_duration
+                        continue
+                    except Exception as exc:
+                        logger.exception("Runtime cover-letter resolution failed")
+                        result = f"failed:manual_review_required:cover_letter_generation:{type(exc).__name__}"
+                        break
 
-                if result == "captcha" and relay_round >= 3:
-                    result = "failed:manual_captcha_relay_limit"
+                if result == "captcha":
+                    if (
+                        manual_captcha_relay
+                        and not verification_relay_used
+                        and _wait_for_manual_captcha(port, worker_id)
+                    ):
+                        verification_relay_used = True
+                        resumed_job = dict(job)
+                        resumed_job["_browser_observation"] = {
+                            "verification_resume": True,
+                            "signal": "manual_verification_cleared",
+                            "submission_gate": True,
+                        }
+                        result, resumed_duration = run_job(
+                            resumed_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=dry_run,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase=submission_phase,
+                        )
+                        duration_ms += resumed_duration
+                        continue
                     break
 
                 if result == "ready_to_submit" and not dry_run:
-                    audit_error, _audit_report = _audit_live_pre_submit_page(
+                    audit_signal, audit_report = _audit_live_pre_submit_page(
                         port, worker_id, job
                     )
-                    if audit_error == "visible_captcha":
-                        result = "captcha"
-                        continue
-                    if audit_error:
-                        result = f"failed:{audit_error}"
-                        break
-                    add_event(f"[W{worker_id}] PRE-SUBMIT AUDIT PASSED")
+                    observation_label = audit_signal or "clear"
+                    add_event(
+                        f"[W{worker_id}] Browser observation: {observation_label[:45]}"
+                    )
                     update_state(
                         worker_id,
-                        status="audited",
-                        last_action="pre-submit audit passed",
+                        status="observed",
+                        last_action=f"browser signal: {observation_label[:25]}",
                     )
+                    if audit_signal:
+                        result = f"failed:manual_review_required:{audit_signal}"
+                        break
+                    reserved, reservation_reason = _reserve_manifest_submission(
+                        authorization_manifest, job
+                    )
+                    if not reserved:
+                        result = f"failed:manual_review_required:{reservation_reason}"
+                        break
+                    ledger_reserved = authorization_manifest is not None
+                    observed_job = dict(job)
+                    observed_job["_browser_observation"] = {
+                        **audit_report,
+                        "signal": audit_signal,
+                        "advisory_only": False,
+                        "submission_gate": True,
+                    }
                     submission_phase = "submit"
+                    submission_started = True
                     result, submit_duration = run_job(
-                        job,
+                        observed_job,
                         port=port,
                         worker_id=worker_id,
                         model=model,
@@ -1438,7 +2356,147 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         submission_phase="submit",
                     )
                     duration_ms += submit_duration
-                    continue
+                    agent_evidence = observed_job.get("_agent_submission_evidence")
+                    observer_evidence = _observe_post_submit_page(
+                        port, worker_id, job, attempt=1
+                    )
+                    disposition = _classify_post_submit_observation(observer_evidence)
+                    attempts = [{
+                        "agent": agent_evidence,
+                        "observer": observer_evidence,
+                        "disposition": disposition,
+                    }]
+
+                    # One repair turn is allowed only when visible validation
+                    # errors prove the first click was rejected. An absent
+                    # receipt alone can never authorize another click.
+                    if disposition == "validation_blocked_repairable":
+                        repair_job = dict(observed_job)
+                        repair_job.pop("_agent_submission_evidence", None)
+                        repair_job["_browser_observation"] = {
+                            "repair_mode": True,
+                            "signal": disposition,
+                            "validation_errors": observer_evidence.get(
+                                "validation_errors", []
+                            ),
+                            "submission_gate": True,
+                        }
+                        add_event(f"[W{worker_id}] Repairing supported validation errors once")
+                        update_state(
+                            worker_id,
+                            status="repairing",
+                            last_action="one-time validation repair",
+                        )
+                        result, repair_duration = run_job(
+                            repair_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase="submit",
+                        )
+                        duration_ms += repair_duration
+                        agent_evidence = repair_job.get("_agent_submission_evidence")
+                        observer_evidence = _observe_post_submit_page(
+                            port, worker_id, job, attempt=2
+                        )
+                        disposition = _classify_post_submit_observation(
+                            observer_evidence
+                        )
+                        attempts.append({
+                            "agent": agent_evidence,
+                            "observer": observer_evidence,
+                            "disposition": disposition,
+                        })
+                    elif (
+                        disposition == "verification_required"
+                        and manual_captcha_relay
+                        and not verification_relay_used
+                        and _wait_for_manual_captcha(port, worker_id)
+                    ):
+                        verification_relay_used = True
+                        verification_job = dict(observed_job)
+                        verification_job.pop("_agent_submission_evidence", None)
+                        verification_job["_browser_observation"] = {
+                            "verification_resume": True,
+                            "signal": "manual_verification_cleared",
+                            "submission_gate": True,
+                        }
+                        result, resumed_duration = run_job(
+                            verification_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase="submit",
+                        )
+                        duration_ms += resumed_duration
+                        agent_evidence = verification_job.get(
+                            "_agent_submission_evidence"
+                        )
+                        observer_evidence = _observe_post_submit_page(
+                            port, worker_id, job, attempt=2
+                        )
+                        disposition = _classify_post_submit_observation(
+                            observer_evidence
+                        )
+                        attempts.append({
+                            "agent": agent_evidence,
+                            "observer": observer_evidence,
+                            "disposition": disposition,
+                        })
+
+                    submission_evidence = {
+                        "agent": agent_evidence,
+                        "observer": observer_evidence,
+                        "attempts": attempts,
+                    }
+                    archived = _archive_worker_evidence(
+                        config.APPLY_WORKER_DIR / f"worker-{worker_id}",
+                        job,
+                        worker_id,
+                        datetime.now().astimezone().strftime("%Y%m%d_%H%M%S"),
+                    )
+                    archived_by_name = {path.name: path for path in archived}
+                    for index, attempt_evidence in enumerate(attempts, start=1):
+                        filename = (
+                            "submission-confirmation-observer.png"
+                            if index == 1
+                            else f"submission-confirmation-observer-attempt-{index}.png"
+                        )
+                        archived_observer = archived_by_name.get(filename)
+                        if archived_observer is not None:
+                            attempt_evidence["observer"]["screenshot_path"] = str(
+                                archived_observer
+                            )
+                    final_archive = archived_by_name.get(
+                        "submission-confirmation-observer.png"
+                        if len(attempts) == 1
+                        else f"submission-confirmation-observer-attempt-{len(attempts)}.png"
+                    )
+                    if final_archive is not None:
+                        observer_evidence["screenshot_path"] = str(final_archive)
+
+                    if disposition == "confirmed":
+                        if result != "applied" or not _submission_evidence_consistent(
+                            agent_evidence, observer_evidence
+                        ):
+                            result = "submission_uncertain"
+                    elif disposition == "verification_required":
+                        result = "captcha"
+                    elif disposition == "validation_blocked_manual":
+                        result = "failed:manual_review_required:submission_validation"
+                    elif disposition == "validation_blocked_repairable":
+                        result = "failed:submission_validation_blocked_after_repair"
+                    else:
+                        result = "submission_uncertain"
+                    break
                 break
 
             if dry_run and result == "applied":
@@ -1455,15 +2513,84 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
-                applied += 1
-                update_state(worker_id, jobs_applied=applied,
-                             jobs_done=applied + failed)
+                ledger_updated = _update_submission_ledger(
+                    authorization_manifest if ledger_reserved else None,
+                    job,
+                    "applied",
+                    submission_evidence,
+                )
+                if not ledger_updated:
+                    uncertainty_evidence = {
+                        "submit_started": True,
+                        "reason": "submission_ledger_update_failed",
+                        "submission_evidence": submission_evidence,
+                    }
+                    mark_result(
+                        job["url"],
+                        "submission_uncertain",
+                        "submission ledger could not record the confirmed browser outcome",
+                        duration_ms=duration_ms,
+                        evidence=uncertainty_evidence,
+                    )
+                    add_event(
+                        f"[W{worker_id}] Submission receipt found but ledger update failed"
+                    )
+                    update_state(
+                        worker_id,
+                        status="submission_uncertain",
+                        last_action="ledger update failed",
+                        jobs_done=applied + failed + 1,
+                    )
+                else:
+                    mark_result(
+                        job["url"],
+                        "applied",
+                        duration_ms=duration_ms,
+                        evidence=submission_evidence,
+                    )
+                    applied += 1
+                    update_state(worker_id, jobs_applied=applied,
+                                 jobs_done=applied + failed)
+            elif result == "submission_uncertain":
+                uncertainty_evidence = submission_evidence or {
+                    "submit_started": submission_started,
+                    "reason": "agent_or_observer_confirmation_inconclusive",
+                }
+                _update_submission_ledger(
+                    authorization_manifest if ledger_reserved else None,
+                    job,
+                    "submission_uncertain",
+                    uncertainty_evidence,
+                )
+                mark_result(
+                    job["url"],
+                    "submission_uncertain",
+                    "browser did not show a decisive receipt after the final action",
+                    duration_ms=duration_ms,
+                    evidence=uncertainty_evidence,
+                )
+                add_event(f"[W{worker_id}] Submission state uncertain; status recorded")
+                update_state(
+                    worker_id,
+                    status="submission_uncertain",
+                    last_action="status recorded for agent review",
+                    jobs_done=applied + failed + 1,
+                )
             elif result == "previewed":
                 mark_result(job["url"], "previewed", duration_ms=duration_ms)
                 update_state(worker_id, jobs_done=applied + failed + 1)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
+                if submission_started and ledger_reserved:
+                    _update_submission_ledger(
+                        authorization_manifest,
+                        job,
+                        "failed",
+                        {
+                            "reason": reason,
+                            "submission_evidence": submission_evidence,
+                        },
+                    )
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms)
@@ -1472,7 +2599,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                              jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
+            if submission_started:
+                uncertainty_evidence = {
+                    "submit_started": True,
+                    "reason": "operator_interrupt_after_submit_phase_started",
+                }
+                _update_submission_ledger(
+                    authorization_manifest if ledger_reserved else None,
+                    job,
+                    "submission_uncertain",
+                    uncertainty_evidence,
+                )
+                mark_result(
+                    job["url"],
+                    "submission_uncertain",
+                    "operator interrupt after submit phase started",
+                    evidence=uncertainty_evidence,
+                )
+            else:
+                release_lock(job["url"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -1480,9 +2625,28 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
-            failed += 1
-            update_state(worker_id, jobs_failed=failed)
+            if submission_started:
+                uncertainty_evidence = {
+                    "submit_started": True,
+                    "reason": f"launcher_error:{type(e).__name__}",
+                }
+                _update_submission_ledger(
+                    authorization_manifest if ledger_reserved else None,
+                    job,
+                    "submission_uncertain",
+                    uncertainty_evidence,
+                )
+                mark_result(
+                    job["url"],
+                    "submission_uncertain",
+                    "launcher error after submit phase started",
+                    evidence=uncertainty_evidence,
+                )
+                update_state(worker_id, status="submission_uncertain")
+            else:
+                release_lock(job["url"])
+                failed += 1
+                update_state(worker_id, jobs_failed=failed)
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
@@ -1500,15 +2664,16 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 6, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          agent_backend: str = "claude",
-         manual_captcha_relay: bool = False) -> None:
+         manual_captcha_relay: bool = False,
+         authorization_manifest: dict | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
-        limit: Max jobs to apply to (0 or with continuous=True means run forever).
+        limit: Confirmed submissions to achieve (preview jobs for dry-run); 0 or continuous=True runs forever.
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
@@ -1525,14 +2690,48 @@ def main(limit: int = 1, target_url: str | None = None,
     config.ensure_dirs()
     console = Console()
 
+    if not dry_run and authorization_manifest is None:
+        raise ValueError("Every real submission requires an authorization manifest.")
+
+    submission_policy = config.load_profile().get("submission_policy", {})
+    if (
+        not dry_run
+        and submission_policy.get("batch_final_authorization_required", False)
+        and not authorization_manifest.get("_final_submission_authorized", False)
+    ):
+        raise ValueError(
+            "One final batch authorization is required before browser submission."
+        )
+
+    profile_worker_cap = int(submission_policy.get("maximum_workers", 1))
+    workers = min(max(1, workers), max(1, profile_worker_cap), 3)
+
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
     else:
-        effective_limit = limit
-        mode_label = f"{limit} jobs"
+        run_cap = int(
+            config.load_profile().get("submission_policy", {}).get(
+                "maximum_verified_submissions_per_run", 12
+            )
+        )
+        effective_limit = min(limit, run_cap) if run_cap > 0 else limit
+        mode_label = f"{limit} confirmed submissions"
+        if effective_limit != limit:
+            mode_label = f"{effective_limit} confirmed submissions (profile cap)"
+
+    if authorization_manifest is not None:
+        manifest_cap = int(authorization_manifest.get("max_submissions", 0))
+        if manifest_cap <= 0:
+            raise ValueError("Authorization manifest has no positive submission allowance.")
+        if effective_limit == 0:
+            effective_limit = manifest_cap
+        else:
+            effective_limit = min(effective_limit, manifest_cap)
+        mode_label = f"{effective_limit} manifest-authorized confirmed submissions"
 
     # Initialize dashboard for all workers
+    attempted_urls: set[str] = set()
     for i in range(workers):
         init_worker(i)
 
@@ -1590,6 +2789,8 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     agent_backend=agent_backend,
                     manual_captcha_relay=manual_captcha_relay,
+                    authorization_manifest=authorization_manifest,
+                    attempted_urls=attempted_urls,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1615,6 +2816,8 @@ def main(limit: int = 1, target_url: str | None = None,
                             dry_run=dry_run,
                             agent_backend=agent_backend,
                             manual_captcha_relay=manual_captcha_relay,
+                            authorization_manifest=authorization_manifest,
+                            attempted_urls=attempted_urls,
                         ): i
                         for i in range(workers)
                     }

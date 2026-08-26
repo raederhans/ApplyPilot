@@ -42,6 +42,37 @@ def _skill_tails_are_dense(
     return all(_tail_is_dense(counts, min_words) for counts in skill_line_word_counts)
 
 
+def _pdf_page_text_spans(pdf_path: str | Path) -> list[float]:
+    """Measure the vertical text span on each rendered PDF page."""
+    from pypdf import PdfReader
+
+    spans: list[float] = []
+    for page in PdfReader(str(pdf_path)).pages:
+        y_positions: list[float] = []
+
+        def collect_text_position(text, _cm, tm, _font, _font_size) -> None:
+            if text.strip():
+                y_positions.append(float(tm[5]))
+
+        page.extract_text(visitor_text=collect_text_position)
+        spans.append(
+            max(y_positions) - min(y_positions) if len(y_positions) >= 2 else 0.0
+        )
+    return spans
+
+
+def _last_page_is_usefully_filled(
+    page_text_spans: list[float], min_ratio: float = 0.4
+) -> bool:
+    """Allow multiple pages only when the final page is materially occupied."""
+    if len(page_text_spans) <= 1:
+        return True
+    reference_span = max(page_text_spans[:-1], default=0.0)
+    if reference_span <= 0:
+        return False
+    return page_text_spans[-1] / reference_span >= min_ratio
+
+
 # ── Resume Parser ────────────────────────────────────────────────────────
 
 def parse_resume(text: str) -> dict:
@@ -320,6 +351,7 @@ body {{
     border-bottom: 1.5px solid #2a7ab5;
     padding-bottom: 1px;
     margin-bottom: 3px;
+    break-after: avoid;
 }}
 .summary {{
     font-size: 9.5pt;
@@ -385,6 +417,7 @@ def render_pdf(
     output_path: str,
     summary_tail_min_words: int = SUMMARY_TAIL_MIN_WORDS,
     skill_tail_min_words: int = SKILL_TAIL_MIN_WORDS,
+    last_page_min_fill_ratio: float = 0.4,
 ) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
 
@@ -464,6 +497,18 @@ def render_pdf(
             print_background=True,
         )
         browser.close()
+        page_spans = _pdf_page_text_spans(output_path)
+        if not _last_page_is_usefully_filled(
+            page_spans, min_ratio=last_page_min_fill_ratio
+        ):
+            Path(output_path).unlink(missing_ok=True)
+            fill_ratio = page_spans[-1] / max(page_spans[:-1])
+            raise ValueError(
+                "Sparse final PDF page: rendered fill ratio "
+                f"{fill_ratio:.0%} is below the configured "
+                f"{last_page_min_fill_ratio:.0%}. Use one page or retain enough "
+                "distinct role-relevant evidence to justify another page."
+            )
 
 
 # ── Public API ───────────────────────────────────────────────────────────
@@ -505,11 +550,15 @@ def convert_to_pdf(
         layout.get("technical_skill_min_rendered_tail_words", SKILL_TAIL_MIN_WORDS)
         or SKILL_TAIL_MIN_WORDS
     )
+    last_page_min_fill_ratio = float(
+        layout.get("multi_page_last_page_min_fill_ratio", 0.4) or 0.4
+    )
     render_pdf(
         html,
         str(out),
         summary_tail_min_words=summary_tail_min_words,
         skill_tail_min_words=skill_tail_min_words,
+        last_page_min_fill_ratio=last_page_min_fill_ratio,
     )
     log.info("PDF generated: %s", out)
     return out

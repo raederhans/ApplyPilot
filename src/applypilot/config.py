@@ -15,7 +15,10 @@ PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
+RADAR_CONFIG_PATH = APP_DIR / "radar.yaml"
 ENV_PATH = APP_DIR / ".env"
+RADAR_IMPORT_DIR = APP_DIR / "radar-imports"
+RADAR_REPORT_DIR = APP_DIR / "reports"
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
@@ -102,6 +105,12 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def ensure_radar_dirs() -> None:
+    """Create only the storage used by discovery-only radar commands."""
+    for directory in (APP_DIR, RADAR_IMPORT_DIR, RADAR_REPORT_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
 def load_profile() -> dict:
     """Load user profile from ~/.applypilot/profile.json."""
     import json
@@ -122,6 +131,122 @@ def load_search_config() -> dict:
             return yaml.safe_load(example.read_text(encoding="utf-8"))
         return {}
     return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def load_radar_config() -> dict:
+    """Load the Singapore radar policy without inheriting the US example.
+
+    A user-owned ``radar.yaml`` has highest priority.  Existing ApplyPilot
+    users may keep location/title policy in ``searches.yaml``; that file is
+    reused only when it actually exists.  A fresh radar installation falls
+    back to the package's Singapore-specific example.
+    """
+    import yaml
+
+    if RADAR_CONFIG_PATH.exists():
+        return yaml.safe_load(RADAR_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    if SEARCH_CONFIG_PATH.exists():
+        return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    example = CONFIG_DIR / "radar.example.yaml"
+    if example.exists():
+        return yaml.safe_load(example.read_text(encoding="utf-8")) or {}
+    return {}
+
+
+def get_location_filters(search_config: dict | None = None) -> tuple[list[str], list[str]]:
+    """Return normalized accept/reject location patterns.
+
+    Current search files use ``location.accept_patterns`` and
+    ``location.reject_patterns``.  The legacy flat keys remain supported so
+    existing user configurations continue to work during the migration.
+    """
+    search_config = search_config if search_config is not None else load_search_config()
+    location = search_config.get("location", {})
+    if not isinstance(location, dict):
+        location = {}
+    accept = location.get("accept_patterns")
+    reject = location.get("reject_patterns")
+    if accept is None:
+        accept = search_config.get("location_accept", [])
+    if reject is None:
+        reject = search_config.get("location_reject_non_remote", [])
+    return (
+        [str(value) for value in (accept or []) if str(value).strip()],
+        [str(value) for value in (reject or []) if str(value).strip()],
+    )
+
+
+def get_excluded_title_patterns(search_config: dict | None = None) -> list[str]:
+    """Return configured case-insensitive title exclusions."""
+    search_config = search_config if search_config is not None else load_search_config()
+    values = search_config.get("exclude_titles", [])
+    if not isinstance(values, list):
+        return []
+    return [str(value).casefold().strip() for value in values if str(value).strip()]
+
+
+def title_is_excluded(
+    title: str | None,
+    patterns: list[str] | None = None,
+    *,
+    search_config: dict | None = None,
+) -> bool:
+    """Return whether a title contains one of the configured exclusions."""
+    if not title:
+        return False
+    normalized = " ".join(str(title).casefold().split())
+    selected = patterns if patterns is not None else get_excluded_title_patterns(search_config)
+    return any(pattern and pattern in normalized for pattern in selected)
+
+
+def location_is_accepted(
+    location: str | None,
+    accept_patterns: list[str],
+    reject_patterns: list[str],
+    *,
+    keep_unknown: bool = True,
+) -> bool:
+    """Apply one shared, case-insensitive location policy."""
+    if not location:
+        return keep_unknown
+    normalized = " ".join(str(location).casefold().split())
+    if any(pattern.casefold() in normalized for pattern in reject_patterns):
+        return False
+    if not accept_patterns:
+        return True
+    return any(pattern.casefold() in normalized for pattern in accept_patterns)
+
+
+def radar_location_is_accepted(
+    location: str | None,
+    accept_patterns: list[str],
+    reject_patterns: list[str],
+    *,
+    allow_ambiguous_remote: bool = False,
+) -> bool:
+    """Apply a strict geographic policy to global official-career feeds.
+
+    Generic ``Remote`` or ``Hybrid`` text does not prove that a role can be
+    performed from Singapore. It is accepted only when the location also
+    names one of the configured geographic scopes, unless a user explicitly
+    opts into ambiguous remote listings.
+    """
+    if not location:
+        return False
+    normalized = " ".join(str(location).casefold().split())
+    if any(pattern.casefold() in normalized for pattern in reject_patterns):
+        return False
+    non_geographic = {"remote", "hybrid", "anywhere"}
+    geographic_patterns = [
+        pattern
+        for pattern in accept_patterns
+        if pattern.casefold().strip() not in non_geographic
+    ]
+    if any(pattern.casefold() in normalized for pattern in geographic_patterns):
+        return True
+    return allow_ambiguous_remote and any(
+        marker in normalized for marker in non_geographic
+    )
 
 
 def load_sites_config() -> dict:
@@ -225,6 +350,9 @@ def portal_application_gate(
     if mode == "manual_only":
         return f"{name} requires a candidate-operated manual application."
 
+    if mode == "standing_authorized":
+        return None
+
     domains = policy.get("domains", [])
     if isinstance(domains, str):
         domains = [domains]
@@ -278,6 +406,11 @@ def portal_discovery_gate(
         )
     if mode == "manual_only":
         return f"{name} requires candidate-operated browsing; automated portal enrichment is disabled."
+    if mode == "visible_agent_browse":
+        return (
+            f"{name} permits bounded visible agent browsing in the authenticated user session; "
+            "the unattended detail crawler remains disabled."
+        )
     return f"{name} has an unrecognised discovery policy and is excluded from automated enrichment."
 
 
@@ -321,7 +454,7 @@ def load_base_urls() -> dict[str, str | None]:
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
-    "min_score": 7,
+    "min_score": 6,
     "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
     "poll_interval": 60,

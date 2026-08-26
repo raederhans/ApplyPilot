@@ -127,9 +127,7 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
 
     Falls back to sensible defaults if not defined in the YAML.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.get_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
@@ -138,36 +136,22 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     Remote jobs are always accepted. Non-remote jobs must match an accept
     pattern and not match a reject pattern.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+    return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
+def store_jobspy_results(
+    conn: sqlite3.Connection,
+    df,
+    source_label: str,
+    excluded_titles: list[str] | None = None,
+) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
-    new = 0
-    existing = 0
+    excluded = 0
+    excluded_titles = excluded_titles or []
+    grouped: dict[str, list[dict]] = {}
 
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
@@ -175,6 +159,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
+        if config.title_is_excluded(title, excluded_titles):
+            excluded += 1
+            continue
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
@@ -200,8 +187,6 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
 
-        strategy = "jobspy"
-
         # If JobSpy gave us a full description, promote it directly
         full_description = None
         detail_scraped_at = None
@@ -211,40 +196,26 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
-        from applypilot.eligibility import evaluate_job_eligibility
-        eligibility_status, eligibility_reason = evaluate_job_eligibility({
+        grouped.setdefault(site_label, []).append({
+            "url": url,
             "title": title,
+            "salary": salary,
             "description": description,
+            "location": location_str,
+            "company_name": company,
             "full_description": full_description,
+            "application_url": apply_url,
+            "detail_scraped_at": detail_scraped_at,
         })
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, company_name, source_site, "
-                "site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at, eligibility_status, "
-                "eligibility_reason, eligibility_evaluated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, company, site_label, site_label,
-                 strategy, now,
-                 full_description, apply_url, detail_scraped_at, eligibility_status,
-                 eligibility_reason, now),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            # A repeat crawl can repair employer/source metadata that older
-            # ApplyPilot versions discarded without overwriting richer data.
-            conn.execute(
-                "UPDATE jobs SET "
-                "company_name = COALESCE(NULLIF(company_name, ''), ?), "
-                "source_site = COALESCE(NULLIF(source_site, ''), ?), "
-                "site = COALESCE(NULLIF(site, ''), ?) "
-                "WHERE url = ?",
-                (company, site_label, site_label, url),
-            )
-            existing += 1
-
-    conn.commit()
+    new = 0
+    existing = 0
+    for site_label, prepared_jobs in grouped.items():
+        added, duplicates = store_jobs(conn, prepared_jobs, site_label, "jobspy")
+        new += added
+        existing += duplicates
+    if excluded:
+        log.info("Filtered %d jobs by excluded title", excluded)
     return new, existing
 
 
@@ -261,6 +232,7 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    excluded_titles: list[str],
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -351,7 +323,7 @@ def _run_one_search(
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(conn, df, s["query"], excluded_titles)
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
@@ -452,6 +424,7 @@ def _full_crawl(
     max_retries = int(defaults.get("max_retries", max_retries))
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    excluded_titles = config.get_excluded_title_patterns(search_cfg)
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -486,7 +459,7 @@ def _full_crawl(
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
-            accept_locs, reject_locs, glassdoor_map,
+            accept_locs, reject_locs, glassdoor_map, excluded_titles,
         )
         completed += 1
         total_new += result["new"]

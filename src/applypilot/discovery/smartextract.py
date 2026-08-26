@@ -19,18 +19,15 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import quote_plus
 
-import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import get_stats, init_db, store_jobs
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -52,25 +49,12 @@ def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
     if search_cfg is None:
         search_cfg = config.load_search_config()
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.get_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -92,12 +76,12 @@ def _store_jobs_filtered(
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+    excluded_titles: list[str] | None = None,
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
-    new = 0
-    existing = 0
     filtered = 0
+    excluded_titles = excluded_titles or []
+    prepared_jobs: list[dict] = []
 
     for job in jobs:
         url = job.get("url")
@@ -106,21 +90,14 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            existing += 1
+        if config.title_is_excluded(job.get("title"), excluded_titles):
+            filtered += 1
+            continue
+        prepared_jobs.append(job)
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
-    conn.commit()
-    return new, existing
+    return store_jobs(conn, prepared_jobs, site, strategy)
 
 
 # -- Page intelligence collector ---------------------------------------------
@@ -424,7 +401,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -1016,6 +993,7 @@ def _run_all(
     targets: list[dict],
     accept_locs: list[str],
     reject_locs: list[str],
+    excluded_titles: list[str] | None = None,
     workers: int = 1,
 ) -> dict:
     """Run smart extract on all targets.
@@ -1038,7 +1016,8 @@ def _run_all(
         if jobs:
             new, existing = _store_jobs_filtered(conn, jobs, target["name"],
                                                   r.get("strategy", "?"),
-                                                  accept_locs, reject_locs)
+                                                  accept_locs, reject_locs,
+                                                  excluded_titles)
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
@@ -1103,6 +1082,7 @@ def run_smart_extract(
     """
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+    excluded_titles = config.get_excluded_title_patterns(search_cfg)
 
     targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
 
@@ -1115,4 +1095,10 @@ def run_smart_extract(
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
 
-    return _run_all(targets, accept_locs, reject_locs, workers=workers)
+    return _run_all(
+        targets,
+        accept_locs,
+        reject_locs,
+        excluded_titles=excluded_titles,
+        workers=workers,
+    )

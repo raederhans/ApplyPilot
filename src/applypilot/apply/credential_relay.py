@@ -121,6 +121,15 @@ try {
 """
     child_env = os.environ.copy()
     child_env["APPLYPILOT_ATS_CREDENTIAL_FILE"] = str(path)
+    # A Python process launched from PowerShell 7 may inherit a PSModulePath
+    # that contains only pwsh module roots. Windows PowerShell then cannot
+    # autoload Microsoft.PowerShell.Security, which makes DPAPI decryption fail
+    # even for the same Windows user. Point the child at the built-in Windows
+    # PowerShell modules explicitly.
+    system_root = child_env.get("SystemRoot", r"C:\Windows")
+    child_env["PSModulePath"] = str(
+        Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+    )
     try:
         completed = subprocess.run(
             [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],

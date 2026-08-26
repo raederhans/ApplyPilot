@@ -115,11 +115,20 @@ def _build_tailor_prompt(profile: dict, source_has_projects: bool = True) -> str
     # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
+    multi_page_min_fill = float(
+        profile.get("tailoring", {})
+        .get("resume_layout", {})
+        .get("multi_page_last_page_min_fill_ratio", 0.4)
+        or 0.4
+    )
     length_guidance = (
         "This selected source includes projects. Preserve only the projects that materially improve "
         "the match. For an internship or current-student application, prefer one readable page when "
-        "the strongest evidence fits; otherwise allow two pages. Word counts are guidance, never a "
-        "reason to pad, shrink fonts, or delete decisive evidence."
+        "the strongest evidence fits. A genuinely high-threshold role may use two pages when multiple "
+        "distinct evidence areas are needed, but the final page must contain enough role-relevant content "
+        f"to occupy at least {multi_page_min_fill:.0%} of a normally filled page. Otherwise select more "
+        "aggressively and use one page. Word counts are guidance, never a reason to pad, shrink fonts, "
+        "or delete decisive evidence."
         if source_has_projects else
         "This selected source has no project section. Do not invent one. Prefer one readable page, "
         "but treat length as guidance rather than a strict word-count target."
@@ -202,7 +211,7 @@ def _build_judge_prompt(profile: dict) -> str:
 Return only one JSON object matching this schema:
 {{"verdict":"PASS or FAIL","issues":["specific issue"],"summary_claims":[{{"claim":"exact complete sentence copied from the tailored SUMMARY","source_quotes":["one or more exact supporting quotes copied verbatim from the original resume"],"supported":true}}]}}
 
-Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact original-resume quotes that together support the whole claim. Each quote must be verbatim; do not write an explanation in `source_quotes`. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL. Target-function labels such as "Data Analyst" may be supported by closely matching source work, but claims such as "analyzed engagement data", "ran experiments", or "turned user behavior into product improvements" require those facts in the original resume.
+Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact original-resume quotes that together support the whole claim. Each quote must be verbatim; do not write an explanation in `source_quotes`. If a summary sentence names a sector or domain such as urban planning, legal, finance, transportation, or healthcare, at least one quoted source line must contain that same sector/domain word; an exact source role, degree, section line, or bullet is valid evidence. Do not omit an obvious sector quote. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL. Target-function labels such as "Data Analyst" may be supported by closely matching source work, but claims such as "analyzed engagement data", "ran experiments", or "turned user behavior into product improvements" require those facts in the original resume.
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
 - Use the title field only to select the target function and layout; it is not printed in the header
@@ -455,7 +464,8 @@ def judge_tailored_resume(
         issues_list = ["Judge issues field was not a list."]
 
     summary_match = re.search(
-        r"(?ims)^SUMMARY\s*$\s*(.*?)\s*^TECHNICAL SKILLS\s*$",
+        r"(?ims)^SUMMARY\s*$\s*(.*?)\s*^"
+        r"(?:EDUCATION|TECHNICAL SKILLS|EXPERIENCE|PROJECTS)\s*$",
         tailored_text,
     )
     summary_text = summary_match.group(1).strip() if summary_match else ""
@@ -503,6 +513,11 @@ def judge_tailored_resume(
             term for term in sector_terms
             if re.search(rf"\b{re.escape(term)}\b", claim, flags=re.IGNORECASE)
         }
+        # "Urban planning" is one domain phrase, not two independent sector
+        # claims. Exact evidence that says "City Planning" proves the planning
+        # domain without requiring a second quote solely for the adjective.
+        if {"urban", "planning"} <= claim_sectors:
+            claim_sectors.discard("urban")
         quote_sectors = {
             term for term in sector_terms
             if re.search(rf"\b{re.escape(term)}\b", combined_quotes, flags=re.IGNORECASE)
@@ -627,6 +642,8 @@ def tailor_resume(
         "generation_diagnostics": [],
     }
     avoid_notes: list[str] = []
+    if str(job.get("tailor_error") or "").strip():
+        avoid_notes.append(str(job["tailor_error"]).strip())
     tailored = ""
     client = get_client()
     source_has_projects = bool(
@@ -646,10 +663,23 @@ def tailor_resume(
             prompt += "\n\n## AVOID THESE ISSUES (from previous attempt):\n" + "\n".join(
                 f"- {n}" for n in avoid_notes[-5:]
             )
+        retry_feedback = ""
+        if avoid_notes:
+            retry_feedback = (
+                "CRITICAL RETRY: The prior draft was rejected. You MUST materially rewrite "
+                "the affected summary or bullets and must not repeat the rejected claim. "
+                "Use only source wording that resolves each issue below:\n- "
+                + "\n- ".join(avoid_notes[-5:])
+                + "\n\n"
+            )
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {"role": "user", "content": (
+                retry_feedback
+                + f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\n"
+                + f"TARGET JOB:\n{job_text}\n\nReturn the JSON:"
+            )},
         ]
 
         max_tokens = int(os.environ.get("APPLYPILOT_TAILOR_MAX_TOKENS", "4096"))
@@ -755,6 +785,8 @@ def _tailor_report_error(report: dict) -> str:
     judge = report.get("judge") or {}
     if judge and not judge.get("passed", False):
         issues.append(f"Judge: {judge.get('issues') or judge.get('raw') or 'no PASS verdict'}")
+    if report.get("render_error"):
+        issues.append(f"Render: {report['render_error']}")
     if not issues:
         issues.append(str(report.get("status") or "unknown tailoring failure"))
     return "; ".join(issues[:8])
@@ -763,21 +795,61 @@ def _tailor_report_error(report: dict) -> str:
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+                  validation_mode: str = "normal",
+                  target_url: str | None = None) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process.
         validation_mode: "strict", "normal", or "lenient".
+        target_url:      Optional exact job/application URL. When set, no other
+                         database row can be tailored.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
     conn = get_connection()
+    from applypilot.resume_library import (
+        register_tailored_artifact,
+        route_resume_for_job,
+        sync_resume_library,
+    )
 
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    configured_variants = profile.get("tailoring", {}).get("resume_variants", [])
+    library_enabled = bool(configured_variants)
+    # Import historical validated material before routing. Synthetic/minimal
+    # profiles without a configured source library retain the legacy path.
+    if library_enabled:
+        sync_resume_library(conn, profile)
+
+    if target_url:
+        from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
+
+        refresh_job_eligibility(conn)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE (url = ? OR application_url = ?)
+              AND fit_score >= ?
+              AND full_description IS NOT NULL
+              AND tailored_resume_path IS NULL
+              AND COALESCE(tailor_attempts, 0) < 5
+              AND {ELIGIBLE_SQL}
+            """,
+            (target_url, target_url, min_score),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Exact URL matched more than one pending job.")
+        jobs = [dict(rows[0])] if rows else []
+    else:
+        jobs = get_jobs_by_stage(
+            conn=conn,
+            stage="pending_tailor",
+            min_score=min_score,
+            limit=limit,
+        )
     missing_company = [job for job in jobs if not job.get("company_name")]
     jobs = [job for job in jobs if job.get("company_name")]
 
@@ -815,6 +887,76 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     for job in jobs:
         completed += 1
         try:
+            library_route = (
+                route_resume_for_job(conn, job, profile)
+                if library_enabled
+                else {
+                    "decision": "create_variant",
+                    "assignment_id": None,
+                    "reason": "Resume library is not configured.",
+                }
+            )
+            route_decision = library_route["decision"]
+            if route_decision == "reuse_exact":
+                artifact = library_route["artifact"]
+                result = {
+                    "url": job["url"],
+                    "path": artifact["text_path"],
+                    "rejected_path": None,
+                    "report_path": library_route["reuse_report_path"],
+                    "source_resume_path": (
+                        artifact.get("source_resume_path") or artifact["text_path"]
+                    ),
+                    "error": None,
+                    "pdf_path": artifact["pdf_path"],
+                    "title": job["title"],
+                    "company_name": job["company_name"],
+                    "source_site": job.get("source_site") or job.get("site"),
+                    "status": "machine_validated",
+                    "attempts": 0,
+                    "resume_library_decision": "reuse_exact",
+                    "resume_artifact_id": artifact["artifact_id"],
+                    "resume_library_assignment_id": library_route["assignment_id"],
+                }
+                results.append(result)
+                stats["machine_validated"] += 1
+                log.info(
+                    "%d/%d [REUSED] artifact=%s | %s",
+                    completed,
+                    len(jobs),
+                    artifact["artifact_id"],
+                    result["title"][:40],
+                )
+                continue
+            if route_decision in {"manual_review", "ignore"}:
+                result = {
+                    "url": job["url"],
+                    "path": None,
+                    "rejected_path": None,
+                    "report_path": None,
+                    "source_resume_path": None,
+                    "error": library_route["reason"],
+                    "pdf_path": None,
+                    "title": job["title"],
+                    "company_name": job["company_name"],
+                    "source_site": job.get("source_site") or job.get("site"),
+                    "status": f"routing_{route_decision}",
+                    "attempts": 0,
+                    "resume_library_decision": route_decision,
+                    "resume_library_assignment_id": library_route["assignment_id"],
+                }
+                results.append(result)
+                stats[result["status"]] = stats.get(result["status"], 0) + 1
+                log.info(
+                    "%d/%d [%s] %s | %s",
+                    completed,
+                    len(jobs),
+                    route_decision.upper(),
+                    library_route["reason"],
+                    result["title"][:40],
+                )
+                continue
+
             source_path, routing = select_resume_source(job, profile)
             resume_text = read_resume_source(source_path)
             document_retries = max(0, int(os.environ.get("APPLYPILOT_DOCUMENT_MAX_RETRIES", "3")))
@@ -864,21 +1006,29 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(
-                json.dumps(report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
             # Generate PDF only after deterministic checks and the strict judge pass.
             pdf_path = None
             if success:
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                except Exception as exc:
+                    log.warning("PDF generation failed for %s: %s", txt_path, exc)
+                    report["render_error"] = str(exc)
+                    report["status"] = "failed_render"
+                    rejected_dir = TAILORED_DIR / "rejected"
+                    rejected_dir.mkdir(parents=True, exist_ok=True)
+                    rejected_path = rejected_dir / f"{prefix}_REJECTED.txt"
+                    txt_path.replace(rejected_path)
+                    txt_path = rejected_path
+                    success = False
+
+            # Persist the render verdict together with the content verdict.
+            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
             result = {
                 "url": job["url"],
@@ -893,6 +1043,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "source_site": job.get("source_site") or job.get("site"),
                 "status": report["status"],
                 "attempts": report["attempts"],
+                "resume_library_decision": "create_variant",
+                "resume_library_assignment_id": library_route["assignment_id"],
             }
         except Exception as e:
             result = {
@@ -902,6 +1054,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "status": "error", "attempts": 0, "path": None, "pdf_path": None,
                 "rejected_path": None, "report_path": None,
                 "source_resume_path": None, "error": str(e),
+                "resume_library_decision": "error",
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
@@ -923,16 +1076,18 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
         if r["status"] == "machine_validated":
+            attempt_increment = 0 if r.get("resume_library_decision") == "reuse_exact" else 1
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
                 "tailor_status='machine_validated', tailor_error=NULL, "
                 "tailor_source_resume_path=?, tailor_report_path=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                "tailor_attempts=COALESCE(tailor_attempts,0)+? WHERE url=?",
                 (
                     r["path"],
                     now,
                     r["source_resume_path"],
                     r["report_path"],
+                    attempt_increment,
                     r["url"],
                 ),
             )
@@ -952,6 +1107,28 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
     conn.commit()
 
+    # Newly generated material becomes reusable only after the normal strict
+    # content and render gates have already promoted it to machine_validated.
+    for r in results:
+        if (
+            library_enabled
+            and
+            r["status"] == "machine_validated"
+            and r.get("resume_library_decision") == "create_variant"
+        ):
+            stored = conn.execute("SELECT * FROM jobs WHERE url=?", (r["url"],)).fetchone()
+            if stored is not None:
+                registration = register_tailored_artifact(
+                    conn,
+                    job=dict(stored),
+                    text_path=r["path"],
+                    source_resume_path=r.get("source_resume_path"),
+                    report_path=r.get("report_path"),
+                    profile=profile,
+                )
+                r["resume_artifact_id"] = registration["artifact_id"]
+    conn.commit()
+
     elapsed = time.time() - t0
     log.info(
         "Tailoring done in %.1fs: %d machine_validated, %d failed_validation, "
@@ -969,7 +1146,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         "failed": sum(
             stats.get(status, 0)
             for status in (
-                "failed_validation", "failed_judge", "unreviewed_lenient", "exhausted_retries"
+                "failed_validation", "failed_judge", "failed_render",
+                "unreviewed_lenient", "exhausted_retries"
             )
         ),
         "errors": stats.get("error", 0),
