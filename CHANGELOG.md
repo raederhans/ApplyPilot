@@ -26,8 +26,9 @@ All notable changes to ApplyPilot will be documented in this file.
   dashboard generation for deterministic clean-workspace checks.
 - Added a Windows release smoke job covering wheel install, initialization,
   setup diagnosis, and packaged dashboard generation.
-- Gated tagged publishing on version parity and PyPI success before creating a
-  GitHub Release with wheel, source archive, verified bundle, and checksums.
+- Gated tagged publishing on version parity before creating a GitHub Release
+  with wheel, source archive, verified bundle, and checksums; PyPI publishing
+  remains an explicit repository opt-in until its trusted publisher is ready.
 
 ### Added
 
