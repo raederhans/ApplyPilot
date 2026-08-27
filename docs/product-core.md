@@ -36,11 +36,13 @@ exposing local paths. A path alone is never treated as validation. The browser
 does not route, generate, revalidate, approve, authorize, or submit materials;
 the CLI remains authoritative for those actions.
 
-The next frontend surface should expose Verify by adapting existing durable
-authorization and receipt contracts, not by creating parallel status logic in
-the browser. Until that work is deliberately scheduled, the CLI remains the
-authoritative interface for authorization, application execution, and receipt
-admission.
+The **Verification Workbench** adds a read-only Verify surface. It keeps batch
+reservations, runtime authorization, execution observations, reported platform
+state, browser confirmation, and reconciled durable receipts visibly separate.
+A reservation is not active authorization; a preview, final click, security
+code, or stored status is not a receipt. Runtime-only authorization is never
+reconstructed. The CLI remains authoritative for authorization, execution, and
+receipt admission.
 
 ## Current frontend boundary
 
@@ -50,6 +52,7 @@ admission.
 - The complete ranked dataset remains searchable in the page payload, while the DOM renders at most 60 matching cards at a time.
 - Decide and Prepare share one accessible keyboard-navigable workflow, and only the active queue is rendered into the DOM.
 - Prepare serializes status, timestamps, safe filenames, and bounded evidence summaries; resume content, hashes, full local paths, and validation evidence payloads stay out of the page.
+- Verify serializes only bounded status, timing, boolean observation, and ledger summaries; raw manifest data, receipt identifiers and text, ledger evidence payloads, local paths, and security codes stay out of the page.
 - The frontend uses no remote fonts, scripts, analytics, or network assets.
 - Profiles, resumes, credentials, receipt evidence, and unrestricted job data are never included in release archives.
 - No database schema, pipeline stage, application decision, or receipt rule is changed as part of the frontend work.

@@ -4,7 +4,7 @@ import json
 
 from applypilot.apply.authorization import compute_job_fingerprint
 from applypilot.database import close_connection, init_db
-from applypilot.frontend.contracts import build_prepare_job
+from applypilot.frontend.contracts import build_prepare_job, build_verify_job
 from applypilot.view import collect_dashboard_data, render_dashboard
 
 
@@ -188,5 +188,149 @@ def test_missing_resume_library_tables_degrade_without_migration(tmp_path) -> No
 
     assert data["prepare"]["system"]["state"] == "needs_evidence"
     assert data["jobs"][0]["prepare"]["route"]["state"] == "unrecorded"
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
+
+
+def test_verify_contract_separates_reservation_observation_and_receipt() -> None:
+    ledger = {
+        "batch_id": "standing-1234567890-secret-tail",
+        "status": "reserved",
+        "reserved_at": "2026-08-27T01:00:00+00:00",
+        "updated_at": "2026-08-27T01:00:00+00:00",
+    }
+    result = build_verify_job(
+        {
+            "apply_status": "submission_uncertain",
+            "apply_retry_blocked": 0,
+            "submission_observation_json": json.dumps(
+                {
+                    "submit_clicked": True,
+                    "receipt_visible": False,
+                    "receipt_id": "gmail-secret-123",
+                    "confirmation_text": "private receipt body",
+                    "page_url": "https://private.example.test/confirmation",
+                }
+            ),
+            "submission_observed_at": "2026-08-27T01:01:00+00:00",
+        },
+        [ledger],
+    )
+    serialized = json.dumps(result)
+
+    assert result["state"] == "action_needed"
+    assert result["batch"]["state"] == "recorded"
+    assert result["authorization"]["state"] == "reservation_recorded"
+    assert result["observation"]["submitClicked"] is True
+    assert result["receipt"]["state"] == "pending"
+    assert "standing-1" not in serialized
+    assert "ret-tail" not in serialized
+    assert "gmail-secret-123" not in serialized
+    assert "private receipt body" not in serialized
+    assert "private.example.test" not in serialized
+
+
+def test_verify_contract_only_calls_reconciled_receipts_durable() -> None:
+    durable = build_verify_job(
+        {
+            "apply_status": "applied",
+            "verification_confidence": "durable_receipt_reconciled",
+        }
+    )
+    browser = build_verify_job(
+        {
+            "apply_status": "applied",
+            "verification_confidence": "visible_confirmation",
+        }
+    )
+    export = build_verify_job(
+        {
+            "apply_status": "applied",
+            "verification_confidence": "platform_export",
+        }
+    )
+    unclassified = build_verify_job({"apply_status": "applied"})
+
+    assert durable["state"] == "reconciled"
+    assert durable["receipt"]["state"] == "durable"
+    assert browser["state"] == "confirmed"
+    assert browser["receipt"]["state"] == "confirmed"
+    assert export["state"] == "reported"
+    assert export["receipt"]["state"] == "reported"
+    assert unclassified["state"] == "action_needed"
+    assert unclassified["receipt"]["state"] == "unclassified"
+
+
+def test_dashboard_collects_verify_evidence_without_raw_receipts_or_writes(tmp_path) -> None:
+    db_path = tmp_path / "verify.db"
+    conn = init_db(db_path)
+    job_url = "https://careers.example.test/jobs/verified"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, apply_status, applied_at, "
+        "verification_confidence, application_recorded_at, submission_observation_json, "
+        "submission_observed_at) VALUES (?, ?, ?, 'applied', ?, ?, ?, ?, ?)",
+        (
+            job_url,
+            "Data Analyst",
+            "Example",
+            "2026-08-27T01:00:00+00:00",
+            "durable_receipt_reconciled",
+            "2026-08-27T01:01:00+00:00",
+            json.dumps(
+                {
+                    "source": "confirmation_email",
+                    "receipt_id": "gmail-private-789",
+                    "confirmation_text": "We received your private application.",
+                }
+            ),
+            "2026-08-27T01:01:00+00:00",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO application_batch_consumptions "
+        "(batch_id, job_url, reserved_at, status, updated_at, evidence_json) "
+        "VALUES (?, ?, ?, 'applied', ?, ?)",
+        (
+            "batch-private-1234567890",
+            job_url,
+            "2026-08-27T00:59:00+00:00",
+            "2026-08-27T01:01:00+00:00",
+            json.dumps({"confirmation_text": "secret ledger evidence"}),
+        ),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+    html = render_dashboard(data)
+
+    assert data["verify"]["stats"]["reconciled"] == 1
+    assert data["verify"]["jobs"][0]["verify"]["state"] == "reconciled"
+    assert "gmail-private-789" not in html
+    assert "private application" not in html
+    assert "secret ledger evidence" not in html
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
+
+
+def test_missing_batch_ledger_degrades_without_migration(tmp_path) -> None:
+    db_path = tmp_path / "legacy-verify.db"
+    conn = init_db(db_path)
+    conn.execute("DROP TABLE application_batch_consumptions")
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, apply_status, "
+        "verification_confidence) VALUES (?, ?, ?, 'applied', 'visible_confirmation')",
+        ("https://example.test/legacy", "Analyst", "Example"),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+
+    assert data["verify"]["system"]["state"] == "needs_evidence"
+    assert data["verify"]["jobs"][0]["verify"]["state"] == "confirmed"
     assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
     close_connection(db_path)
