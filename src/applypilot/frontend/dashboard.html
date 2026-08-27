@@ -15,10 +15,11 @@
       --line-soft: #1d221e;
       --text: #ecf2ed;
       --muted: #8e9a91;
-      --quiet: #667068;
+      --quiet: #7f8b82;
       --mint: #9ef5c4;
       --blue: #8cbcff;
       --amber: #f2c56b;
+      --brick: #ff9d87;
       --radius: 14px;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -48,10 +49,25 @@
     }
     button, input { font: inherit; }
     button, a { -webkit-tap-highlight-color: transparent; }
-    button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible, h2:focus-visible {
+    button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visible, h2:focus-visible, main:focus-visible {
       outline: 2px solid var(--mint);
       outline-offset: 3px;
     }
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      top: 12px;
+      left: 12px;
+      translate: 0 -160%;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: var(--mint);
+      color: var(--ink);
+      font: 650 12px/1 var(--mono);
+      text-decoration: none;
+      transition: translate .16s ease;
+    }
+    .skip-link:focus { translate: 0; }
 
     .app-shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100vh; }
     .rail {
@@ -104,7 +120,7 @@
     }
     .workflow button {
       display: grid;
-      grid-template-columns: 28px 1fr;
+      grid-template-columns: 28px 1fr auto;
       gap: 8px;
       width: 100%;
       min-height: 48px;
@@ -127,7 +143,19 @@
     }
     .step-number { padding-top: 2px; color: var(--quiet); font: 11px/1.4 var(--mono); }
     .workflow strong { display: block; font-size: 13px; font-weight: 650; }
-    .workflow span:last-child span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+    .workflow button > span:nth-child(2) > span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+    .stage-count {
+      align-self: center;
+      justify-self: end;
+      min-width: 24px;
+      padding: 4px 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--quiet);
+      font: 10px/1 var(--mono);
+      text-align: center;
+    }
+    .workflow li.active .stage-count { border-color: #45624f; color: var(--mint); }
     .rail-note {
       margin-top: auto;
       padding-top: 18px;
@@ -189,6 +217,7 @@
       background: #111713;
     }
     .system-panel.state-error { background: #1a1210; }
+    .system-panel.state-error { border-left: 3px solid var(--brick); }
     .system-kicker {
       margin: 0 0 6px;
       color: var(--mint);
@@ -196,14 +225,14 @@
       letter-spacing: .12em;
       text-transform: uppercase;
     }
-    .system-panel.state-error .system-kicker { color: var(--amber); }
+    .system-panel.state-error .system-kicker { color: var(--brick); }
     .system-title { margin: 0; font-size: 16px; font-weight: 650; }
     .system-copy { max-width: 720px; margin: 6px 0 0; color: var(--muted); font-size: 12px; }
     .system-detail { margin: 8px 0 0; color: var(--quiet); font: 10px/1.5 var(--mono); }
     .system-actions { display: grid; gap: 7px; min-width: min(100%, 330px); }
     .command-row {
       display: grid;
-      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-columns: auto minmax(0, 1fr) auto;
       gap: 10px;
       align-items: center;
       padding: 8px 10px;
@@ -211,6 +240,18 @@
       border-radius: 8px;
       background: var(--ink);
     }
+    .command-copy {
+      min-width: 44px;
+      min-height: 44px;
+      padding: 8px 10px;
+      border: 0;
+      border-left: 1px solid var(--line);
+      background: transparent;
+      color: var(--mint);
+      cursor: pointer;
+      font: 10px/1 var(--mono);
+    }
+    .command-copy:hover { background: var(--panel-raised); }
     .command-row span { color: var(--quiet); font-size: 10px; }
     .command-row code { overflow-x: auto; color: var(--text); font: 10px/1.4 var(--mono); white-space: nowrap; }
     .metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
@@ -252,17 +293,27 @@
     }
     .search {
       width: 100%;
-      min-height: 38px;
+      min-height: 44px;
       padding: 8px 12px 8px 36px;
       border: 1px solid var(--line);
       border-radius: 9px;
       background: var(--ink);
       color: var(--text);
     }
-    .search::placeholder { color: #555f58; }
+    .search::placeholder { color: #778279; }
+    .sort {
+      min-height: 44px;
+      padding: 8px 34px 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--ink);
+      color: var(--muted);
+      cursor: pointer;
+      font: 11px/1 var(--mono);
+    }
     .filters { display: flex; flex: none; gap: 5px; }
     .filter {
-      min-height: 36px;
+      min-height: 44px;
       padding: 7px 11px;
       border: 1px solid transparent;
       border-radius: 8px;
@@ -275,9 +326,10 @@
     .filter.active { border-color: #45624f; background: #17221b; color: var(--mint); }
 
     .content-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; min-height: 520px; }
-    .queue { min-width: 0; padding: 10px 22px 26px; }
+    .queue { min-width: 0; padding: 10px 22px 26px; scroll-margin-top: 68px; }
     .queue-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 2px 12px; }
     .queue-head h2, .insights h2 { margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+    .queue-head h2 { scroll-margin-top: 88px; }
     .result-count { color: var(--quiet); font: 10px/1 var(--mono); }
     .opportunity-list { display: grid; }
     .opportunity {
@@ -335,7 +387,7 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 34px;
+      min-height: 44px;
       padding: 7px 11px;
       border: 1px solid #42604c;
       border-radius: 8px;
@@ -350,7 +402,7 @@
     .empty span { display: block; font-size: 12px; }
     .queue-footer { display: flex; justify-content: center; gap: 8px; padding-top: 18px; }
     .page-button {
-      min-height: 38px;
+      min-height: 44px;
       padding: 8px 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -378,6 +430,19 @@
     .source-head span:last-child { flex: none; color: var(--quiet); font: 10px/1.5 var(--mono); }
     .source-track { height: 3px; overflow: hidden; background: #222823; }
     .source-fill { height: 100%; background: #698074; }
+    .source-health-list { display: grid; gap: 10px; }
+    .source-health {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 5px 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+    .source-health:last-child { padding-bottom: 0; border-bottom: 0; }
+    .source-health strong { overflow-wrap: anywhere; font-size: 11px; font-weight: 600; }
+    .source-health span { color: var(--quiet); font: 10px/1.4 var(--mono); }
+    .source-health .source-run-state { color: var(--mint); text-transform: uppercase; }
+    .source-health.needs-attention .source-run-state { color: var(--amber); }
 
     .material-list { display: grid; }
     .material-card {
@@ -453,6 +518,27 @@
     .prepare-note strong { display: block; margin-bottom: 8px; color: var(--text); font-size: 12px; }
     .prepare-note code { display: block; overflow-x: auto; margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--ink); color: var(--text); font: 10px/1.5 var(--mono); }
 
+    .opportunity-title, .company-line, .reasoning, .keywords, .tag,
+    .material-title-row, .material-summary, .material-status-row span,
+    .evidence-record, .system-title, .system-copy, .head-copy {
+      overflow-wrap: anywhere;
+    }
+    .description summary, .material-details summary { max-width: 100%; overflow-wrap: anywhere; }
+    .state-observed { border-color: #3f5369; }
+    .state-lead { border-color: #765f35; color: var(--amber); }
+    .state-verified { border-color: #518166; color: var(--mint); }
+    .pipeline-note { margin-top: 8px; color: var(--quiet); font: 10px/1.4 var(--mono); }
+    .snapshot-note { white-space: nowrap; }
+    .key-hint { color: var(--quiet); }
+    .key-hint kbd {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      border-bottom-color: #3b443d;
+      border-radius: 4px;
+      color: var(--muted);
+      font: 9px/1 var(--mono);
+    }
+
     @keyframes enter { from { opacity: 0; transform: translateY(5px); } }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; }
@@ -462,7 +548,7 @@
       .workflow { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .workflow button { grid-template-columns: 1fr; padding: 8px; }
       .workflow li.active::before { inset: auto 8px -1px; width: auto; height: 2px; }
-      .workflow span:last-child span, .rail-note { display: none; }
+      .workflow button > span:nth-child(2) > span, .stage-count, .rail-note { display: none; }
       main { padding-top: 32px; }
       .content-grid { grid-template-columns: 1fr; }
       .insights { border-top: 1px solid var(--line); border-left: 0; }
@@ -476,9 +562,12 @@
       .metric:nth-child(n+3) { border-top: 1px solid var(--line); }
       .toolbar { align-items: stretch; flex-direction: column; }
       .system-panel { grid-template-columns: 1fr; }
+      .command-row { grid-template-columns: minmax(0, 1fr) auto; }
+      .command-row > span { grid-column: 1 / -1; }
       .search-wrap { flex-basis: auto; }
       .filters { display: grid; grid-template-columns: repeat(4, 1fr); }
       .filter { padding-inline: 4px; }
+      .sort { width: 100%; }
       .queue { padding-inline: 14px; }
       .opportunity { grid-template-columns: 42px minmax(0, 1fr); }
       .actions { grid-column: 2; }
@@ -490,6 +579,7 @@
       .material-title-row { display: block; }
       .material-score { margin-top: 4px; }
       .evidence-record { grid-template-columns: 1fr; gap: 4px; }
+      .snapshot-note { white-space: normal; }
     }
     @media (prefers-reduced-motion: reduce) {
       html { scroll-behavior: auto; }
@@ -502,27 +592,28 @@
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <div class="app-shell">
     <aside class="rail" aria-label="Product workflow">
       <div class="brand"><span class="brand-mark">AP</span><span>ApplyPilot <small>Local</small></span></div>
       <p class="rail-label">Core workflow</p>
       <ol class="workflow" role="tablist" aria-label="Workbench stage">
-        <li role="presentation"><button type="button" role="tab" aria-disabled="true" disabled><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span></button></li>
-        <li class="active" role="presentation"><button id="decide-tab" type="button" role="tab" aria-selected="true" aria-controls="decide-panel" data-stage="decide"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span></button></li>
-        <li role="presentation"><button id="prepare-tab" type="button" role="tab" aria-selected="false" aria-controls="prepare-panel" data-stage="prepare" tabindex="-1"><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span></button></li>
-        <li role="presentation"><button id="verify-tab" type="button" role="tab" aria-selected="false" aria-controls="verify-panel" data-stage="verify" tabindex="-1"><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></button></li>
+        <li role="presentation"><button id="discover-tab" type="button" role="tab" aria-selected="false" aria-controls="discover-panel" data-stage="discover" tabindex="-1"><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span><span class="stage-count" id="discover-stage-count">0</span></button></li>
+        <li class="active" role="presentation"><button id="decide-tab" type="button" role="tab" aria-selected="true" aria-controls="decide-panel" data-stage="decide"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span><span class="stage-count" id="decide-stage-count">0</span></button></li>
+        <li role="presentation"><button id="prepare-tab" type="button" role="tab" aria-selected="false" aria-controls="prepare-panel" data-stage="prepare" tabindex="-1"><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span><span class="stage-count" id="prepare-stage-count">0</span></button></li>
+        <li role="presentation"><button id="verify-tab" type="button" role="tab" aria-selected="false" aria-controls="verify-panel" data-stage="verify" tabindex="-1"><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span><span class="stage-count" id="verify-stage-count">0</span></button></li>
       </ol>
       <div class="rail-note"><strong>Private by default</strong>Generated from your local SQLite workspace. No analytics or remote UI assets.</div>
     </aside>
 
-    <main>
+    <main id="main-content" tabindex="-1">
       <header class="page-head">
         <div>
           <p class="eyebrow" id="page-eyebrow">Opportunity workbench</p>
           <h1 id="page-title">Move evidence forward.</h1>
           <p class="head-copy" id="page-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
         </div>
-        <div class="local-status" id="workspace-status"><span class="status-dot" id="status-dot" aria-hidden="true"></span><span id="status-label">LOCAL WORKSPACE</span></div>
+        <div class="local-status snapshot-note" id="workspace-status"><span class="status-dot" id="status-dot" aria-hidden="true"></span><span id="status-label">LOCAL SNAPSHOT · NO SYNC</span></div>
       </header>
 
       <section class="workbench" aria-label="Opportunity workbench">
@@ -535,6 +626,50 @@
           </div>
           <div class="system-actions" id="system-actions"></div>
         </section>
+        <section id="discover-panel" role="tabpanel" aria-labelledby="discover-tab" hidden>
+          <div class="metrics" aria-label="Discovery summary">
+            <div class="metric"><strong class="metric-value" id="discover-candidates">0</strong><span class="metric-label">Source candidates</span></div>
+            <div class="metric emphasis"><strong class="metric-value" id="discover-verified">0</strong><span class="metric-label">Official listings</span></div>
+            <div class="metric"><strong class="metric-value" id="discover-leads">0</strong><span class="metric-label">Unresolved leads</span></div>
+            <div class="metric"><strong class="metric-value" id="discover-issues">0</strong><span class="metric-label">Source issues</span></div>
+          </div>
+
+          <div class="toolbar">
+            <label class="search-wrap"><span class="sr-only">Search discovered candidates</span><input id="discover-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
+            <label><span class="sr-only">Sort discovered candidates</span><select id="discover-sort" class="sort"><option value="recent">RECENT FIRST</option><option value="source">SOURCE</option><option value="title">ROLE TITLE</option></select></label>
+            <div class="filters" role="group" aria-label="Discovery evidence status">
+              <button class="filter active" type="button" data-discover-filter="all" aria-pressed="true">ALL</button>
+              <button class="filter" type="button" data-discover-filter="verified" aria-pressed="false">OFFICIAL</button>
+              <button class="filter" type="button" data-discover-filter="lead" aria-pressed="false">LEADS</button>
+              <button class="filter" type="button" data-discover-filter="observed" aria-pressed="false">OBSERVED</button>
+            </div>
+          </div>
+
+          <div class="content-grid">
+            <section class="queue" id="discovery">
+              <div class="queue-head"><h2 id="discover-title" tabindex="-1">Source candidates</h2><span class="result-count" id="discover-result-count" aria-live="polite">0 of 0 shown</span></div>
+              <div class="material-list" id="discover-list"></div>
+              <div class="empty" id="discover-empty-state"><strong id="discover-empty-title">No matching source evidence</strong><span id="discover-empty-copy">Try a broader search or another source filter.</span></div>
+              <nav class="queue-footer" aria-label="Discovery pages">
+                <button class="page-button" id="discover-page-previous" type="button" hidden>PREVIOUS PAGE</button>
+                <button class="page-button" id="discover-page-next" type="button" hidden>NEXT PAGE</button>
+              </nav>
+            </section>
+
+            <aside class="insights" aria-label="Discovery source context">
+              <section class="insight-block">
+                <h2>Source health</h2>
+                <p class="insight-kicker">Latest persisted provider run</p>
+                <div class="source-health-list" id="source-health-list"></div>
+              </section>
+              <section class="insight-block prepare-note">
+                <strong>Source truth boundary</strong>
+                Leads remain leads until an official target is verified. This snapshot does not fetch, promote, score, or apply to a role.
+              </section>
+            </aside>
+          </div>
+        </section>
+
         <section id="decide-panel" role="tabpanel" aria-labelledby="decide-tab">
           <div class="metrics" aria-label="Pipeline summary">
             <div class="metric"><strong class="metric-value" id="stat-total">0</strong><span class="metric-label">Eligible roles</span></div>
@@ -545,7 +680,8 @@
 
           <div class="toolbar">
             <label class="search-wrap"><span class="sr-only">Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
-            <div class="filters" aria-label="Minimum fit score">
+            <label><span class="sr-only">Sort opportunities</span><select id="decide-sort" class="sort"><option value="fit">FIT SCORE</option><option value="recent">RECENT</option><option value="company">COMPANY</option></select></label>
+            <div class="filters" role="group" aria-label="Minimum fit score">
               <button class="filter active" type="button" data-min-score="5" aria-pressed="true">ALL 5+</button>
               <button class="filter" type="button" data-min-score="7" aria-pressed="false">7+</button>
               <button class="filter" type="button" data-min-score="8" aria-pressed="false">8+</button>
@@ -589,7 +725,8 @@
 
           <div class="toolbar">
             <label class="search-wrap"><span class="sr-only">Search preparation evidence</span><input id="prepare-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, material status…"></label>
-            <div class="filters" aria-label="Preparation evidence status">
+            <label><span class="sr-only">Sort preparation evidence</span><select id="prepare-sort" class="sort"><option value="attention">ATTENTION FIRST</option><option value="fit">FIT SCORE</option><option value="company">COMPANY</option></select></label>
+            <div class="filters" role="group" aria-label="Preparation evidence status">
               <button class="filter active" type="button" data-prepare-filter="all" aria-pressed="true">ALL</button>
               <button class="filter" type="button" data-prepare-filter="ready" aria-pressed="false">READY</button>
               <button class="filter" type="button" data-prepare-filter="attention" aria-pressed="false">REVIEW</button>
@@ -625,17 +762,18 @@
         <section id="verify-panel" role="tabpanel" aria-labelledby="verify-tab" hidden>
           <div class="metrics" aria-label="Verification summary">
             <div class="metric"><strong class="metric-value" id="verify-records">0</strong><span class="metric-label">Activity records</span></div>
-            <div class="metric"><strong class="metric-value" id="verify-reservations">0</strong><span class="metric-label">Reserved slots</span></div>
-            <div class="metric"><strong class="metric-value" id="verify-review">0</strong><span class="metric-label">Needs review</span></div>
-            <div class="metric emphasis"><strong class="metric-value" id="verify-reconciled">0</strong><span class="metric-label">Durable receipts</span></div>
+            <div class="metric"><strong class="metric-value" id="verify-reservations">0</strong><span class="metric-label">Batch reservations</span></div>
+            <div class="metric"><strong class="metric-value" id="verify-review">0</strong><span class="metric-label">Needs reconciliation</span></div>
+            <div class="metric emphasis"><strong class="metric-value" id="verify-reconciled">0</strong><span class="metric-label">Receipts reconciled</span></div>
           </div>
 
           <div class="toolbar">
             <label class="search-wrap"><span class="sr-only">Search verification evidence</span><input id="verify-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, status, evidence…"></label>
-            <div class="filters" aria-label="Verification evidence status">
+            <label><span class="sr-only">Sort verification evidence</span><select id="verify-sort" class="sort"><option value="attention">ATTENTION FIRST</option><option value="recent">RECENT</option><option value="company">COMPANY</option></select></label>
+            <div class="filters" role="group" aria-label="Verification evidence status">
               <button class="filter active" type="button" data-verify-filter="all" aria-pressed="true">ALL</button>
               <button class="filter" type="button" data-verify-filter="action_needed" aria-pressed="false">ACTION</button>
-              <button class="filter" type="button" data-verify-filter="confirmed" aria-pressed="false">CONFIRMED</button>
+              <button class="filter" type="button" data-verify-filter="activity" aria-pressed="false">ACTIVITY</button>
               <button class="filter" type="button" data-verify-filter="reconciled" aria-pressed="false">RECEIPT</button>
             </div>
           </div>
@@ -654,7 +792,7 @@
             <aside class="insights" aria-label="Verification evidence boundary">
               <section class="insight-block prepare-note">
                 <strong>Evidence strength</strong>
-                A reserved batch slot is not active authorization. An observation or Submit click is not a receipt. Only admitted confirmation evidence supports an applied record.
+                A reserved batch slot is not active authorization. An observation or Submit click is not a receipt. Only a reconciled decisive receipt records an application locally; it does not establish an employer outcome.
               </section>
               <section class="insight-block prepare-note">
                 <strong>Read-only boundary</strong>
@@ -674,14 +812,24 @@
       "use strict";
       const data = JSON.parse(document.getElementById("dashboard-data").textContent);
       const PAGE_SIZE = 60;
-      const state = { stage: "decide", minimumScore: 5, query: "", pageIndex: 0 };
-      const prepareState = { filter: "all", query: "", pageIndex: 0 };
-      const verifyState = { filter: "all", query: "", pageIndex: 0 };
+      const state = { stage: "decide", minimumScore: 5, query: "", sort: "fit", pageIndex: 0 };
+      const discoverState = { filter: "all", query: "", sort: "recent", pageIndex: 0 };
+      const prepareState = { filter: "all", query: "", sort: "attention", pageIndex: 0 };
+      const verifyState = { filter: "all", query: "", sort: "attention", pageIndex: 0 };
+      const discoverList = document.getElementById("discover-list");
       const list = document.getElementById("opportunity-list");
       const materialList = document.getElementById("material-list");
       const verifyList = document.getElementById("verify-list");
+      const rawDiscoverItems = Array.isArray(data.discover?.items) ? data.discover.items : [];
       const rawJobs = Array.isArray(data.jobs) ? data.jobs : [];
       const rawVerifyJobs = Array.isArray(data.verify?.jobs) ? data.verify.jobs : [];
+      const indexedDiscoverItems = rawDiscoverItems.map((item) => ({
+        item,
+        search: [
+          item.title, item.company, item.source, item.provider, item.location,
+          item.label, item.pipeline?.label,
+        ].join(" ").toLocaleLowerCase(),
+      }));
       const indexedJobs = rawJobs.map((job) => ({
         job,
         search: [
@@ -710,11 +858,49 @@
       const safeUrl = (value) => {
         try {
           const url = new URL(value);
-          return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+          return url.protocol === "https:" && !url.username && !url.password ? url.href : "";
         } catch { return ""; }
+      };
+      const formatTime = (value) => {
+        if (!value) return "Not recorded";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "Not recorded";
+        return new Intl.DateTimeFormat(undefined, {
+          year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+        }).format(date);
+      };
+      const textCompare = (left, right) => String(left || "").localeCompare(String(right || ""), undefined, { sensitivity: "base" });
+      const timeValue = (value) => {
+        const parsed = Date.parse(value || "");
+        return Number.isNaN(parsed) ? 0 : parsed;
       };
       const appendTag = (parent, text, className = "") => {
         if (text) parent.append(make("span", `tag ${className}`.trim(), text));
+      };
+      const fallbackCopy = (value) => {
+        const fallback = make("textarea", "sr-only");
+        fallback.value = value;
+        document.body.append(fallback);
+        fallback.select();
+        const copied = document.execCommand("copy");
+        fallback.remove();
+        if (!copied) throw new Error("Browser copy command was rejected");
+      };
+      const copyText = async (value) => {
+        if (navigator.clipboard?.writeText) {
+          try {
+            await navigator.clipboard.writeText(value);
+            return;
+          } catch { /* Fall back to the local selection copy path. */ }
+        }
+        fallbackCopy(value);
+      };
+      const selectText = (node) => {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        selection.removeAllRanges();
+        selection.addRange(range);
       };
 
       const renderSystem = (system = data.system || { state: "ready" }) => {
@@ -734,16 +920,40 @@
         actions.replaceChildren();
         for (const action of (system.actions || [])) {
           const row = make("div", "command-row");
-          row.append(make("span", "", action.label), make("code", "", action.command));
+          const code = make("code", "", action.command);
+          const copy = make("button", "command-copy", "COPY");
+          const copyStatus = make("span", "sr-only");
+          copyStatus.setAttribute("role", "status");
+          copyStatus.setAttribute("aria-live", "polite");
+          copy.type = "button";
+          copy.setAttribute("aria-label", `Copy command: ${action.label}`);
+          copy.addEventListener("click", async () => {
+            try {
+              await copyText(String(action.command || ""));
+              copy.textContent = "COPIED";
+              copyStatus.textContent = "Command copied.";
+            } catch {
+              selectText(code);
+              copy.textContent = "SELECTED";
+              copyStatus.textContent = "Copy unavailable. Command selected for manual copy.";
+            }
+            setTimeout(() => { copy.textContent = "COPY"; }, 1400);
+          });
+          row.append(make("span", "", action.label), code, copy, copyStatus);
           actions.append(row);
         }
         actions.hidden = actions.childElementCount === 0;
 
         const statusLabel = document.getElementById("status-label");
-        statusLabel.textContent = system.state === "error" ? "LOCAL DATA ISSUE" : "LOCAL WORKSPACE";
-        document.getElementById("status-dot").style.background = system.state === "error" ? "var(--amber)" : "var(--mint)";
+        statusLabel.textContent = system.state === "error" ? "LOCAL DATA ISSUE · NO SYNC" : "LOCAL SNAPSHOT · NO SYNC";
+        document.getElementById("status-dot").style.background = system.state === "error" ? "var(--brick)" : "var(--mint)";
       };
 
+      const discoverStats = data.discover?.stats || {};
+      document.getElementById("discover-candidates").textContent = discoverStats.candidates ?? 0;
+      document.getElementById("discover-verified").textContent = discoverStats.verified ?? 0;
+      document.getElementById("discover-leads").textContent = discoverStats.leads ?? 0;
+      document.getElementById("discover-issues").textContent = discoverStats.sourceIssues ?? 0;
       const stats = data.stats || {};
       document.getElementById("stat-total").textContent = stats.total ?? 0;
       document.getElementById("stat-ready").textContent = stats.ready ?? 0;
@@ -759,6 +969,10 @@
       document.getElementById("verify-reservations").textContent = verifyStats.authorizedReservations ?? 0;
       document.getElementById("verify-review").textContent = verifyStats.needsReview ?? 0;
       document.getElementById("verify-reconciled").textContent = verifyStats.reconciled ?? 0;
+      document.getElementById("discover-stage-count").textContent = discoverStats.candidates ?? 0;
+      document.getElementById("decide-stage-count").textContent = stats.highFit ?? 0;
+      document.getElementById("prepare-stage-count").textContent = prepareStats.ready ?? 0;
+      document.getElementById("verify-stage-count").textContent = verifyStats.reconciled ?? 0;
 
       const renderScores = () => {
         const target = document.getElementById("score-bars");
@@ -790,6 +1004,82 @@
           row.append(head, track);
           target.append(row);
         }
+      };
+
+      const renderSourceHealth = () => {
+        const target = document.getElementById("source-health-list");
+        target.replaceChildren();
+        const sources = Array.isArray(data.discover?.sources) ? data.discover.sources : [];
+        for (const source of sources.slice(0, 10)) {
+          const needsAttention = source.status !== "complete"
+            || source.paginationComplete === false || source.hasError === true;
+          const row = make("div", `source-health ${needsAttention ? "needs-attention" : ""}`.trim());
+          row.append(
+            make("strong", "", source.name || source.provider || "Unnamed source"),
+            make("span", "source-run-state", needsAttention ? "ATTENTION" : "COMPLETE"),
+            make("span", "", `${source.provider || "unknown"} · ${source.observed || 0} observed`),
+            make("span", "", formatTime(source.lastRunAt)),
+          );
+          target.append(row);
+        }
+        if (!sources.length) target.append(make("p", "insight-kicker", "No provider-run evidence recorded."));
+      };
+
+      const createDiscoverCard = (item, index) => {
+        const card = make("article", "opportunity");
+        card.style.setProperty("--index", index);
+        const marker = item.state === "verified" ? "OFF" : item.state === "lead" ? "LEAD" : "OBS";
+        card.append(make("div", `material-state state-${item.state || "observed"}`, marker));
+
+        const body = make("div", "opportunity-body");
+        const heading = make("h3", "opportunity-title", item.title || "Untitled opportunity");
+        body.append(heading);
+        const companyLine = make("div", "company-line");
+        companyLine.append(make("span", "", item.company || "Unknown employer"));
+        if (item.location) companyLine.append(make("span", "", item.location));
+        body.append(companyLine);
+
+        const evidence = make("div", "evidence");
+        appendTag(evidence, item.label, item.state === "verified" ? "source" : item.state === "lead" ? "salary" : "");
+        appendTag(evidence, item.source);
+        appendTag(evidence, item.provider);
+        appendTag(
+          evidence,
+          item.sourceCount > 0
+            ? `${item.sourceCount} source${item.sourceCount === 1 ? "" : "s"}`
+            : "No linked source",
+        );
+        body.append(evidence);
+        body.append(make("p", "pipeline-note", item.pipeline?.label || "No pipeline state recorded"));
+
+        const details = make("details", "material-details");
+        details.append(make("summary", "", "View source snapshot evidence"));
+        details.addEventListener("toggle", () => {
+          if (!details.open || details.childElementCount > 1) return;
+          const records = make("div", "evidence-records");
+          records.append(
+            evidenceRecord("Published", formatTime(item.publishedAt)),
+            evidenceRecord("First seen", formatTime(item.firstSeenAt)),
+            evidenceRecord("Last seen", formatTime(item.lastSeenAt)),
+            evidenceRecord("Source state", item.label),
+          );
+          details.append(records);
+        }, { once: true });
+        body.append(details);
+        card.append(body);
+
+        const url = safeUrl(item.url);
+        const actions = make("div", "actions");
+        if (url) {
+          const link = make("a", "action", item.state === "verified" ? "OPEN LISTING ↗" : "REVIEW SOURCE ↗");
+          link.href = url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.setAttribute("aria-label", `${item.state === "verified" ? "Open listing" : "Review source"} for ${item.title}`);
+          actions.append(link);
+        }
+        card.append(actions);
+        return card;
       };
 
       const createJobCard = (job, index) => {
@@ -1011,7 +1301,7 @@
             evidenceRecord(
               "Batch ledger",
               batch.state === "recorded"
-                ? [batch.latestStatus, batch.updatedAt].filter(Boolean).join(" · ")
+                ? [batch.latestStatus, formatTime(batch.updatedAt)].filter(Boolean).join(" · ")
                 : "No durable reservation record",
             ),
             evidenceRecord(
@@ -1025,10 +1315,10 @@
                   ].join(" · ")
                 : observation.label,
             ),
-            evidenceRecord("Receipt evidence", [receipt.confidence, receipt.recordedAt].filter(Boolean).join(" · ")),
+            evidenceRecord("Receipt evidence", [receipt.confidence, formatTime(receipt.recordedAt)].filter(Boolean).join(" · ")),
             evidenceRecord(
               "Attempt record",
-              `${verify.attempt?.count || 0} recorded · ${verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded"}`,
+              `${verify.attempt?.count || 0} recorded · ${formatTime(verify.attempt?.lastAttemptedAt)} · ${verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded"}`,
             ),
           );
           details.append(records);
@@ -1038,11 +1328,54 @@
         return card;
       };
 
+      const matchingDiscoverItems = () => {
+        const query = discoverState.query.toLocaleLowerCase();
+        const matches = indexedDiscoverItems.filter(({ item, search }) => (
+          (discoverState.filter === "all" || item.state === discoverState.filter)
+          && (!query || search.includes(query))
+        ));
+        return matches.sort((left, right) => {
+          if (discoverState.sort === "source") {
+            return textCompare(left.item.source, right.item.source) || textCompare(left.item.title, right.item.title);
+          }
+          if (discoverState.sort === "title") return textCompare(left.item.title, right.item.title);
+          return timeValue(right.item.publishedAt || right.item.lastSeenAt)
+            - timeValue(left.item.publishedAt || left.item.lastSeenAt);
+        });
+      };
+
+      const renderDiscoverItems = () => {
+        const matches = matchingDiscoverItems();
+        const pageCount = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        discoverState.pageIndex = Math.min(discoverState.pageIndex, pageCount - 1);
+        const pageStart = discoverState.pageIndex * PAGE_SIZE;
+        const pageEnd = Math.min(pageStart + PAGE_SIZE, matches.length);
+        const fragment = document.createDocumentFragment();
+        matches.slice(pageStart, pageEnd).forEach(({ item }, index) => fragment.append(createDiscoverCard(item, index)));
+        discoverList.replaceChildren(fragment);
+        document.getElementById("discover-result-count").textContent = matches.length
+          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
+          : "0 of 0 shown";
+        document.getElementById("discover-empty-state").classList.toggle("visible", matches.length === 0);
+        document.getElementById("discover-empty-title").textContent = rawDiscoverItems.length
+          ? "No matching source evidence" : "No discovery snapshot yet";
+        document.getElementById("discover-empty-copy").textContent = rawDiscoverItems.length
+          ? "Try a broader search or another source filter."
+          : "Collect openings from the CLI; this page does not fetch sources by itself.";
+        document.getElementById("discover-page-previous").hidden = pageStart === 0;
+        document.getElementById("discover-page-next").hidden = pageEnd >= matches.length;
+      };
+
       const matchingJobs = () => {
         const query = state.query.toLocaleLowerCase();
-        return indexedJobs.filter(({ job, search }) => (
+        const matches = indexedJobs.filter(({ job, search }) => (
           Number(job.score || 0) >= state.minimumScore && (!query || search.includes(query))
         ));
+        return matches.sort((left, right) => {
+          if (state.sort === "company") return textCompare(left.job.company, right.job.company) || textCompare(left.job.title, right.job.title);
+          if (state.sort === "recent") return timeValue(right.job.lastSeenAt || right.job.discoveredAt) - timeValue(left.job.lastSeenAt || left.job.discoveredAt);
+          return Number(right.job.score || 0) - Number(left.job.score || 0) || textCompare(left.job.company, right.job.company);
+        });
       };
 
       const renderJobs = () => {
@@ -1075,12 +1408,19 @@
 
       const matchingPrepareJobs = () => {
         const query = prepareState.query.toLocaleLowerCase();
-        return indexedJobs.filter(({ job, search }) => {
+        const matches = indexedJobs.filter(({ job, search }) => {
           const materialState = job.prepare?.state || "missing";
           const matchesFilter = prepareState.filter === "all"
             || materialState === prepareState.filter
             || (prepareState.filter === "attention" && ["review", "blocked"].includes(materialState));
           return matchesFilter && (!query || search.includes(query));
+        });
+        const priority = { blocked: 0, review: 1, missing: 2, ready: 3 };
+        return matches.sort((left, right) => {
+          if (prepareState.sort === "company") return textCompare(left.job.company, right.job.company) || textCompare(left.job.title, right.job.title);
+          if (prepareState.sort === "fit") return Number(right.job.score || 0) - Number(left.job.score || 0);
+          return (priority[left.job.prepare?.state] ?? 2) - (priority[right.job.prepare?.state] ?? 2)
+            || Number(right.job.score || 0) - Number(left.job.score || 0);
         });
       };
 
@@ -1113,10 +1453,25 @@
 
       const matchingVerifyJobs = () => {
         const query = verifyState.query.toLocaleLowerCase();
-        return indexedVerifyJobs.filter(({ job, search }) => (
-          (verifyState.filter === "all" || job.verify?.state === verifyState.filter)
+        const matches = indexedVerifyJobs.filter(({ job, search }) => (
+          (verifyState.filter === "all"
+            || job.verify?.state === verifyState.filter
+            || (verifyState.filter === "activity" && ["recorded", "reported", "confirmed"].includes(job.verify?.state)))
           && (!query || search.includes(query))
         ));
+        const priority = { action_needed: 0, recorded: 1, reported: 2, confirmed: 2, reconciled: 3 };
+        const latestTime = (job) => Math.max(
+          timeValue(job.verify?.receipt?.recordedAt),
+          timeValue(job.verify?.observation?.recordedAt),
+          timeValue(job.verify?.batch?.updatedAt),
+          timeValue(job.verify?.attempt?.lastAttemptedAt),
+        );
+        return matches.sort((left, right) => {
+          if (verifyState.sort === "company") return textCompare(left.job.company, right.job.company) || textCompare(left.job.title, right.job.title);
+          if (verifyState.sort === "recent") return latestTime(right.job) - latestTime(left.job);
+          return (priority[left.job.verify?.state] ?? 0) - (priority[right.job.verify?.state] ?? 0)
+            || latestTime(right.job) - latestTime(left.job);
+        });
       };
 
       const renderVerifyJobs = () => {
@@ -1147,6 +1502,11 @@
       };
 
       const stageCopy = {
+        discover: {
+          eyebrow: "Discovery workbench",
+          title: "Trace every source.",
+          copy: "Review official listings, unresolved leads, and provider-run coverage without promoting a lead or fetching new data from the browser.",
+        },
         decide: {
           eyebrow: "Opportunity workbench",
           title: "Move evidence forward.",
@@ -1164,9 +1524,10 @@
         },
       };
 
-      const setStage = (stage, { focus = true } = {}) => {
+      const setStage = (stage, { focusPanel = false, updateHash = true } = {}) => {
         if (!(stage in stageCopy)) return;
         state.stage = stage;
+        document.getElementById("discover-panel").hidden = stage !== "discover";
         document.getElementById("decide-panel").hidden = stage !== "decide";
         document.getElementById("prepare-panel").hidden = stage !== "prepare";
         document.getElementById("verify-panel").hidden = stage !== "verify";
@@ -1180,27 +1541,64 @@
         document.getElementById("page-eyebrow").textContent = copy.eyebrow;
         document.getElementById("page-title").textContent = copy.title;
         document.getElementById("page-copy").textContent = copy.copy;
-        if (stage === "prepare") {
+        document.title = `ApplyPilot Local — ${copy.eyebrow}`;
+        if (updateHash && location.hash !== `#${stage}`) {
+          try { history.replaceState(null, "", `#${stage}`); }
+          catch { location.hash = stage; }
+        }
+        if (stage === "discover") {
+          list.replaceChildren();
+          materialList.replaceChildren();
+          verifyList.replaceChildren();
+          renderDiscoverItems();
+          renderSystem(data.discover?.system || { state: "ready" });
+          if (focusPanel) document.getElementById("discover-title").focus({ preventScroll: true });
+        } else if (stage === "prepare") {
+          discoverList.replaceChildren();
           list.replaceChildren();
           verifyList.replaceChildren();
           renderPrepareJobs();
           renderSystem(data.prepare?.system || { state: "ready" });
-          if (focus) document.getElementById("prepare-title").focus({ preventScroll: true });
+          if (focusPanel) document.getElementById("prepare-title").focus({ preventScroll: true });
         } else if (stage === "verify") {
+          discoverList.replaceChildren();
           list.replaceChildren();
           materialList.replaceChildren();
           renderVerifyJobs();
           renderSystem(data.verify?.system || { state: "ready" });
-          if (focus) document.getElementById("verify-title").focus({ preventScroll: true });
+          if (focusPanel) document.getElementById("verify-title").focus({ preventScroll: true });
         } else {
+          discoverList.replaceChildren();
           materialList.replaceChildren();
           verifyList.replaceChildren();
           renderJobs();
           renderSystem(data.system || { state: "ready" });
-          if (focus) document.getElementById("queue-title").focus({ preventScroll: true });
+          if (focusPanel) document.getElementById("queue-title").focus({ preventScroll: true });
         }
       };
 
+      document.querySelectorAll("[data-discover-filter]").forEach((button) => {
+        button.addEventListener("click", () => {
+          discoverState.filter = button.dataset.discoverFilter;
+          document.querySelectorAll("[data-discover-filter]").forEach((candidate) => {
+            const isActive = candidate === button;
+            candidate.classList.toggle("active", isActive);
+            candidate.setAttribute("aria-pressed", String(isActive));
+          });
+          discoverState.pageIndex = 0;
+          renderDiscoverItems();
+        });
+      });
+      document.getElementById("discover-search").addEventListener("input", (event) => {
+        discoverState.query = event.target.value.trim();
+        discoverState.pageIndex = 0;
+        renderDiscoverItems();
+      });
+      document.getElementById("discover-sort").addEventListener("change", (event) => {
+        discoverState.sort = event.target.value;
+        discoverState.pageIndex = 0;
+        renderDiscoverItems();
+      });
       document.querySelectorAll("#decide-panel .filter").forEach((button) => {
         button.addEventListener("click", () => {
           state.minimumScore = Number(button.dataset.minScore);
@@ -1215,6 +1613,11 @@
       });
       document.getElementById("search").addEventListener("input", (event) => {
         state.query = event.target.value.trim();
+        state.pageIndex = 0;
+        renderJobs();
+      });
+      document.getElementById("decide-sort").addEventListener("change", (event) => {
+        state.sort = event.target.value;
         state.pageIndex = 0;
         renderJobs();
       });
@@ -1235,6 +1638,11 @@
         prepareState.pageIndex = 0;
         renderPrepareJobs();
       });
+      document.getElementById("prepare-sort").addEventListener("change", (event) => {
+        prepareState.sort = event.target.value;
+        prepareState.pageIndex = 0;
+        renderPrepareJobs();
+      });
       document.querySelectorAll("[data-verify-filter]").forEach((button) => {
         button.addEventListener("click", () => {
           verifyState.filter = button.dataset.verifyFilter;
@@ -1251,6 +1659,23 @@
         verifyState.query = event.target.value.trim();
         verifyState.pageIndex = 0;
         renderVerifyJobs();
+      });
+      document.getElementById("verify-sort").addEventListener("change", (event) => {
+        verifyState.sort = event.target.value;
+        verifyState.pageIndex = 0;
+        renderVerifyJobs();
+      });
+      document.getElementById("discover-page-previous").addEventListener("click", () => {
+        discoverState.pageIndex = Math.max(0, discoverState.pageIndex - 1);
+        renderDiscoverItems();
+        document.getElementById("discovery").scrollIntoView({ block: "start" });
+        document.getElementById("discover-title").focus({ preventScroll: true });
+      });
+      document.getElementById("discover-page-next").addEventListener("click", () => {
+        discoverState.pageIndex += 1;
+        renderDiscoverItems();
+        document.getElementById("discovery").scrollIntoView({ block: "start" });
+        document.getElementById("discover-title").focus({ preventScroll: true });
       });
       document.getElementById("page-previous").addEventListener("click", () => {
         state.pageIndex = Math.max(0, state.pageIndex - 1);
@@ -1302,13 +1727,36 @@
           if (event.key === "Home") nextIndex = 0;
           if (event.key === "End") nextIndex = stageTabs.length - 1;
           stageTabs[nextIndex].focus();
-          setStage(stageTabs[nextIndex].dataset.stage, { focus: false });
+          setStage(stageTabs[nextIndex].dataset.stage);
         });
+      });
+
+      document.addEventListener("keydown", (event) => {
+        const target = event.target;
+        const editing = target instanceof HTMLInputElement
+          || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+        if (event.key === "/" && !editing && !event.metaKey && !event.ctrlKey && !event.altKey) {
+          event.preventDefault();
+          const search = document.getElementById({
+            discover: "discover-search", decide: "search", prepare: "prepare-search", verify: "verify-search",
+          }[state.stage]);
+          search?.focus();
+        }
+        if (event.key === "Escape" && target instanceof HTMLInputElement && target.type === "search" && target.value) {
+          target.value = "";
+          target.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      });
+      window.addEventListener("hashchange", () => {
+        const stage = location.hash.slice(1);
+        if (stage in stageCopy && stage !== state.stage) setStage(stage, { updateHash: false });
       });
 
       renderScores();
       renderSources();
-      setStage("decide", { focus: false });
+      renderSourceHealth();
+      const initialStage = location.hash.slice(1);
+      setStage(initialStage in stageCopy ? initialStage : "decide", { updateHash: false });
     })();
   </script>
 </body>

@@ -34,6 +34,16 @@ def test_dashboard_is_local_self_contained_and_script_safe() -> None:
     assert "https://fonts." not in html
     assert "Opportunity Workbench" in html
     assert "Private by default" in html
+    assert 'id="discover-tab"' in html
+    assert 'id="discover-panel"' in html
+    assert 'class="skip-link"' in html
+    assert "LOCAL SNAPSHOT · NO SYNC" in html
+    assert 'id="decide-sort"' in html
+    assert 'role="group" aria-label="Minimum fit score"' in html
+    assert 'url.protocol === "https:" && !url.username && !url.password' in html
+    assert 'const copied = document.execCommand("copy")' in html
+    assert 'copyStatus.setAttribute("role", "status")' in html
+    assert "Copy unavailable. Command selected for manual copy." in html
     assert "const PAGE_SIZE = 60" in html
     assert "NEXT PAGE" in html
     assert 'id="queue-title" tabindex="-1"' in html

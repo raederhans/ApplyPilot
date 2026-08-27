@@ -20,6 +20,8 @@ from applypilot.apply.authorization import compute_job_fingerprint
 from applypilot.config import APP_DIR, DB_PATH
 from applypilot.eligibility import ELIGIBLE_SQL
 from applypilot.frontend.contracts import (
+    build_discover_item,
+    build_discover_summary,
     build_prepare_job,
     build_prepare_summary,
     build_verify_job,
@@ -47,13 +49,16 @@ def _system_state(
 
 
 def _empty_dashboard(system: dict[str, Any]) -> dict[str, Any]:
+    discover = build_discover_summary([], [], lineage_available=False)
     prepare = build_prepare_summary([], library_available=False)
     verify = build_verify_summary([], [], ledger_available=False)
     if system.get("state") == "error":
+        discover["system"] = system
         prepare["system"] = system
         verify["system"] = system
     return {
         "system": system,
+        "discover": {"items": [], "sources": [], **discover},
         "stats": {"total": 0, "ready": 0, "scored": 0, "highFit": 0},
         "scoreDistribution": {},
         "sources": [],
@@ -68,6 +73,116 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _discover_data(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Load bounded discovery lineage without initializing radar tables."""
+    required_tables = {
+        "radar_sources",
+        "radar_fetch_runs",
+        "radar_source_observations",
+        "radar_leads",
+        "radar_job_sources",
+    }
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('radar_sources', 'radar_fetch_runs', "
+            "'radar_source_observations', 'radar_leads', 'radar_job_sources')"
+        ).fetchall()
+    }
+    lineage_available = tables == required_tables
+
+    job_rows = conn.execute("""
+        SELECT j.url, j.title, j.company_name, j.location,
+               COALESCE(j.source_site, j.site) AS source,
+               j.discovered_at AS first_seen_at,
+               COALESCE(MAX(o.last_seen_at), j.last_seen_at, j.discovered_at) AS last_seen_at,
+               MAX(o.published_at) AS published_at,
+               j.fit_score, j.eligibility_status,
+               COUNT(DISTINCT link.source_id) AS source_count,
+               MAX(CASE WHEN o.verification_status IN
+                    ('verified_official', 'official_target_open') THEN 1 ELSE 0 END)
+                    AS verified_official
+        FROM jobs AS j
+        LEFT JOIN radar_job_sources AS link ON link.job_url = j.url
+        LEFT JOIN radar_source_observations AS o
+          ON o.observation_key = link.observation_key
+        GROUP BY j.url
+        ORDER BY COALESCE(MAX(o.published_at), MAX(o.last_seen_at),
+                          j.last_seen_at, j.discovered_at) DESC,
+                 j.company_name, j.title
+    """).fetchall() if lineage_available else conn.execute("""
+        SELECT url, title, company_name, location,
+               COALESCE(source_site, site) AS source,
+               discovered_at AS first_seen_at,
+               COALESCE(last_seen_at, discovered_at) AS last_seen_at,
+               NULL AS published_at, fit_score, eligibility_status,
+               1 AS source_count, 0 AS verified_official
+        FROM jobs
+        ORDER BY COALESCE(last_seen_at, discovered_at) DESC, company_name, title
+    """).fetchall()
+
+    items = [build_discover_item({**dict(row), "kind": "listing", "url": row["url"]}) for row in job_rows]
+    sources: list[dict[str, Any]] = []
+    if lineage_available:
+        lead_rows = conn.execute("""
+            SELECT lead.title, COALESCE(source.company_name, observation.company_name) AS company_name,
+                   lead.location, lead.source_url AS url,
+                   COALESCE(source.company_name, source.provider, source.source_type) AS source,
+                   source.provider, lead.first_seen_at, lead.last_seen_at,
+                   observation.published_at, 1 AS source_count,
+                   0 AS verified_official, NULL AS fit_score,
+                   NULL AS eligibility_status
+            FROM radar_leads AS lead
+            JOIN radar_source_observations AS observation
+              ON observation.observation_key = lead.observation_key
+            LEFT JOIN radar_sources AS source ON source.source_id = observation.source_id
+            WHERE COALESCE(lead.status, '') <> 'promoted'
+            ORDER BY lead.last_seen_at DESC, lead.company_id, lead.title
+        """).fetchall()
+        items.extend(build_discover_item({**dict(row), "kind": "lead"}) for row in lead_rows)
+
+        source_rows = conn.execute("""
+            SELECT source.company_name, source.source_type, source.provider,
+                   source.access_mode, source.priority_tier, source.active,
+                   run.started_at, run.finished_at, run.status,
+                   run.pagination_complete, run.normalized_count,
+                   run.new_count, run.lead_count,
+                   CASE WHEN COALESCE(run.error, '') = '' THEN 0 ELSE 1 END AS has_error
+            FROM radar_sources AS source
+            LEFT JOIN radar_fetch_runs AS run ON run.run_id = (
+                SELECT latest.run_id FROM radar_fetch_runs AS latest
+                WHERE latest.source_id = source.source_id
+                ORDER BY latest.started_at DESC LIMIT 1
+            )
+            WHERE source.active = 1
+            ORDER BY source.priority_tier, source.company_name, source.provider
+        """).fetchall()
+        sources = [
+            {
+                "name": row["company_name"] or row["provider"] or row["source_type"] or "Unnamed source",
+                "type": row["source_type"] or "unknown",
+                "provider": row["provider"] or "unknown",
+                "accessMode": row["access_mode"] or "unknown",
+                "priority": row["priority_tier"] or "",
+                "status": row["status"] or "not_run",
+                "paginationComplete": None
+                if row["pagination_complete"] is None
+                else bool(row["pagination_complete"]),
+                "observed": int(row["normalized_count"] or 0),
+                "new": int(row["new_count"] or 0),
+                "leads": int(row["lead_count"] or 0),
+                "lastRunAt": row["finished_at"] or row["started_at"] or "",
+                "hasError": bool(row["has_error"]),
+            }
+            for row in source_rows
+        ]
+
+    items.sort(key=lambda item: str(item.get("publishedAt") or item.get("lastSeenAt") or ""), reverse=True)
+    summary = build_discover_summary(items, sources, lineage_available=lineage_available)
+    return {"items": items, "sources": sources, **summary}
 
 
 def _prepare_assignments(
@@ -236,6 +351,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
         job_rows = conn.execute(f"""
             SELECT url, title, salary, description, location, company_name,
                    COALESCE(source_site, site) AS source_site, strategy,
+                   discovered_at, last_seen_at,
                    full_description, application_url, detail_error,
                    fit_score, score_reasoning, eligibility_status, eligibility_reason,
                    dedupe_status, possible_repost_of,
@@ -264,6 +380,8 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
                 "company": row["company_name"] or "Unknown employer",
                 "source": row["source_site"] or "Unknown source",
                 "strategy": row["strategy"] or "",
+                "discoveredAt": row["discovered_at"] or "",
+                "lastSeenAt": row["last_seen_at"] or "",
                 "description": row["full_description"] or "",
                 "applicationUrl": row["application_url"] or "",
                 "detailError": row["detail_error"] or "",
@@ -277,6 +395,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
         for job, contract_job in zip(jobs, contract_jobs, strict=True):
             job["prepare"] = build_prepare_job(contract_job, assignments.get(contract_job["url"]))
         verify = _verify_data(conn)
+        discover = _discover_data(conn)
     finally:
         if owns_connection:
             conn.close()
@@ -312,6 +431,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
     prepare = build_prepare_summary(jobs, library_available=library_available)
     return {
         "system": system,
+        "discover": discover,
         "stats": {"total": int(total), "ready": int(ready), "scored": int(scored), "highFit": int(high_fit)},
         "scoreDistribution": score_distribution,
         "sources": sources,
