@@ -46,6 +46,7 @@ jobs:
 
   publish:
     needs: verify-and-build
+    if: vars.PYPI_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -64,7 +65,7 @@ jobs:
           packages-dir: dist/python/
 
   github-release:
-    needs: publish
+    needs: verify-and-build
     runs-on: ubuntu-latest
     permissions:
       contents: write
