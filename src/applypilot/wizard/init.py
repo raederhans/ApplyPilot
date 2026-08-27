@@ -30,6 +30,64 @@ from applypilot.config import (
 console = Console()
 
 
+def _resolved_input(path: Path, *, suffixes: set[str], label: str) -> Path:
+    source = path.expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"{label} file not found: {source}")
+    if source.suffix.casefold() not in suffixes:
+        choices = ", ".join(sorted(suffixes))
+        raise ValueError(f"{label} must use one of these formats: {choices}")
+    return source
+
+
+def initialize_from_files(
+    *,
+    resume: Path,
+    profile: Path,
+    searches: Path,
+    force: bool = False,
+) -> None:
+    """Create a workspace from explicit local files without collecting secrets."""
+    import yaml
+
+    resume_source = _resolved_input(resume, suffixes={".pdf", ".txt"}, label="Resume")
+    profile_source = _resolved_input(profile, suffixes={".json"}, label="Profile")
+    searches_source = _resolved_input(searches, suffixes={".yaml", ".yml"}, label="Search config")
+
+    try:
+        profile_data = json.loads(profile_source.read_text(encoding="utf-8"))
+        search_data = yaml.safe_load(searches_source.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Unable to parse onboarding input: {exc}") from None
+    if not isinstance(profile_data, dict):
+        raise TypeError("Profile JSON must contain an object at the top level")
+    if not isinstance(search_data, dict):
+        raise TypeError("Search YAML must contain a mapping at the top level")
+
+    resume_target = RESUME_PDF_PATH if resume_source.suffix.casefold() == ".pdf" else RESUME_PATH
+    targets = (resume_target, PROFILE_PATH, SEARCH_CONFIG_PATH)
+    existing = [path for path in targets if path.exists()]
+    if existing and not force:
+        joined = ", ".join(str(path) for path in existing)
+        raise FileExistsError(f"Refusing to replace existing onboarding files: {joined}")
+
+    ensure_dirs()
+    shutil.copy2(resume_source, resume_target)
+    PROFILE_PATH.write_text(
+        json.dumps(profile_data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    SEARCH_CONFIG_PATH.write_text(
+        searches_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    console.print(f"[green]Resume imported to {resume_target}[/green]")
+    console.print(f"[green]Profile imported to {PROFILE_PATH}[/green]")
+    console.print(f"[green]Search config imported to {SEARCH_CONFIG_PATH}[/green]")
+    console.print("[dim]No API keys, browser credentials, or submission settings were collected.[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------

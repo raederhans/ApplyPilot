@@ -237,11 +237,48 @@ def radar_main(ctx: typer.Context) -> None:
 
 
 @app.command()
-def init() -> None:
-    """Run the first-time setup wizard (profile, resume, search config)."""
-    from applypilot.wizard.init import run_wizard
+def init(
+    resume: Path | None = typer.Option(
+        None,
+        "--resume",
+        help="Import a .txt or .pdf resume without opening the interactive wizard.",
+    ),
+    profile: Path | None = typer.Option(
+        None,
+        "--profile",
+        help="Import an existing profile JSON file.",
+    ),
+    searches: Path | None = typer.Option(
+        None,
+        "--searches",
+        help="Import an existing search YAML file.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Replace existing onboarding files when importing all three inputs.",
+    ),
+) -> None:
+    """Initialize interactively, or import profile, resume, and search files."""
+    from applypilot.wizard.init import initialize_from_files, run_wizard
 
-    run_wizard()
+    inputs = (resume, profile, searches)
+    if not any(inputs):
+        run_wizard()
+        return
+    if not all(inputs):
+        raise typer.BadParameter(
+            "--resume, --profile, and --searches must be provided together"
+        )
+    try:
+        initialize_from_files(
+            resume=resume,
+            profile=profile,
+            searches=searches,
+            force=force,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from None
 
 
 @app.command("unanswered")
@@ -1839,13 +1876,27 @@ def mark_cover_not_required(
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def dashboard(
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Write the generated workbench to this path.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the generated workbench in the default browser.",
+    ),
+) -> None:
+    """Generate the local HTML dashboard and optionally open it."""
     _bootstrap()
 
-    from applypilot.view import open_dashboard
+    from applypilot.view import generate_dashboard, open_dashboard
 
-    open_dashboard()
+    if open_browser:
+        open_dashboard(str(output) if output else None)
+    else:
+        generate_dashboard(str(output) if output else None)
 
 
 @app.command()

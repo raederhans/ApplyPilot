@@ -27,10 +27,14 @@ jobs:
       - name: Install verification dependencies
         run: python -m pip install -e ".[dev,jobboards]"
 
+      - name: Verify tag matches package version
+        run: |
+          python -c "import os, pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']; actual = os.environ['GITHUB_REF_NAME']; assert actual == f'v{version}', f'tag {actual} does not match v{version}'"
+
       - name: Verify release candidate
         run: |
           ruff check src
-          pytest -q
+          python -m pytest -q
           python scripts/build_release.py
 
       - name: Upload distributions
@@ -58,3 +62,29 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/python/
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-artifacts
+          path: dist/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/python/*.whl \
+            dist/python/*.tar.gz \
+            dist/*-bundle.zip \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

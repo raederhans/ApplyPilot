@@ -22,6 +22,12 @@ All notable changes to ApplyPilot will be documented in this file.
   research notes, experiments, receipts, and runtime data cannot be packaged.
 - Enabled automatic CI for pushes and pull requests, with lint, full tests,
   clean package builds, and dependency caching.
+- Added a non-interactive, file-based onboarding path and browser-free
+  dashboard generation for deterministic clean-workspace checks.
+- Added a Windows release smoke job covering wheel install, initialization,
+  setup diagnosis, and packaged dashboard generation.
+- Gated tagged publishing on version parity and PyPI success before creating a
+  GitHub Release with wheel, source archive, verified bundle, and checksums.
 
 ### Added
 

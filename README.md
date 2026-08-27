@@ -79,6 +79,16 @@ applypilot doctor
 applypilot --version
 ```
 
+For a repeatable import from files you already maintain, provide all three
+inputs together. ApplyPilot validates them, refuses to replace existing files
+unless `--force` is explicit, and does not collect API keys or browser
+credentials:
+
+```bash
+applypilot init --resume resume.txt --profile profile.json --searches searches.yaml
+applypilot dashboard --no-open
+```
+
 `applypilot doctor` reports optional capabilities separately; a missing
 JobSpy installation does not prevent the official-company radar, resume
 library, status tools, or manually imported jobs from working.
