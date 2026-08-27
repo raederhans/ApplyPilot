@@ -116,12 +116,14 @@ def smoke_release(wheel: Path) -> None:
             workspace / "profile.json",
             workspace / "resume.txt",
             workspace / "searches.yaml",
-            workspace / "applypilot.db",
             dashboard,
         )
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise RuntimeError(f"Clean-workspace smoke missed outputs: {', '.join(missing)}")
+        database = workspace / "applypilot.db"
+        if database.exists():
+            raise RuntimeError(f"Read-only dashboard unexpectedly created a database: {database}")
         html = dashboard.read_text(encoding="utf-8")
         if "__APPLYPILOT_DASHBOARD_DATA__" in html or "Opportunity Workbench" not in html:
             raise RuntimeError("Generated dashboard did not contain the packaged frontend")
