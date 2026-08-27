@@ -19,7 +19,12 @@ from rich.console import Console
 from applypilot.apply.authorization import compute_job_fingerprint
 from applypilot.config import APP_DIR, DB_PATH
 from applypilot.eligibility import ELIGIBLE_SQL
-from applypilot.frontend.contracts import build_prepare_job, build_prepare_summary
+from applypilot.frontend.contracts import (
+    build_prepare_job,
+    build_prepare_summary,
+    build_verify_job,
+    build_verify_summary,
+)
 
 console = Console()
 DATA_PLACEHOLDER = "__APPLYPILOT_DASHBOARD_DATA__"
@@ -43,8 +48,10 @@ def _system_state(
 
 def _empty_dashboard(system: dict[str, Any]) -> dict[str, Any]:
     prepare = build_prepare_summary([], library_available=False)
+    verify = build_verify_summary([], [], ledger_available=False)
     if system.get("state") == "error":
         prepare["system"] = system
+        verify["system"] = system
     return {
         "system": system,
         "stats": {"total": 0, "ready": 0, "scored": 0, "highFit": 0},
@@ -52,6 +59,7 @@ def _empty_dashboard(system: dict[str, Any]) -> dict[str, Any]:
         "sources": [],
         "jobs": [],
         "prepare": prepare,
+        "verify": verify,
     }
 
 
@@ -106,6 +114,64 @@ def _prepare_assignments(
         if url not in current and record["job_fingerprint"] == expected.get(url):
             current[url] = record
     return {url: current.get(url, record) for url, record in latest.items()}, True
+
+
+def _verify_data(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Load persisted application outcomes without reading manifest or receipt files."""
+    ledger_available = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_batch_consumptions'"
+        ).fetchone()
+        is not None
+    )
+    ledgers = (
+        [
+            dict(row)
+            for row in conn.execute(
+                "SELECT batch_id, job_url, reserved_at, status, updated_at "
+                "FROM application_batch_consumptions "
+                "ORDER BY updated_at DESC, batch_id, job_url"
+            ).fetchall()
+        ]
+        if ledger_available
+        else []
+    )
+    ledger_clause = " OR url IN (SELECT job_url FROM application_batch_consumptions)" if ledger_available else ""
+    rows = conn.execute(f"""
+        SELECT url, title, company_name, location, fit_score,
+               COALESCE(source_site, site) AS source_site,
+               apply_status, applied_at, apply_attempts, apply_retry_blocked,
+               last_attempted_at, verification_confidence,
+               application_recorded_at, submission_observation_json,
+               submission_observed_at
+        FROM jobs
+        WHERE apply_status IS NOT NULL OR applied_at IS NOT NULL
+           OR application_recorded_at IS NOT NULL
+           OR submission_observed_at IS NOT NULL{ledger_clause}
+        ORDER BY COALESCE(application_recorded_at, submission_observed_at,
+                          last_attempted_at, applied_at) DESC,
+                 company_name, title
+    """).fetchall()
+    ledgers_by_url: dict[str, list[dict[str, Any]]] = {}
+    for ledger in ledgers:
+        ledgers_by_url.setdefault(str(ledger["job_url"]), []).append(ledger)
+
+    jobs: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        jobs.append(
+            {
+                "url": row["url"] or "",
+                "title": row["title"] or "Untitled opportunity",
+                "company": row["company_name"] or "Unknown employer",
+                "location": row["location"] or "",
+                "source": row["source_site"] or "Unknown source",
+                "score": int(row["fit_score"] or 0),
+                "verify": build_verify_job(record, ledgers_by_url.get(str(row["url"]), [])),
+            }
+        )
+    summary = build_verify_summary(jobs, ledgers, ledger_available=ledger_available)
+    return {"jobs": jobs, **summary}
 
 
 def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -210,6 +276,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
         assignments, library_available = _prepare_assignments(conn, contract_jobs)
         for job, contract_job in zip(jobs, contract_jobs, strict=True):
             job["prepare"] = build_prepare_job(contract_job, assignments.get(contract_job["url"]))
+        verify = _verify_data(conn)
     finally:
         if owns_connection:
             conn.close()
@@ -250,6 +317,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
         "sources": sources,
         "jobs": jobs,
         "prepare": prepare,
+        "verify": verify,
     }
 
 

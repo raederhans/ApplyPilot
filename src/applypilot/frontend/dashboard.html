@@ -413,6 +413,7 @@
       gap: 8px;
       margin-top: 14px;
     }
+    .material-status-grid.verify-status-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .material-status-row {
       min-width: 0;
       padding: 10px;
@@ -485,6 +486,7 @@
       .workflow li { font-size: 11px; }
       .step-number { display: none; }
       .material-status-grid { grid-template-columns: 1fr; }
+      .material-status-grid.verify-status-grid { grid-template-columns: 1fr; }
       .material-title-row { display: block; }
       .material-score { margin-top: 4px; }
       .evidence-record { grid-template-columns: 1fr; gap: 4px; }
@@ -508,7 +510,7 @@
         <li role="presentation"><button type="button" role="tab" aria-disabled="true" disabled><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span></button></li>
         <li class="active" role="presentation"><button id="decide-tab" type="button" role="tab" aria-selected="true" aria-controls="decide-panel" data-stage="decide"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span></button></li>
         <li role="presentation"><button id="prepare-tab" type="button" role="tab" aria-selected="false" aria-controls="prepare-panel" data-stage="prepare" tabindex="-1"><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span></button></li>
-        <li role="presentation"><button type="button" role="tab" aria-disabled="true" disabled><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></button></li>
+        <li role="presentation"><button id="verify-tab" type="button" role="tab" aria-selected="false" aria-controls="verify-panel" data-stage="verify" tabindex="-1"><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></button></li>
       </ol>
       <div class="rail-note"><strong>Private by default</strong>Generated from your local SQLite workspace. No analytics or remote UI assets.</div>
     </aside>
@@ -619,6 +621,49 @@
             </aside>
           </div>
         </section>
+
+        <section id="verify-panel" role="tabpanel" aria-labelledby="verify-tab" hidden>
+          <div class="metrics" aria-label="Verification summary">
+            <div class="metric"><strong class="metric-value" id="verify-records">0</strong><span class="metric-label">Activity records</span></div>
+            <div class="metric"><strong class="metric-value" id="verify-reservations">0</strong><span class="metric-label">Reserved slots</span></div>
+            <div class="metric"><strong class="metric-value" id="verify-review">0</strong><span class="metric-label">Needs review</span></div>
+            <div class="metric emphasis"><strong class="metric-value" id="verify-reconciled">0</strong><span class="metric-label">Durable receipts</span></div>
+          </div>
+
+          <div class="toolbar">
+            <label class="search-wrap"><span class="sr-only">Search verification evidence</span><input id="verify-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, status, evidence…"></label>
+            <div class="filters" aria-label="Verification evidence status">
+              <button class="filter active" type="button" data-verify-filter="all" aria-pressed="true">ALL</button>
+              <button class="filter" type="button" data-verify-filter="action_needed" aria-pressed="false">ACTION</button>
+              <button class="filter" type="button" data-verify-filter="confirmed" aria-pressed="false">CONFIRMED</button>
+              <button class="filter" type="button" data-verify-filter="reconciled" aria-pressed="false">RECEIPT</button>
+            </div>
+          </div>
+
+          <div class="content-grid">
+            <section class="queue" id="verification">
+              <div class="queue-head"><h2 id="verify-title" tabindex="-1">Verification queue</h2><span class="result-count" id="verify-result-count" aria-live="polite">0 of 0 shown</span></div>
+              <div class="material-list" id="verify-list"></div>
+              <div class="empty" id="verify-empty-state"><strong id="verify-empty-title">No matching verification evidence</strong><span id="verify-empty-copy">Try a broader search or another evidence filter.</span></div>
+              <nav class="queue-footer" aria-label="Verification pages">
+                <button class="page-button" id="verify-page-previous" type="button" hidden>PREVIOUS PAGE</button>
+                <button class="page-button" id="verify-page-next" type="button" hidden>NEXT PAGE</button>
+              </nav>
+            </section>
+
+            <aside class="insights" aria-label="Verification evidence boundary">
+              <section class="insight-block prepare-note">
+                <strong>Evidence strength</strong>
+                A reserved batch slot is not active authorization. An observation or Submit click is not a receipt. Only admitted confirmation evidence supports an applied record.
+              </section>
+              <section class="insight-block prepare-note">
+                <strong>Read-only boundary</strong>
+                This page never authorizes, submits, retries, or reconciles an application. Runtime-only standing authorization is not reconstructed here.
+                <code>applypilot reconcile-receipts --file &lt;receipt.json&gt;</code>
+              </section>
+            </aside>
+          </div>
+        </section>
       </section>
     </main>
   </div>
@@ -631,9 +676,12 @@
       const PAGE_SIZE = 60;
       const state = { stage: "decide", minimumScore: 5, query: "", pageIndex: 0 };
       const prepareState = { filter: "all", query: "", pageIndex: 0 };
+      const verifyState = { filter: "all", query: "", pageIndex: 0 };
       const list = document.getElementById("opportunity-list");
       const materialList = document.getElementById("material-list");
+      const verifyList = document.getElementById("verify-list");
       const rawJobs = Array.isArray(data.jobs) ? data.jobs : [];
+      const rawVerifyJobs = Array.isArray(data.verify?.jobs) ? data.verify.jobs : [];
       const indexedJobs = rawJobs.map((job) => ({
         job,
         search: [
@@ -642,6 +690,15 @@
           job.prepare?.coverLetter?.label, job.prepare?.route?.decision,
         ]
           .join(" ").toLocaleLowerCase(),
+      }));
+      const indexedVerifyJobs = rawVerifyJobs.map((job) => ({
+        job,
+        search: [
+          job.title, job.company, job.source, job.location,
+          job.verify?.label, job.verify?.reportedStatus,
+          job.verify?.receipt?.label, job.verify?.receipt?.confidence,
+          job.verify?.batch?.latestStatus,
+        ].join(" ").toLocaleLowerCase(),
       }));
 
       const make = (tag, className, text) => {
@@ -697,6 +754,11 @@
       document.getElementById("prepare-ready").textContent = prepareStats.ready ?? 0;
       document.getElementById("prepare-attention").textContent = prepareStats.attention ?? 0;
       document.getElementById("prepare-unrecorded").textContent = prepareStats.unrecorded ?? 0;
+      const verifyStats = data.verify?.stats || {};
+      document.getElementById("verify-records").textContent = verifyStats.records ?? 0;
+      document.getElementById("verify-reservations").textContent = verifyStats.authorizedReservations ?? 0;
+      document.getElementById("verify-review").textContent = verifyStats.needsReview ?? 0;
+      document.getElementById("verify-reconciled").textContent = verifyStats.reconciled ?? 0;
 
       const renderScores = () => {
         const target = document.getElementById("score-bars");
@@ -880,6 +942,102 @@
         return card;
       };
 
+      const createVerifyCard = (job, index) => {
+        const verify = job.verify || {};
+        const receipt = verify.receipt || {};
+        const observation = verify.observation || {};
+        const batch = verify.batch || {};
+        const card = make("article", "material-card");
+        card.style.setProperty("--index", index);
+        const marker = {
+          reconciled: "RCPT",
+          confirmed: "OBS",
+          reported: "RPT",
+          recorded: "PLAN",
+          action_needed: "?",
+        }[verify.state] || "?";
+        card.append(make("div", `material-state ${verify.state === "reconciled" ? "ready" : verify.state === "action_needed" ? "review" : ""}`.trim(), marker));
+
+        const body = make("div", "opportunity-body");
+        const titleRow = make("div", "material-title-row");
+        const heading = make("h3", "");
+        const sourceUrl = safeUrl(job.url);
+        if (sourceUrl) {
+          const link = make("a", "", job.title);
+          link.href = sourceUrl;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          heading.append(link);
+        } else {
+          heading.textContent = job.title;
+        }
+        titleRow.append(heading, make("span", "material-score", job.score ? `FIT ${job.score}/10` : "UNSCORED"));
+        body.append(titleRow);
+
+        const companyLine = make("div", "company-line");
+        companyLine.append(make("span", "", job.company));
+        if (job.location) companyLine.append(make("span", "", job.location));
+        body.append(companyLine);
+
+        const statusGrid = make("div", "material-status-grid verify-status-grid");
+        statusGrid.append(
+          materialStatus("Batch", {
+            state: batch.state === "recorded" ? "review" : "missing",
+            label: batch.label || "No batch ledger recorded",
+          }),
+          materialStatus("Authorization", {
+            state: verify.authorization?.state === "reservation_recorded" ? "review" : "missing",
+            label: verify.authorization?.label || "Not durably available",
+          }),
+          materialStatus("Observation", {
+            state: observation.state === "recorded" ? "review" : observation.state === "unreadable" ? "blocked" : "missing",
+            label: observation.label || "No observation recorded",
+          }),
+          materialStatus("Receipt", {
+            state: receipt.state === "durable" ? "ready" : ["confirmed", "reported"].includes(receipt.state) ? "review" : receipt.state === "pending" ? "blocked" : "missing",
+            label: receipt.label || "No decisive receipt recorded",
+          }),
+        );
+        body.append(statusGrid);
+        body.append(make("p", "material-summary", `${verify.label || "No verification evidence"}. This is not an employer outcome claim.`));
+
+        const details = make("details", "material-details");
+        details.append(make("summary", "", "View recorded verification evidence"));
+        details.addEventListener("toggle", () => {
+          if (!details.open || details.childElementCount > 1) return;
+          const records = make("div", "evidence-records");
+          records.append(
+            evidenceRecord("Reported status", verify.reportedStatus || "not_recorded"),
+            evidenceRecord(
+              "Batch ledger",
+              batch.state === "recorded"
+                ? [batch.latestStatus, batch.updatedAt].filter(Boolean).join(" · ")
+                : "No durable reservation record",
+            ),
+            evidenceRecord(
+              "Observation flags",
+              observation.state === "recorded"
+                ? [
+                    observation.submitClicked ? "submit click observed" : "no submit click recorded",
+                    observation.receiptVisible ? "receipt visible" : "no visible receipt recorded",
+                    observation.appliedBadgeVisible ? "Applied marker visible" : "no Applied marker recorded",
+                    observation.captchaVisible ? "verification gate observed" : "no verification gate recorded",
+                  ].join(" · ")
+                : observation.label,
+            ),
+            evidenceRecord("Receipt evidence", [receipt.confidence, receipt.recordedAt].filter(Boolean).join(" · ")),
+            evidenceRecord(
+              "Attempt record",
+              `${verify.attempt?.count || 0} recorded · ${verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded"}`,
+            ),
+          );
+          details.append(records);
+        }, { once: true });
+        body.append(details);
+        card.append(body);
+        return card;
+      };
+
       const matchingJobs = () => {
         const query = state.query.toLocaleLowerCase();
         return indexedJobs.filter(({ job, search }) => (
@@ -953,6 +1111,41 @@
         document.getElementById("prepare-page-next").hidden = pageEnd >= matches.length;
       };
 
+      const matchingVerifyJobs = () => {
+        const query = verifyState.query.toLocaleLowerCase();
+        return indexedVerifyJobs.filter(({ job, search }) => (
+          (verifyState.filter === "all" || job.verify?.state === verifyState.filter)
+          && (!query || search.includes(query))
+        ));
+      };
+
+      const renderVerifyJobs = () => {
+        const matches = matchingVerifyJobs();
+        const pageCount = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        verifyState.pageIndex = Math.min(verifyState.pageIndex, pageCount - 1);
+        const pageStart = verifyState.pageIndex * PAGE_SIZE;
+        const pageEnd = Math.min(pageStart + PAGE_SIZE, matches.length);
+        const fragment = document.createDocumentFragment();
+        matches.slice(pageStart, pageEnd).forEach(({ job }, index) => {
+          fragment.append(createVerifyCard(job, index));
+        });
+        verifyList.replaceChildren(fragment);
+
+        document.getElementById("verify-result-count").textContent = matches.length
+          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
+          : "0 of 0 shown";
+        const empty = document.getElementById("verify-empty-state");
+        empty.classList.toggle("visible", matches.length === 0);
+        document.getElementById("verify-empty-title").textContent = rawVerifyJobs.length
+          ? "No matching verification evidence"
+          : "Nothing to verify yet";
+        document.getElementById("verify-empty-copy").textContent = rawVerifyJobs.length
+          ? "Try a broader search or another evidence filter."
+          : "Opening or previewing a form does not create verification evidence.";
+        document.getElementById("verify-page-previous").hidden = pageStart === 0;
+        document.getElementById("verify-page-next").hidden = pageEnd >= matches.length;
+      };
+
       const stageCopy = {
         decide: {
           eyebrow: "Opportunity workbench",
@@ -964,6 +1157,11 @@
           title: "Inspect material evidence.",
           copy: "See which persisted resumes, cover-letter decisions, and routing records are available before running any preparation command.",
         },
+        verify: {
+          eyebrow: "Verification workbench",
+          title: "Read evidence without overstating it.",
+          copy: "Inspect recorded batch reservations, execution observations, and receipt evidence. This page does not authorize, submit, retry, or reconcile applications.",
+        },
       };
 
       const setStage = (stage, { focus = true } = {}) => {
@@ -971,6 +1169,7 @@
         state.stage = stage;
         document.getElementById("decide-panel").hidden = stage !== "decide";
         document.getElementById("prepare-panel").hidden = stage !== "prepare";
+        document.getElementById("verify-panel").hidden = stage !== "verify";
         document.querySelectorAll(".workflow button[data-stage]").forEach((button) => {
           const selected = button.dataset.stage === stage;
           button.setAttribute("aria-selected", String(selected));
@@ -983,19 +1182,26 @@
         document.getElementById("page-copy").textContent = copy.copy;
         if (stage === "prepare") {
           list.replaceChildren();
+          verifyList.replaceChildren();
           renderPrepareJobs();
           renderSystem(data.prepare?.system || { state: "ready" });
           if (focus) document.getElementById("prepare-title").focus({ preventScroll: true });
+        } else if (stage === "verify") {
+          list.replaceChildren();
+          materialList.replaceChildren();
+          renderVerifyJobs();
+          renderSystem(data.verify?.system || { state: "ready" });
+          if (focus) document.getElementById("verify-title").focus({ preventScroll: true });
         } else {
           materialList.replaceChildren();
+          verifyList.replaceChildren();
           renderJobs();
           renderSystem(data.system || { state: "ready" });
           if (focus) document.getElementById("queue-title").focus({ preventScroll: true });
         }
       };
 
-      document.querySelectorAll(".filter").forEach((button) => {
-        if (button.dataset.prepareFilter) return;
+      document.querySelectorAll("#decide-panel .filter").forEach((button) => {
         button.addEventListener("click", () => {
           state.minimumScore = Number(button.dataset.minScore);
           document.querySelectorAll("#decide-panel .filter").forEach((candidate) => {
@@ -1029,6 +1235,23 @@
         prepareState.pageIndex = 0;
         renderPrepareJobs();
       });
+      document.querySelectorAll("[data-verify-filter]").forEach((button) => {
+        button.addEventListener("click", () => {
+          verifyState.filter = button.dataset.verifyFilter;
+          document.querySelectorAll("[data-verify-filter]").forEach((candidate) => {
+            const isActive = candidate === button;
+            candidate.classList.toggle("active", isActive);
+            candidate.setAttribute("aria-pressed", String(isActive));
+          });
+          verifyState.pageIndex = 0;
+          renderVerifyJobs();
+        });
+      });
+      document.getElementById("verify-search").addEventListener("input", (event) => {
+        verifyState.query = event.target.value.trim();
+        verifyState.pageIndex = 0;
+        renderVerifyJobs();
+      });
       document.getElementById("page-previous").addEventListener("click", () => {
         state.pageIndex = Math.max(0, state.pageIndex - 1);
         renderJobs();
@@ -1053,6 +1276,18 @@
         renderPrepareJobs();
         document.getElementById("preparation").scrollIntoView({ block: "start" });
         document.getElementById("prepare-title").focus({ preventScroll: true });
+      });
+      document.getElementById("verify-page-previous").addEventListener("click", () => {
+        verifyState.pageIndex = Math.max(0, verifyState.pageIndex - 1);
+        renderVerifyJobs();
+        document.getElementById("verification").scrollIntoView({ block: "start" });
+        document.getElementById("verify-title").focus({ preventScroll: true });
+      });
+      document.getElementById("verify-page-next").addEventListener("click", () => {
+        verifyState.pageIndex += 1;
+        renderVerifyJobs();
+        document.getElementById("verification").scrollIntoView({ block: "start" });
+        document.getElementById("verify-title").focus({ preventScroll: true });
       });
 
       const stageTabs = [...document.querySelectorAll(".workflow button[data-stage]")];
