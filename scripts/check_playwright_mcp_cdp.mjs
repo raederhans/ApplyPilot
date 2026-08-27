@@ -5,12 +5,29 @@ import readline from "node:readline";
 import { spawn } from "node:child_process";
 
 const endpoint = process.argv[2];
-if (!endpoint?.startsWith("http://127.0.0.1:") && !endpoint?.startsWith("http://localhost:")) {
+let parsedEndpoint;
+try {
+  parsedEndpoint = new URL(endpoint);
+} catch {
+  throw new Error("usage: check_playwright_mcp_cdp.mjs http://127.0.0.1:<port>");
+}
+const port = Number(parsedEndpoint.port);
+if (
+  parsedEndpoint.protocol !== "http:" ||
+  !["127.0.0.1", "localhost"].includes(parsedEndpoint.hostname) ||
+  !Number.isInteger(port) || port < 1 || port > 65535 ||
+  parsedEndpoint.pathname !== "/" || parsedEndpoint.search || parsedEndpoint.hash
+) {
   throw new Error("usage: check_playwright_mcp_cdp.mjs http://127.0.0.1:<port>");
 }
 
-const command = `npx -y @playwright/mcp@latest --cdp-endpoint=${endpoint} --viewport-size=1024x768`;
-const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
+const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+const child = spawn(npx, [
+  "-y",
+  "@playwright/mcp@latest",
+  `--cdp-endpoint=${parsedEndpoint.origin}`,
+  "--viewport-size=1024x768",
+], {
   stdio: ["pipe", "pipe", "pipe"],
 });
 const pending = new Map();

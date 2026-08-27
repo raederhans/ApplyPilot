@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from applypilot import config
-from applypilot.apply import launcher
+from applypilot.apply import launcher, router
 from applypilot.database import init_db
 
 
@@ -24,6 +24,88 @@ from applypilot.database import init_db
 )
 def test_result_marker_is_one_standalone_line(output: str, expected: object) -> None:
     assert launcher._parse_result_line(output) == expected
+
+
+def test_control_router_separates_driver_runtime_and_handoff_policy() -> None:
+    primary = router.initial_route("auto")
+    contract = router.prompt_control_contract(
+        primary,
+        interaction_mode="auto",
+        resume_existing_page=False,
+    )
+
+    assert primary.interaction_driver == "playwright"
+    assert primary.browser_runtime == "edge"
+    assert contract["requestable_handoffs"] == ["computer_use"]
+    assert contract["single_writer"] is True
+    assert contract["runtime_switch_after_submit_forbidden"] is True
+
+
+def test_control_router_only_escalates_explicit_pre_submit_browser_blocks() -> None:
+    explicit = router.cloak_fallback_route(
+        "failed:cloudflare_challenge:turnstile",
+        requested_browser_backend="auto",
+        phase="prepare",
+        current_runtime="edge",
+        fallback_already_used=False,
+    )
+    generic_stall = router.cloak_fallback_route(
+        "failed:stuck",
+        requested_browser_backend="auto",
+        phase="prepare",
+        current_runtime="edge",
+        fallback_already_used=False,
+    )
+    after_submit = router.cloak_fallback_route(
+        "failed:cloudflare_blocked",
+        requested_browser_backend="auto",
+        phase="submit",
+        current_runtime="edge",
+        fallback_already_used=False,
+    )
+
+    assert explicit is not None and explicit.browser_runtime == "cloak"
+    assert generic_stall is None
+    assert after_submit is None
+
+
+def test_computer_use_is_a_prepare_only_external_handoff() -> None:
+    assert router.computer_use_handoff_allowed(
+        "failed:visual_only_control",
+        interaction_mode="auto",
+        phase="prepare",
+        submit_started=False,
+    )
+    assert not router.computer_use_handoff_allowed(
+        "failed:visual_only_control",
+        interaction_mode="auto",
+        phase="submit",
+        submit_started=True,
+    )
+    assert not router.computer_use_handoff_allowed(
+        "captcha",
+        interaction_mode="auto",
+        phase="prepare",
+        submit_started=False,
+    )
+
+
+def test_auto_keeps_edge_workers_parallel_while_explicit_cloak_is_bounded() -> None:
+    auto_workers, auto_reduced = launcher._resolve_worker_count(
+        3,
+        3,
+        "auto",
+        cloak_concurrency_allowed=False,
+    )
+    cloak_workers, cloak_reduced = launcher._resolve_worker_count(
+        3,
+        3,
+        "cloak",
+        cloak_concurrency_allowed=False,
+    )
+
+    assert (auto_workers, auto_reduced) == (3, False)
+    assert (cloak_workers, cloak_reduced) == (1, True)
 
 
 @pytest.mark.parametrize(
@@ -49,6 +131,48 @@ def test_result_interpretation_is_phase_strict(
         submission_phase=phase,
     )
     assert status == expected
+
+
+def test_upload_failure_context_becomes_actionable_without_file_paths() -> None:
+    output = (
+        "RESULT:FAILED:resume_upload\n"
+        'FAILURE_CONTEXT: {"category":"resume_upload","field_label":"Resume/CV",'
+        '"visible_state":"optional attachment accepted but required resume stayed empty",'
+        '"attempts":2,"path":"C:/private/resume.pdf"}'
+    )
+
+    context = launcher._parse_failure_context(output)
+    error = launcher._format_failure_error("resume_upload", context)
+
+    assert context == {
+        "category": "resume_upload",
+        "field_label": "Resume/CV",
+        "visible_state": "optional attachment accepted but required resume stayed empty",
+        "attempts": 2,
+    }
+    assert error == (
+        "resume_upload; field=Resume/CV; "
+        "state=optional attachment accepted but required resume stayed empty; attempts=2"
+    )
+    assert "private" not in error
+
+
+def test_required_document_context_names_the_actual_blocking_material() -> None:
+    output = (
+        "RESULT:FAILED:manual_review_required:required_document\n"
+        'FAILURE_CONTEXT: {"category":"required_document","field_label":"Transcript",'
+        '"blocking_material":"Academic transcript","visible_state":"required file not supplied",'
+        '"attempts":0}'
+    )
+
+    error = launcher._format_failure_error(
+        "manual_review_required:required_document",
+        launcher._parse_failure_context(output),
+    )
+
+    assert "field=Transcript" in error
+    assert "required_material=Academic transcript" in error
+    assert "attempts=0" in error
 
 
 def test_pre_submit_snapshot_hard_pauses_new_uncertain_states() -> None:
@@ -102,6 +226,61 @@ def test_visible_captcha_remains_a_hard_pause_even_if_a_token_exists() -> None:
     )
 
     assert "visible_captcha" in issues
+
+
+def test_pre_submit_accepts_a_configured_existing_docx_in_the_resume_card() -> None:
+    issues = launcher._validate_pre_submit_snapshot(
+        {
+            "url": "https://www.linkedin.com/jobs/view/123/apply",
+            "required_unfilled": [],
+            "sensitive_required_unknown": [],
+            "resume_field_present": True,
+            "resume_uploaded": False,
+            "resume_card_texts": ["Yu_Qiushi_AI_Automation_Projects.docx Last used today"],
+            "full_name_values": [],
+            "email_values": [],
+            "current_location_values": [],
+            "select_fields": [],
+            "radio_questions": [],
+            "submit_control_count": 1,
+            "assessment_visible": False,
+            "captcha_visible": False,
+        },
+        {
+            "personal": {},
+            "screening": {},
+            "resume_library": {
+                "linkedin_existing_resume_preferences": {
+                    "ai_solutions": "AI_Automation_Projects"
+                }
+            },
+        },
+        {
+            "url": "https://www.linkedin.com/jobs/view/123/",
+            "site": "linkedin",
+            "full_description": "AI agents and automation",
+        },
+    )
+
+    assert "resume_not_uploaded" not in issues
+
+
+def test_application_page_selection_prefers_review_tab_over_last_detail_tab() -> None:
+    class Page:
+        def __init__(self, signals: dict) -> None:
+            self.signals = signals
+
+        def evaluate(self, _script: str) -> dict:
+            return self.signals
+
+    review = Page(
+        {"receipt": False, "final_submit": True, "review": True, "dialog": True}
+    )
+    detail = Page(
+        {"receipt": False, "final_submit": False, "review": False, "dialog": False}
+    )
+
+    assert launcher._select_application_page([review, detail]) is review
 
 
 def test_hidden_captcha_iframe_is_not_a_visible_verification_gate() -> None:
@@ -236,6 +415,11 @@ def test_manifest_is_rechecked_before_atomic_reservation(monkeypatch) -> None:
         "applypilot.database.reserve_batch_submission",
         lambda batch, url, cap: calls.append((batch, url, cap)) or True,
     )
+    monkeypatch.setattr(
+        "applypilot.apply.authorization.freeze_submission_materials",
+        lambda supplied_job, profile: {"version": 1, "materials": []},
+    )
+    monkeypatch.setattr(config, "load_profile", dict)
 
     assert launcher._reserve_manifest_submission(manifest, job) == (True, "reserved")
     assert calls == [("batch-1", job["url"], 2)]
@@ -260,6 +444,8 @@ def _run_worker_contract(
     ledger_update_succeeds: bool = True,
     launch_calls: list[tuple[tuple, dict]] | None = None,
     queued_jobs: list[dict] | None = None,
+    acquire_calls: list[dict] | None = None,
+    verification_calls: list[dict] | None = None,
     use_target_url: bool = True,
     limit: int = 1,
 ):
@@ -278,6 +464,8 @@ def _run_worker_contract(
     def fake_run(current_job, *args, **kwargs):
         nonlocal prepare_index, submit_index
         assert current_job.get("_browser_backend") in {"edge", "cloak"}
+        assert current_job["_control_contract"]["interaction_driver"] == "playwright"
+        assert current_job["_control_contract"]["browser_runtime"] == current_job["_browser_backend"]
         phase = kwargs["submission_phase"]
         run_phases.append(phase)
         if phase == "prepare":
@@ -322,14 +510,36 @@ def _run_worker_contract(
     monkeypatch.setattr(launcher, "_submission_rate_status", lambda *args: (True, 0, "ready"))
     monkeypatch.setattr(launcher, "get_connection", lambda: object())
     queued = iter(queued_jobs or [job])
-    monkeypatch.setattr(launcher, "acquire_job", lambda **kwargs: next(queued, None))
+    def fake_acquire(**kwargs):
+        if acquire_calls is not None:
+            acquire_calls.append(dict(kwargs))
+        return next(queued, None)
+
+    monkeypatch.setattr(launcher, "acquire_job", fake_acquire)
     def fake_launch(*args, **kwargs):
         if launch_calls is not None:
             launch_calls.append((args, kwargs))
         return object()
 
     monkeypatch.setattr(launcher, "launch_chrome", fake_launch)
+    monkeypatch.setattr(
+        launcher,
+        "_open_bound_application_target",
+        lambda _port, _url: {"application-root"},
+    )
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
+    monkeypatch.setattr(launcher, "release_cdp_port", lambda _worker_id: None)
+    monkeypatch.setattr(
+        launcher,
+        "capture_browser_session",
+        lambda *args, **kwargs: {"cookies": [{"name": "session"}]},
+    )
+    monkeypatch.setattr(
+        launcher,
+        "restore_browser_session",
+        lambda *args, **kwargs: 1,
+    )
     monkeypatch.setattr(launcher, "run_job", fake_run)
     monkeypatch.setattr(launcher, "_audit_live_pre_submit_page", lambda *args: (None, {"status": "clear"}))
     monkeypatch.setattr(launcher, "_reserve_manifest_submission", lambda *args: (True, "reserved"))
@@ -339,7 +549,12 @@ def _run_worker_contract(
         fake_observer,
     )
     monkeypatch.setattr(launcher, "_archive_worker_evidence", lambda *args: [])
-    monkeypatch.setattr(launcher, "_wait_for_manual_captcha", lambda *args: True)
+    def fake_verification_wait(*args, **kwargs):
+        if verification_calls is not None:
+            verification_calls.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(launcher, "_wait_for_manual_captcha", fake_verification_wait)
     monkeypatch.setattr(
         launcher,
         "_mark_runtime_cover_not_required",
@@ -384,6 +599,49 @@ def _run_worker_contract(
     return result, run_phases, ledger, marked
 
 
+def test_worker_uses_one_adaptive_lease_for_acquire_and_phase_renewals(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "3600")
+    acquire_calls: list[dict] = []
+    renewals: list[dict] = []
+    job = {
+        "url": "https://jobs.example.test/role",
+        "application_url": "https://jobs.example.test/role/apply",
+        "title": "Data Analyst",
+        "company_name": "Example",
+        "_attempt_id": "attempt-1",
+    }
+    monkeypatch.setattr(
+        "applypilot.database.update_application_attempt",
+        lambda _attempt_id, **kwargs: renewals.append(dict(kwargs)) or True,
+    )
+
+    result, _phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        queued_jobs=[job],
+        acquire_calls=acquire_calls,
+    )
+
+    assert result == (1, 0)
+    assert acquire_calls[0]["application_lease_minutes"] == 62
+    assert [item["lease_minutes"] for item in renewals] == [62, 62]
+
+
+def test_manual_verification_receives_the_same_adaptive_lease(monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "3600")
+    verification_calls: list[dict] = []
+
+    _run_worker_contract(
+        monkeypatch,
+        prepare_results=["captcha", "failed:verification_not_cleared"],
+        manual_captcha_relay=True,
+        verification_calls=verification_calls,
+    )
+
+    assert verification_calls[0]["application_lease_minutes"] == 62
+
+
 def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypatch) -> None:
     launches: list[tuple[tuple, dict]] = []
 
@@ -399,6 +657,14 @@ def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypa
     assert [call[1]["browser_backend"] for call in launches] == ["edge", "cloak"]
     assert marked[0][1]["evidence"]["browser_backend"] == "cloak"
     assert marked[0][1]["evidence"]["fallback_from_edge"] is True
+    assert marked[0][1]["evidence"]["interaction_driver"] == "playwright"
+    assert marked[0][1]["evidence"]["browser_runtime"] == "cloak"
+    assert marked[0][1]["evidence"]["submit_owner"] == "playwright"
+    assert [event["event"] for event in marked[0][1]["evidence"]["route_history"]] == [
+        "route_selected",
+        "runtime_transition",
+        "phase_transition",
+    ]
 
 
 def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:
@@ -414,6 +680,71 @@ def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:
     assert result == (0, 1)
     assert phases == ["prepare"]
     assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+
+
+def test_auto_browser_backend_does_not_misclassify_generic_stall_as_bot_block(
+    monkeypatch,
+) -> None:
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["failed:stuck", "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+    assert marked[0][0][:3] == (
+        "https://jobs.example.test/role",
+        "failed",
+        "stuck",
+    )
+
+
+def test_dry_run_timeout_restores_pre_preview_state(monkeypatch) -> None:
+    job = {
+        "url": "https://example.test/preview",
+        "title": "AI Intern",
+        "company_name": "Example",
+        "apply_status": None,
+        "apply_error": None,
+        "apply_attempts": 0,
+        "last_attempted_at": None,
+    }
+    restored: list[dict] = []
+    marked: list[tuple] = []
+
+    launcher._stop_event.clear()
+    monkeypatch.setattr(config, "load_profile", dict)
+    monkeypatch.setattr(launcher, "acquire_job", lambda **kwargs: job)
+    monkeypatch.setattr(launcher, "launch_chrome", lambda *args, **kwargs: object())
+    monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
+    monkeypatch.setattr(launcher, "release_cdp_port", lambda _worker_id: None)
+    monkeypatch.setattr(launcher, "run_job", lambda *args, **kwargs: ("timeout", 480000))
+    monkeypatch.setattr(
+        launcher, "restore_preview_state", lambda supplied: restored.append(dict(supplied))
+    )
+    monkeypatch.setattr(
+        launcher, "mark_result", lambda *args, **kwargs: marked.append((args, kwargs))
+    )
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+
+    result = launcher.worker_loop(
+        worker_id=0,
+        limit=1,
+        target_url=job["url"],
+        dry_run=True,
+        browser_backend="edge",
+    )
+
+    assert result == (0, 1)
+    assert restored == [job]
+    assert marked == []
 
 
 def test_auto_browser_backend_accepts_a_detailed_cloudflare_reason(monkeypatch) -> None:
@@ -474,7 +805,7 @@ def test_worker_bootstraps_browser_at_the_authorized_application_url(monkeypatch
 
     _run_worker_contract(monkeypatch, launch_calls=launches)
 
-    assert launches[0][1]["start_url"] == "https://jobs.example.test/role/apply"
+    assert launches[0][1]["start_url"] is None
 
 
 @pytest.mark.parametrize("discovery_result", ["cover_not_required", "cover_letter_required"])
@@ -595,6 +926,8 @@ def test_worker_never_repairs_media_or_identity_validation(monkeypatch) -> None:
 
 
 def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "3600")
+    verification_calls: list[dict] = []
     verification_gate = {
         "confirmed": False,
         "verification_visible": True,
@@ -614,6 +947,7 @@ def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> No
         submit_results=["submission_uncertain", "applied"],
         observer_results=[verification_gate, confirmed],
         manual_captcha_relay=True,
+        verification_calls=verification_calls,
     )
 
     assert result == (1, 0)
@@ -622,3 +956,29 @@ def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> No
     assert marked[0][1]["evidence"]["attempts"][0]["disposition"] == (
         "verification_required"
     )
+    assert verification_calls[0]["submit_started"] is True
+    assert verification_calls[0]["application_lease_minutes"] == 62
+
+
+def test_post_submit_verification_without_manual_relay_is_retry_blocked_uncertain(
+    monkeypatch,
+) -> None:
+    verification_gate = {
+        "confirmed": False,
+        "verification_visible": True,
+        "captcha_visible": True,
+        "validation_error_count": 0,
+        "current_url": "https://jobs.example.test/role/apply",
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="submission_uncertain",
+        observer_results=[verification_gate],
+        manual_captcha_relay=False,
+    )
+
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "submission_uncertain"
+    assert marked[0][0][1] == "submission_uncertain"

@@ -30,6 +30,10 @@ from applypilot.frontend.contracts import (
 
 console = Console()
 DATA_PLACEHOLDER = "__APPLYPILOT_DASHBOARD_DATA__"
+ACTIVE_APPLICATION_SQL = (
+    "(apply_status IS NULL OR apply_status NOT IN ('applied', 'submission_uncertain')) "
+    "AND COALESCE(apply_retry_blocked, 0) = 0"
+)
 
 
 def _system_state(
@@ -308,17 +312,18 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
         conn.row_factory = sqlite3.Row
 
     try:
-        total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {ELIGIBLE_SQL}").fetchone()[0]
+        active_where = f"{ELIGIBLE_SQL} AND {ACTIVE_APPLICATION_SQL}"
+        total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {active_where}").fetchone()[0]
         ready = conn.execute(
             "SELECT COUNT(*) FROM jobs "
-            f"WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND {ELIGIBLE_SQL}"
+            f"WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND {active_where}"
         ).fetchone()[0]
-        scored = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL}").fetchone()[0]
-        high_fit = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 AND {ELIGIBLE_SQL}").fetchone()[0]
+        scored = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND {active_where}").fetchone()[0]
+        high_fit = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 AND {active_where}").fetchone()[0]
 
         score_rows = conn.execute(
             "SELECT fit_score, COUNT(*) AS count FROM jobs "
-            f"WHERE fit_score IS NOT NULL AND {ELIGIBLE_SQL} "
+            f"WHERE fit_score IS NOT NULL AND {active_where} "
             "GROUP BY fit_score ORDER BY fit_score DESC"
         ).fetchall()
         score_distribution = {str(int(row["fit_score"])): int(row["count"]) for row in score_rows}
@@ -331,7 +336,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
                    SUM(CASE WHEN fit_score < 5 AND fit_score IS NOT NULL THEN 1 ELSE 0 END) AS low_fit,
                    SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) AS unscored,
                    ROUND(AVG(fit_score), 1) AS avg_score
-            FROM jobs WHERE {ELIGIBLE_SQL}
+            FROM jobs WHERE {active_where}
             GROUP BY COALESCE(source_site, site)
             ORDER BY high_fit DESC, total DESC
         """).fetchall()
@@ -363,7 +368,7 @@ def collect_dashboard_data(conn: sqlite3.Connection | None = None) -> dict[str, 
                    application_readiness_status, application_readiness_reason,
                    application_readiness_reviewed_at, application_readiness_fingerprint
             FROM jobs
-            WHERE fit_score >= 5 AND {ELIGIBLE_SQL}
+            WHERE fit_score >= 5 AND {active_where}
             ORDER BY fit_score DESC, company_name, title
         """).fetchall()
         jobs: list[dict[str, Any]] = []

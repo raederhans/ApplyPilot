@@ -7,6 +7,7 @@ from pathlib import Path
 from applypilot import single_job
 from applypilot.database import init_db
 from applypilot.resume_library import (
+    TAXONOMY_VERSION,
     extract_job_profile,
     library_status,
     project_reuse_to_job,
@@ -14,6 +15,10 @@ from applypilot.resume_library import (
     sync_resume_library,
 )
 from applypilot.scoring import tailor
+
+
+def test_resume_taxonomy_version_tracks_routing_term_changes() -> None:
+    assert TAXONOMY_VERSION == "resume-library-v4"
 
 
 def _profile(base_resume: Path) -> dict:
@@ -156,6 +161,44 @@ def test_resume_taxonomy_extends_discovery_for_real_work_natures() -> None:
         assert result["confidence"] >= 0.85
 
 
+def test_resume_taxonomy_routes_analytics_and_insights_titles_before_degree_terms() -> None:
+    cases = {
+        "Intern, Analytics & Projects, GrabMart": ("data_bi_decision", "data_analytics"),
+        "Intern, Strategy & Insights": ("data_bi_decision", "strategy_analytics"),
+    }
+
+    for title, expected in cases.items():
+        result = extract_job_profile(
+            {
+                "url": "https://example.test/" + title.replace(" ", "-"),
+                "title": title,
+                "full_description": (
+                    "Applicants may study Software Engineering. Required: SQL and Python."
+                ),
+            }
+        )
+        assert (result["track"], result["subtype"]) == expected
+        assert result["confidence"] >= 0.79
+
+
+def test_resume_taxonomy_routes_ai_platform_before_generic_platform_terms() -> None:
+    result = extract_job_profile(
+        {
+            "url": "https://example.test/ai-platform",
+            "title": "Intern, AI Platform",
+            "full_description": (
+                "Build data pipelines for model training, validation, and deployment."
+            ),
+        }
+    )
+
+    assert (result["track"], result["subtype"]) == (
+        "ai_implementation",
+        "ai_solutions",
+    )
+    assert result["confidence"] >= 0.79
+
+
 def test_sync_collapses_duplicate_content_and_keeps_coverage_evidence(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "library.db")
     base = tmp_path / "base.txt"
@@ -213,6 +256,63 @@ def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
     assert result["required_coverage"] == 1.0
     assert result["overall_score"] >= 0.85
     assert result["artifact"]["validation_status"] == "machine_validated"
+
+
+def test_configured_track_source_resolves_equal_artifact_scores(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    preferred_source = tmp_path / "preferred-source.txt"
+    legacy_source = tmp_path / "legacy-source.txt"
+    preferred_source.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    legacy_source.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+
+    for suffix, source, content in (
+        (
+            "preferred",
+            preferred_source,
+            "DATA ANALYST\nSQL and Python\nBuilt dashboards, analytics, and reporting.",
+        ),
+        (
+            "legacy",
+            legacy_source,
+            "DATA ANALYST\nPython and SQL\nDelivered analytics, dashboards, and reporting.",
+        ),
+    ):
+        text_path = tmp_path / f"validated-{suffix}.txt"
+        text_path.write_text(content, encoding="utf-8")
+        text_path.with_suffix(".pdf").write_bytes(f"pdf-{suffix}".encode())
+        report_path = tmp_path / f"validated-{suffix}.json"
+        report_path.write_text('{"status":"machine_validated"}', encoding="utf-8")
+        _insert_job(
+            conn,
+            url=f"https://careers.example.test/{suffix}",
+            title="Data Analyst",
+            description="Required: SQL. Build dashboards and reporting for business decisions.",
+            tailored_resume_path=str(text_path),
+            tailor_source_resume_path=str(source),
+            tailor_report_path=str(report_path),
+            tailor_status="machine_validated",
+            tailored_at="2026-08-25T00:00:00+00:00",
+        )
+
+    profile = _profile(preferred_source)
+    sync_resume_library(conn, profile, tmp_path)
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": "https://careers.example.test/new-data",
+            "title": "Data Analyst",
+            "full_description": (
+                "Required: SQL. Build dashboards and reporting for business decisions."
+            ),
+            "eligibility_status": "eligible",
+        },
+        profile,
+    )
+
+    assert result["decision"] == "reuse_exact"
+    assert Path(result["artifact"]["source_resume_path"]) == preferred_source
+    assert result["runner_up_margin"] == 1.0
+    assert "explicitly configured source" in result["reason"]
 
 
 def test_exact_unchanged_job_keeps_its_machine_validated_artifact(

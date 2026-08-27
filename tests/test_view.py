@@ -34,6 +34,23 @@ def test_dashboard_is_local_self_contained_and_script_safe() -> None:
     assert "https://fonts." not in html
     assert "Opportunity Workbench" in html
     assert "Private by default" in html
+
+
+def test_verification_defaults_to_action_queue_with_bounded_pages() -> None:
+    html = render_dashboard(
+        {
+            "stats": {"total": 0, "ready": 0, "scored": 0, "highFit": 0},
+            "scoreDistribution": {},
+            "sources": [],
+            "jobs": [],
+            "verify": {"jobs": []},
+        }
+    )
+
+    assert 'data-verify-filter="action_needed" aria-pressed="true"' in html
+    assert 'data-verify-filter="all" aria-pressed="false"' in html
+    assert 'const VERIFY_PAGE_SIZE = 20;' in html
+    assert 'const verifyState = { filter: "action_needed"' in html
     assert 'id="discover-tab"' in html
     assert 'id="discover-panel"' in html
     assert 'class="skip-link"' in html
@@ -47,6 +64,29 @@ def test_dashboard_is_local_self_contained_and_script_safe() -> None:
     assert "const PAGE_SIZE = 60" in html
     assert "NEXT PAGE" in html
     assert 'id="queue-title" tabindex="-1"' in html
+
+
+def test_dashboard_supports_persistent_chinese_and_english_interface() -> None:
+    html = render_dashboard(
+        {
+            "stats": {"total": 0, "ready": 0, "scored": 0, "highFit": 0},
+            "scoreDistribution": {},
+            "sources": [],
+            "jobs": [],
+            "verify": {"jobs": []},
+        }
+    )
+
+    assert '<html lang="zh-CN">' in html
+    assert 'const LOCALE_KEY = "applypilot.locale";' in html
+    assert 'data-locale="zh" aria-pressed="true"' in html
+    assert 'data-locale="en" aria-pressed="false"' in html
+    assert 'role="group" aria-label="Interface language"' in html
+    assert 'document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";' in html
+    assert 'localStorage.setItem(LOCALE_KEY, locale)' in html
+    assert '"Verification workbench": "结果核验台"' in html
+    assert '"No decisive receipt recorded": "未记录决定性回执"' in html
+    assert "applypilot reconcile-receipts --file" in html
 
 
 def test_dashboard_collection_is_read_only(tmp_path) -> None:
@@ -79,6 +119,78 @@ def test_dashboard_collection_is_read_only(tmp_path) -> None:
     assert len(data["jobs"]) == 1
     assert statements
     assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
+
+
+def test_completed_applications_leave_active_queue_but_remain_verifiable(tmp_path) -> None:
+    db_path = tmp_path / "workspace.db"
+    conn = init_db(db_path)
+    conn.executemany(
+        "INSERT INTO jobs (url, title, company_name, source_site, full_description, "
+        "application_url, fit_score, eligibility_status, apply_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "https://example.test/active",
+                "Active role",
+                "Example",
+                "Official",
+                "Evidence-backed role",
+                "https://example.test/active/apply",
+                8,
+                "eligible",
+                None,
+            ),
+            (
+                "https://example.test/applied",
+                "Completed role",
+                "Example",
+                "Official",
+                "Evidence-backed role",
+                "https://example.test/applied/apply",
+                9,
+                "eligible",
+                "applied",
+            ),
+            (
+                "https://example.test/uncertain",
+                "Pending receipt role",
+                "Example",
+                "Official",
+                "Evidence-backed role",
+                "https://example.test/uncertain/apply",
+                9,
+                "eligible",
+                "submission_uncertain",
+            ),
+            (
+                "https://example.test/blocked",
+                "Blocked retry role",
+                "Example",
+                "Official",
+                "Evidence-backed role",
+                "https://example.test/blocked/apply",
+                9,
+                "eligible",
+                "failed",
+            ),
+        ],
+    )
+    conn.execute(
+        "UPDATE jobs SET apply_retry_blocked = 1 WHERE url = ?",
+        ("https://example.test/blocked",),
+    )
+    conn.commit()
+
+    data = collect_dashboard_data(conn)
+
+    assert data["stats"] == {"total": 1, "ready": 1, "scored": 1, "highFit": 1}
+    assert [job["title"] for job in data["jobs"]] == ["Active role"]
+    assert {job["title"] for job in data["verify"]["jobs"]} == {
+        "Completed role",
+        "Pending receipt role",
+        "Blocked retry role",
+    }
     close_connection(db_path)
 
 

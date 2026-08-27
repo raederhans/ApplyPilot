@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import httpx
@@ -11,7 +12,15 @@ import pandas as pd
 import pytest
 
 from applypilot import config, llm
-from applypilot.apply import chrome, credential_relay, launcher, prompt
+from applypilot.apply import (
+    agent_runtime,
+    chrome,
+    credential_relay,
+    credential_relay_mcp,
+    launcher,
+    prompt,
+    worker_orchestration,
+)
 from applypilot.database import (
     canonicalize_job_url,
     extract_platform_job_id,
@@ -187,6 +196,7 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
         port=9432,
         worker_dir=tmp_path,
         mcp_config_path=tmp_path / "unused.json",
+        credential_relay_authorized=True,
     )
     rendered = " ".join(command)
 
@@ -197,6 +207,8 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
     assert "http://localhost:9432" in rendered
     assert "browser_fill_form" in rendered
     assert "browser_file_upload" in rendered
+    assert "mcp_servers.credential_relay.command" in rendered
+    assert "applypilot.apply.credential_relay_mcp" in rendered
     assert "browser_evaluate" not in rendered
     assert "gmail" not in rendered.casefold()
     assert "--sandbox read-only" in rendered
@@ -206,6 +218,59 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
     assert 'skills.config=[{path="' in rendered
     assert '"enabled": false' not in rendered
     assert final_path == tmp_path / "codex-final-message.txt"
+
+
+def test_posix_codex_command_uses_direct_npx_and_omits_unauthorized_relay(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(agent_runtime.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(agent_runtime.shutil, "which", lambda name: "/usr/bin/npx" if name == "npx" else None)
+
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "gpt-5.6-sol",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        resolve_codex=lambda: ["/usr/bin/codex"],
+        credential_relay_authorized=False,
+    )
+    rendered = " ".join(command)
+
+    assert 'mcp_servers.playwright.command="/usr/bin/npx"' in rendered
+    assert "cmd.exe" not in rendered
+    assert '"/d"' not in rendered
+    assert "credential_relay" not in rendered
+
+
+def test_credential_relay_mcp_rejects_direct_calls_without_profile_authorization(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED", raising=False)
+    monkeypatch.setattr(
+        credential_relay_mcp,
+        "_decrypt_password",
+        lambda _path: pytest.fail("password must not be decrypted"),
+    )
+
+    response = credential_relay_mcp._handle({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "fill_ats_credentials", "arguments": {"field": "password"}},
+    })
+
+    assert response["result"]["isError"] is True
+    assert "not authorized" in response["result"]["content"][0]["text"]
+
+
+def test_credential_relay_registration_respects_profile_and_browser_policy() -> None:
+    enabled = {"authentication": {"ats_account_creation_authorized": True}}
+    disabled = {"authentication": {"ats_account_creation_authorized": False}}
+
+    assert launcher._credential_relay_allowed(enabled, {"_browser_backend": "edge"}) is True
+    assert launcher._credential_relay_allowed(disabled, {"_browser_backend": "edge"}) is False
+    assert launcher._credential_relay_allowed(enabled, {"_browser_backend": "cloak"}) is False
 
 
 def test_fresh_browser_profile_does_not_clone_daily_profile(monkeypatch, tmp_path: Path) -> None:
@@ -258,6 +323,74 @@ def test_browser_backend_validation_rejects_auto_for_a_concrete_launch() -> None
         chrome.resolve_browser_backend("auto", allow_auto=False)
 
 
+def test_cdp_ports_are_ephemeral_owned_and_unique(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path)
+    assert not hasattr(chrome, "_kill_on_port")
+
+    first = chrome.allocate_cdp_port(0)
+    second = chrome.allocate_cdp_port(1)
+    try:
+        assert first != second
+        assert (tmp_path / "cdp-port-locks" / f"{first}.lock").is_file()
+        assert (tmp_path / "cdp-port-locks" / f"{second}.lock").is_file()
+    finally:
+        chrome.release_cdp_port(0)
+        chrome.release_cdp_port(1)
+
+    assert not (tmp_path / "cdp-port-locks" / f"{first}.lock").exists()
+    assert not (tmp_path / "cdp-port-locks" / f"{second}.lock").exists()
+
+
+def test_worker_releases_cdp_claim_when_profile_loading_fails(monkeypatch) -> None:
+    released: list[int] = []
+    monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
+    monkeypatch.setattr(launcher, "release_cdp_port", released.append)
+    monkeypatch.setattr(
+        launcher.config,
+        "load_profile",
+        lambda: (_ for _ in ()).throw(ValueError("invalid profile")),
+    )
+
+    with pytest.raises(ValueError, match="invalid profile"):
+        launcher.worker_loop()
+
+    assert released == [0]
+
+
+def test_worker_runtime_port_validation_reports_missing_contract() -> None:
+    with pytest.raises(TypeError, match="missing required ports"):
+        worker_orchestration.worker_loop(SimpleNamespace())
+
+
+def test_dead_cdp_lock_is_removed_only_after_liveness_check(monkeypatch, tmp_path: Path) -> None:
+    lock_path = tmp_path / "12345.lock"
+    lock_path.write_text("pid=123 worker=0\n", encoding="ascii")
+    monkeypatch.setattr(chrome, "_lock_owner_is_running", lambda _path: False)
+
+    chrome._remove_stale_cdp_locks(tmp_path)
+
+    assert not lock_path.exists()
+
+
+def test_cookie_bridge_scopes_to_bound_https_application_urls() -> None:
+    assert chrome._scoped_cookie_urls([
+        "https://jobs.lever.co/example/role",
+        "https://careers.example.com/apply",
+        "http://insecure.example.test/",
+        "javascript:alert(1)",
+    ]) == [
+        "https://jobs.lever.co/example/role",
+        "https://careers.example.com/apply",
+    ]
+
+
+def test_cloak_binary_rejects_verification_bypass_override(monkeypatch) -> None:
+    monkeypatch.setenv("CLOAKBROWSER_SKIP_CHECKSUM", "1")
+
+    with pytest.raises(RuntimeError, match="rejects binary/checksum overrides"):
+        chrome.get_browser_executable("cloak")
+
+
 def test_cloak_login_policy_disables_authorized_ats_account_creation() -> None:
     steps = prompt._build_login_steps(
         _application_profile(),
@@ -287,7 +420,6 @@ def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) 
             return 0
 
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
-    monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
     monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
@@ -321,7 +453,6 @@ def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -
             return 0
 
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
-    monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
     monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
@@ -356,7 +487,6 @@ def test_cloak_launch_uses_separate_profile_and_stable_fingerprint(monkeypatch, 
             return None
 
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile)
-    monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(chrome, "get_browser_executable", lambda _backend: "cloak-chrome.exe")
     monkeypatch.setattr(chrome, "_wait_for_cdp_ready", lambda *_args, **_kwargs: None)
@@ -709,11 +839,17 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "Continue with Google" in steps
     assert "already signed-in account" in steps
     assert "candidate@example.com" in steps
-    assert ".\\fill-ats-credentials.ps1" in steps
-    assert "never repeat the code" in steps
-    assert "within the last 10 minutes" in steps
-    assert "password reset" in steps
+    assert "mcp__credential_relay__fill_ats_credentials" in steps
+    assert "no authorized mailbox capability" in steps
     assert "credential_relay_required" in steps
+
+    claude_steps = prompt._build_login_steps(
+        _application_profile(), agent_backend="claude"
+    )
+    assert ".\\fill-ats-credentials.ps1" in claude_steps
+    assert "never repeat the code" in claude_steps
+    assert "within the last 10 minutes" in claude_steps
+    assert "password reset" in claude_steps
 
 
 def test_login_policy_stops_when_google_reuse_is_not_authorized() -> None:
@@ -746,12 +882,86 @@ def test_screening_allows_supported_adjacent_category_but_not_exact_tool_claim()
 
 
 def test_credential_relay_host_policy_is_ats_scoped() -> None:
-    assert credential_relay.host_is_allowed("jobs.lever.co", set()) is True
+    assert credential_relay.host_is_allowed("jobs.lever.co", set()) is False
+    assert credential_relay.host_is_known_ats("jobs.lever.co") is True
     assert credential_relay.host_is_allowed(
         "careers.example.com", {"careers.example.com"}
     ) is True
     assert credential_relay.host_is_allowed("accounts.google.com", {"google.com"}) is False
     assert credential_relay.host_is_allowed("evil.example", {"careers.example.com"}) is False
+
+
+def test_credential_password_host_requires_known_ats_or_explicit_profile_host(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS", raising=False)
+    assert credential_relay._password_host_is_allowed("careers.example.com") is False
+    assert credential_relay._password_host_is_allowed("jobs.lever.co") is True
+    monkeypatch.setenv(
+        "APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS", "careers.example.com"
+    )
+    assert credential_relay._password_host_is_allowed("careers.example.com") is True
+
+
+def test_credential_relay_prefers_exact_host_over_unique_ats_redirect() -> None:
+    exact = {
+        "page_index": 1,
+        "frame_url": "https://careers.example.com/login",
+        "page_url": "https://careers.example.com/login",
+        "match": "exact",
+        "field_count": 1,
+    }
+    redirect = {
+        "page_index": 2,
+        "frame_url": "https://jobs.lever.co/example",
+        "page_url": "https://jobs.lever.co/example",
+        "match": "known_ats_redirect",
+        "field_count": 2,
+    }
+
+    assert credential_relay._select_candidate([redirect, exact]) is exact
+
+
+def test_credential_relay_rejects_multiple_matching_tabs() -> None:
+    candidates = [
+        {
+            "page_index": index,
+            "frame_url": url,
+            "page_url": url,
+            "match": "known_ats_redirect",
+            "field_count": 2,
+        }
+        for index, url in enumerate(
+            ("https://jobs.lever.co/one", "https://jobs.lever.co/two")
+        )
+    ]
+
+    with pytest.raises(credential_relay.CredentialRelayError, match="multiple browser tabs"):
+        credential_relay._select_candidate(candidates)
+
+
+def test_credential_relay_target_lineage_allows_redirect_descendant_only() -> None:
+    infos = {
+        "root": {"targetId": "root"},
+        "ats-child": {"targetId": "ats-child", "openerId": "root"},
+        "unrelated": {"targetId": "unrelated"},
+    }
+
+    assert credential_relay._target_descends_from("root", {"root"}, infos) is True
+    assert credential_relay._target_descends_from("ats-child", {"root"}, infos) is True
+    assert credential_relay._target_descends_from("unrelated", {"root"}, infos) is False
+
+
+def test_credential_relay_both_mode_rejects_partial_forms() -> None:
+    assert credential_relay._requested_fields_present("both", True, True) is True
+    assert credential_relay._requested_fields_present("both", True, False) is False
+    assert credential_relay._requested_fields_present("email", True, False) is True
+
+
+def test_apply_backend_defaults_to_codex(monkeypatch) -> None:
+    monkeypatch.delenv("APPLYPILOT_APPLY_BACKEND", raising=False)
+
+    assert config.get_apply_backend() == "codex"
 
 
 def test_pdf_renderer_preserves_education_rows() -> None:
@@ -1255,13 +1465,17 @@ def test_submission_observation_updates_state_without_setting_a_retry_block(
     assert status == "submission_uncertain"
     assert tuple(row) == (
         "submission_uncertain",
-        0,
+        1,
         "browser_observation_pending",
     )
 
     status = record_submission_observation(
         url,
-        {"receipt_visible": True, "page_url": url + "/apply/"},
+        {
+            "receipt_visible": True,
+            "receipt_structured": True,
+            "page_url": url + "/apply/",
+        },
         conn,
     )
     row = conn.execute(
@@ -1681,12 +1895,28 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
         "tailor_status": "machine_validated",
         "cover_letter_path": str(letter_txt),
         "cover_letter_status": "human_approved",
+        "_control_contract": {
+            "contract_version": 1,
+            "interaction_driver": "playwright",
+            "browser_runtime": "edge",
+            "phase": "prepare",
+            "reason_code": "primary_playwright",
+            "single_writer": True,
+            "submit_owner": "playwright",
+            "requestable_handoffs": ["computer_use"],
+            "handoff_requires_fresh_observation": True,
+            "runtime_switch_after_submit_forbidden": True,
+        },
     }
 
     built = prompt.build_prompt(job, "Verified resume", dry_run=True, worker_id=3)
 
     assert "must-not-appear" not in built
     assert "CAPSOLVER_API_KEY" not in built
+    assert "CONTROL_CONTRACT:" in built
+    assert '"interaction_driver": "playwright"' in built
+    assert "RESULT:FAILED:computer_use_handoff_required" in built
+    assert "never reuse element refs, screenshot ids, coordinates" in built
     assert "RESULT:PREVIEWED" in built
     assert "click the visible filename or resume card once" in built
     assert "verify that the Selected marker moves" in built
@@ -1695,6 +1925,10 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "RESULT:FAILED:resume_upload for this job so the batch can continue" in built
     assert "Browser upload boundary" in built
     assert "must not stop unrelated jobs in the batch" in built
+    assert "Required document preflight" in built
+    assert "manual_review_required:required_document" in built
+    assert "A filename or remove/replace control under Cover letter" in built
+    assert "FAILURE_CONTEXT" in built
     assert "LinkedIn/SmartRecruiters city autocomplete" in built
     assert "Typed text alone is not a valid selection" in built
     assert "Greenhouse/React Select location controls" in built
@@ -1804,7 +2038,7 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "justify YES" in built
     assert "Continue with Google" in built
     assert "already signed-in account" in built
-    assert ".\\fill-ats-credentials.ps1" in built
+    assert "mcp__credential_relay__fill_ats_credentials" in built
     assert "FULL-TIME salaried positions only" not in built
     assert "internships or full-time employment" in built
     assert 'aria-label is exactly or starts with "Easy Apply to this job"' in built
@@ -2163,6 +2397,11 @@ def test_worker_treats_browser_observation_as_hard_submission_gate(monkeypatch) 
     monkeypatch.setattr(config, "load_profile", _application_profile)
     monkeypatch.setattr(launcher, "acquire_job", lambda **kwargs: job)
     monkeypatch.setattr(launcher, "launch_chrome", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        launcher,
+        "_open_bound_application_target",
+        lambda _port, _url: {"application-root"},
+    )
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(launcher, "run_job", fake_run_job)
     monkeypatch.setattr(
@@ -2595,6 +2834,52 @@ def test_tailoring_judge_accepts_exact_clause_with_semicolon_boundary(monkeypatc
         tailored_text,
         job["title"],
         {"resume_facts": {}, "skills_boundary": {"data": ["Python", "PostgreSQL"]}},
+        job_description=job["full_description"],
+    )
+
+    assert result["passed"] is True
+    assert result["summary_evidence_complete"] is True
+
+
+def test_tailoring_judge_ignores_extra_non_exact_quote_when_exact_evidence_exists(
+    monkeypatch,
+) -> None:
+    source, job, _ = _grounded_tailor_payload()
+    exact_quote = "Built Python automation for verified public data workflows."
+    summary_sentence = "Built Python automation for verified public data workflows."
+    tailored_text = (
+        f"Ryan Yu\nAI Engineer\n\nSUMMARY\n{summary_sentence}\n\n"
+        "TECHNICAL SKILLS\nData: Python\n"
+    )
+
+    class FakeJudgeClient:
+        last_response_meta: ClassVar[dict] = {}
+
+        def chat(self, *args, **kwargs):
+            return json.dumps(
+                {
+                    "verdict": "PASS",
+                    "issues": [],
+                    "summary_claims": [
+                        {
+                            "claim": summary_sentence,
+                            "source_quotes": [
+                                exact_quote,
+                                "Recomposed explanatory wording not present in the source.",
+                            ],
+                            "supported": True,
+                        }
+                    ],
+                }
+            )
+
+    monkeypatch.setattr(tailor, "get_client", lambda: FakeJudgeClient())
+
+    result = tailor.judge_tailored_resume(
+        source,
+        tailored_text,
+        job["title"],
+        {"resume_facts": {}, "skills_boundary": {"data": ["Python"]}},
         job_description=job["full_description"],
     )
 

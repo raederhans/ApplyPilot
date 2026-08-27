@@ -44,6 +44,8 @@ tracks:
       - data analyst
       - analytics consultant
       - data analytics
+      - analytics & projects
+      - analytics and projects
     business_intelligence:
       - business intelligence
       - BI analyst
@@ -58,11 +60,15 @@ tracks:
       - supply planning analyst
     strategy_analytics:
       - strategy analyst
+      - strategy & insights
+      - strategy and insights
+      - growth strategy
 
   ai_implementation:
     ai_solutions:
       - AI solutions
       - AI solutions consultant
+      - AI platform
       - AI engineer
       - artificial intelligence engineer
       - generative AI

@@ -134,6 +134,20 @@ applypilot apply --dry-run --url <verified-job-url> --browser-backend auto
 `auto` starts with Edge and makes at most one CloakBrowser retry only for an
 explicit bot/WAF block. It never retries a CAPTCHA, assessment, selector
 failure, authentication failure, or any operation after submission begins.
+CloakBrowser is a browser runtime, not a second form-filling agent: Playwright
+remains the structured interaction driver on both Edge and Cloak. Independent
+Edge workers may run in parallel; workers that actually need Cloak share one
+serialized fallback lane unless the configured license explicitly permits
+concurrency.
+
+`--interaction-mode auto` also teaches the isolated Playwright agent when to
+request a bounded Windows Computer Use handoff for a genuinely visual-only or
+native control. Computer Use is not injected into the isolated CLI process, so
+the request fails closed for an outer agent to handle with a fresh observation;
+it is never used for file pickers, CAPTCHA/MFA, permissions, assessments, or a
+second final-submit attempt. Use `--interaction-mode playwright` to disable
+that handoff request.
+
 CloakBrowser uses its own `cloak-workers/` profiles and never clones the daily
 Edge profile. ApplyPilot disables CloakBrowser auto-updates and pins the
 keyless binary unless `APPLYPILOT_CLOAK_VERSION` or a separately managed

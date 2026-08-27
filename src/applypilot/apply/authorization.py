@@ -46,6 +46,36 @@ _FINAL_AUTHORIZATION_FIELDS = {
     "expires_at",
 }
 
+_PROFILE_FACT_PATHS = {
+    "stable": (
+        "personal.full_name",
+        "personal.preferred_display_name",
+        "personal.citizenship",
+        "personal.nationality",
+        "work_authorization",
+        "screening",
+        "education",
+    ),
+    "sensitive": (
+        "personal.email",
+        "personal.phone",
+        "personal.address",
+        "personal.address_line_2",
+        "personal.city",
+        "personal.province_state",
+        "personal.country",
+        "personal.postal_code",
+        "personal.date_of_birth",
+        "personal.country_of_birth",
+        "eeo_voluntary",
+    ),
+    "temporary": (
+        "availability",
+        "compensation",
+        "current_employment",
+    ),
+}
+
 
 def compute_file_binding(path: str | Path) -> tuple[str, int]:
     """Return the SHA-256 digest and byte length for one immutable attachment."""
@@ -57,6 +87,105 @@ def compute_file_binding(path: str | Path) -> tuple[str, int]:
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
+
+
+def _profile_value(profile: dict, dotted_path: str) -> object:
+    value: object = profile
+    for part in dotted_path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def build_profile_fact_binding(profile: dict) -> dict[str, object]:
+    """Bind categorized profile facts without persisting raw personal values."""
+    result: dict[str, object] = {"version": 1, "raw_values_stored": False}
+    for category, paths in _PROFILE_FACT_PATHS.items():
+        payload = {path: _profile_value(profile, path) for path in paths}
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        result[category] = {
+            "fields": list(paths),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    return result
+
+
+def freeze_submission_materials(job: dict, profile: dict) -> dict[str, object]:
+    """Freeze the actual outbound material set immediately before reservation."""
+    resume_path = resolve_resume_attachment(job)
+    resume_digest, resume_size = compute_file_binding(resume_path)
+    staged_resume_text = str(job.get("_staged_resume_path") or "").strip()
+    if staged_resume_text:
+        staged_resume = Path(staged_resume_text).expanduser().resolve(strict=True)
+        staged_digest, staged_size = compute_file_binding(staged_resume)
+        if (staged_digest, staged_size) != (resume_digest, resume_size):
+            raise ValueError("Staged resume bytes differ from the authorized source PDF")
+    materials: list[dict[str, object]] = [
+        {
+            "kind": "resume",
+            "sha256": resume_digest,
+            "size": resume_size,
+            "validation": str(job.get("tailor_status") or ""),
+        }
+    ]
+
+    cover_status = str(job.get("cover_letter_status") or "").strip()
+    cover_path_text = str(job.get("cover_letter_path") or "").strip()
+    if cover_status == "not_required":
+        materials.append(
+            {
+                "kind": "cover_letter",
+                "state": "not_required",
+                "validation": str(job.get("cover_letter_approved_by") or "policy_or_form"),
+            }
+        )
+    elif cover_path_text and cover_status in {"human_approved", "agent_validated"}:
+        cover_path = Path(cover_path_text).expanduser().resolve()
+        cover_path = cover_path.with_suffix(".pdf")
+        cover_path = cover_path.resolve(strict=True)
+        cover_digest, cover_size = compute_file_binding(cover_path)
+        staged_cover_text = str(job.get("_staged_cover_letter_path") or "").strip()
+        if staged_cover_text:
+            staged_cover = Path(staged_cover_text).expanduser().resolve(strict=True)
+            staged_digest, staged_size = compute_file_binding(staged_cover)
+            if (staged_digest, staged_size) != (cover_digest, cover_size):
+                raise ValueError(
+                    "Staged cover-letter bytes differ from the validated source PDF"
+                )
+        materials.append(
+            {
+                "kind": "cover_letter_pdf",
+                "sha256": cover_digest,
+                "size": cover_size,
+                "validation": cover_status,
+            }
+        )
+        cover_text_path = Path(cover_path_text).expanduser().resolve().with_suffix(".txt")
+        if cover_text_path.is_file():
+            text_digest, text_size = compute_file_binding(cover_text_path)
+            materials.append(
+                {
+                    "kind": "cover_letter_text",
+                    "sha256": text_digest,
+                    "size": text_size,
+                    "validation": cover_status,
+                }
+            )
+    else:
+        raise ValueError("Cover-letter material is unresolved at final reservation")
+
+    return {
+        "version": 1,
+        "job_fingerprint": compute_job_fingerprint(job),
+        "materials": materials,
+        "profile_facts": build_profile_fact_binding(profile),
+    }
 
 
 def resolve_resume_attachment(job: dict) -> Path:

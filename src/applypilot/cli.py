@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,9 @@ from rich.console import Console
 from rich.table import Table
 
 from applypilot import __version__
+from applypilot.commands import apply as apply_command_mod
+from applypilot.commands import doctor as doctor_command_mod
+from applypilot.commands import radar as radar_command_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,7 +114,9 @@ def _build_standing_authorization_manifest(
         ).fetchall()
         if len(rows) != 1:
             raise ValueError(
-                f"Standing authorization expected one exact job for {target_url}, found {len(rows)}"
+                f"Standing authorization expected one exact job for {target_url}, found {len(rows)}. "
+                "Register it first with `applypilot import-job`, then run the exact-job "
+                "enrichment, scoring, and material-readiness steps before retrying `apply --url`."
             )
     else:
         # Scan a bounded superset so a portal/manual exclusion cannot consume
@@ -130,17 +136,42 @@ def _build_standing_authorization_manifest(
         ).fetchall()
 
     selected: list[dict] = []
+    exact_blocker: dict[str, str] | None = None
     for row in rows:
         job = dict(row)
         job["application_url"] = job.get("application_url") or job.get("url")
-        if decision.evaluate(
+        decision_result = decision.evaluate(
             job,
             minimum_fit_score=minimum_fit_score,
             allow_runtime_readiness=bool(policy.get("allow_runtime_readiness_review", False)),
             allow_runtime_cover_letter=bool(
                 policy.get("allow_runtime_cover_letter_discovery", False)
             ),
-        ).get("decision") != "ready_to_apply":
+        )
+        if decision_result.get("decision") != "ready_to_apply":
+            if target_url:
+                reason = str(decision_result.get("reason") or "Readiness gate did not pass.")
+                if not str(job.get("full_description") or "").strip():
+                    next_step = (
+                        f"applypilot import-job --url \"{target_url}\" "
+                        "--description-file <official-job-description.txt>"
+                    )
+                elif job.get("fit_score") is None:
+                    next_step = f"applypilot score-job --url \"{target_url}\""
+                elif not str(job.get("application_readiness_status") or "").strip():
+                    next_step = (
+                        f"applypilot review-readiness --url \"{target_url}\" "
+                        "--status confirmed --reason <evidence-summary> --reviewed-by agent"
+                    )
+                elif not str(job.get("tailored_resume_path") or "").strip() or str(
+                    job.get("tailor_status") or ""
+                ).casefold() != "machine_validated":
+                    next_step = f"applypilot tailor-job --url \"{target_url}\""
+                elif "cover-letter" in reason.casefold():
+                    next_step = f"applypilot prepare-cover --url \"{target_url}\""
+                else:
+                    next_step = f"applypilot apply --dry-run --url \"{target_url}\""
+                exact_blocker = {"reason": reason, "next_step": next_step}
             continue
         if not str(job.get("company_name") or "").strip():
             continue
@@ -161,6 +192,11 @@ def _build_standing_authorization_manifest(
             break
 
     if not selected:
+        if target_url and exact_blocker:
+            raise ValueError(
+                "Exact job is registered but not ready for application. "
+                f"Gate: {exact_blocker['reason']} Next: {exact_blocker['next_step']}"
+            )
         raise ValueError("No exact job currently satisfies standing authorization gates")
     return authorization.build_bound_manifest(
         selected,
@@ -230,9 +266,11 @@ def main(
 @radar_app.callback()
 def radar_main(ctx: typer.Context) -> None:
     """Restrict discovery-only execution to the explicit radar allowlist."""
-    _assert_discovery_only_command(
-        ctx.invoked_subcommand,
-        {"collect", "queries", "import-leads", "report"},
+    return radar_command_mod.run_radar_main(
+        sys.modules[__name__],
+        {
+            "ctx": ctx,
+        },
     )
 
 
@@ -457,6 +495,38 @@ def reconcile_receipts(
     })
 
 
+@app.command("prune-application-history")
+def prune_application_history(
+    days: int = typer.Option(
+        180,
+        "--days",
+        min=30,
+        help="Retain terminal runtime attempts for at least this many days.",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        help="Delete eligible attempt rows; omission is a read-only preview.",
+    ),
+) -> None:
+    """Preview or prune old attempts without deleting receipts or uncertainty."""
+    if execute:
+        _bootstrap()
+    from applypilot.database import prune_application_runtime_history
+
+    result = prune_application_runtime_history(retention_days=days, execute=execute)
+    count_key = "deleted_attempts" if execute else "eligible_attempts"
+    label = "Deleted" if execute else "Eligible"
+    console.print(
+        f"[green]{label}: {result[count_key]}[/green] terminal attempt rows "
+        f"older than {days} days."
+    )
+    console.print(
+        "[dim]Applied evidence, durable receipts, active attempts, and "
+        "submission_uncertain rows are preserved.[/dim]"
+    )
+
+
 @app.command("fact-revision")
 def fact_revision(
     key: str = typer.Option(..., "--key", help="Stable application fact key."),
@@ -542,33 +612,14 @@ def radar_queries(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Generate candidate-operated LinkedIn Content Search URLs without browsing."""
-    import yaml
-
-    from applypilot.config import CONFIG_DIR
-    from applypilot.radar import build_linkedin_query_matrix
-
-    path = CONFIG_DIR / "linkedin_searches.yaml"
-    query_config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if window:
-        query_config.setdefault("defaults", {})["window"] = window
-    matrix = build_linkedin_query_matrix(query_config)
-    if track:
-        matrix = [item for item in matrix if item["track"] == track]
-    if subtrack:
-        matrix = [item for item in matrix if item["subtrack"] == subtrack]
-    if json_output:
-        console.print_json(data=matrix)
-        return
-    table = Table(title="LinkedIn read-only search queue")
-    table.add_column("Track")
-    table.add_column("Subtrack")
-    table.add_column("Window")
-    table.add_column("URL", overflow="fold")
-    for item in matrix:
-        table.add_row(item["track"], item["subtrack"], item["window"], item["url"])
-    console.print(table)
-    console.print(
-        "[dim]URLs are for visible, candidate-operated review. ApplyPilot does not crawl LinkedIn.[/dim]"
+    return radar_command_mod.run_radar_queries(
+        sys.modules[__name__],
+        {
+            "window": window,
+            "track": track,
+            "subtrack": subtrack,
+            "json_output": json_output,
+        },
     )
 
 
@@ -587,128 +638,14 @@ def radar_collect(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show selected sources without HTTP or DB writes."),
 ) -> None:
     """Collect verified official jobs using bounded public GET adapters."""
-    import yaml
-
-    from applypilot import config as app_config
-    from applypilot.database import (
-        finish_radar_fetch_run,
-        get_connection,
-        ingest_radar_official_jobs,
-        reconcile_radar_leads,
-        start_radar_fetch_run,
+    return radar_command_mod.run_radar_collect(
+        sys.modules[__name__],
+        {
+            "company": company,
+            "include_inactive": include_inactive,
+            "dry_run": dry_run,
+        },
     )
-    from applypilot.discovery.official import collect_company, load_company_watchlist
-    from applypilot.radar import classify_job_subtracks
-
-    selected_ids = {value.casefold() for value in (company or [])}
-    watchlist = load_company_watchlist()
-    selected = [
-        item for item in watchlist
-        if (not selected_ids or str(item.get("id", "")).casefold() in selected_ids)
-        and (item.get("active", False) or (include_inactive and dry_run))
-    ]
-    unknown = selected_ids - {str(item.get("id", "")).casefold() for item in watchlist}
-    if unknown:
-        console.print(f"[red]Unknown company IDs:[/red] {', '.join(sorted(unknown))}")
-        raise typer.Exit(code=1)
-    if include_inactive and not dry_run:
-        console.print("[red]--include-inactive is inspection-only and requires --dry-run.[/red]")
-        raise typer.Exit(code=2)
-    if not selected:
-        console.print("[yellow]No matching radar sources.[/yellow]")
-        return
-
-    if dry_run:
-        console.print_json(data={
-            "read_only": True,
-            "selected": [
-                {
-                    "company_id": item.get("id"),
-                    "provider": item.get("provider"),
-                    "active": item.get("active", False),
-                    "cadence": item.get("cadence"),
-                }
-                for item in selected
-            ],
-        })
-        return
-
-    _radar_bootstrap()
-    conn = get_connection()
-    radar_config = app_config.load_radar_config()
-    accept_locations, reject_locations = app_config.get_location_filters(radar_config)
-    excluded_titles = app_config.get_excluded_title_patterns(radar_config)
-    query_config = yaml.safe_load(
-        (app_config.CONFIG_DIR / "linkedin_searches.yaml").read_text(encoding="utf-8")
-    ) or {}
-    summaries: list[dict] = []
-
-    for company_config in selected:
-        source = _official_source_config(company_config)
-        run_id = start_radar_fetch_run(conn, source, parser_version="official-adapters-v1")
-        try:
-            result = collect_company(company_config)
-            accepted_jobs = []
-            location_title_filtered = 0
-            track_filtered = 0
-            for job in result.get("jobs", []):
-                if not app_config.radar_location_is_accepted(
-                    job.get("location"),
-                    accept_locations,
-                    reject_locations,
-                    allow_ambiguous_remote=bool(
-                        radar_config.get("allow_ambiguous_remote", False)
-                    ),
-                ) or app_config.title_is_excluded(job.get("title"), excluded_titles):
-                    location_title_filtered += 1
-                    continue
-                subtracks = classify_job_subtracks(job.get("title"), query_config)
-                if not subtracks:
-                    track_filtered += 1
-                    continue
-                accepted_job = dict(job)
-                accepted_job["subtracks"] = list(subtracks)
-                accepted_job["track_tags"] = list(subtracks)
-                accepted_jobs.append(accepted_job)
-            counts = ingest_radar_official_jobs(conn, run_id, source, accepted_jobs)
-            finish_radar_fetch_run(
-                conn,
-                run_id,
-                status=result.get("status", "partial"),
-                pagination_complete=result.get("pagination_complete"),
-                pages_fetched=result.get("pages_scanned"),
-                raw_count=result.get("raw_count", 0),
-                normalized_count=result.get("normalised_count", 0),
-                new_count=counts["new"],
-                existing_count=counts["existing"],
-                error=result.get("error"),
-                metadata={
-                    **result.get("metadata", {}),
-                    "accepted_count": len(accepted_jobs),
-                    "filtered_count": len(result.get("jobs", [])) - len(accepted_jobs),
-                    "location_title_filtered_count": location_title_filtered,
-                    "track_filtered_count": track_filtered,
-                },
-            )
-            reconciled = reconcile_radar_leads(conn, official_run_ids=[run_id])
-            summaries.append({
-                "company_id": company_config.get("id"),
-                "status": result.get("status"),
-                "raw": result.get("raw_count", 0),
-                "normalised": result.get("normalised_count", 0),
-                "accepted": len(accepted_jobs),
-                **counts,
-                "promoted_leads": reconciled["promoted"],
-                "error": result.get("error"),
-            })
-        except Exception as error:  # noqa: BLE001 - provider failures must close the run ledger
-            finish_radar_fetch_run(conn, run_id, status="partial", error=str(error))
-            summaries.append({
-                "company_id": company_config.get("id"),
-                "status": "partial",
-                "error": str(error),
-            })
-    console.print_json(data={"read_only": True, "sources": summaries})
 
 
 @radar_app.command("import-leads")
@@ -717,95 +654,13 @@ def radar_import_leads(
     source_id: str = typer.Option("linkedin-content-manual", "--source-id"),
 ) -> None:
     """Import a candidate-reviewed JSON/CSV lead file without creating jobs."""
-    import csv
-    import json
-
-    import yaml
-
-    from applypilot.config import CONFIG_DIR, RADAR_IMPORT_DIR
-
-    if (
-        os.environ.get("APPLYPILOT_DISCOVERY_ONLY") == "1"
-        and source_id != "linkedin-content-manual"
-    ):
-        console.print(
-            "[red]Discovery-only lead imports require source-id "
-            "linkedin-content-manual.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if os.environ.get("APPLYPILOT_ATTENDED_REVIEW") != "1":
-        console.print(
-            "[red]Lead import requires an explicit attended-review session.[/red]"
-        )
-        raise typer.Exit(code=2)
-    _assert_discovery_storage_path(file, RADAR_IMPORT_DIR, "Lead import")
-    _radar_bootstrap()
-    from applypilot.database import (
-        finish_radar_fetch_run,
-        get_connection,
-        ingest_radar_leads,
-        start_radar_fetch_run,
+    return radar_command_mod.run_radar_import_leads(
+        sys.modules[__name__],
+        {
+            "file": file,
+            "source_id": source_id,
+        },
     )
-    from applypilot.radar import classify_job_subtracks
-
-    if file.suffix.casefold() == ".json":
-        payload = json.loads(file.read_text(encoding="utf-8"))
-        rows = payload if isinstance(payload, list) else payload.get("leads", [])
-    elif file.suffix.casefold() == ".csv":
-        with file.open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-    else:
-        console.print("[red]Lead import supports JSON or CSV.[/red]")
-        raise typer.Exit(code=1)
-    if not isinstance(rows, list):
-        console.print("[red]Lead file must contain a list.[/red]")
-        raise typer.Exit(code=1)
-
-    source = {
-        "source_id": source_id,
-        "source_type": "social_lead",
-        "provider": "candidate_reviewed_import",
-        "access_mode": "authorised_local_import",
-        "active": True,
-    }
-    conn = get_connection()
-    query_config = yaml.safe_load(
-        (CONFIG_DIR / "linkedin_searches.yaml").read_text(encoding="utf-8")
-    ) or {}
-    run_id = start_radar_fetch_run(conn, source, parser_version="lead-import-v1")
-    normalized = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        source_url = row.get("source_url") or row.get("url")
-        if not str(source_url or "").strip():
-            continue
-        normalized.append({
-            **row,
-            "source_url": source_url,
-            "subtracks": row.get("subtracks")
-            or list(classify_job_subtracks(row.get("title"), query_config)),
-            "status": "awaiting_official",
-            "verification_status": "unverified",
-            "reason": row.get("reason") or "requires official careers verification",
-        })
-    counts = ingest_radar_leads(conn, run_id, source, normalized)
-    finish_radar_fetch_run(
-        conn,
-        run_id,
-        status="partial",
-        pagination_complete=False,
-        raw_count=len(rows),
-        normalized_count=len(normalized),
-        lead_count=counts["leads"],
-        metadata={"coverage_note": "candidate-reviewed import is not an exhaustive source scan"},
-    )
-    console.print_json(data={
-        "read_only": True,
-        **counts,
-        "promoted": 0,
-        "promotion_note": "awaiting a fresh official-source refresh",
-    })
 
 
 @radar_app.command("report")
@@ -819,60 +674,14 @@ def radar_report(
     ),
 ) -> None:
     """Render the auditable daily radar report."""
-    from datetime import UTC, datetime, timedelta
-
-    from applypilot.config import RADAR_REPORT_DIR
-
-    if os.environ.get("APPLYPILOT_DISCOVERY_ONLY") == "1" and not require_applied_snapshot:
-        console.print(
-            "[red]Discovery-only reports require this run's Applied snapshot ID.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if output:
-        if (
-            os.environ.get("APPLYPILOT_DISCOVERY_ONLY") == "1"
-            and output.suffix.casefold() != ".md"
-        ):
-            console.print("[red]Discovery-only reports must use a .md output.[/red]")
-            raise typer.Exit(code=2)
-        _assert_discovery_storage_path(output, RADAR_REPORT_DIR, "Radar report")
-    _radar_bootstrap()
-    from applypilot.database import get_radar_daily_snapshot
-    from applypilot.discovery.official import load_company_watchlist
-    from applypilot.radar import render_daily_report
-
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-    expected_sources = [
-        _official_source_config(company)
-        for company in load_company_watchlist()
-        if company.get("active", False)
-    ]
-    snapshot = get_radar_daily_snapshot(
-        since=since,
-        expected_sources=expected_sources,
-        applied_snapshot_id=require_applied_snapshot,
+    return radar_command_mod.run_radar_report(
+        sys.modules[__name__],
+        {
+            "hours": hours,
+            "output": output,
+            "require_applied_snapshot": require_applied_snapshot,
+        },
     )
-    if require_applied_snapshot:
-        applied_snapshot = snapshot["applied_snapshot"]
-        snapshot_valid = (
-            applied_snapshot.get("snapshot_id") == require_applied_snapshot
-            and applied_snapshot.get("completeness") == "complete"
-            and applied_snapshot.get("integrity_valid") is True
-            and applied_snapshot.get("fresh") is True
-        )
-        if not snapshot_valid:
-            console.print(
-                "[red]Required LinkedIn Applied snapshot is missing, incomplete, "
-                "invalid, or stale; report publication is blocked.[/red]"
-            )
-            raise typer.Exit(code=2)
-    report = render_daily_report(**snapshot, report_date=datetime.now(UTC).date().isoformat())
-    if output:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(report, encoding="utf-8")
-        console.print(f"[green]Wrote radar report:[/green] {output}")
-    else:
-        console.print(report)
 
 
 @app.command()
@@ -1172,6 +981,11 @@ def apply(
         "--browser-backend",
         help="Browser runtime: edge, cloak, or auto. Defaults to APPLYPILOT_BROWSER_BACKEND.",
     ),
+    interaction_mode: str | None = typer.Option(
+        None,
+        "--interaction-mode",
+        help="Interaction policy: auto or playwright. Auto permits a structured Computer Use handoff request.",
+    ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     manual_captcha_relay: bool = typer.Option(
@@ -1202,297 +1016,27 @@ def apply(
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
-    _bootstrap()
-
-    from applypilot.config import PROFILE_PATH as _profile_path
-    from applypilot.database import get_connection
-
-    # --- Utility modes (no Chrome/Claude needed) ---
-
-    if mark_applied:
-        from applypilot.apply.launcher import mark_job
-        mark_job(mark_applied, "applied")
-        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
-        return
-
-    if mark_failed:
-        from applypilot.apply.launcher import mark_job
-        mark_job(mark_failed, "failed", reason=fail_reason)
-        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
-        return
-
-    if reset_failed:
-        from applypilot.apply.launcher import reset_failed as do_reset
-        count = do_reset()
-        console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
-        return
-
-    if dry_run and not url:
-        console.print("[red]--dry-run requires one explicit --url.[/red]")
-        raise typer.Exit(code=1)
-    try:
-        profile = json.loads(_profile_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        profile = {}
-    standing_auto_authorize = _standing_auto_authorization_enabled(profile)
-    submission_policy = profile.get("submission_policy", {})
-    final_batch_authorization_required = bool(
-        isinstance(submission_policy, dict)
-        and submission_policy.get("batch_final_authorization_required", False)
-    )
-
-    if final_authorization_file is not None and authorization_file is None:
-        console.print(
-            "[red]--final-authorization-file requires its bound --authorization-file.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if (
-        not dry_run
-        and final_batch_authorization_required
-        and authorization_file is not None
-        and final_authorization_file is None
-    ):
-        console.print(
-            "[red]This workspace requires one final batch authorization before any browser submission. "
-            "Run finalize-batch after the user approves the complete prepared batch, then pass both files.[/red]"
-        )
-        raise typer.Exit(code=2)
-
-    if not dry_run and authorization_file is None and not url and not standing_auto_authorize:
-        console.print(
-            "[red]Submission without a manifest requires one exact --url.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if not dry_run and authorization_file is None:
-        submission_policy = profile.get("submission_policy", {})
-        manifest_required = bool(
-            profile.get("batch_authorization_required", False)
-            or (
-                isinstance(submission_policy, dict)
-                and submission_policy.get("batch_authorization_required", False)
-            )
-        )
-        if manifest_required and not standing_auto_authorize:
-            console.print(
-                "[red]Profile policy requires --authorization-file for every submission.[/red]"
-            )
-            raise typer.Exit(code=2)
-    requested_limit = limit if limit is not None else (0 if continuous else 1)
-    if not dry_run and continuous and authorization_file is None:
-        console.print(
-            "[red]Continuous submission requires --authorization-file.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if (
-        not dry_run
-        and requested_limit > 1
-        and authorization_file is None
-        and not standing_auto_authorize
-    ):
-        console.print(
-            "[red]Batch submission requires --authorization-file or standing auto-authorization.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if (
-        not dry_run
-        and url
-        and authorization_file is None
-        and os.environ.get("APPLYPILOT_AUTO_SUBMIT") != "1"
-        and not standing_auto_authorize
-    ):
-        console.print(
-            "[red]Single-URL submission requires APPLYPILOT_AUTO_SUBMIT=1 or "
-            "--authorization-file.[/red]"
-        )
-        raise typer.Exit(code=2)
-    if manual_captcha_relay and (dry_run or continuous or headless):
-        console.print(
-            "[red]Manual CAPTCHA relay requires bounded visible submission mode.[/red]"
-        )
-        raise typer.Exit(code=1)
-        if continuous or headless or workers != 1 or (limit not in (None, 1)):
-            console.print(
-                "[red]Fill-only review requires a visible browser, one worker, one URL, and limit 1.[/red]"
-            )
-            raise typer.Exit(code=1)
-
-    # --- Full apply mode ---
-
-    backend = (agent_backend or os.environ.get("APPLYPILOT_APPLY_BACKEND", "claude")).strip().lower()
-    if backend not in {"codex", "claude"}:
-        console.print("[red]--agent-backend must be codex or claude.[/red]")
-        raise typer.Exit(code=1)
-    from applypilot.apply.chrome import get_browser_executable, resolve_browser_backend
-
-    try:
-        effective_browser_backend = resolve_browser_backend(browser_backend)
-    except ValueError as exc:
-        console.print(f"[red]{exc}.[/red]")
-        raise typer.Exit(code=1) from None
-    effective_model = model or (
-        os.environ.get("APPLYPILOT_CODEX_MODEL", "gpt-5.6-sol")
-        if backend == "codex"
-        else os.environ.get("APPLYPILOT_CLAUDE_MODEL", "opus")
-    )
-
-    # Check 1: the selected browser-agent CLI and a visible browser are required.
-    import shutil
-
-    backend_binary = shutil.which("codex.exe") or shutil.which("codex") if backend == "codex" else shutil.which("claude")
-    try:
-        if effective_browser_backend in {"edge", "auto"}:
-            get_browser_executable("edge")
-        if effective_browser_backend in {"cloak", "auto"}:
-            get_browser_executable("cloak")
-        has_browser = True
-        browser_error = ""
-    except (FileNotFoundError, RuntimeError) as exc:
-        has_browser = False
-        browser_error = str(exc)
-    if not backend_binary or not has_browser:
-        missing = []
-        if not backend_binary:
-            missing.append(f"{backend} CLI")
-        if not has_browser:
-            missing.append(browser_error or effective_browser_backend)
-        console.print(f"[red]Browser apply is missing: {', '.join(missing)}.[/red]")
-        raise typer.Exit(code=1)
-
-    # Check 2: Profile exists
-    if not _profile_path.exists():
-        console.print(
-            "[red]Profile not found.[/red]\n"
-            "Run [bold]applypilot init[/bold] to create your profile first."
-        )
-        raise typer.Exit(code=1)
-
-    # Check 3: Submission needs an approved cover letter. A fill-only preview
-    # can proceed with a validated resume and leave an optional letter blank.
-    if not (gen and url):
-        conn = get_connection()
-        if dry_run:
-            ready = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-                "AND tailor_status = 'machine_validated' AND applied_at IS NULL "
-                "AND eligibility_status != 'ineligible'"
-            ).fetchone()[0]
-        else:
-            allow_runtime_cover = bool(
-                profile.get("submission_policy", {}).get(
-                    "allow_runtime_cover_letter_discovery", False
-                )
-            )
-            ready = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-                "AND tailor_status = 'machine_validated' "
-                "AND applied_at IS NULL "
-                + (
-                    ""
-                    if allow_runtime_cover
-                    else "AND ((cover_letter_path IS NOT NULL AND cover_letter_status IN "
-                    "('human_approved', 'agent_validated')) OR cover_letter_status = 'not_required')"
-                )
-            ).fetchone()[0]
-        if ready == 0:
-            if dry_run:
-                console.print("[red]No machine-validated tailored resume is ready for preview.[/red]")
-            else:
-                console.print(
-                    "[red]No submission-ready materials.[/red]\n"
-                    "Prepare a validated resume and resolve any material hard requirements first."
-                )
-            raise typer.Exit(code=1)
-
-    if gen:
-        from applypilot.apply.launcher import gen_prompt
-        target = url or ""
-        if not target:
-            console.print("[red]--gen requires --url to specify which job.[/red]")
-            raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=effective_model)
-        if not prompt_file:
-            console.print("[red]No matching job found for that URL.[/red]")
-            raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
-        console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        if backend == "claude":
-            console.print("\n[bold]Run manually:[/bold]")
-            console.print(
-                f"  claude --model {effective_model} "
-                f"--mcp-config {mcp_path} "
-                f"--permission-mode bypassPermissions < {prompt_file}"
-            )
-        else:
-            console.print(
-                "\n[dim]Codex MCP isolation is assembled by ApplyPilot at runtime; "
-                "use apply --dry-run --url URL instead of copying a partial command.[/dim]"
-            )
-        return
-
-    from applypilot.apply.launcher import main as apply_main
-
-    effective_limit = limit if limit is not None else (0 if continuous else 1)
-    authorization_manifest = None
-    if authorization_file is not None:
-        from applypilot.apply.authorization import (
-            load_final_authorization,
-            load_manifest,
-        )
-
-        try:
-            if final_authorization_file is not None:
-                authorization_manifest = load_final_authorization(
-                    final_authorization_file,
-                    authorization_file,
-                )
-            else:
-                authorization_manifest = load_manifest(authorization_file)
-        except (OSError, TypeError, ValueError) as exc:
-            console.print(f"[red]Invalid authorization manifest:[/red] {exc}")
-            raise typer.Exit(code=2) from None
-    elif not dry_run and standing_auto_authorize:
-        try:
-            authorization_manifest = _build_standing_authorization_manifest(
-                get_connection(),
-                profile=profile,
-                target_url=url,
-                requested_limit=requested_limit,
-                min_score=min_score,
-            )
-        except (TypeError, ValueError) as exc:
-            console.print(f"[red]Standing auto-authorization could not bind a ready job:[/red] {exc}")
-            raise typer.Exit(code=2) from None
-        console.print(
-            "[green]Standing authorization bound "
-            f"{len(authorization_manifest['jobs'])} exact ready candidate(s) for up to "
-            f"{authorization_manifest['max_submissions']} submissions.[/green]"
-        )
-
-    console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
-    console.print(f"  Success target: {'unlimited' if continuous else effective_limit}")
-    console.print(f"  Workers:  {workers}")
-    console.print(f"  Backend:  {backend}")
-    console.print(f"  Model:    {effective_model}")
-    console.print(f"  Headless: {headless}")
-    console.print(f"  Dry run:  {dry_run}")
-    console.print(f"  CAPTCHA:  {'manual relay' if manual_captcha_relay else 'stop on blocker'}")
-    if url:
-        console.print(f"  Target:   {url}")
-    console.print()
-
-    apply_main(
-        limit=effective_limit,
-        target_url=url,
-        min_score=min_score,
-        headless=headless,
-        model=effective_model,
-        dry_run=dry_run,
-        continuous=continuous,
+    return apply_command_mod.run_apply(
+        sys.modules[__name__],
+        limit=limit,
         workers=workers,
-        agent_backend=backend,
+        min_score=min_score,
+        model=model,
+        agent_backend=agent_backend,
+        browser_backend=browser_backend,
+        interaction_mode=interaction_mode,
+        continuous=continuous,
+        dry_run=dry_run,
         manual_captcha_relay=manual_captcha_relay,
-        browser_backend=effective_browser_backend,
-        authorization_manifest=authorization_manifest,
+        headless=headless,
+        url=url,
+        authorization_file=authorization_file,
+        final_authorization_file=final_authorization_file,
+        gen=gen,
+        mark_applied=mark_applied,
+        mark_failed=mark_failed,
+        fail_reason=fail_reason,
+        reset_failed=reset_failed,
     )
 
 
@@ -1528,9 +1072,11 @@ def browser_session(
         raise typer.Exit(code=1)
 
     from applypilot.apply.chrome import (
+        allocate_cdp_port,
         cleanup_worker,
         get_browser_executable,
         launch_chrome,
+        release_cdp_port,
         resolve_browser_backend,
     )
 
@@ -1547,19 +1093,24 @@ def browser_session(
     console.print(f"  URL:     {url}")
     console.print("  Close this dedicated browser window after completing the login.")
 
-    process = launch_chrome(
-        worker,
-        headless=False,
-        start_url=url,
-        browser_backend=effective_browser_backend,
-    )
+    port = allocate_cdp_port(worker)
+    process = None
     try:
+        process = launch_chrome(
+            worker,
+            port=port,
+            headless=False,
+            start_url=url,
+            browser_backend=effective_browser_backend,
+        )
         while process.poll() is None:
             time.sleep(0.5)
     except KeyboardInterrupt:
         console.print("\n[yellow]Closing browser session...[/yellow]")
     finally:
-        cleanup_worker(worker, process)
+        if process is not None:
+            cleanup_worker(worker, process)
+        release_cdp_port(worker)
 
 
 @app.command()
@@ -1940,172 +1491,7 @@ def dashboard(
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
-    import importlib.metadata
-    import shutil
-    import sqlite3
-
-    from applypilot.config import (
-        DB_PATH,
-        PROFILE_PATH,
-        RESUME_PATH,
-        RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH,
-        get_chrome_path,
-        load_env,
-    )
-
-    load_env()
-
-    ok_mark = "[green]OK[/green]"
-    fail_mark = "[red]MISSING[/red]"
-    warn_mark = "[yellow]WARN[/yellow]"
-
-    results: list[tuple[str, str, str]] = []  # (check, status, note)
-
-    # --- Tier 1 checks ---
-    # Profile
-    if PROFILE_PATH.exists():
-        results.append(("profile.json", ok_mark, str(PROFILE_PATH)))
-    else:
-        results.append(("profile.json", fail_mark, "Run 'applypilot init' to create"))
-
-    # Resume
-    if RESUME_PATH.exists():
-        results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
-    elif RESUME_PDF_PATH.exists():
-        results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
-    else:
-        results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
-
-    # Search config
-    if SEARCH_CONFIG_PATH.exists():
-        results.append(("searches.yaml", ok_mark, str(SEARCH_CONFIG_PATH)))
-    else:
-        results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
-
-    # Local database (read-only; never initializes, migrates, or repairs it).
-    if not DB_PATH.is_file():
-        results.append(("job database", warn_mark, "Not created yet — collect opportunities first"))
-    else:
-        from applypilot.view import collect_dashboard_data
-
-        try:
-            dashboard_data = collect_dashboard_data()
-        except (OSError, sqlite3.DatabaseError) as exc:
-            detail = f"{type(exc).__name__}: {exc}"[:120]
-            results.append((
-                "job database",
-                fail_mark,
-                f"{detail}; restore a known-good backup (automatic repair is disabled)",
-            ))
-        else:
-            total = dashboard_data["stats"]["total"]
-            results.append(("job database", ok_mark, f"Readable; {total} eligible roles"))
-
-    # JobSpy is an optional capability rather than a core import dependency.
-    try:
-        from applypilot.optional_dependencies import require_jobboards
-
-        require_jobboards()
-        results.append(("python-jobspy", ok_mark, "Job board scraping available"))
-    except RuntimeError as exc:
-        results.append(("python-jobspy", warn_mark, str(exc)))
-
-    # --- Tier 2 checks ---
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_deepseek:
-        model = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
-        results.append(("LLM API key", ok_mark, f"DeepSeek ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
-    else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY in the local .env"))
-
-    # --- Tier 3 checks ---
-    # Claude Code CLI
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
-    else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
-
-    # Chromium browser
-    try:
-        chrome_path = get_chrome_path()
-        results.append(("Edge/Chrome/Chromium", ok_mark, chrome_path))
-    except FileNotFoundError:
-        results.append(("Edge/Chrome/Chromium", fail_mark,
-                        "Install Edge/Chrome or set CHROME_PATH (needed for auto-apply)"))
-
-    try:
-        cloak_version = importlib.metadata.version("cloakbrowser")
-        results.append((
-            "CloakBrowser backend",
-            ok_mark,
-            f"wrapper {cloak_version}; binary is verified/resolved only when selected",
-        ))
-    except importlib.metadata.PackageNotFoundError:
-        results.append((
-            "CloakBrowser backend",
-            "[dim]optional[/dim]",
-            "Install applypilot-local[stealth] for the explicit anti-detection backend",
-        ))
-
-    # Node.js / npx (for Playwright MCP)
-    npx_bin = shutil.which("npx")
-    if npx_bin:
-        results.append(("Node.js (npx)", ok_mark, npx_bin))
-    else:
-        results.append(("Node.js (npx)", fail_mark,
-                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
-
-    # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
-    if capsolver:
-        captcha_mode = os.environ.get("APPLYPILOT_CAPTCHA_MODE", "manual_relay")
-        results.append((
-            "CapSolver API key",
-            ok_mark,
-            f"configured; mode={captcha_mode}; validity/balance not tested",
-        ))
-    else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
-
-    # --- Render results ---
-    console.print()
-    console.print("[bold]ApplyPilot Local Doctor[/bold]\n")
-
-    col_w = max(len(r[0]) for r in results) + 2
-    for check, status, note in results:
-        pad = " " * (col_w - len(check))
-        console.print(f"  {check}{pad}{status}  [dim]{note}[/dim]")
-
-    console.print()
-
-    # Tier summary
-    from applypilot.config import TIER_LABELS, get_tier
-    tier = get_tier()
-    console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
-
-    if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
-    elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
-
-    console.print()
+    return doctor_command_mod.run_doctor(sys.modules[__name__])
 
 
 if __name__ == "__main__":

@@ -429,7 +429,12 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_login_steps(profile: dict, *, allow_account_creation: bool = True) -> str:
+def _build_login_steps(
+    profile: dict,
+    *,
+    allow_account_creation: bool = True,
+    agent_backend: str = "codex",
+) -> str:
     """Build a narrow, auditable authentication policy for the browser agent."""
     authentication = profile.get("authentication", {})
     google_reuse_authorized = bool(
@@ -455,10 +460,16 @@ def _build_login_steps(profile: dict, *, allow_account_creation: bool = True) ->
             if google_reuse_authorized
             else "Google SSO reuse is not authorized."
         )
+        relay_instruction = (
+            "call mcp__credential_relay__fill_ats_credentials with field=email, password, "
+            "or both"
+            if agent_backend == "codex"
+            else "run .\\fill-ats-credentials.ps1 -Field email, password, or both from "
+            "the worker directory"
+        )
         signup_rule = (
             f"For an ordinary employer ATS only, account creation with {email} is authorized. Never type, print, "
-            "read aloud, copy into the prompt, or expose the password. Fill credentials only by running "
-            ".\\fill-ats-credentials.ps1 -Field email, password, or both from the worker directory. The relay "
+            f"read aloud, copy into the prompt, or expose the password. Fill credentials only by {relay_instruction}. The relay "
             "fills the browser directly and must not submit the form. If the relay is missing, unconfigured, "
             "rejects the current host, or fails, stop with RESULT:FAILED:credential_relay_required."
             if account_creation_authorized
@@ -472,8 +483,13 @@ def _build_login_steps(profile: dict, *, allow_account_creation: bool = True) ->
             "screenshots, or logs. If the mailbox differs, the message is stale/ambiguous, or the flow requests "
             "phone/SMS verification, password reset, account recovery, security questions, or MFA enrollment, "
             "stop with RESULT:LOGIN_ISSUE."
-            if gmail_verification_authorized
-            else "Do not open email or enter verification codes."
+            if gmail_verification_authorized and agent_backend == "claude"
+            else (
+                "This backend has no authorized mailbox capability. If email verification is required, "
+                "stop with RESULT:LOGIN_ISSUE and continue the batch with another job."
+                if gmail_verification_authorized
+                else "Do not open email or enter verification codes."
+            )
         )
         return (
             "5. Authentication policy: "
@@ -795,6 +811,37 @@ def build_prompt(job: dict, tailored_resume: str,
     search_config = config.load_search_config()
     personal = profile["personal"]
     submission_policy = profile.get("submission_policy", {})
+    control_contract = job.get("_control_contract") or {
+        "contract_version": 1,
+        "interaction_driver": "playwright",
+        "browser_runtime": job.get("_browser_backend", "edge"),
+        "phase": submission_phase,
+        "reason_code": "legacy_playwright_route",
+        "single_writer": True,
+        "submit_owner": "playwright",
+        "requestable_handoffs": [],
+        "handoff_requires_fresh_observation": True,
+        "runtime_switch_after_submit_forbidden": True,
+    }
+    control_contract_json = json.dumps(control_contract, ensure_ascii=False, sort_keys=True)
+    computer_use_handoff_enabled = (
+        "computer_use" in control_contract.get("requestable_handoffs", [])
+    )
+    if computer_use_handoff_enabled:
+        computer_use_handoff_instruction = (
+            "Request the external Computer Use handoff with "
+            "RESULT:FAILED:computer_use_handoff_required and "
+            'FAILURE_CONTEXT: {"category":"computer_use_handoff",'
+            '"field_label":"<visible control>",'
+            '"visible_state":"<why Playwright cannot control it>","attempts":1}. '
+            "Do not request it for file upload, CAPTCHA, verification, permissions, "
+            "assessments, or after any final action."
+        )
+    else:
+        computer_use_handoff_instruction = (
+            "Computer Use handoff is not enabled for this turn; output "
+            "RESULT:FAILED:visual_only_control."
+        )
     if submission_phase not in {"prepare", "submit"}:
         raise ValueError(f"Unknown submission phase: {submission_phase}")
     if job.get("tailor_status") != "machine_validated":
@@ -837,6 +884,7 @@ def build_prompt(job: dict, tailored_resume: str,
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
     shutil.copy(str(src_pdf), str(upload_pdf))
     pdf_path = str(upload_pdf)
+    job["_staged_resume_path"] = pdf_path
 
     # --- Cover letter handling ---
     cover_letter_text = cover_letter or ""
@@ -857,6 +905,7 @@ def build_prompt(job: dict, tailored_resume: str,
             cl_upload = dest_dir / f"{name_slug}_Cover_Letter.pdf"
             shutil.copy(str(cl_pdf_src), str(cl_upload))
             cl_upload_path = str(cl_upload)
+            job["_staged_cover_letter_path"] = cl_upload_path
 
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
@@ -894,11 +943,16 @@ def build_prompt(job: dict, tailored_resume: str,
     authorized_login_steps = _build_login_steps(
         profile,
         allow_account_creation=job.get("_browser_backend") != "cloak",
+        agent_backend=str(job.get("_agent_backend") or "codex"),
     )
 
     # Preview mode is a separate workflow, not a weakened submission prompt.
     linkedin_resume = _linkedin_resume_preference(profile, job)
-    if (job.get("source_site") or job.get("site") or "").casefold() == "linkedin" and linkedin_resume:
+    if (
+        dry_run
+        and (job.get("source_site") or job.get("site") or "").casefold() == "linkedin"
+        and linkedin_resume
+    ):
         resume_step = (
             f"6. In LinkedIn Easy Apply, first select the already-uploaded resume whose visible filename "
             f'contains "{linkedin_resume}" when it is available. Verify the selected filename. '
@@ -911,7 +965,7 @@ def build_prompt(job: dict, tailored_resume: str,
             "bounded retry, output RESULT:FAILED:resume_upload for this job so the batch can continue."
         )
     else:
-        resume_step = "6. Upload resume. If an old resume is visibly attached, remove it first; if the field is empty, do not look for a delete control. Click the upload control once, call browser_file_upload with the PDF path above, wait for parsing, then snapshot and verify that an uploaded filename or replacement/remove control is visible. Once verified, never click the upload control again. This is the tailored resume for THIS job. Non-negotiable."
+        resume_step = "6. Upload the bound Resume PDF from FILES. If an old resume is visibly attached, remove it first; if the field is empty, do not look for a delete control. Do not select an existing cloud resume during a real submission because its bytes are not bound to this attempt. Click the upload control once, call browser_file_upload with the PDF path above, wait for parsing, then snapshot and verify that an uploaded filename or replacement/remove control is visible. Once verified, never click the upload control again. This is the tailored resume for THIS job. Non-negotiable."
     field_review_steps = """8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - \"Current Job Title\" or \"Most Recent Title\" -> use the Current Employment title from APPLICANT PROFILE, NOT the target job title or a resume-parser guess.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
@@ -1087,9 +1141,18 @@ RESULT:COVER_NOT_REQUIRED -- the opened ATS has no required cover-letter field
 RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a file"""
 
     if resume_existing_page:
+        expected_page_url = str(
+            (job.get("_browser_observation") or {}).get("page_url") or ""
+        )
+        expected_page_rule = (
+            f" List tabs and select the tab whose current URL is `{expected_page_url}` before the first snapshot."
+            if expected_page_url
+            else ""
+        )
         opening_steps = (
-            "1. Do not navigate or reload. The visible Edge session is already on this exact application after "
-            "a previous controlled step. Snapshot the current page first. If an application confirmation is already "
+            "1. Do not navigate or reload. The active isolated browser session is already on this exact application "
+            "after a previous controlled step." + expected_page_rule + " Snapshot the current page first. "
+            "If an application confirmation is already "
             "visible, output RESULT:APPLIED immediately without clicking Submit again.\n"
             "2. If the application form is visible, continue from its current state without clearing existing fields. "
             "In prepare phase, finish and verify the form; in submit phase, use the advisory observation and current page state."
@@ -1105,7 +1168,10 @@ RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a f
     prompt = f"""You are a job application assistant. {mission_instruction}
 
 == REQUIRED BROWSER CONTROL ==
-The `playwright` MCP server is already attached to the visible isolated Chromium session. Use only its browser_* MCP tools for all browser interaction. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or any other browser automation route. If the attached browser MCP is unavailable, output RESULT:FAILED:browser_mcp_unavailable and stop.
+CONTROL_CONTRACT: {control_contract_json}
+The current driver is Playwright and the current browser runtime is assigned by the launcher. Use only the attached playwright browser_* MCP tools in this isolated turn. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or start/switch browsers yourself. The launcher, not this agent turn, owns runtime transitions.
+If Playwright can observe the page but one prepare-phase control is genuinely visual-only or native and has no stable browser ref, do not guess coordinates. {computer_use_handoff_instruction}
+If the attached Playwright MCP is unavailable, output RESULT:FAILED:browser_mcp_unavailable and stop. A different driver/runtime must make a fresh observation; never reuse element refs, screenshot ids, coordinates, or assumed page state across a handoff. Once submit phase starts, no driver or runtime switch is allowed.
 
 == FIELD IDENTITY RULES ==
 - Full name and all first/given/last/family/surname fields use the legal identity from APPLICANT PROFILE. Preferred/display name is used only when the label explicitly asks for it.
@@ -1207,7 +1273,8 @@ If a required or useful application question could not be answered from confirme
 - Greenhouse/React Select location controls: after an exact suggestion is selected, the editable input may legitimately clear while the selected city moves into a visible value chip/container. Treat that visible selected value as the selection evidence; do not refill the textbox merely because its raw input value is empty. If the required-location alert still remains after one normal validation/submit attempt, stop with RESULT:FAILED:manual_review_required:location_validation instead of repeatedly selecting or submitting.
 - Email/security-code verification: an 8-character code split across one-character inputs is a CAPTCHA/identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
 - Video/audio upload contradiction: if a field is labelled optional but native/site validation blocks submission until a recording or media file is provided, the validation behaviour is authoritative. Stop with RESULT:FAILED:unsafe_verification; never activate camera/microphone or fabricate media to satisfy it.
-- File upload verification: after browser_file_upload, wait and snapshot. Continue only when the filename or a remove/replace control proves the file is attached. Do not click the upload area again after success. If no proof appears, retry the click-plus-upload sequence once, snapshot again, then fail with RESULT:FAILED:resume_upload if still empty.
+- Required document preflight: before uploading anything, identify every visible required file field by its own label. FILES authorizes only the named Resume/CV and cover-letter materials. Never upload the resume into Transcript, Portfolio, Supporting documents, Certificates, or a generic optional attachment field to satisfy another requirement. If a required non-resume document is not supplied, stop before submission with `RESULT:FAILED:manual_review_required:required_document`, emit `UNANSWERED_QUESTIONS` for that exact field, and emit `FAILURE_CONTEXT: {{"category":"required_document","field_label":"<visible label>","blocking_material":"<required material>","visible_state":"required file not supplied","attempts":0}}`.
+- File upload verification: bind upload proof to the same labelled Resume/CV field container that received the upload. A filename or remove/replace control under Cover letter, Certificates, Supporting documents, or another attachment field is not resume proof. After browser_file_upload, wait and snapshot. Continue only when the Resume/CV field itself shows the filename or a remove/replace control. Do not click the upload area again after success. If no proof appears, retry the Resume/CV click-plus-upload sequence once, snapshot again, then output `RESULT:FAILED:resume_upload` and `FAILURE_CONTEXT: {{"category":"resume_upload","field_label":"<visible resume label>","visible_state":"<what remained empty or where attachment proof appeared>","attempts":2}}`.
 - Browser upload boundary: use only browser_file_upload/the browser file-chooser primitive. Never switch to Windows Computer Use or an OS-native file picker for a browser upload; the independent browser-URL safety gate is not an application workaround. A bounded upload failure belongs to the affected job and must not stop unrelated jobs in the batch.
 - Native dropdown/combobox: use browser_select_option directly with the exact visible option text. Snapshot afterward and verify the selected option. Use click-the-option only for a custom non-native dropdown.
 - React/controlled text and number inputs: after a bulk fill, verify the visible value or the review-page answer. If one field clears itself or reports a format error despite a supported answer, retry only that field once by focusing it, selecting any existing text, and typing the value sequentially. Do not repeat the whole form, use DOM value injection, or loop. A review page that displays the intended answer is decisive persistence evidence even when the form snapshot omits raw input values.

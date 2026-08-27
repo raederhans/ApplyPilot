@@ -504,11 +504,17 @@ def judge_tailored_resume(
             for quote in raw_quotes
             if str(quote).strip()
         ]
-        quotes_are_exact = bool(quotes) and all(
-            _is_exact_source_quote(quote, normalized_source)
-            for quote in quotes
-        )
-        combined_quotes = " ".join(quotes)
+        # Judges sometimes return a useful exact evidence set plus one
+        # explanatory or slightly recomposed quote. Keep only the contiguous
+        # source substrings for deterministic checks instead of discarding the
+        # whole claim because one extra quote is invalid. A claim with no exact
+        # quote still fails closed below.
+        exact_quotes = [
+            quote for quote in quotes
+            if _is_exact_source_quote(quote, normalized_source)
+        ]
+        quotes_are_exact = bool(exact_quotes)
+        combined_quotes = " ".join(exact_quotes)
         claim_sectors = {
             term for term in sector_terms
             if re.search(rf"\b{re.escape(term)}\b", claim, flags=re.IGNORECASE)

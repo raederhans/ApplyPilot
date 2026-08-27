@@ -9,13 +9,19 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from applypilot import database as database_mod
 from applypilot.apply import authorization, launcher
 from applypilot.cli import _build_standing_authorization_manifest, app
 from applypilot.database import (
+    finalize_application_attempt,
     init_db,
+    prune_application_runtime_history,
     reconcile_submission_receipt,
     record_unanswered_questions,
+    recover_stale_application_attempts,
     reserve_batch_submission,
+    start_application_attempt,
+    update_application_attempt,
     update_batch_submission_status,
 )
 
@@ -515,6 +521,159 @@ def test_durable_confirmation_email_reconciles_uncertain_submission_idempotently
     assert stored["verification_confidence"] == "durable_receipt_reconciled"
 
 
+def test_browser_receipt_reconciles_manual_frontend_submission(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "manual-browser-receipt.db")
+    job_url = "https://jobs.ashbyhq.com/example/software-intern"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name) VALUES (?, ?, ?)",
+        (job_url, "Software Engineer Intern", "Example"),
+    )
+    conn.commit()
+
+    result = reconcile_submission_receipt(
+        {
+            "job_url": job_url,
+            "source": "browser_receipt",
+            "receipt_id": "ashby-example-20260827",
+            "company_name": "Example",
+            "job_title": "Software Engineer Intern",
+            "confirmation_text": "Your application was successfully submitted.",
+        },
+        conn,
+    )
+    stored = conn.execute(
+        "SELECT apply_status, application_evidence, verification_confidence "
+        "FROM jobs WHERE url = ?",
+        (job_url,),
+    ).fetchone()
+
+    assert result["status"] == "applied" and result["changed"] is True
+    assert stored["apply_status"] == "applied"
+    assert stored["application_evidence"] == "browser_receipt:ashby-example-20260827"
+    assert stored["verification_confidence"] == "durable_receipt_reconciled"
+
+
+def test_confirmation_email_reconciles_manual_submission_from_resume_receipt(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "manual-email-receipt.db")
+    job_url = "https://example.applytojob.com/apply/ai-intern"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name) VALUES (?, ?, ?)",
+        (job_url, "AI Workflow Intern", "Example Climate"),
+    )
+    conn.commit()
+
+    result = reconcile_submission_receipt(
+        {
+            "job_url": job_url,
+            "source": "confirmation_email",
+            "receipt_id": "gmail-example-resume-received",
+            "company_name": "Example Climate",
+            "job_title": "AI Workflow Intern",
+            "confirmation_text": "Qiushi, we've received your resume.",
+        },
+        conn,
+    )
+    stored = conn.execute(
+        "SELECT apply_status, application_evidence, verification_confidence "
+        "FROM jobs WHERE url = ?",
+        (job_url,),
+    ).fetchone()
+
+    assert result["status"] == "applied" and result["changed"] is True
+    assert stored["apply_status"] == "applied"
+    assert stored["application_evidence"] == "confirmation_email:gmail-example-resume-received"
+    assert stored["verification_confidence"] == "durable_receipt_reconciled"
+
+
+def test_browser_receipt_overrides_prior_cli_upload_failure(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "failed-cli-browser-success.db")
+    job_url = "https://jobs.ashbyhq.com/example/product-intern"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, apply_status, apply_error) "
+        "VALUES (?, ?, ?, 'failed', 'resume_upload')",
+        (job_url, "Product Intern", "Example"),
+    )
+    conn.commit()
+
+    result = reconcile_submission_receipt(
+        {
+            "job_url": job_url,
+            "source": "browser_receipt",
+            "receipt_id": "ashby-example-browser-success",
+            "company_name": "Example",
+            "job_title": "Product Intern",
+            "confirmation_text": "Your application was successfully submitted.",
+        },
+        conn,
+    )
+    stored = conn.execute(
+        "SELECT apply_status, application_evidence, verification_confidence "
+        "FROM jobs WHERE url = ?",
+        (job_url,),
+    ).fetchone()
+
+    assert result["status"] == "applied" and result["changed"] is True
+    assert stored["apply_status"] == "applied"
+    assert stored["application_evidence"] == "browser_receipt:ashby-example-browser-success"
+    assert stored["verification_confidence"] == "durable_receipt_reconciled"
+
+
+def test_standing_authorization_missing_exact_job_explains_import_flow(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "missing-exact-job.db")
+    profile = {
+        "submission_policy": {
+            "authorization_granted": True,
+            "standing_auto_authorize_ready_jobs": True,
+            "batch_authorization_required": False,
+        }
+    }
+
+    with pytest.raises(ValueError, match="Register it first with `applypilot import-job`"):
+        _build_standing_authorization_manifest(
+            conn,
+            profile=profile,
+            target_url="https://jobs.example.test/company/role",
+            requested_limit=1,
+            min_score=7,
+        )
+
+
+def test_standing_authorization_reports_exact_registered_job_gate_and_next_step(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "registered-not-ready.db")
+    job_url = "https://jobs.example.test/company/role"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name) VALUES (?, ?, ?)",
+        (job_url, "AI Intern", "Example"),
+    )
+    conn.commit()
+    profile = {
+        "submission_policy": {
+            "authorization_granted": True,
+            "standing_auto_authorize_ready_jobs": True,
+            "batch_authorization_required": False,
+        }
+    }
+
+    with pytest.raises(ValueError) as error:
+        _build_standing_authorization_manifest(
+            conn,
+            profile=profile,
+            target_url=job_url,
+            requested_limit=1,
+            min_score=7,
+        )
+
+    message = str(error.value)
+    assert "Exact job is registered but not ready" in message
+    assert "Job fit score is missing" in message
+    assert f'applypilot import-job --url "{job_url}"' in message
+    assert "--description-file <official-job-description.txt>" in message
+
+
 def test_receipt_reconciliation_rejects_cross_job_or_weak_evidence(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "receipts-rejected.db")
     job_url = "https://careers.example.test/jobs/data"
@@ -619,6 +778,217 @@ def test_batch_consumption_is_one_shot_and_enforces_global_quota(tmp_path: Path)
     ).fetchone()
     assert stored["status"] == "submission_uncertain"
     assert json.loads(stored["evidence_json"]) == {"seen": False}
+
+
+def test_attempt_lease_recovery_distinguishes_pre_and_post_submit(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "attempts.db")
+    conn.execute("INSERT INTO jobs (url, apply_status) VALUES (?, 'in_progress')", ("job:pre",))
+    pre_id = start_application_attempt("job:pre", "worker-1", conn=conn)
+    conn.execute(
+        "UPDATE application_attempts SET lease_expires_at=? WHERE attempt_id=?",
+        ((NOW - timedelta(minutes=1)).isoformat(), pre_id),
+    )
+    conn.execute("UPDATE jobs SET apply_task_id=? WHERE url='job:pre'", (pre_id,))
+
+    conn.execute("INSERT INTO jobs (url, apply_status) VALUES (?, 'in_progress')", ("job:post",))
+    post_id = start_application_attempt("job:post", "worker-2", conn=conn)
+    update_application_attempt(
+        post_id,
+        phase="submit",
+        submit_started=True,
+        conn=conn,
+    )
+    conn.execute(
+        "UPDATE application_attempts SET lease_expires_at=? WHERE attempt_id=?",
+        ((NOW - timedelta(minutes=1)).isoformat(), post_id),
+    )
+    conn.execute("UPDATE jobs SET apply_task_id=? WHERE url='job:post'", (post_id,))
+    conn.commit()
+
+    recovered = recover_stale_application_attempts(conn, now=NOW)
+
+    assert recovered == {"pre_submit": 1, "submission_uncertain": 1}
+    states = {
+        row["url"]: (row["apply_status"], row["apply_retry_blocked"])
+        for row in conn.execute(
+            "SELECT url, apply_status, apply_retry_blocked FROM jobs"
+        ).fetchall()
+    }
+    assert states["job:pre"] == ("failed", 0)
+    assert states["job:post"] == ("submission_uncertain", 1)
+    assert finalize_application_attempt(post_id, "applied", conn=conn) is False
+
+
+def test_prune_history_is_preview_first_and_preserves_uncertainty(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "prune.db")
+    old = (NOW - timedelta(days=200)).isoformat()
+    for attempt_id, status in (("old-failed", "failed"), ("old-uncertain", "submission_uncertain")):
+        conn.execute(
+            "INSERT INTO application_attempts "
+            "(attempt_id, job_url, worker_id, started_at, lease_expires_at, phase, "
+            "submit_started, status, updated_at) VALUES (?, ?, 'worker', ?, ?, 'done', 1, ?, ?)",
+            (attempt_id, f"job:{attempt_id}", old, old, status, old),
+        )
+    conn.commit()
+
+    preview = prune_application_runtime_history(
+        retention_days=180, execute=False, conn=conn, now=NOW
+    )
+    executed = prune_application_runtime_history(
+        retention_days=180, execute=True, conn=conn, now=NOW
+    )
+
+    assert preview["eligible_attempts"] == 1
+    assert executed["deleted_attempts"] == 1
+    remaining = {
+        row[0] for row in conn.execute("SELECT attempt_id FROM application_attempts")
+    }
+    assert remaining == {"old-uncertain"}
+
+
+def test_ledger_facade_preserves_an_existing_thread_local_transaction(
+    monkeypatch, tmp_path: Path
+) -> None:
+    conn = init_db(tmp_path / "transaction-ownership.db")
+    conn.execute(
+        "INSERT INTO jobs (url, title) VALUES ('job:outer', 'outer transaction')"
+    )
+    monkeypatch.setattr(database_mod, "get_connection", lambda: conn)
+
+    attempt_id = start_application_attempt("job:attempt", "worker-1")
+
+    assert attempt_id
+    assert conn.in_transaction is True
+    conn.rollback()
+    assert conn.execute("SELECT 1 FROM jobs WHERE url='job:outer'").fetchone() is None
+
+
+def test_prune_execute_does_not_commit_an_outer_transaction(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "prune-outer-transaction.db")
+    old = (NOW - timedelta(days=200)).isoformat()
+    conn.execute(
+        "INSERT INTO application_attempts "
+        "(attempt_id, job_url, worker_id, started_at, lease_expires_at, phase, "
+        "submit_started, status, updated_at) "
+        "VALUES ('old-failed', 'job:failed', 'worker', ?, ?, 'done', 0, 'failed', ?)",
+        (old, old, old),
+    )
+    conn.commit()
+    conn.execute("INSERT INTO jobs (url, title) VALUES ('job:outer', 'outer')")
+
+    result = prune_application_runtime_history(
+        retention_days=180, execute=True, conn=conn, now=NOW
+    )
+
+    assert result["deleted_attempts"] == 1
+    assert conn.in_transaction is True
+    conn.rollback()
+    assert conn.execute(
+        "SELECT 1 FROM application_attempts WHERE attempt_id='old-failed'"
+    ).fetchone() is not None
+    assert conn.execute("SELECT 1 FROM jobs WHERE url='job:outer'").fetchone() is None
+
+
+def test_prune_preview_does_not_create_a_missing_database(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "missing.db"
+    monkeypatch.setattr(database_mod, "DB_PATH", db_path)
+
+    result = CliRunner().invoke(app, ["prune-application-history"])
+
+    assert result.exit_code == 0, result.output
+    assert "Eligible: 0" in result.output
+    assert not db_path.exists()
+
+
+def test_prune_preview_does_not_migrate_an_old_database(monkeypatch, tmp_path: Path) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE jobs (url TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    before = db_path.read_bytes()
+    monkeypatch.setattr(database_mod, "DB_PATH", db_path)
+
+    result = CliRunner().invoke(app, ["prune-application-history"])
+
+    assert result.exit_code == 0, result.output
+    assert db_path.read_bytes() == before
+    check = sqlite3.connect(db_path)
+    tables = {row[0] for row in check.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    check.close()
+    assert tables == {"jobs"}
+
+
+def test_receipt_id_cannot_be_replayed_for_a_second_job(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "receipts.db")
+    for url in ("https://jobs.example/one", "https://jobs.example/two"):
+        conn.execute(
+            "INSERT INTO jobs (url, title, company_name, apply_status) "
+            "VALUES (?, 'Data Intern', 'Example Co', 'submission_uncertain')",
+            (url,),
+        )
+    conn.commit()
+    evidence = {
+        "source": "confirmation_email",
+        "receipt_id": "message-123",
+        "job_url": "https://jobs.example/one",
+        "company_name": "Example Co",
+        "job_title": "Data Intern",
+        "confirmation_text": "We have received your application.",
+    }
+
+    assert reconcile_submission_receipt(evidence, conn)["status"] == "applied"
+    conflicting = dict(evidence, job_url="https://jobs.example/two")
+    result = reconcile_submission_receipt(conflicting, conn)
+
+    assert result["reason"] == "receipt_replay_conflict"
+    assert conn.execute(
+        "SELECT apply_status FROM jobs WHERE url=?", (conflicting["job_url"],)
+    ).fetchone()[0] == "submission_uncertain"
+
+
+def test_profile_fact_binding_keeps_raw_values_out_and_tracks_categories() -> None:
+    profile = {
+        "personal": {
+            "full_name": "Sensitive Name",
+            "email": "private@example.com",
+            "address": "Private Street",
+        },
+        "work_authorization": {"legally_authorized_to_work": "Yes"},
+        "availability": {"earliest_start_date": "2027-01-01"},
+    }
+
+    binding = authorization.build_profile_fact_binding(profile)
+    serialized = json.dumps(binding)
+
+    assert set(binding) == {"version", "raw_values_stored", "stable", "sensitive", "temporary"}
+    assert binding["raw_values_stored"] is False
+    assert "Sensitive Name" not in serialized
+    assert "private@example.com" not in serialized
+    assert "Private Street" not in serialized
+
+
+def test_final_material_freeze_rejects_staged_resume_byte_drift(tmp_path: Path) -> None:
+    resume = tmp_path / "resume.pdf"
+    staged = tmp_path / "staged-resume.pdf"
+    resume.write_bytes(b"authorized-resume")
+    staged.write_bytes(b"different-staged-resume")
+    job = _job()
+    job.update(
+        {
+            "tailored_resume_path": str(resume),
+            "tailor_status": "machine_validated",
+            "cover_letter_status": "not_required",
+            "_staged_resume_path": str(staged),
+        }
+    )
+
+    with pytest.raises(ValueError, match="Staged resume bytes differ"):
+        authorization.freeze_submission_materials(job, {})
 
 
 def test_default_non_dry_apply_without_url_or_manifest_is_rejected(monkeypatch) -> None:
