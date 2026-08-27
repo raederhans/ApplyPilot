@@ -29,10 +29,18 @@ existing read-only data:
 - client-side search and score filters;
 - explicit “Open form” language that does not imply an application was sent.
 
-The next frontend surfaces should expose Prepare and Verify by adapting existing
-contracts, not by creating parallel status logic in the browser. Until that work
-is deliberately scheduled, the CLI remains the authoritative interface for
-resume routing, authorization, application execution, and receipt admission.
+The **Preparation Workbench** adds a read-only Prepare surface to the same local
+page. It shows persisted resume validation, cover-letter resolution, current
+resume-route evidence, and recorded gaps without reading material contents or
+exposing local paths. A path alone is never treated as validation. The browser
+does not route, generate, revalidate, approve, authorize, or submit materials;
+the CLI remains authoritative for those actions.
+
+The next frontend surface should expose Verify by adapting existing durable
+authorization and receipt contracts, not by creating parallel status logic in
+the browser. Until that work is deliberately scheduled, the CLI remains the
+authoritative interface for authorization, application execution, and receipt
+admission.
 
 ## Current frontend boundary
 
@@ -40,6 +48,8 @@ resume routing, authorization, application execution, and receipt admission.
 - Dashboard generation does not initialize, refresh, or mutate database state; a missing or unreadable database becomes an actionable frontend state.
 - The packaged HTML owns layout, responsive behavior, accessibility, URL safety, and client-side filtering.
 - The complete ranked dataset remains searchable in the page payload, while the DOM renders at most 60 matching cards at a time.
+- Decide and Prepare share one accessible keyboard-navigable workflow, and only the active queue is rendered into the DOM.
+- Prepare serializes status, timestamps, safe filenames, and bounded evidence summaries; resume content, hashes, full local paths, and validation evidence payloads stay out of the page.
 - The frontend uses no remote fonts, scripts, analytics, or network assets.
 - Profiles, resumes, credentials, receipt evidence, and unrestricted job data are never included in release archives.
 - No database schema, pipeline stage, application decision, or receipt rule is changed as part of the frontend work.

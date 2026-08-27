@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import json
+
+from applypilot.apply.authorization import compute_job_fingerprint
+from applypilot.database import close_connection, init_db
+from applypilot.frontend.contracts import build_prepare_job
+from applypilot.view import collect_dashboard_data, render_dashboard
+
+
+def _job(**changes: object) -> dict[str, object]:
+    job: dict[str, object] = {
+        "url": "https://careers.example.test/jobs/data",
+        "application_url": "https://careers.example.test/jobs/data/apply",
+        "title": "Data Analyst",
+        "company_name": "Example",
+        "location": "Singapore",
+        "full_description": "Use SQL and Python to build decision dashboards.",
+        "fit_score": 8,
+        "eligibility_status": "eligible",
+        "tailored_resume_path": "C:/private/resumes/tailored-data.pdf",
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+    }
+    job.update(changes)
+    return job
+
+
+def test_prepare_contract_requires_validation_and_hides_local_paths() -> None:
+    job = _job()
+    assignment = {
+        "job_fingerprint": compute_job_fingerprint(job),
+        "decision": "reuse_exact",
+        "reason": "Current validated artifact covers this subtype.",
+        "hard_gaps_json": "[]",
+        "recorded_at": "2026-08-27T01:00:00+00:00",
+        "artifact_kind": "tailored",
+        "artifact_track": "data_bi_decision",
+        "artifact_pdf_path": "C:/private/resumes/tailored-data.pdf",
+        "artifact_pdf_sha256": "a" * 64,
+        "artifact_pdf_size": 12_345,
+        "artifact_validation_status": "machine_validated",
+        "artifact_validation_report_path": "C:/private/reports/result.json",
+        "artifact_validated_at": "2026-08-27T00:59:00+00:00",
+    }
+
+    result = build_prepare_job(job, assignment)
+    serialized = json.dumps(result)
+
+    assert result["state"] == "ready"
+    assert result["route"]["state"] == "current"
+    assert result["resume"]["artifactName"] == "tailored-data.pdf"
+    assert result["route"]["artifact"]["hasPdfBinding"] is True
+    assert "C:/private" not in serialized
+    assert "result.json" not in serialized
+
+
+def test_prepare_contract_never_treats_a_path_as_validation() -> None:
+    result = build_prepare_job(_job(tailor_status="pending", cover_letter_status="machine_validated"))
+
+    assert result["state"] == "review"
+    assert result["resume"]["state"] == "review"
+    assert result["coverLetter"]["state"] == "review"
+    assert result["route"]["state"] == "unrecorded"
+
+
+def test_prepare_contract_requires_a_current_gap_free_bound_route() -> None:
+    job = _job()
+    current = {
+        "job_fingerprint": compute_job_fingerprint(job),
+        "decision": "reuse_exact",
+        "reason": "Persisted route.",
+        "hard_gaps_json": "[]",
+        "artifact_validation_status": "machine_validated",
+        "artifact_pdf_path": "C:/private/resume.pdf",
+        "artifact_pdf_sha256": "a" * 64,
+        "artifact_pdf_size": 12_345,
+    }
+
+    assert build_prepare_job(job)["state"] == "review"
+    assert build_prepare_job(job, {**current, "artifact_pdf_sha256": None})["state"] == "review"
+    assert build_prepare_job(job, {**current, "hard_gaps_json": '["unsupported"]'})["state"] == "review"
+    assert build_prepare_job(job, current)["state"] == "ready"
+
+
+def test_prepare_contract_marks_old_fingerprint_route_as_stale() -> None:
+    job = _job()
+    assignment = {
+        "job_fingerprint": compute_job_fingerprint({**job, "full_description": "Old copy"}),
+        "decision": "reuse_exact",
+        "reason": "This must not be presented as current.",
+        "hard_gaps_json": '["stale gap"]',
+        "recorded_at": "2026-08-26T01:00:00+00:00",
+    }
+
+    result = build_prepare_job(job, assignment)
+
+    assert result["state"] == "review"
+    assert result["route"]["state"] == "stale"
+    assert result["route"]["gaps"] == []
+    assert "older version" in result["route"]["reason"]
+
+
+def test_dashboard_collects_current_prepare_evidence_with_selects_only(tmp_path) -> None:
+    db_path = tmp_path / "prepare.db"
+    conn = init_db(db_path)
+    job = _job()
+    conn.execute(
+        "INSERT INTO jobs (url, application_url, title, company_name, location, "
+        "full_description, fit_score, eligibility_status, tailored_resume_path, "
+        "tailor_status, cover_letter_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        tuple(job.values()),
+    )
+    fingerprint = compute_job_fingerprint(dict(conn.execute("SELECT * FROM jobs").fetchone()))
+    conn.execute(
+        "INSERT INTO resume_artifacts (artifact_id, content_sha256, kind, track, "
+        "text_path, pdf_path, pdf_sha256, pdf_size, validation_status, "
+        "validation_report_path, validated_at, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "resume:test",
+            "a" * 64,
+            "tailored",
+            "data_bi_decision",
+            "C:/private/resumes/tailored-data.txt",
+            "C:/private/resumes/tailored-data.pdf",
+            "a" * 64,
+            12_345,
+            "machine_validated",
+            "C:/private/reports/result.json",
+            "2026-08-27T01:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO job_resume_assignments (assignment_id, job_url, job_fingerprint, "
+        "artifact_id, decision, hard_gaps_json, components_json, reason, policy_version, "
+        "recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "assignment:test",
+            job["url"],
+            fingerprint,
+            "resume:test",
+            "reuse_exact",
+            "[]",
+            "{}",
+            "Validated artifact covers this role.",
+            "test",
+            "2026-08-27T01:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+    html = render_dashboard(data)
+
+    assert data["prepare"]["stats"]["ready"] == 1
+    assert data["jobs"][0]["prepare"]["route"]["state"] == "current"
+    assert data["jobs"][0]["prepare"]["route"]["artifact"]["hasPdfBinding"] is True
+    assert "tailored-data.pdf" in html
+    assert "C:/private" not in html
+    assert "a" * 64 not in html
+    assert 'document.querySelectorAll("#decide-panel .filter")' in html
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
+
+
+def test_missing_resume_library_tables_degrade_without_migration(tmp_path) -> None:
+    db_path = tmp_path / "legacy.db"
+    conn = init_db(db_path)
+    conn.execute("DROP TABLE job_resume_assignments")
+    job = _job(tailored_resume_path=None, tailor_status=None)
+    conn.execute(
+        "INSERT INTO jobs (url, application_url, title, company_name, location, "
+        "full_description, fit_score, eligibility_status, cover_letter_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        tuple(value for key, value in job.items() if key not in {"tailored_resume_path", "tailor_status"}),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+
+    assert data["prepare"]["system"]["state"] == "needs_evidence"
+    assert data["jobs"][0]["prepare"]["route"]["state"] == "unrecorded"
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
