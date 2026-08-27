@@ -21,8 +21,13 @@ def _venv_python(root: Path) -> Path:
     return root / "bin" / "python"
 
 
+def display_command(command: list[str]) -> str:
+    """Return a log-safe command even when the parent console is non-UTF-8."""
+    return " ".join(part if part.isascii() else ascii(part) for part in command)
+
+
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> None:
-    print(f"+ {' '.join(command)}", flush=True)
+    print(f"+ {display_command(command)}", flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 

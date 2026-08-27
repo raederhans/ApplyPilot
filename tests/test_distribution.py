@@ -8,6 +8,7 @@ import pytest
 
 import install
 from scripts.build_release import audit_wheel
+from scripts.smoke_release import display_command
 
 
 def test_bundle_source_requires_matching_checksum(tmp_path: Path) -> None:
@@ -31,6 +32,13 @@ def test_jobboard_extra_supports_package_paths_and_vcs() -> None:
     assert install.with_extra("git+https://example.test/repo.git", True) == (
         "applypilot-local[jobboards] @ git+https://example.test/repo.git"
     )
+
+
+def test_release_smoke_command_preview_is_ascii_safe() -> None:
+    preview = display_command(["python", "--output", "C:/release workspace/工作区/dashboard.html"])
+
+    assert preview.isascii()
+    assert "\\u5de5\\u4f5c\\u533a" in preview
 
 
 def _write_wheel(path: Path, *, include_private_file: bool = False) -> None:
