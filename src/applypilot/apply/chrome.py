@@ -8,11 +8,13 @@ import json
 import logging
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.request import urlopen
 
 from applypilot import config
 
@@ -24,6 +26,41 @@ BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+
+SUPPORTED_BROWSER_BACKENDS = {"edge", "cloak", "auto"}
+DEFAULT_CLOAK_BROWSER_VERSION = "146.0.7680.177.5"
+
+
+def resolve_browser_backend(value: str | None = None, *, allow_auto: bool = True) -> str:
+    """Resolve and validate the requested browser runtime."""
+    backend = (value or os.environ.get("APPLYPILOT_BROWSER_BACKEND", "edge")).strip().lower()
+    allowed = SUPPORTED_BROWSER_BACKENDS if allow_auto else SUPPORTED_BROWSER_BACKENDS - {"auto"}
+    if backend not in allowed:
+        expected = "edge, cloak, or auto" if allow_auto else "edge or cloak"
+        raise ValueError(f"browser backend must be {expected}")
+    return backend
+
+
+def get_browser_executable(browser_backend: str) -> str:
+    """Return the executable for an Edge/Chrome or CloakBrowser worker."""
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    if backend == "edge":
+        return config.get_chrome_path()
+
+    try:
+        from cloakbrowser import ensure_binary
+    except ImportError as exc:
+        raise RuntimeError(
+            "CloakBrowser backend is not installed; install applypilot-local[stealth]"
+        ) from exc
+
+    # ApplyPilot owns update admission. CloakBrowser must not silently replace
+    # the tested browser binary between application runs.
+    os.environ.setdefault("CLOAKBROWSER_AUTO_UPDATE", "false")
+    requested_version = os.environ.get("APPLYPILOT_CLOAK_VERSION")
+    if not requested_version and not os.environ.get("CLOAKBROWSER_LICENSE_KEY"):
+        requested_version = DEFAULT_CLOAK_BROWSER_VERSION
+    return ensure_binary(browser_version=requested_version)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +136,7 @@ def _kill_on_port(port: int) -> None:
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int) -> Path:
+def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     """Create an isolated Chrome profile for a worker.
 
     On first run, clones from an existing worker profile (preferred, since
@@ -112,15 +149,31 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    worker_root = (
+        config.CLOAK_WORKER_DIR if backend == "cloak" else config.CHROME_WORKER_DIR
+    )
+    profile_dir = worker_root / f"worker-{worker_id}"
 
     mode = os.environ.get("APPLYPILOT_BROWSER_PROFILE_MODE", "clone").lower()
+
+    # A patched Chromium profile is a separate browser identity. Copying the
+    # user's daily Edge profile across browser products is both fragile and a
+    # privacy leak, so the legacy clone default becomes an isolated persistent
+    # profile for CloakBrowser.
+    if backend == "cloak" and mode == "clone":
+        mode = "persistent"
+        logger.info(
+            "[worker-%d] CloakBrowser never clones the daily browser profile; "
+            "using an isolated persistent profile",
+            worker_id,
+        )
 
     # Preview runs must not inherit extensions, autofill data, or stale session
     # state from either the user's daily profile or a previous experiment. Only
     # the ApplyPilot-owned worker directory is ever removed here.
     if mode == "fresh":
-        worker_root = config.CHROME_WORKER_DIR.resolve()
+        worker_root = worker_root.resolve()
         resolved_profile = profile_dir.resolve()
         if resolved_profile.parent != worker_root or resolved_profile == worker_root:
             raise ValueError(f"Unsafe browser worker profile path: {resolved_profile}")
@@ -199,6 +252,32 @@ def setup_worker_profile(worker_id: int) -> Path:
     return profile_dir
 
 
+def _cloak_fingerprint_seed(profile_dir: Path) -> int:
+    """Return a stable fingerprint seed for one isolated CloakBrowser profile."""
+    override = os.environ.get("APPLYPILOT_CLOAK_FINGERPRINT_SEED")
+    if override:
+        try:
+            value = int(override)
+        except ValueError as exc:
+            raise ValueError("APPLYPILOT_CLOAK_FINGERPRINT_SEED must be an integer") from exc
+        if value <= 0:
+            raise ValueError("APPLYPILOT_CLOAK_FINGERPRINT_SEED must be positive")
+        return value
+
+    marker = profile_dir / ".applypilot-cloak-fingerprint"
+    if marker.is_file():
+        try:
+            value = int(marker.read_text(encoding="ascii").strip())
+            if value > 0:
+                return value
+        except (OSError, ValueError):
+            logger.warning("Ignoring invalid CloakBrowser fingerprint marker at %s", marker)
+
+    value = secrets.randbelow(900_000) + 100_000
+    marker.write_text(str(value), encoding="ascii")
+    return value
+
+
 def _suppress_restore_nag(profile_dir: Path) -> None:
     """Clear Chrome's 'restore pages' nag by fixing Preferences.
 
@@ -226,10 +305,32 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
+def _wait_for_cdp_ready(
+    process: subprocess.Popen, port: int, timeout_seconds: float = 20.0
+) -> None:
+    """Wait until the browser exposes its local DevTools endpoint."""
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Browser exited before CDP became ready (exit={process.returncode})"
+            )
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.5) as response:
+                if response.status == 200:
+                    return
+        except Exception as exc:  # noqa: BLE001 - readiness preserves the last transport error
+            last_error = exc
+        time.sleep(0.2)
+    raise TimeoutError(f"Browser CDP port {port} was not ready: {last_error}")
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
                   headless: bool = False,
-                  start_url: str | None = None) -> subprocess.Popen:
-    """Launch a Chrome instance with remote debugging for a worker.
+                  start_url: str | None = None,
+                  browser_backend: str = "edge") -> subprocess.Popen:
+    """Launch an isolated Chromium runtime with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -243,7 +344,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    profile_dir = setup_worker_profile(worker_id, backend)
 
     # Kill any zombie Chrome from a previous run on this port
     _kill_on_port(port)
@@ -251,10 +353,11 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
-    chrome_exe = config.get_chrome_path()
+    browser_exe = get_browser_executable(backend)
 
     cmd = [
-        chrome_exe,
+        browser_exe,
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
@@ -273,12 +376,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         # party can observe or rewrite application fields.
         "--disable-extensions",
         "--disable-component-extensions-with-background-pages",
-        # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
+        # Block dangerous permissions at browser level. Do not use Chromium's
+        # fake-media auto-accept flags: they grant a synthetic camera/mic and
+        # contradict the application's permission boundary.
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if backend == "cloak":
+        cmd.append(f"--fingerprint={_cloak_fingerprint_seed(profile_dir)}")
     if headless:
         cmd.append("--headless=new")
     if start_url:
@@ -294,13 +399,17 @@ def launch_chrome(worker_id: int, port: int | None = None,
         kwargs["preexec_fn"] = os.setsid
 
     proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        _wait_for_cdp_ready(proc, port)
+    except Exception:
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
+        raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
+    logger.info("[worker-%d] %s browser started on port %d (pid %d)",
+                worker_id, backend, port, proc.pid)
     return proc
 
 

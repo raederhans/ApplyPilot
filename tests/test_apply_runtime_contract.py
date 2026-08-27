@@ -256,6 +256,7 @@ def _run_worker_contract(
     prepare_results: list[str] | None = None,
     observer_results: list[dict] | None = None,
     manual_captcha_relay: bool = False,
+    browser_backend: str = "edge",
     ledger_update_succeeds: bool = True,
     launch_calls: list[tuple[tuple, dict]] | None = None,
     queued_jobs: list[dict] | None = None,
@@ -276,6 +277,7 @@ def _run_worker_contract(
 
     def fake_run(current_job, *args, **kwargs):
         nonlocal prepare_index, submit_index
+        assert current_job.get("_browser_backend") in {"edge", "cloak"}
         phase = kwargs["submission_phase"]
         run_phases.append(phase)
         if phase == "prepare":
@@ -341,13 +343,16 @@ def _run_worker_contract(
     monkeypatch.setattr(
         launcher,
         "_mark_runtime_cover_not_required",
-        lambda current_job: {**current_job, "cover_letter_status": "not_required"},
+        lambda current_job: {
+            **{key: value for key, value in current_job.items() if key != "_browser_backend"},
+            "cover_letter_status": "not_required",
+        },
     )
     monkeypatch.setattr(
         launcher,
         "_prepare_runtime_cover_letter",
         lambda current_job: {
-            **current_job,
+            **{key: value for key, value in current_job.items() if key != "_browser_backend"},
             "cover_letter_status": "agent_validated",
             "cover_letter_path": "cover.txt",
         },
@@ -373,9 +378,57 @@ def _run_worker_contract(
         target_url=job["url"] if use_target_url else None,
         dry_run=False,
         manual_captcha_relay=manual_captcha_relay,
+        browser_backend=browser_backend,
         authorization_manifest={"batch_id": "batch-1", "max_submissions": 1},
     )
     return result, run_phases, ledger, marked
+
+
+def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["failed:cloudflare_blocked", "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge", "cloak"]
+    assert marked[0][1]["evidence"]["browser_backend"] == "cloak"
+    assert marked[0][1]["evidence"]["fallback_from_edge"] is True
+
+
+def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["captcha"],
+        launch_calls=launches,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+
+
+def test_auto_browser_backend_accepts_a_detailed_cloudflare_reason(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["failed:cloudflare_challenge:turnstile", "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge", "cloak"]
 
 
 def test_real_batch_replaces_pre_submit_failure_until_success_target(monkeypatch) -> None:

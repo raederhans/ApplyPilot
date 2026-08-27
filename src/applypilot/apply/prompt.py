@@ -429,13 +429,13 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_login_steps(profile: dict) -> str:
+def _build_login_steps(profile: dict, *, allow_account_creation: bool = True) -> str:
     """Build a narrow, auditable authentication policy for the browser agent."""
     authentication = profile.get("authentication", {})
     google_reuse_authorized = bool(
         authentication.get("google_sso_existing_session_authorized", False)
     )
-    account_creation_authorized = bool(
+    account_creation_authorized = allow_account_creation and bool(
         authentication.get("ats_account_creation_authorized", False)
     )
     gmail_verification_authorized = bool(
@@ -891,7 +891,10 @@ def build_prompt(job: dict, tailored_resume: str,
     # Phone digits only (for fields with country prefix)
     phone_digits = _national_phone_digits(personal)
 
-    authorized_login_steps = _build_login_steps(profile)
+    authorized_login_steps = _build_login_steps(
+        profile,
+        allow_account_creation=job.get("_browser_backend") != "cloak",
+    )
 
     # Preview mode is a separate workflow, not a weakened submission prompt.
     linkedin_resume = _linkedin_resume_preference(profile, job)
@@ -1102,7 +1105,7 @@ RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a f
     prompt = f"""You are a job application assistant. {mission_instruction}
 
 == REQUIRED BROWSER CONTROL ==
-The `playwright` MCP server is already attached to the visible isolated Edge session. Use only its browser_* MCP tools for all browser interaction. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or any other browser automation route. If the attached browser MCP is unavailable, output RESULT:FAILED:browser_mcp_unavailable and stop.
+The `playwright` MCP server is already attached to the visible isolated Chromium session. Use only its browser_* MCP tools for all browser interaction. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or any other browser automation route. If the attached browser MCP is unavailable, output RESULT:FAILED:browser_mcp_unavailable and stop.
 
 == FIELD IDENTITY RULES ==
 - Full name and all first/given/last/family/surname fields use the legal identity from APPLICANT PROFILE. Preferred/display name is used only when the label explicitly asks for it.

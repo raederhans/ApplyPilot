@@ -40,6 +40,9 @@ dependencies = [
 jobboards = [
     "python-jobspy==1.1.82; python_version < '3.13'",
 ]
+stealth = [
+    "cloakbrowser==0.5.9",
+]
 dev = [
     "build>=1.2",
     "hatchling>=1.27",

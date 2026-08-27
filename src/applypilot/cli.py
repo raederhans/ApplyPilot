@@ -1167,6 +1167,11 @@ def apply(
         "--agent-backend",
         help="Browser-agent CLI: codex or claude. Defaults to APPLYPILOT_APPLY_BACKEND.",
     ),
+    browser_backend: str | None = typer.Option(
+        None,
+        "--browser-backend",
+        help="Browser runtime: edge, cloak, or auto. Defaults to APPLYPILOT_BROWSER_BACKEND.",
+    ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     manual_captcha_relay: bool = typer.Option(
@@ -1200,7 +1205,6 @@ def apply(
     _bootstrap()
 
     from applypilot.config import PROFILE_PATH as _profile_path
-    from applypilot.config import get_chrome_path
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -1318,6 +1322,13 @@ def apply(
     if backend not in {"codex", "claude"}:
         console.print("[red]--agent-backend must be codex or claude.[/red]")
         raise typer.Exit(code=1)
+    from applypilot.apply.chrome import get_browser_executable, resolve_browser_backend
+
+    try:
+        effective_browser_backend = resolve_browser_backend(browser_backend)
+    except ValueError as exc:
+        console.print(f"[red]{exc}.[/red]")
+        raise typer.Exit(code=1) from None
     effective_model = model or (
         os.environ.get("APPLYPILOT_CODEX_MODEL", "gpt-5.6-sol")
         if backend == "codex"
@@ -1329,16 +1340,21 @@ def apply(
 
     backend_binary = shutil.which("codex.exe") or shutil.which("codex") if backend == "codex" else shutil.which("claude")
     try:
-        get_chrome_path()
+        if effective_browser_backend in {"edge", "auto"}:
+            get_browser_executable("edge")
+        if effective_browser_backend in {"cloak", "auto"}:
+            get_browser_executable("cloak")
         has_browser = True
-    except FileNotFoundError:
+        browser_error = ""
+    except (FileNotFoundError, RuntimeError) as exc:
         has_browser = False
+        browser_error = str(exc)
     if not backend_binary or not has_browser:
         missing = []
         if not backend_binary:
             missing.append(f"{backend} CLI")
         if not has_browser:
-            missing.append("Edge/Chrome/Chromium")
+            missing.append(browser_error or effective_browser_backend)
         console.print(f"[red]Browser apply is missing: {', '.join(missing)}.[/red]")
         raise typer.Exit(code=1)
 
@@ -1475,6 +1491,7 @@ def apply(
         workers=workers,
         agent_backend=backend,
         manual_captcha_relay=manual_captcha_relay,
+        browser_backend=effective_browser_backend,
         authorization_manifest=authorization_manifest,
     )
 
@@ -1487,6 +1504,11 @@ def browser_session(
         help="HTTPS page to open in the dedicated persistent browser profile.",
     ),
     worker: int = typer.Option(0, "--worker", help="Browser worker profile number."),
+    browser_backend: str | None = typer.Option(
+        None,
+        "--browser-backend",
+        help="Browser runtime: edge or cloak. Defaults to APPLYPILOT_BROWSER_BACKEND.",
+    ),
 ) -> None:
     """Open the dedicated visible browser for one-time interactive login."""
     _bootstrap()
@@ -1505,14 +1527,32 @@ def browser_session(
         )
         raise typer.Exit(code=1)
 
-    from applypilot.apply.chrome import cleanup_worker, launch_chrome
+    from applypilot.apply.chrome import (
+        cleanup_worker,
+        get_browser_executable,
+        launch_chrome,
+        resolve_browser_backend,
+    )
+
+    try:
+        effective_browser_backend = resolve_browser_backend(browser_backend, allow_auto=False)
+        get_browser_executable(effective_browser_backend)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Browser backend unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from None
 
     console.print("\n[bold blue]Opening persistent ApplyPilot browser session[/bold blue]")
     console.print(f"  Worker:  {worker}")
+    console.print(f"  Backend: {effective_browser_backend}")
     console.print(f"  URL:     {url}")
     console.print("  Close this dedicated browser window after completing the login.")
 
-    process = launch_chrome(worker, headless=False, start_url=url)
+    process = launch_chrome(
+        worker,
+        headless=False,
+        start_url=url,
+        browser_backend=effective_browser_backend,
+    )
     try:
         while process.poll() is None:
             time.sleep(0.5)
@@ -1900,6 +1940,7 @@ def dashboard(
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
+    import importlib.metadata
     import shutil
     import sqlite3
 
@@ -2006,6 +2047,20 @@ def doctor() -> None:
     except FileNotFoundError:
         results.append(("Edge/Chrome/Chromium", fail_mark,
                         "Install Edge/Chrome or set CHROME_PATH (needed for auto-apply)"))
+
+    try:
+        cloak_version = importlib.metadata.version("cloakbrowser")
+        results.append((
+            "CloakBrowser backend",
+            ok_mark,
+            f"wrapper {cloak_version}; binary is verified/resolved only when selected",
+        ))
+    except importlib.metadata.PackageNotFoundError:
+        results.append((
+            "CloakBrowser backend",
+            "[dim]optional[/dim]",
+            "Install applypilot-local[stealth] for the explicit anti-detection backend",
+        ))
 
     # Node.js / npx (for Playwright MCP)
     npx_bin = shutil.which("npx")

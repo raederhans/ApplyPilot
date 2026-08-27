@@ -27,6 +27,7 @@ LOG_DIR = APP_DIR / "logs"
 
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
+CLOAK_WORKER_DIR = APP_DIR / "cloak-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 
 # Package-shipped config (YAML registries)
@@ -100,7 +101,15 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        LOG_DIR,
+        CHROME_WORKER_DIR,
+        CLOAK_WORKER_DIR,
+        APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 

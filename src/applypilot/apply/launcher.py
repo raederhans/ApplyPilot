@@ -35,6 +35,7 @@ from applypilot.apply.chrome import (
     kill_all_chrome,
     launch_chrome,
     reset_worker_dir,
+    resolve_browser_backend,
 )
 from applypilot.apply.dashboard import (
     add_event,
@@ -2126,6 +2127,23 @@ PERMANENT_PREFIXES: tuple[str, ...] = (
     "unsafe_verification",
 )
 
+BOT_BLOCK_PREFIXES: tuple[str, ...] = (
+    "site_blocked",
+    "cloudflare",
+    "blocked_by_cloudflare",
+    "automation_blocked",
+    "bot_detected",
+)
+
+
+def _should_retry_with_cloak(result: str, requested_backend: str) -> bool:
+    """Return whether a pre-submit Edge failure merits one stealth retry."""
+    if requested_backend != "auto":
+        return False
+    reason = result.split(":", 1)[-1] if ":" in result else result
+    normalized = reason.casefold().replace(" ", "_").replace("-", "_")
+    return normalized.startswith(BOT_BLOCK_PREFIXES)
+
 
 def _is_permanent_failure(result: str) -> bool:
     """Determine if a failure should never be retried."""
@@ -2147,6 +2165,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 model: str = "sonnet", dry_run: bool = False,
                 agent_backend: str = "claude",
                 manual_captcha_relay: bool = False,
+                browser_backend: str = "edge",
                 authorization_manifest: dict | None = None,
                 attempted_urls: set[str] | None = None) -> tuple[int, int]:
     """Run jobs until the confirmed-success target is reached or the queue is empty.
@@ -2170,6 +2189,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
     profile = config.load_profile()
+    requested_browser_backend = resolve_browser_backend(browser_backend)
     run_attempted_urls = attempted_urls if attempted_urls is not None else set()
 
     while not _stop_event.is_set():
@@ -2227,13 +2247,18 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         ledger_reserved = False
         submission_evidence: dict | None = None
         try:
-            add_event(f"[W{worker_id}] Launching Chrome...")
+            active_browser_backend = (
+                "edge" if requested_browser_backend == "auto" else requested_browser_backend
+            )
+            job["_browser_backend"] = active_browser_backend
+            add_event(f"[W{worker_id}] Launching {active_browser_backend} browser...")
             start_url = str(job.get("application_url") or job["url"])
             chrome_proc = launch_chrome(
                 worker_id,
                 port=port,
                 headless=headless,
                 start_url=start_url,
+                browser_backend=active_browser_backend,
             )
 
             submission_phase = "submit" if dry_run else "prepare"
@@ -2247,6 +2272,49 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 manual_captcha_relay=manual_captcha_relay,
                 submission_phase=submission_phase,
             )
+
+            if _should_retry_with_cloak(result, requested_browser_backend):
+                edge_block_result = result
+                cleanup_worker(worker_id, chrome_proc)
+                chrome_proc = None
+                active_browser_backend = "cloak"
+                job["_browser_backend"] = active_browser_backend
+                add_event(
+                    f"[W{worker_id}] Bot protection detected; retrying once with CloakBrowser"
+                )
+                update_state(
+                    worker_id,
+                    status="retrying",
+                    last_action="switching to CloakBrowser",
+                )
+                try:
+                    chrome_proc = launch_chrome(
+                        worker_id,
+                        port=port,
+                        headless=headless,
+                        start_url=start_url,
+                        browser_backend=active_browser_backend,
+                    )
+                    result, stealth_duration = run_job(
+                        job,
+                        port=port,
+                        worker_id=worker_id,
+                        model=model,
+                        dry_run=dry_run,
+                        agent_backend=agent_backend,
+                        manual_captcha_relay=manual_captcha_relay,
+                        submission_phase=submission_phase,
+                    )
+                    duration_ms += stealth_duration
+                except Exception as exc:
+                    logger.exception("CloakBrowser fallback failed")
+                    result = f"failed:cloak_backend_unavailable:{type(exc).__name__}"
+                logger.info(
+                    "[worker-%d] Browser fallback edge_result=%s cloak_result=%s",
+                    worker_id,
+                    edge_block_result,
+                    result,
+                )
 
             while True:
                 if result in {"cover_not_required", "cover_letter_required"}:
@@ -2266,6 +2334,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                 last_action="generating validated cover letter",
                             )
                             job = _prepare_runtime_cover_letter(job)
+                        # Runtime cover resolution reloads the database row.
+                        # Re-attach the non-persisted browser policy before the
+                        # agent resumes on the existing Cloak/Edge page.
+                        job["_browser_backend"] = active_browser_backend
                         result, resumed_duration = run_job(
                             job,
                             port=port,
@@ -2453,6 +2525,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         })
 
                     submission_evidence = {
+                        "browser_backend": active_browser_backend,
+                        "fallback_from_edge": (
+                            requested_browser_backend == "auto"
+                            and active_browser_backend == "cloak"
+                        ),
                         "agent": agent_evidence,
                         "observer": observer_evidence,
                         "attempts": attempts,
@@ -2669,6 +2746,7 @@ def main(limit: int = 1, target_url: str | None = None,
          poll_interval: int = 60, workers: int = 1,
          agent_backend: str = "claude",
          manual_captcha_relay: bool = False,
+         browser_backend: str = "edge",
          authorization_manifest: dict | None = None) -> None:
     """Launch the apply pipeline.
 
@@ -2689,6 +2767,7 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+    requested_browser_backend = resolve_browser_backend(browser_backend)
 
     if not dry_run and authorization_manifest is None:
         raise ValueError("Every real submission requires an authorization manifest.")
@@ -2705,6 +2784,16 @@ def main(limit: int = 1, target_url: str | None = None,
 
     profile_worker_cap = int(submission_policy.get("maximum_workers", 1))
     workers = min(max(1, workers), max(1, profile_worker_cap), 3)
+    if (
+        requested_browser_backend in {"cloak", "auto"}
+        and workers > 1
+        and os.environ.get("APPLYPILOT_CLOAK_ALLOW_CONCURRENCY") != "1"
+    ):
+        console.print(
+            "[yellow]CloakBrowser defaults to one worker; set "
+            "APPLYPILOT_CLOAK_ALLOW_CONCURRENCY=1 only when the license permits it.[/yellow]"
+        )
+        workers = 1
 
     if continuous:
         effective_limit = 0
@@ -2736,7 +2825,10 @@ def main(limit: int = 1, target_url: str | None = None,
         init_worker(i)
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
-    console.print(f"Launching apply pipeline ({mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
+    console.print(
+        f"Launching apply pipeline ({mode_label}, {worker_label}, "
+        f"browser={requested_browser_backend}, poll every {POLL_INTERVAL}s)..."
+    )
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
     # Double Ctrl+C handler
@@ -2789,6 +2881,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     agent_backend=agent_backend,
                     manual_captcha_relay=manual_captcha_relay,
+                    browser_backend=requested_browser_backend,
                     authorization_manifest=authorization_manifest,
                     attempted_urls=attempted_urls,
                 )
@@ -2816,6 +2909,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             dry_run=dry_run,
                             agent_backend=agent_backend,
                             manual_captcha_relay=manual_captcha_relay,
+                            browser_backend=requested_browser_backend,
                             authorization_manifest=authorization_manifest,
                             attempted_urls=attempted_urls,
                         ): i

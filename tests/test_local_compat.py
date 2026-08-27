@@ -237,6 +237,37 @@ def test_persistent_browser_profile_never_clones_daily_profile(monkeypatch, tmp_
     assert not (profile / "Default" / "Cookies").exists()
 
 
+def test_cloak_clone_mode_becomes_an_isolated_persistent_profile(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("APPLYPILOT_BROWSER_PROFILE_MODE", "clone")
+    monkeypatch.setattr(config, "CLOAK_WORKER_DIR", tmp_path / "cloak-workers")
+    daily_profile = tmp_path / "daily" / "Default"
+    daily_profile.mkdir(parents=True)
+    (daily_profile / "Cookies").write_text("sensitive", encoding="utf-8")
+    monkeypatch.setattr(config, "get_chrome_user_data", lambda: daily_profile.parent)
+
+    profile = chrome.setup_worker_profile(0, "cloak")
+
+    assert profile == tmp_path / "cloak-workers" / "worker-0"
+    assert profile.is_dir()
+    assert not (profile / "Default" / "Cookies").exists()
+
+
+def test_browser_backend_validation_rejects_auto_for_a_concrete_launch() -> None:
+    assert chrome.resolve_browser_backend("auto") == "auto"
+    with pytest.raises(ValueError, match="edge or cloak"):
+        chrome.resolve_browser_backend("auto", allow_auto=False)
+
+
+def test_cloak_login_policy_disables_authorized_ats_account_creation() -> None:
+    steps = prompt._build_login_steps(
+        _application_profile(),
+        allow_account_creation=False,
+    )
+
+    assert "Do not create a new account" in steps
+    assert "account creation with" not in steps
+
+
 def test_unknown_browser_profile_mode_is_rejected(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("APPLYPILOT_BROWSER_PROFILE_MODE", "mystery")
     monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
@@ -255,12 +286,12 @@ def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) 
         def poll():
             return 0
 
-    monkeypatch.setattr(chrome, "setup_worker_profile", lambda _worker_id: tmp_path)
+    monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
     monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
     monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(chrome.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(chrome, "_wait_for_cdp_ready", lambda *_args, **_kwargs: None)
 
     def fake_popen(command, **kwargs):
         captured["command"] = command
@@ -274,6 +305,9 @@ def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) 
     assert "--disable-extensions" in captured["command"]
     assert "--disable-component-extensions-with-background-pages" in captured["command"]
     assert f"--user-data-dir={tmp_path}" in captured["command"]
+    assert "--remote-debugging-address=127.0.0.1" in captured["command"]
+    assert "--use-fake-device-for-media-stream" not in captured["command"]
+    assert "--use-fake-ui-for-media-stream" not in captured["command"]
 
 
 def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -> None:
@@ -286,12 +320,12 @@ def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -
         def poll():
             return 0
 
-    monkeypatch.setattr(chrome, "setup_worker_profile", lambda _worker_id: tmp_path)
+    monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
     monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
     monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(chrome.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(chrome, "_wait_for_cdp_ready", lambda *_args, **_kwargs: None)
 
     def fake_popen(command, **kwargs):
         captured["command"] = command
@@ -306,6 +340,51 @@ def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -
     )
 
     assert captured["command"][-1] == "https://www.linkedin.com/login"
+
+
+def test_cloak_launch_uses_separate_profile_and_stable_fingerprint(monkeypatch, tmp_path: Path) -> None:
+    captured = {}
+    profile = tmp_path / "cloak-worker"
+    profile.mkdir()
+
+    class Process:
+        pid = 789
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile)
+    monkeypatch.setattr(chrome, "_kill_on_port", lambda _port: None)
+    monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
+    monkeypatch.setattr(chrome, "get_browser_executable", lambda _backend: "cloak-chrome.exe")
+    monkeypatch.setattr(chrome, "_wait_for_cdp_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chrome, "_cloak_fingerprint_seed", lambda _profile: 424242)
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return Process()
+
+    monkeypatch.setattr(chrome.subprocess, "Popen", fake_popen)
+
+    chrome.launch_chrome(worker_id=0, port=9433, browser_backend="cloak")
+
+    assert captured["command"][0] == "cloak-chrome.exe"
+    assert "--fingerprint=424242" in captured["command"]
+    assert f"--user-data-dir={profile}" in captured["command"]
+
+
+def test_cloak_fingerprint_seed_persists_per_profile(monkeypatch, tmp_path: Path) -> None:
+    values = iter((123456, 654321))
+    monkeypatch.setattr(chrome.secrets, "randbelow", lambda _limit: next(values) - 100000)
+
+    first = chrome._cloak_fingerprint_seed(tmp_path)
+    second = chrome._cloak_fingerprint_seed(tmp_path)
+
+    assert first == 123456
+    assert second == first
 
 
 def test_agent_watchdog_kills_process_at_wall_clock_deadline(monkeypatch) -> None:
