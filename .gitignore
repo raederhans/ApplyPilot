@@ -19,6 +19,8 @@ output/
 tailored_resumes/
 cover_letters/
 chrome-workers/
+cloak-workers/
+.playwright-mcp/
 apply-workers/
 apply_logs/
 logs/

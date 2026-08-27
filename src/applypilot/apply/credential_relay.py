@@ -69,7 +69,12 @@ def _host_matches(host: str, candidate: str) -> bool:
 
 
 def host_is_allowed(host: str, configured_hosts: set[str]) -> bool:
-    """Return whether a host is an authorized employer/ATS credential target."""
+    """Return whether a host is an exact authorized employer credential target.
+
+    Known ATS domains are deliberately *not* globally authorized here.  They
+    are considered only by the unique-redirect fallback in ``_fill_fields``.
+    This keeps a second, unrelated ATS tab from receiving credentials.
+    """
     normalized = host.lower().strip(".")
     if not normalized:
         return False
@@ -77,8 +82,66 @@ def host_is_allowed(host: str, configured_hosts: set[str]) -> bool:
         return False
     return any(
         _host_matches(normalized, candidate)
-        for candidate in configured_hosts | KNOWN_ATS_HOSTS
+        for candidate in configured_hosts
     )
+
+
+def host_is_known_ats(host: str) -> bool:
+    """Return whether a non-identity host belongs to a supported ATS family."""
+    normalized = host.lower().strip(".")
+    if not normalized:
+        return False
+    if any(_host_matches(normalized, blocked) for blocked in BLOCKED_IDENTITY_HOSTS):
+        return False
+    return any(_host_matches(normalized, candidate) for candidate in KNOWN_ATS_HOSTS)
+
+
+def _select_candidate(candidates: list[dict[str, object]]) -> dict[str, object]:
+    """Choose one unambiguous page/frame candidate.
+
+    Exact configured-host candidates win.  A known-ATS redirect is accepted
+    only when the caller explicitly enabled it and exactly one browser page
+    contains eligible credential fields.  Multiple matching tabs fail closed
+    instead of selecting whichever Playwright happened to enumerate first.
+    """
+    exact = [candidate for candidate in candidates if candidate["match"] == "exact"]
+    eligible = exact or [
+        candidate for candidate in candidates if candidate["match"] == "known_ats_redirect"
+    ]
+    if not eligible:
+        raise CredentialRelayError(
+            "No visible editable credential field was found on the authorized job page."
+        )
+
+    page_indexes = {int(candidate["page_index"]) for candidate in eligible}
+    if len(page_indexes) != 1:
+        raise CredentialRelayError(
+            "Credential relay found matching fields on multiple browser tabs; close or "
+            "disambiguate the unrelated ATS tab and retry."
+        )
+
+    ranked = sorted(
+        eligible,
+        key=lambda candidate: (
+            int(candidate.get("field_count", 0)),
+            candidate.get("frame_url") == candidate.get("page_url"),
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    tied = [
+        candidate
+        for candidate in ranked
+        if candidate.get("field_count") == best.get("field_count")
+        and (candidate.get("frame_url") == candidate.get("page_url"))
+        == (best.get("frame_url") == best.get("page_url"))
+    ]
+    if len(tied) > 1:
+        raise CredentialRelayError(
+            "Credential relay found equally plausible credential forms in one tab; retry "
+            "after the page finishes navigating."
+        )
+    return best
 
 
 def _credential_path() -> Path:
@@ -161,6 +224,14 @@ def _visible_locator(frame: Frame, selectors: tuple[str, ...]) -> Locator | None
     return None
 
 
+def _requested_fields_present(field: str, email_present: bool, password_present: bool) -> bool:
+    if field == "both":
+        return email_present and password_present
+    if field == "email":
+        return email_present
+    return password_present
+
+
 def _candidate_pages(pages: list[Page]) -> list[Page]:
     return sorted(
         (page for page in pages if page.url and page.url != "about:blank"),
@@ -174,20 +245,90 @@ def _allowed_hosts() -> set[str]:
     return {host.strip().lower() for host in raw.split(",") if host.strip()}
 
 
+def _password_allowed_hosts() -> set[str]:
+    raw = os.environ.get("APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS", "")
+    return {host.strip().lower() for host in raw.split(",") if host.strip()}
+
+
+def _relay_is_authorized() -> bool:
+    return os.environ.get("APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED", "").strip() == "1"
+
+
+def _password_host_is_allowed(host: str) -> bool:
+    return host_is_known_ats(host) or host_is_allowed(host, _password_allowed_hosts())
+
+
+def _known_ats_redirect_enabled() -> bool:
+    return os.environ.get("APPLYPILOT_CREDENTIAL_ALLOW_KNOWN_ATS_REDIRECT", "").strip() == "1"
+
+
+def _root_target_ids() -> set[str]:
+    raw = os.environ.get("APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS", "")
+    return {value.strip() for value in raw.split(",") if value.strip()}
+
+
+def _target_descends_from(
+    target_id: str,
+    root_target_ids: set[str],
+    target_infos: dict[str, dict[str, object]],
+) -> bool:
+    """Accept the original application CDP target or an opener descendant."""
+    current = target_id
+    visited: set[str] = set()
+    while current and current not in visited:
+        if current in root_target_ids:
+            return True
+        visited.add(current)
+        current = str(target_infos.get(current, {}).get("openerId") or "")
+    return False
+
+
 def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[str, object]:
+    if not _relay_is_authorized():
+        raise CredentialRelayError("Credential relay is not authorized by the trusted profile.")
     configured_hosts = _allowed_hosts()
     if not configured_hosts:
         raise CredentialRelayError("No authorized employer/ATS host was configured for this job.")
+    root_target_ids = _root_target_ids()
+    if not root_target_ids:
+        raise CredentialRelayError(
+            "Credential relay could not bind this request to the worker's application tab."
+        )
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+        browser_session = browser.new_browser_cdp_session()
+        target_infos = {
+            str(info.get("targetId") or ""): info
+            for info in browser_session.send("Target.getTargets").get("targetInfos", [])
+            if info.get("targetId")
+        }
         pages = [page for context in browser.contexts for page in context.pages]
-        for page in _candidate_pages(pages):
+        candidates: list[dict[str, object]] = []
+        for page_index, page in enumerate(_candidate_pages(pages)):
+            try:
+                target_info = page.context.new_cdp_session(page).send("Target.getTargetInfo")[
+                    "targetInfo"
+                ]
+            except Exception:  # noqa: BLE001, S112 - navigation may detach between snapshots
+                continue
+            target_id = str(target_info.get("targetId") or "")
+            target_infos[target_id] = target_info
+            if not _target_descends_from(target_id, root_target_ids, target_infos):
+                continue
             page_host = (urlparse(page.url).hostname or "").lower()
-            for frame in page.frames:
+            for frame_index, frame in enumerate(page.frames):
                 frame_host = (urlparse(frame.url).hostname or page_host).lower()
                 target_host = frame_host or page_host
-                if not host_is_allowed(target_host, configured_hosts):
+                if host_is_allowed(target_host, configured_hosts):
+                    match = "exact"
+                elif _known_ats_redirect_enabled() and host_is_known_ats(target_host):
+                    match = "known_ats_redirect"
+                else:
+                    continue
+                if field in {"password", "both"} and not (
+                    _password_host_is_allowed(target_host)
+                ):
                     continue
 
                 email_locator = (
@@ -200,28 +341,46 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                     if field in {"password", "both"}
                     else None
                 )
-                if email_locator is None and password_locator is None:
+                if not _requested_fields_present(
+                    field,
+                    email_locator is not None,
+                    password_locator is not None,
+                ):
                     continue
+                candidates.append(
+                    {
+                        "page_index": page_index,
+                        "target_id": target_id,
+                        "frame_index": frame_index,
+                        "page_url": page.url,
+                        "frame_url": frame.url,
+                        "host": target_host,
+                        "match": match,
+                        "field_count": int(email_locator is not None) + int(password_locator is not None),
+                        "email_locator": email_locator,
+                        "password_locator": password_locator,
+                    }
+                )
 
-                email_filled = False
-                password_filled = False
-                if email_locator is not None:
-                    email_locator.fill(email)
-                    email_filled = True
-                if password_locator is not None:
-                    password_locator.fill(password)
-                    password_filled = True
-                return {
-                    "status": "filled",
-                    "host": target_host,
-                    "email_filled": email_filled,
-                    "password_filled": password_filled,
-                    "submitted": False,
-                }
-
-    raise CredentialRelayError(
-        "No visible editable credential field was found on an authorized employer/ATS page."
-    )
+        selected = _select_candidate(candidates)
+        email_locator = selected["email_locator"]
+        password_locator = selected["password_locator"]
+        email_filled = False
+        password_filled = False
+        if email_locator is not None:
+            email_locator.fill(email)
+            email_filled = True
+        if password_locator is not None:
+            password_locator.fill(password)
+            password_filled = True
+        return {
+            "status": "filled",
+            "host": selected["host"],
+            "selection": selected["match"],
+            "email_filled": email_filled,
+            "password_filled": password_filled,
+            "submitted": False,
+        }
 
 
 def main(argv: list[str] | None = None) -> int:

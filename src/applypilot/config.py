@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
+from applypilot.runtime_settings import load_runtime_settings
+
 # User data directory — all user-specific files live here
 APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
 
@@ -27,6 +29,7 @@ LOG_DIR = APP_DIR / "logs"
 
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
+CLOAK_WORKER_DIR = APP_DIR / "cloak-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 
 # Package-shipped config (YAML registries)
@@ -100,7 +103,15 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        LOG_DIR,
+        CHROME_WORKER_DIR,
+        CLOAK_WORKER_DIR,
+        APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -503,12 +514,24 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
+def get_apply_backend() -> str:
+    """Return the configured browser-agent backend, defaulting to Codex."""
+    return load_runtime_settings().resolve_apply_backend(fallback_invalid=True)
+
+
+def get_apply_backend_binary() -> str | None:
+    backend = get_apply_backend()
+    if backend == "codex":
+        return shutil.which("codex.exe") or shutil.which("codex")
+    return shutil.which("claude")
+
+
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):       + selected browser-agent CLI + Chrome
     """
     load_env()
 
@@ -516,14 +539,14 @@ def get_tier() -> int:
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    has_apply_backend = get_apply_backend_binary() is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_apply_backend and has_chrome:
         return 3
 
     return 2
@@ -547,8 +570,8 @@ def check_tier(required: int, feature: str) -> None:
     if required >= 2 and not has_llm_provider():
         missing.append("LLM provider — set Gemini, OpenAI, DeepSeek, or a local OpenAI-compatible endpoint")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if not get_apply_backend_binary():
+            missing.append(f"{get_apply_backend()} CLI — install or add it to PATH")
         try:
             get_chrome_path()
         except FileNotFoundError:

@@ -26,7 +26,7 @@ from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
 from applypilot.scoring.cover_letter import read_resume_source
 
-TAXONOMY_VERSION = "resume-library-v2"
+TAXONOMY_VERSION = "resume-library-v4"
 POLICY_VERSION = "reuse-policy-v2"
 
 REUSE_REQUIRED_COVERAGE = 0.90
@@ -204,6 +204,31 @@ def _profile_skills(profile: Mapping[str, object]) -> set[str]:
             if isinstance(items, Iterable) and not isinstance(items, (str, bytes)):
                 result.update(_normalise_text(item) for item in items if _normalise_text(item))
     return result
+
+
+def _configured_source_paths_for_track(
+    profile: Mapping[str, object], track: str | None
+) -> set[str]:
+    """Return explicitly configured source resumes for one canonical track."""
+    if not track:
+        return set()
+    tailoring = profile.get("tailoring", {})
+    if not isinstance(tailoring, Mapping):
+        return set()
+    variants = tailoring.get("resume_variants", [])
+    if not isinstance(variants, list):
+        return set()
+    paths: set[str] = set()
+    for variant in variants:
+        if not isinstance(variant, Mapping):
+            continue
+        configured_track = _PROFILE_TRACK_ALIASES.get(
+            _normalise_text(variant.get("track"))
+        )
+        configured_path = str(variant.get("path") or "").strip()
+        if configured_track == track and configured_path:
+            paths.add(str(Path(configured_path).resolve()).casefold())
+    return paths
 
 
 def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
@@ -993,6 +1018,9 @@ def route_resume_for_job(
     elif not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55:
         reason = "No sufficiently confident fine-grained role subtype was found."
     else:
+        configured_source_paths = _configured_source_paths_for_track(
+            profile, str(job_profile.get("track") or "") or None
+        )
         rows = conn.execute(
             """
             SELECT DISTINCT a.*
@@ -1026,12 +1054,27 @@ def route_resume_for_job(
                     artifact,
                     exact_job_validation=exact_evidence is not None,
                 )
+                source_path = str(artifact.get("source_resume_path") or "").strip()
+                source_is_configured = bool(source_path) and (
+                    str(Path(source_path).resolve()).casefold()
+                    in configured_source_paths
+                )
+                artifact_track_matches = (
+                    str(artifact.get("track") or "")
+                    == str(job_profile.get("track") or "")
+                )
+                scored["configured_source_preference"] = source_is_configured
+                scored["artifact_track_matches"] = artifact_track_matches
+                scored["route_preference_score"] = (
+                    int(source_is_configured) + int(artifact_track_matches)
+                )
                 scored["artifact"] = artifact
                 candidates.append(scored)
         candidates.sort(
             key=lambda item: (
                 not item["exact_job_validation"],
                 -item["overall_score"],
+                -item["route_preference_score"],
                 item["artifact_id"],
             )
         )
@@ -1047,11 +1090,22 @@ def route_resume_for_job(
             artifact_id = str(top["artifact_id"])
             required_coverage = float(top["required_coverage"])
             overall_score = float(top["overall_score"])
-            margin = (
-                round(overall_score - float(candidates[1]["overall_score"]), 6)
-                if len(candidates) > 1
-                else 1.0
-            )
+            route_preference_resolved_tie = False
+            if len(candidates) > 1:
+                runner_up = candidates[1]
+                route_preference_resolved_tie = (
+                    overall_score == float(runner_up["overall_score"])
+                    and int(top["route_preference_score"])
+                    > int(runner_up["route_preference_score"])
+                )
+                margin = (
+                    1.0
+                    if route_preference_resolved_tie
+                    else round(overall_score - float(runner_up["overall_score"]), 6)
+                )
+            else:
+                margin = 1.0
+            components["route_preference_resolved_tie"] = route_preference_resolved_tie
             hard_gaps = list(top["missing_required"])
             if top["exact_job_validation"]:
                 margin = 1.0
@@ -1086,7 +1140,16 @@ def route_resume_for_job(
                 reason = "Two validated artifacts are too close to choose automatically."
             elif not top["exact_job_validation"]:
                 decision = "reuse_exact"
-                reason = "A current validated artifact covers the same subtype and clears all reuse gates."
+                if route_preference_resolved_tie:
+                    reason = (
+                        "A current validated artifact uses the explicitly configured source "
+                        "for this track and clears all reuse gates."
+                    )
+                else:
+                    reason = (
+                        "A current validated artifact covers the same subtype and clears all "
+                        "reuse gates."
+                    )
 
     assignment_id = _record_assignment(
         conn,

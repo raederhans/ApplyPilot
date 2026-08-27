@@ -121,6 +121,40 @@ applypilot apply --authorization-file <batch-manifest.json>
 applypilot reconcile-receipts --file <receipt.json>
 ```
 
+The default browser backend is the installed Edge/Chrome runtime. An optional,
+isolated CloakBrowser backend is available for authorized sites that reject a
+normal Playwright/CDP session because of automation fingerprinting:
+
+```bash
+python -m pip install -e ".[stealth]"
+applypilot apply --dry-run --url <verified-job-url> --browser-backend cloak
+applypilot apply --dry-run --url <verified-job-url> --browser-backend auto
+```
+
+`auto` starts with Edge and makes at most one CloakBrowser retry only for an
+explicit bot/WAF block. It never retries a CAPTCHA, assessment, selector
+failure, authentication failure, or any operation after submission begins.
+CloakBrowser is a browser runtime, not a second form-filling agent: Playwright
+remains the structured interaction driver on both Edge and Cloak. Independent
+Edge workers may run in parallel; workers that actually need Cloak share one
+serialized fallback lane unless the configured license explicitly permits
+concurrency.
+
+`--interaction-mode auto` also teaches the isolated Playwright agent when to
+request a bounded Windows Computer Use handoff for a genuinely visual-only or
+native control. Computer Use is not injected into the isolated CLI process, so
+the request fails closed for an outer agent to handle with a fresh observation;
+it is never used for file pickers, CAPTCHA/MFA, permissions, assessments, or a
+second final-submit attempt. Use `--interaction-mode playwright` to disable
+that handoff request.
+
+CloakBrowser uses its own `cloak-workers/` profiles and never clones the daily
+Edge profile. ApplyPilot disables CloakBrowser auto-updates and pins the
+keyless binary unless `APPLYPILOT_CLOAK_VERSION` or a separately managed
+`CLOAKBROWSER_LICENSE_KEY` selects another admitted build. The upstream binary
+license prohibits automated account creation and redistribution; those flows
+must continue with the ordinary/manual path.
+
 Dry-run and preview states are not submission receipts. The application
 runtime deliberately keeps uncertain outcomes as `submission_uncertain` until
 reconciliation proves the exact application was accepted.
@@ -160,7 +194,8 @@ The default workspace is `~/.applypilot/`. Do not commit or share:
 
 - `profile.json`, resumes, generated PDFs, cover letters, or SQLite databases;
 - `.env`, API keys, credential records, browser profiles, or verification codes;
-- application screenshots, receipts, logs, or worker attachments.
+- application screenshots, receipts, logs, worker attachments, or
+  `chrome-workers/` / `cloak-workers/` browser profiles.
 
 Credentials are read only at execution time. The project does not endorse
 CAPTCHA bypass, identity-document automation, account recovery, or hidden

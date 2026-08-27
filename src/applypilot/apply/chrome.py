@@ -8,13 +8,18 @@ import json
 import logging
 import os
 import platform
+import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from applypilot import config
+from applypilot.runtime_settings import load_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +29,156 @@ BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+_cdp_port_claims: dict[int, tuple[int, Path]] = {}
+
+SUPPORTED_BROWSER_BACKENDS = {"edge", "cloak", "auto"}
+DEFAULT_CLOAK_BROWSER_VERSION = "146.0.7680.177.5"
+
+
+def _lock_owner_is_running(lock_path: Path) -> bool | None:
+    """Return process liveness, or None when ownership cannot be proven."""
+    try:
+        content = lock_path.read_text(encoding="ascii")
+        token = next(part for part in content.split() if part.startswith("pid="))
+        pid = int(token.removeprefix("pid="))
+        if pid <= 0:
+            return None
+        if platform.system() == "Windows":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False if ctypes.get_last_error() == 87 else None
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return None
+                return exit_code.value == 259
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def _remove_stale_cdp_locks(lock_dir: Path) -> None:
+    """Remove only lock files whose recorded process is confirmed dead."""
+    for lock_path in lock_dir.glob("*.lock"):
+        if _lock_owner_is_running(lock_path) is False:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("Unable to remove stale CDP lock %s", lock_path, exc_info=True)
+
+
+def allocate_cdp_port(worker_id: int) -> int:
+    """Claim a run-owned ephemeral CDP port without touching other processes.
+
+    A small lock file coordinates concurrent ApplyPilot processes. The socket
+    is released immediately before Chromium binds it; the lock prevents other
+    ApplyPilot runs from selecting the same port during that short window.
+    """
+    lock_dir = config.APPLY_WORKER_DIR / "cdp-port-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    _remove_stale_cdp_locks(lock_dir)
+    release_cdp_port(worker_id)
+
+    for _ in range(32):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+        lock_path = lock_dir / f"{port}.lock"
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        try:
+            os.write(fd, f"pid={os.getpid()} worker={worker_id}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+        with _chrome_lock:
+            _cdp_port_claims[worker_id] = (port, lock_path)
+        return port
+    raise RuntimeError("Unable to reserve an isolated CDP port")
+
+
+def release_cdp_port(worker_id: int) -> None:
+    """Release only the CDP-port claim owned by this process and worker."""
+    with _chrome_lock:
+        claim = _cdp_port_claims.pop(worker_id, None)
+    if claim is None:
+        return
+    _port, lock_path = claim
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Unable to remove owned CDP lock %s", lock_path, exc_info=True)
+
+
+def resolve_browser_backend(value: str | None = None, *, allow_auto: bool = True) -> str:
+    """Resolve and validate the requested browser runtime."""
+    return load_runtime_settings().resolve_browser_backend(value, allow_auto=allow_auto)
+
+
+def get_browser_executable(browser_backend: str) -> str:
+    """Return the executable for an Edge/Chrome or CloakBrowser worker."""
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    if backend == "edge":
+        return config.get_chrome_path()
+
+    unsafe_overrides = (
+        "CLOAKBROWSER_BINARY_PATH",
+        "CLOAKBROWSER_DOWNLOAD_URL",
+        "CLOAKBROWSER_SKIP_CHECKSUM",
+    )
+    configured_overrides = [name for name in unsafe_overrides if os.environ.get(name)]
+    if configured_overrides:
+        raise RuntimeError(
+            "CloakBrowser security policy rejects binary/checksum overrides: "
+            + ", ".join(configured_overrides)
+        )
+
+    try:
+        from cloakbrowser import ensure_binary
+    except ImportError as exc:
+        raise RuntimeError(
+            "CloakBrowser backend is not installed; install applypilot-local[stealth]"
+        ) from exc
+
+    # ApplyPilot owns update admission. CloakBrowser must not silently replace
+    # the tested browser binary between application runs.
+    os.environ["CLOAKBROWSER_AUTO_UPDATE"] = "false"
+    requested_version = (
+        os.environ.get("APPLYPILOT_CLOAK_VERSION")
+        or DEFAULT_CLOAK_BROWSER_VERSION
+    )
+    if os.environ.get("CLOAKBROWSER_LICENSE_KEY"):
+        from cloakbrowser.license import resolve_license_key, validate_license
+
+        license_info = validate_license(resolve_license_key(None))
+        if not license_info or not license_info.valid:
+            raise RuntimeError("CloakBrowser license could not be validated for pinned execution")
+        if str(license_info.plan).casefold() == "free":
+            raise RuntimeError(
+                "CloakBrowser free licenses force an unpinned latest binary; "
+                "unset the key or use a pin-capable license"
+            )
+    return ensure_binary(browser_version=requested_version)
 
 
 # ---------------------------------------------------------------------------
@@ -63,43 +218,11 @@ def _kill_process_tree(pid: int) -> None:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
 
 
-def _kill_on_port(port: int) -> None:
-    """Kill any process listening on a specific port (zombie cleanup).
-
-    Uses netstat on Windows, lsof on macOS/Linux.
-    """
-    try:
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10, check=False,
-            )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        _kill_process_tree(int(pid))
-        else:
-            # macOS / Linux
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10, check=False,
-            )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
-                if pid_str.isdigit():
-                    _kill_process_tree(int(pid_str))
-    except FileNotFoundError:
-        logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
-    except Exception:
-        logger.debug("Failed to kill process on port %d", port, exc_info=True)
-
-
 # ---------------------------------------------------------------------------
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int) -> Path:
+def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     """Create an isolated Chrome profile for a worker.
 
     On first run, clones from an existing worker profile (preferred, since
@@ -112,15 +235,31 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    worker_root = (
+        config.CLOAK_WORKER_DIR if backend == "cloak" else config.CHROME_WORKER_DIR
+    )
+    profile_dir = worker_root / f"worker-{worker_id}"
 
     mode = os.environ.get("APPLYPILOT_BROWSER_PROFILE_MODE", "clone").lower()
+
+    # A patched Chromium profile is a separate browser identity. Copying the
+    # user's daily Edge profile across browser products is both fragile and a
+    # privacy leak, so the legacy clone default becomes an isolated persistent
+    # profile for CloakBrowser.
+    if backend == "cloak" and mode == "clone":
+        mode = "persistent"
+        logger.info(
+            "[worker-%d] CloakBrowser never clones the daily browser profile; "
+            "using an isolated persistent profile",
+            worker_id,
+        )
 
     # Preview runs must not inherit extensions, autofill data, or stale session
     # state from either the user's daily profile or a previous experiment. Only
     # the ApplyPilot-owned worker directory is ever removed here.
     if mode == "fresh":
-        worker_root = config.CHROME_WORKER_DIR.resolve()
+        worker_root = worker_root.resolve()
         resolved_profile = profile_dir.resolve()
         if resolved_profile.parent != worker_root or resolved_profile == worker_root:
             raise ValueError(f"Unsafe browser worker profile path: {resolved_profile}")
@@ -199,6 +338,32 @@ def setup_worker_profile(worker_id: int) -> Path:
     return profile_dir
 
 
+def _cloak_fingerprint_seed(profile_dir: Path) -> int:
+    """Return a stable fingerprint seed for one isolated CloakBrowser profile."""
+    override = os.environ.get("APPLYPILOT_CLOAK_FINGERPRINT_SEED")
+    if override:
+        try:
+            value = int(override)
+        except ValueError as exc:
+            raise ValueError("APPLYPILOT_CLOAK_FINGERPRINT_SEED must be an integer") from exc
+        if value <= 0:
+            raise ValueError("APPLYPILOT_CLOAK_FINGERPRINT_SEED must be positive")
+        return value
+
+    marker = profile_dir / ".applypilot-cloak-fingerprint"
+    if marker.is_file():
+        try:
+            value = int(marker.read_text(encoding="ascii").strip())
+            if value > 0:
+                return value
+        except (OSError, ValueError):
+            logger.warning("Ignoring invalid CloakBrowser fingerprint marker at %s", marker)
+
+    value = secrets.randbelow(900_000) + 100_000
+    marker.write_text(str(value), encoding="ascii")
+    return value
+
+
 def _suppress_restore_nag(profile_dir: Path) -> None:
     """Clear Chrome's 'restore pages' nag by fixing Preferences.
 
@@ -226,10 +391,72 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
+def _wait_for_cdp_ready(
+    process: subprocess.Popen, port: int, timeout_seconds: float = 20.0
+) -> None:
+    """Wait until the browser exposes its local DevTools endpoint."""
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Browser exited before CDP became ready (exit={process.returncode})"
+            )
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.5) as response:
+                if response.status == 200:
+                    return
+        except Exception as exc:  # noqa: BLE001 - readiness preserves the last transport error
+            last_error = exc
+        time.sleep(0.2)
+    raise TimeoutError(f"Browser CDP port {port} was not ready: {last_error}")
+
+
+def _scoped_cookie_urls(allowed_urls: list[str] | tuple[str, ...]) -> list[str]:
+    scoped_urls = []
+    for value in allowed_urls:
+        parsed = urlparse(str(value))
+        if parsed.scheme == "https" and parsed.hostname:
+            scoped_urls.append(str(value))
+    return scoped_urls
+
+
+def capture_browser_session(port: int, allowed_urls: list[str] | tuple[str, ...]) -> dict:
+    """Capture only cookies applicable to explicitly bound application URLs."""
+    scoped_urls = _scoped_cookie_urls(allowed_urls)
+    from playwright.sync_api import sync_playwright
+
+    endpoint = f"http://127.0.0.1:{port}"
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts or not scoped_urls:
+            return {"cookies": []}
+        return {"cookies": browser.contexts[0].cookies(scoped_urls)}
+
+
+def restore_browser_session(port: int, session: dict, start_url: str) -> int:
+    """Import an in-memory session into a running ApplyPilot browser."""
+    from playwright.sync_api import sync_playwright
+
+    cookies = list(session.get("cookies") or [])
+    endpoint = f"http://127.0.0.1:{port}"
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts:
+            raise RuntimeError("CloakBrowser exposed no default browser context")
+        context = browser.contexts[0]
+        if cookies:
+            context.add_cookies(cookies)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(start_url, wait_until="domcontentloaded", timeout=45_000)
+    return len(cookies)
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
                   headless: bool = False,
-                  start_url: str | None = None) -> subprocess.Popen:
-    """Launch a Chrome instance with remote debugging for a worker.
+                  start_url: str | None = None,
+                  browser_backend: str = "edge") -> subprocess.Popen:
+    """Launch an isolated Chromium runtime with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -243,18 +470,17 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
-
-    # Kill any zombie Chrome from a previous run on this port
-    _kill_on_port(port)
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    profile_dir = setup_worker_profile(worker_id, backend)
 
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
-    chrome_exe = config.get_chrome_path()
+    browser_exe = get_browser_executable(backend)
 
     cmd = [
-        chrome_exe,
+        browser_exe,
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
@@ -273,12 +499,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         # party can observe or rewrite application fields.
         "--disable-extensions",
         "--disable-component-extensions-with-background-pages",
-        # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
+        # Block dangerous permissions at browser level. Do not use Chromium's
+        # fake-media auto-accept flags: they grant a synthetic camera/mic and
+        # contradict the application's permission boundary.
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if backend == "cloak":
+        cmd.append(f"--fingerprint={_cloak_fingerprint_seed(profile_dir)}")
     if headless:
         cmd.append("--headless=new")
     if start_url:
@@ -294,13 +522,17 @@ def launch_chrome(worker_id: int, port: int | None = None,
         kwargs["preexec_fn"] = os.setsid
 
     proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        _wait_for_cdp_ready(proc, port)
+    except Exception:
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
+        raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
+    logger.info("[worker-%d] %s browser started on port %d (pid %d)",
+                worker_id, backend, port, proc.pid)
     return proc
 
 
@@ -330,10 +562,12 @@ def kill_all_chrome() -> None:
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        release_cdp_port(wid)
 
-    # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
+    with _chrome_lock:
+        claimed_workers = list(_cdp_port_claims)
+    for wid in claimed_workers:
+        release_cdp_port(wid)
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -367,7 +601,9 @@ def cleanup_on_exit() -> None:
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        release_cdp_port(wid)
 
-    # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
+    with _chrome_lock:
+        claimed_workers = list(_cdp_port_claims)
+    for wid in claimed_workers:
+        release_cdp_port(wid)

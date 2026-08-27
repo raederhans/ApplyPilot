@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -157,7 +157,7 @@
     }
     .workflow li.active .stage-count { border-color: #45624f; color: var(--mint); }
     .rail-note {
-      margin-top: auto;
+      margin-top: 14px;
       padding-top: 18px;
       border-top: 1px solid var(--line-soft);
       color: var(--quiet);
@@ -171,6 +171,35 @@
       letter-spacing: .08em;
       text-transform: uppercase;
     }
+    .language-control {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      margin-top: auto;
+      color: var(--quiet);
+      font: 10px/1 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .language-options {
+      display: inline-flex;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--ink);
+    }
+    .language-option {
+      min-width: 34px;
+      padding: 6px 7px;
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--quiet);
+      font: 650 10px/1 var(--mono);
+      cursor: pointer;
+    }
+    .language-option[aria-pressed="true"] { background: var(--panel-raised); color: var(--mint); }
 
     main { min-width: 0; padding: 46px clamp(24px, 4vw, 64px) 70px; }
     .page-head {
@@ -549,6 +578,7 @@
       .workflow button { grid-template-columns: 1fr; padding: 8px; }
       .workflow li.active::before { inset: auto 8px -1px; width: auto; height: 2px; }
       .workflow button > span:nth-child(2) > span, .stage-count, .rail-note { display: none; }
+      .language-control { margin-top: 18px; }
       main { padding-top: 32px; }
       .content-grid { grid-template-columns: 1fr; }
       .insights { border-top: 1px solid var(--line); border-left: 0; }
@@ -603,6 +633,13 @@
         <li role="presentation"><button id="prepare-tab" type="button" role="tab" aria-selected="false" aria-controls="prepare-panel" data-stage="prepare" tabindex="-1"><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span><span class="stage-count" id="prepare-stage-count">0</span></button></li>
         <li role="presentation"><button id="verify-tab" type="button" role="tab" aria-selected="false" aria-controls="verify-panel" data-stage="verify" tabindex="-1"><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span><span class="stage-count" id="verify-stage-count">0</span></button></li>
       </ol>
+      <div class="language-control">
+        <span>Interface language</span>
+        <div class="language-options" role="group" aria-label="Interface language">
+          <button class="language-option" type="button" data-locale="zh" aria-pressed="true" aria-label="Use Chinese">中文</button>
+          <button class="language-option" type="button" data-locale="en" aria-pressed="false" aria-label="Use English">EN</button>
+        </div>
+      </div>
       <div class="rail-note"><strong>Private by default</strong>Generated from your local SQLite workspace. No analytics or remote UI assets.</div>
     </aside>
 
@@ -682,10 +719,9 @@
             <label class="search-wrap"><span class="sr-only">Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
             <label><span class="sr-only">Sort opportunities</span><select id="decide-sort" class="sort"><option value="fit">FIT SCORE</option><option value="recent">RECENT</option><option value="company">COMPANY</option></select></label>
             <div class="filters" role="group" aria-label="Minimum fit score">
-              <button class="filter active" type="button" data-min-score="5" aria-pressed="true">ALL 5+</button>
-              <button class="filter" type="button" data-min-score="7" aria-pressed="false">7+</button>
-              <button class="filter" type="button" data-min-score="8" aria-pressed="false">8+</button>
-              <button class="filter" type="button" data-min-score="9" aria-pressed="false">9+</button>
+              <button class="filter" type="button" data-min-score="5" aria-pressed="false">ALL 5+</button>
+              <button class="filter active" type="button" data-min-score="7" aria-pressed="true">STRONG 7+</button>
+              <button class="filter" type="button" data-min-score="8" aria-pressed="false">TOP 8+</button>
             </div>
           </div>
 
@@ -725,7 +761,7 @@
 
           <div class="toolbar">
             <label class="search-wrap"><span class="sr-only">Search preparation evidence</span><input id="prepare-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, material status…"></label>
-            <label><span class="sr-only">Sort preparation evidence</span><select id="prepare-sort" class="sort"><option value="attention">ATTENTION FIRST</option><option value="fit">FIT SCORE</option><option value="company">COMPANY</option></select></label>
+            <label><span class="sr-only">Sort preparation evidence</span><select id="prepare-sort" class="sort"><option value="fit">FIT SCORE</option><option value="attention">ATTENTION FIRST</option><option value="company">COMPANY</option></select></label>
             <div class="filters" role="group" aria-label="Preparation evidence status">
               <button class="filter active" type="button" data-prepare-filter="all" aria-pressed="true">ALL</button>
               <button class="filter" type="button" data-prepare-filter="ready" aria-pressed="false">READY</button>
@@ -771,8 +807,8 @@
             <label class="search-wrap"><span class="sr-only">Search verification evidence</span><input id="verify-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, status, evidence…"></label>
             <label><span class="sr-only">Sort verification evidence</span><select id="verify-sort" class="sort"><option value="attention">ATTENTION FIRST</option><option value="recent">RECENT</option><option value="company">COMPANY</option></select></label>
             <div class="filters" role="group" aria-label="Verification evidence status">
-              <button class="filter active" type="button" data-verify-filter="all" aria-pressed="true">ALL</button>
-              <button class="filter" type="button" data-verify-filter="action_needed" aria-pressed="false">ACTION</button>
+              <button class="filter" type="button" data-verify-filter="all" aria-pressed="false">ALL</button>
+              <button class="filter active" type="button" data-verify-filter="action_needed" aria-pressed="true">ACTION</button>
               <button class="filter" type="button" data-verify-filter="activity" aria-pressed="false">ACTIVITY</button>
               <button class="filter" type="button" data-verify-filter="reconciled" aria-pressed="false">RECEIPT</button>
             </div>
@@ -811,11 +847,351 @@
     (() => {
       "use strict";
       const data = JSON.parse(document.getElementById("dashboard-data").textContent);
+      const LOCALE_KEY = "applypilot.locale";
+      const ZH = {
+        "Skip to main content": "跳到主要内容",
+        "Product workflow": "产品工作流",
+        "Local": "本地",
+        "Core workflow": "核心流程",
+        "Workbench stage": "工作台阶段",
+        "Discover": "发现",
+        "Source truth": "来源依据",
+        "Decide": "判断",
+        "Fit & eligibility": "匹配度与资格",
+        "Prepare": "准备",
+        "Resumes & materials": "简历与材料",
+        "Verify": "核验",
+        "Authority & receipts": "授权与回执",
+        "Interface language": "界面语言",
+        "Use Chinese": "使用中文",
+        "Use English": "使用英文",
+        "Private by default": "默认保护隐私",
+        "Generated from your local SQLite workspace. No analytics or remote UI assets.": "由本地 SQLite 工作区生成，不含分析追踪或远程界面资源。",
+        "Opportunity workbench": "岗位工作台",
+        "Move evidence forward.": "让依据推动下一步。",
+        "Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.": "审核符合条件的岗位、比较匹配依据并打开已核验的申请入口，不把预览误报为已投递。",
+        "LOCAL SNAPSHOT · NO SYNC": "本地快照 · 未同步",
+        "LOCAL DATA ISSUE · NO SYNC": "本地数据异常 · 未同步",
+        "Workspace guidance": "工作区提示",
+        "Workspace issue": "工作区异常",
+        "Next safe action": "下一步安全操作",
+        "Workspace status": "工作区状态",
+        "Discovery summary": "发现阶段概览",
+        "Source candidates": "来源候选",
+        "Official listings": "官方岗位",
+        "Unresolved leads": "待核实线索",
+        "Source issues": "来源异常",
+        "Search discovered candidates": "搜索发现的岗位",
+        "Search role, company, source, location…": "搜索岗位、公司、来源、地点…",
+        "Sort discovered candidates": "排序发现的岗位",
+        "RECENT FIRST": "最新优先",
+        "SOURCE": "来源",
+        "ROLE TITLE": "岗位名称",
+        "Discovery evidence status": "发现依据状态",
+        "ALL": "全部",
+        "OFFICIAL": "官方",
+        "LEADS": "线索",
+        "OBSERVED": "已发现",
+        "0 of 0 shown": "显示 0 / 0",
+        "No matching source evidence": "没有匹配的来源依据",
+        "Try a broader search or another source filter.": "请扩大搜索范围或切换来源筛选。",
+        "Discovery pages": "发现结果分页",
+        "PREVIOUS PAGE": "上一页",
+        "NEXT PAGE": "下一页",
+        "Discovery source context": "发现来源信息",
+        "Source health": "来源健康度",
+        "Latest persisted provider run": "最近一次已保存的来源运行",
+        "Source truth boundary": "来源依据边界",
+        "Leads remain leads until an official target is verified. This snapshot does not fetch, promote, score, or apply to a role.": "线索在官方岗位被核实前始终只是线索。本快照不会抓取、提升、评分或投递岗位。",
+        "Pipeline summary": "流程概览",
+        "Eligible roles": "符合条件岗位",
+        "Ready to review": "可审核",
+        "Fit scored": "已评分",
+        "Strong fit 7+": "强匹配 7+",
+        "Search opportunities": "搜索岗位",
+        "Sort opportunities": "排序岗位",
+        "FIT SCORE": "匹配分",
+        "RECENT": "最新",
+        "COMPANY": "公司",
+        "Minimum fit score": "最低匹配分",
+        "ALL 5+": "全部 5+",
+        "STRONG 7+": "强匹配 7+",
+        "TOP 8+": "优选 8+",
+        "Ranked opportunities": "岗位排序",
+        "No matching opportunities": "没有匹配的岗位",
+        "Try a broader search or lower the minimum fit score.": "请扩大搜索范围或降低最低匹配分。",
+        "Opportunity pages": "岗位结果分页",
+        "Evidence overview": "依据概览",
+        "Fit distribution": "匹配分布",
+        "Scored candidates by evidence band": "按依据区间统计的已评分岗位",
+        "Source quality": "来源质量",
+        "Strong-fit share by discovery source": "各发现来源中的强匹配占比",
+        "Preparation summary": "准备阶段概览",
+        "Shortlisted roles": "入围岗位",
+        "Material-ready": "材料就绪",
+        "Needs evidence": "需要补充依据",
+        "No material set": "无材料组合",
+        "Search preparation evidence": "搜索准备依据",
+        "Search role, company, material status…": "搜索岗位、公司、材料状态…",
+        "Sort preparation evidence": "排序准备依据",
+        "ATTENTION FIRST": "待处理优先",
+        "Preparation evidence status": "准备依据状态",
+        "READY": "就绪",
+        "REVIEW": "待审核",
+        "MISSING": "缺失",
+        "Preparation queue": "准备队列",
+        "No matching preparation evidence": "没有匹配的准备依据",
+        "Try a broader search or another evidence filter.": "请扩大搜索范围或切换依据筛选。",
+        "Preparation pages": "准备结果分页",
+        "Preparation evidence boundary": "准备依据边界",
+        "Read-only evidence": "只读依据",
+        "Status comes from records already persisted in your local workspace. This page does not route, generate, validate, authorize, or submit materials.": "状态来自本地工作区中已经保存的记录。本页面不会分配、生成、验证、授权或提交材料。",
+        "Inspect before acting": "操作前先检查",
+        "A recorded path alone is not treated as validation. Use the CLI to inspect the resume library before changing material state.": "仅记录文件路径不等于完成验证。改变材料状态前，请先用 CLI 检查简历库。",
+        "Verification summary": "核验阶段概览",
+        "Activity records": "活动记录",
+        "Batch reservations": "批次预留",
+        "Needs reconciliation": "需要对账",
+        "Receipts reconciled": "已对账回执",
+        "Search verification evidence": "搜索核验依据",
+        "Search role, company, status, evidence…": "搜索岗位、公司、状态、依据…",
+        "Sort verification evidence": "排序核验依据",
+        "Verification evidence status": "核验依据状态",
+        "ACTION": "待处理",
+        "ACTIVITY": "活动",
+        "RECEIPT": "回执",
+        "Verification queue": "核验队列",
+        "No matching verification evidence": "没有匹配的核验依据",
+        "Verification pages": "核验结果分页",
+        "Verification evidence boundary": "核验依据边界",
+        "Evidence strength": "依据强度",
+        "A reserved batch slot is not active authorization. An observation or Submit click is not a receipt. Only a reconciled decisive receipt records an application locally; it does not establish an employer outcome.": "批次名额预留不等于当前授权，观察记录或点击提交也不等于回执。只有已对账的决定性回执才会在本地记录一次投递，但它不代表雇主结果。",
+        "Read-only boundary": "只读边界",
+        "This page never authorizes, submits, retries, or reconciles an application. Runtime-only standing authorization is not reconstructed here.": "本页面绝不会授权、提交、重试或对账投递，也不会在此重建仅存在于运行时的持续授权。",
+        "COPY": "复制",
+        "COPIED": "已复制",
+        "SELECTED": "已选中",
+        "Command copied.": "命令已复制。",
+        "Copy unavailable. Command selected for manual copy.": "无法自动复制，已选中命令供手动复制。",
+        "Unnamed source": "未命名来源",
+        "unknown": "未知",
+        "ATTENTION": "需处理",
+        "COMPLETE": "完整",
+        "observed": "条记录",
+        "No provider-run evidence recorded.": "尚未记录来源运行依据。",
+        "Untitled opportunity": "未命名岗位",
+        "Unknown employer": "未知雇主",
+        "No linked source": "无关联来源",
+        "No pipeline state recorded": "未记录流程状态",
+        "View source snapshot evidence": "查看来源快照依据",
+        "Published": "发布时间",
+        "First seen": "首次发现",
+        "Last seen": "最近发现",
+        "Source state": "来源状态",
+        "OPEN LISTING ↗": "打开岗位 ↗",
+        "REVIEW SOURCE ↗": "核查来源 ↗",
+        "Open listing": "打开岗位",
+        "Review source": "核查来源",
+        "OPEN FORM ↗": "打开表单 ↗",
+        "Not recorded": "未记录",
+        "Resume": "简历",
+        "Cover letter": "求职信",
+        "Resume route": "简历路由",
+        "No current route recorded": "未记录当前路由",
+        "No material evidence recorded": "未记录材料依据",
+        "View recorded material evidence": "查看已记录的材料依据",
+        "Resume status": "简历状态",
+        "Cover status": "求职信状态",
+        "Route decision": "路由决定",
+        "Artifact evidence": "产物依据",
+        "Recorded gaps": "已记录缺口",
+        "Preflight evidence": "投递前检查依据",
+        "No decision evidence recorded": "未记录决定依据",
+        "not authorization": "不代表授权",
+        "Batch": "批次",
+        "Authorization": "授权",
+        "Observation": "观察记录",
+        "Receipt": "回执",
+        "No batch ledger recorded": "未记录批次账本",
+        "Not durably available": "无持久化记录",
+        "No observation recorded": "未记录观察结果",
+        "No decisive receipt recorded": "未记录决定性回执",
+        "No verification evidence": "无核验依据",
+        "This is not an employer outcome claim.": "这不代表雇主结果。",
+        "View recorded verification evidence": "查看已记录的核验依据",
+        "Reported status": "上报状态",
+        "Batch ledger": "批次账本",
+        "No durable reservation record": "无持久化预留记录",
+        "Observation flags": "观察标记",
+        "submit click observed": "观察到提交点击",
+        "no submit click recorded": "未记录提交点击",
+        "receipt visible": "回执可见",
+        "no visible receipt recorded": "未记录可见回执",
+        "Applied marker visible": "Applied 标记可见",
+        "no Applied marker recorded": "未记录 Applied 标记",
+        "verification gate observed": "观察到验证关卡",
+        "no verification gate recorded": "未记录验证关卡",
+        "Receipt evidence": "回执依据",
+        "Attempt record": "尝试记录",
+        "manual stop recorded": "已记录人工停止",
+        "no retry block recorded": "未记录重试阻止",
+        "No discovery snapshot yet": "尚无发现快照",
+        "Collect openings from the CLI; this page does not fetch sources by itself.": "请通过 CLI 收集岗位；本页面不会自行抓取来源。",
+        "Nothing to rank yet": "暂无可排序岗位",
+        "Resolve the workspace issue above, then regenerate this page.": "请先解决上方工作区异常，再重新生成本页面。",
+        "Use the next safe action above to build the queue.": "请使用上方的安全操作来构建队列。",
+        "Nothing to prepare yet": "暂无可准备岗位",
+        "Build and review a shortlist first; this page does not create materials.": "请先建立并审核入围列表；本页面不会创建材料。",
+        "Nothing to verify yet": "暂无可核验记录",
+        "Opening or previewing a form does not create verification evidence.": "打开或预览表单不会产生核验依据。",
+        "Discovery workbench": "发现工作台",
+        "Trace every source.": "追溯每一个来源。",
+        "Review official listings, unresolved leads, and provider-run coverage without promoting a lead or fetching new data from the browser.": "审核官方岗位、待核实线索和来源运行覆盖情况，不在浏览器中提升线索或抓取新数据。",
+        "Preparation workbench": "材料准备台",
+        "Inspect material evidence.": "检查材料依据。",
+        "See which persisted resumes, cover-letter decisions, and routing records are available before running any preparation command.": "运行任何准备命令前，先查看已保存的简历、求职信决定和路由记录。",
+        "Verification workbench": "结果核验台",
+        "Read evidence without overstating it.": "核对依据，不夸大结果。",
+        "Inspect recorded batch reservations, execution observations, and receipt evidence. This page does not authorize, submit, retry, or reconcile applications.": "检查已记录的批次预留、执行观察和回执依据。本页面不会授权、提交、重试或对账投递。",
+        "Official listing verified": "已核实官方岗位",
+        "Lead awaiting an official listing": "等待官方岗位的线索",
+        "Listing observed; official lineage not recorded": "已发现岗位，尚未记录官方来源链路",
+        "Excluded by recorded eligibility": "已按记录的资格条件排除",
+        "Available in the decision queue": "可进入判断队列",
+        "Scored below the current shortlist": "评分低于当前入围标准",
+        "Needs enrichment and fit evidence": "需要补充岗位信息和匹配依据",
+        "Validated resume recorded": "已记录通过验证的简历",
+        "Resume validation did not pass": "简历验证未通过",
+        "Resume evidence is incomplete": "简历依据不完整",
+        "No prepared resume recorded": "未记录已准备简历",
+        "Cover letter recorded as not required": "已记录无需求职信",
+        "Validated cover letter recorded": "已记录通过验证的求职信",
+        "Cover-letter validation did not pass": "求职信验证未通过",
+        "Cover-letter evidence is unresolved": "求职信依据待解决",
+        "Cover-letter requirement is not recorded": "未记录求职信要求",
+        "Current bound material evidence recorded": "已记录当前绑定材料依据",
+        "Material evidence needs review": "材料依据需要审核",
+        "Current bound material evidence is incomplete": "当前绑定材料依据不完整",
+        "No complete material set is recorded": "未记录完整材料组合",
+        "No authorization reservation ledger recorded": "未记录授权预留账本",
+        "One-shot authorization reservation recorded": "已记录一次性授权预留",
+        "No browser observation recorded": "未记录浏览器观察结果",
+        "Recorded observation cannot be safely summarized": "无法安全汇总已记录的观察结果",
+        "Receipt reconciliation record stored": "已保存回执对账记录",
+        "Execution observation recorded — not a receipt by itself": "已记录执行观察，但它本身不是回执",
+        "No decisive receipt admitted; reconciliation is required": "未接纳决定性回执，需要对账",
+        "Decisive durable receipt reconciled": "已对账决定性持久回执",
+        "Decisive browser confirmation recorded": "已记录决定性浏览器确认",
+        "Platform export reports this role as applied": "平台导出记录显示该岗位已投递",
+        "Applied status is recorded without classified receipt evidence": "已记录投递状态，但回执依据尚未分类",
+        "Receipt reconciled": "回执已对账",
+        "Confirmation evidence recorded": "已记录确认依据",
+        "Platform report recorded": "已记录平台报告",
+        "Evidence needs reconciliation": "依据需要对账",
+        "No confirmed outcome recorded": "未记录已确认结果",
+        "Authorization reservation recorded": "已记录授权预留",
+        "No durable verification record": "无持久化核验记录",
+        "Past authorization reservation recorded; active authorization is not inferred": "已记录过去的授权预留，但不推断当前仍有授权",
+        "Authorization is not durably available in this workspace view": "此工作区视图中没有可用的持久化授权记录",
+        "No opportunities yet": "尚无岗位",
+        "Collect current openings, then enrich and score them to build your shortlist.": "先收集当前岗位，再补充信息并评分以建立入围列表。",
+        "Collect openings": "收集岗位",
+        "Build shortlist": "建立入围列表",
+        "Continue enrichment and scoring while reviewing the evidence already available.": "在审核现有依据的同时，继续补充岗位信息并评分。",
+        "Enrich and score": "补充信息并评分",
+        "No role currently meets the 5+ shortlist threshold": "当前没有岗位达到 5+ 的入围标准",
+        "The evidence is available, but none of the scored roles belongs in the ranked queue yet.": "依据已经可用，但当前没有已评分岗位适合进入排序队列。",
+        "Workspace ready": "工作区已就绪",
+        "The ranked queue reflects the latest persisted local evidence.": "排序队列反映最近保存的本地依据。",
+        "Collect current openings to create a local source snapshot. This page does not fetch or promote listings by itself.": "收集当前岗位以创建本地来源快照。本页面不会自行抓取或提升岗位。",
+        "Source lineage is not available": "来源链路不可用",
+        "Existing job records remain visible, but provider runs and unresolved leads cannot be verified from this workspace snapshot.": "现有岗位记录仍然可见，但无法从此工作区快照核实来源运行和待核实线索。",
+        "Collect source evidence": "收集来源依据",
+        "Partial or incomplete source runs are kept visible and are not treated as complete coverage.": "部分或不完整的来源运行会保留可见，但不会被视为完整覆盖。",
+        "Refresh sources": "刷新来源",
+        "Discovery snapshot ready": "发现快照已就绪",
+        "Listings, unresolved leads, and provider-run state reflect persisted local source evidence.": "岗位、待核实线索和来源运行状态均反映已保存的本地来源依据。",
+        "Resume routing evidence is not available": "简历路由依据不可用",
+        "Legacy material status is still shown, but no current resume-library records were found. This page did not create or migrate them.": "仍显示旧材料状态，但未找到当前简历库记录。本页面没有创建或迁移这些记录。",
+        "Inspect library": "检查简历库",
+        "Preparation evidence ready": "准备依据已就绪",
+        "Every shortlisted role has a current resume route, a validated PDF binding, no recorded hard gap, and a resolved cover-letter requirement.": "每个入围岗位都有当前简历路由、已验证的 PDF 绑定、无已记录硬性缺口，且求职信要求已解决。",
+        "Review the recorded gaps before running any preparation command. Nothing is generated or changed from this page.": "运行准备命令前请审核已记录的缺口。本页面不会生成或更改任何内容。",
+        "Unable to read the local workspace": "无法读取本地工作区",
+        "Your data was not changed. Run the read-only diagnostic; ApplyPilot will not repair or replace the database automatically.": "数据未被更改。请运行只读诊断；ApplyPilot 不会自动修复或替换数据库。",
+        "Run diagnostic": "运行诊断",
+        "No persisted resume route is available for this job version.": "此岗位版本没有已保存的简历路由。",
+        "The recorded resume route belongs to an older version of this job.": "已记录的简历路由属于此岗位的旧版本。",
+        "Verification evidence appears only after local records are persisted. Reviewing or opening a form does not create it.": "只有本地记录持久化后才会出现核验依据；审核或打开表单不会产生核验依据。",
+        "Batch reservation evidence is not available": "批次预留依据不可用",
+        "Application observations are still shown, but this page did not create or migrate the missing ledger.": "投递观察仍会显示，但本页面没有创建或迁移缺失的账本。",
+        "A click, preview, security code, or stored status is not a decisive receipt. Reconcile only evidence bound to the exact role.": "点击、预览、安全码或已保存状态都不是决定性回执。只对账与准确岗位绑定的依据。",
+        "Reconcile receipts": "对账回执",
+        "Recorded outcomes have classified evidence": "已记录结果均有分类依据",
+        "This view reports persisted evidence only; it does not claim employer acceptance or a hiring outcome.": "本视图只报告已保存依据，不声称雇主已接纳或产生录用结果。",
+        "recorded": "已记录",
+        "not_recorded": "未记录",
+        "needs_review": "需要审核",
+        "reuse_exact": "精确复用",
+        "machine_validated": "机器验证通过",
+        "historical_validated": "历史验证",
+        "not_required": "不需要",
+        "agent_validated": "代理验证通过",
+        "human_approved": "人工批准",
+        "exact_url": "精确链接",
+        "unscored": "未评分"
+      };
+      let locale = "zh";
+      try { locale = localStorage.getItem(LOCALE_KEY) === "en" ? "en" : "zh"; }
+      catch { /* A blocked localStorage still gets the private-by-default Chinese UI. */ }
+      const t = (key, values = {}) => {
+        const source = String(key ?? "");
+        const translated = locale === "zh" ? (ZH[source] || source) : source;
+        return translated.replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
+      };
+      const translateRuntimeText = (value) => {
+        const source = String(value || "");
+        if (locale !== "zh") return source;
+        let match = source.match(/^(\d+) opportunities still need fit evidence$/);
+        if (match) return `${match[1]} 个岗位仍需要匹配依据`;
+        match = source.match(/^(\d+) source runs need attention$/);
+        if (match) return `${match[1]} 个来源运行需要处理`;
+        match = source.match(/^(\d+) shortlisted roles need material evidence$/);
+        if (match) return `${match[1]} 个入围岗位需要材料依据`;
+        match = source.match(/^(\d+) application records need evidence review$/);
+        if (match) return `${match[1]} 条投递记录需要依据审核`;
+        return t(source);
+      };
+      const staticTextRecords = [];
+      const textWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      for (let node = textWalker.nextNode(); node; node = textWalker.nextNode()) {
+        const parent = node.parentElement;
+        const key = node.nodeValue.trim();
+        if (!key || !parent || ["SCRIPT", "STYLE", "CODE"].includes(parent.tagName)) continue;
+        staticTextRecords.push({ node, original: node.nodeValue, key });
+      }
+      const staticAttributeRecords = [];
+      document.querySelectorAll("[aria-label], [placeholder], [title]").forEach((element) => {
+        for (const name of ["aria-label", "placeholder", "title"]) {
+          if (element.hasAttribute(name)) staticAttributeRecords.push({ element, name, value: element.getAttribute(name) });
+        }
+      });
+      const applyLocaleChrome = () => {
+        document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+        for (const record of staticTextRecords) {
+          record.node.nodeValue = record.original.replace(record.key, t(record.key));
+        }
+        for (const record of staticAttributeRecords) record.element.setAttribute(record.name, t(record.value));
+        document.querySelectorAll("[data-locale]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.locale === locale));
+        });
+      };
       const PAGE_SIZE = 60;
-      const state = { stage: "decide", minimumScore: 5, query: "", sort: "fit", pageIndex: 0 };
+      const VERIFY_PAGE_SIZE = 20;
+      const state = { stage: "decide", minimumScore: 7, query: "", sort: "fit", pageIndex: 0 };
       const discoverState = { filter: "all", query: "", sort: "recent", pageIndex: 0 };
-      const prepareState = { filter: "all", query: "", sort: "attention", pageIndex: 0 };
-      const verifyState = { filter: "all", query: "", sort: "attention", pageIndex: 0 };
+      const prepareState = { filter: "all", query: "", sort: "fit", pageIndex: 0 };
+      const verifyState = { filter: "action_needed", query: "", sort: "attention", pageIndex: 0 };
       const discoverList = document.getElementById("discover-list");
       const list = document.getElementById("opportunity-list");
       const materialList = document.getElementById("material-list");
@@ -862,10 +1238,10 @@
         } catch { return ""; }
       };
       const formatTime = (value) => {
-        if (!value) return "Not recorded";
+        if (!value) return t("Not recorded");
         const date = new Date(value);
-        if (Number.isNaN(date.getTime())) return "Not recorded";
-        return new Intl.DateTimeFormat(undefined, {
+        if (Number.isNaN(date.getTime())) return t("Not recorded");
+        return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", {
           year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
         }).format(date);
       };
@@ -908,12 +1284,12 @@
         const isReady = system.state === "ready";
         panel.hidden = isReady;
         panel.className = `system-panel state-${system.state || "ready"}`;
-        document.getElementById("system-kicker").textContent = system.state === "error" ? "Workspace issue" : "Next safe action";
-        document.getElementById("system-title").textContent = system.title || "Workspace status";
-        document.getElementById("system-copy").textContent = system.message || "";
+        document.getElementById("system-kicker").textContent = t(system.state === "error" ? "Workspace issue" : "Next safe action");
+        document.getElementById("system-title").textContent = translateRuntimeText(system.title || "Workspace status");
+        document.getElementById("system-copy").textContent = translateRuntimeText(system.message || "");
 
         const detail = document.getElementById("system-detail");
-        detail.textContent = system.detail || "";
+        detail.textContent = translateRuntimeText(system.detail || "");
         detail.hidden = !system.detail;
 
         const actions = document.getElementById("system-actions");
@@ -921,31 +1297,31 @@
         for (const action of (system.actions || [])) {
           const row = make("div", "command-row");
           const code = make("code", "", action.command);
-          const copy = make("button", "command-copy", "COPY");
+          const copy = make("button", "command-copy", t("COPY"));
           const copyStatus = make("span", "sr-only");
           copyStatus.setAttribute("role", "status");
           copyStatus.setAttribute("aria-live", "polite");
           copy.type = "button";
-          copy.setAttribute("aria-label", `Copy command: ${action.label}`);
+          copy.setAttribute("aria-label", locale === "zh" ? `复制命令：${translateRuntimeText(action.label)}` : `Copy command: ${action.label}`);
           copy.addEventListener("click", async () => {
             try {
               await copyText(String(action.command || ""));
-              copy.textContent = "COPIED";
-              copyStatus.textContent = "Command copied.";
+              copy.textContent = t("COPIED");
+              copyStatus.textContent = t("Command copied.");
             } catch {
               selectText(code);
-              copy.textContent = "SELECTED";
-              copyStatus.textContent = "Copy unavailable. Command selected for manual copy.";
+              copy.textContent = t("SELECTED");
+              copyStatus.textContent = t("Copy unavailable. Command selected for manual copy.");
             }
-            setTimeout(() => { copy.textContent = "COPY"; }, 1400);
+            setTimeout(() => { copy.textContent = t("COPY"); }, 1400);
           });
-          row.append(make("span", "", action.label), code, copy, copyStatus);
+          row.append(make("span", "", translateRuntimeText(action.label)), code, copy, copyStatus);
           actions.append(row);
         }
         actions.hidden = actions.childElementCount === 0;
 
         const statusLabel = document.getElementById("status-label");
-        statusLabel.textContent = system.state === "error" ? "LOCAL DATA ISSUE · NO SYNC" : "LOCAL SNAPSHOT · NO SYNC";
+        statusLabel.textContent = t(system.state === "error" ? "LOCAL DATA ISSUE · NO SYNC" : "LOCAL SNAPSHOT · NO SYNC");
         document.getElementById("status-dot").style.background = system.state === "error" ? "var(--brick)" : "var(--mint)";
       };
 
@@ -1015,14 +1391,16 @@
             || source.paginationComplete === false || source.hasError === true;
           const row = make("div", `source-health ${needsAttention ? "needs-attention" : ""}`.trim());
           row.append(
-            make("strong", "", source.name || source.provider || "Unnamed source"),
-            make("span", "source-run-state", needsAttention ? "ATTENTION" : "COMPLETE"),
-            make("span", "", `${source.provider || "unknown"} · ${source.observed || 0} observed`),
+            make("strong", "", source.name || source.provider || t("Unnamed source")),
+            make("span", "source-run-state", t(needsAttention ? "ATTENTION" : "COMPLETE")),
+            make("span", "", locale === "zh"
+              ? `${source.provider || t("unknown")} · 已发现 ${source.observed || 0} 条`
+              : `${source.provider || "unknown"} · ${source.observed || 0} observed`),
             make("span", "", formatTime(source.lastRunAt)),
           );
           target.append(row);
         }
-        if (!sources.length) target.append(make("p", "insight-kicker", "No provider-run evidence recorded."));
+        if (!sources.length) target.append(make("p", "insight-kicker", t("No provider-run evidence recorded.")));
       };
 
       const createDiscoverCard = (item, index) => {
@@ -1032,36 +1410,36 @@
         card.append(make("div", `material-state state-${item.state || "observed"}`, marker));
 
         const body = make("div", "opportunity-body");
-        const heading = make("h3", "opportunity-title", item.title || "Untitled opportunity");
+        const heading = make("h3", "opportunity-title", translateRuntimeText(item.title || "Untitled opportunity"));
         body.append(heading);
         const companyLine = make("div", "company-line");
-        companyLine.append(make("span", "", item.company || "Unknown employer"));
+        companyLine.append(make("span", "", translateRuntimeText(item.company || "Unknown employer")));
         if (item.location) companyLine.append(make("span", "", item.location));
         body.append(companyLine);
 
         const evidence = make("div", "evidence");
-        appendTag(evidence, item.label, item.state === "verified" ? "source" : item.state === "lead" ? "salary" : "");
+        appendTag(evidence, translateRuntimeText(item.label), item.state === "verified" ? "source" : item.state === "lead" ? "salary" : "");
         appendTag(evidence, item.source);
         appendTag(evidence, item.provider);
         appendTag(
           evidence,
           item.sourceCount > 0
-            ? `${item.sourceCount} source${item.sourceCount === 1 ? "" : "s"}`
-            : "No linked source",
+            ? (locale === "zh" ? `${item.sourceCount} 个来源` : `${item.sourceCount} source${item.sourceCount === 1 ? "" : "s"}`)
+            : t("No linked source"),
         );
         body.append(evidence);
-        body.append(make("p", "pipeline-note", item.pipeline?.label || "No pipeline state recorded"));
+        body.append(make("p", "pipeline-note", translateRuntimeText(item.pipeline?.label || "No pipeline state recorded")));
 
         const details = make("details", "material-details");
-        details.append(make("summary", "", "View source snapshot evidence"));
+        details.append(make("summary", "", t("View source snapshot evidence")));
         details.addEventListener("toggle", () => {
           if (!details.open || details.childElementCount > 1) return;
           const records = make("div", "evidence-records");
           records.append(
-            evidenceRecord("Published", formatTime(item.publishedAt)),
-            evidenceRecord("First seen", formatTime(item.firstSeenAt)),
-            evidenceRecord("Last seen", formatTime(item.lastSeenAt)),
-            evidenceRecord("Source state", item.label),
+            evidenceRecord(t("Published"), formatTime(item.publishedAt)),
+            evidenceRecord(t("First seen"), formatTime(item.firstSeenAt)),
+            evidenceRecord(t("Last seen"), formatTime(item.lastSeenAt)),
+            evidenceRecord(t("Source state"), translateRuntimeText(item.label)),
           );
           details.append(records);
         }, { once: true });
@@ -1071,11 +1449,13 @@
         const url = safeUrl(item.url);
         const actions = make("div", "actions");
         if (url) {
-          const link = make("a", "action", item.state === "verified" ? "OPEN LISTING ↗" : "REVIEW SOURCE ↗");
+          const link = make("a", "action", t(item.state === "verified" ? "OPEN LISTING ↗" : "REVIEW SOURCE ↗"));
           link.href = url;
           link.target = "_blank";
           link.rel = "noopener noreferrer";
-          link.setAttribute("aria-label", `${item.state === "verified" ? "Open listing" : "Review source"} for ${item.title}`);
+          link.setAttribute("aria-label", locale === "zh"
+            ? `${t(item.state === "verified" ? "Open listing" : "Review source")}：${item.title}`
+            : `${item.state === "verified" ? "Open listing" : "Review source"} for ${item.title}`);
           actions.append(link);
         }
         card.append(actions);
@@ -1090,33 +1470,37 @@
           const heading = make("h3", "opportunity-title");
           const sourceUrl = safeUrl(job.url);
           if (sourceUrl) {
-            const link = make("a", "", job.title);
+            const link = make("a", "", translateRuntimeText(job.title));
             link.href = sourceUrl;
             link.target = "_blank";
             link.rel = "noopener noreferrer";
             heading.append(link);
           } else {
-            heading.textContent = job.title;
+            heading.textContent = translateRuntimeText(job.title);
           }
           body.append(heading);
 
           const companyLine = make("div", "company-line");
-          companyLine.append(make("span", "", job.company));
+          companyLine.append(make("span", "", translateRuntimeText(job.company)));
           if (job.location) companyLine.append(make("span", "", job.location));
           body.append(companyLine);
 
           const evidence = make("div", "evidence");
           appendTag(evidence, job.source, "source");
           appendTag(evidence, job.salary, "salary");
-          appendTag(evidence, job.strategy);
-          appendTag(evidence, job.coverLetterStatus ? `cover: ${job.coverLetterStatus}` : "");
+          appendTag(evidence, translateRuntimeText(job.strategy));
+          appendTag(evidence, job.coverLetterStatus
+            ? (locale === "zh" ? `求职信：${translateRuntimeText(job.coverLetterStatus)}` : `cover: ${job.coverLetterStatus}`)
+            : "");
           body.append(evidence);
           if (job.reasoning) body.append(make("p", "reasoning", job.reasoning));
           if (job.keywords) body.append(make("p", "keywords", job.keywords));
 
           if (job.description) {
             const details = make("details", "description");
-            details.append(make("summary", "", `Read source description · ${job.description.length.toLocaleString()} chars`));
+            details.append(make("summary", "", locale === "zh"
+              ? `阅读来源描述 · ${job.description.length.toLocaleString("zh-CN")} 字符`
+              : `Read source description · ${job.description.length.toLocaleString()} chars`));
             details.addEventListener("toggle", () => {
               if (details.open && details.childElementCount === 1) details.append(make("div", "description-copy", job.description));
             }, { once: true });
@@ -1127,11 +1511,11 @@
           const actions = make("div", "actions");
           const applicationUrl = safeUrl(job.applicationUrl);
           if (applicationUrl) {
-            const apply = make("a", "action", "OPEN FORM ↗");
+            const apply = make("a", "action", t("OPEN FORM ↗"));
             apply.href = applicationUrl;
             apply.target = "_blank";
             apply.rel = "noopener noreferrer";
-            apply.setAttribute("aria-label", `Open application form for ${job.title}`);
+            apply.setAttribute("aria-label", locale === "zh" ? `打开 ${job.title} 的申请表单` : `Open application form for ${job.title}`);
             actions.append(apply);
           }
           card.append(actions);
@@ -1140,13 +1524,13 @@
 
       const materialStatus = (label, item) => {
         const row = make("div", `material-status-row state-${item?.state || "missing"}`);
-        row.append(make("strong", "", label), make("span", "", item?.label || "Not recorded"));
+        row.append(make("strong", "", label), make("span", "", translateRuntimeText(item?.label || "Not recorded")));
         return row;
       };
 
       const evidenceRecord = (label, value) => {
         const row = make("div", "evidence-record");
-        row.append(make("strong", "", label), make("span", "", value || "Not recorded"));
+        row.append(make("strong", "", label), make("span", "", translateRuntimeText(value || "Not recorded")));
         return row;
       };
 
@@ -1162,27 +1546,27 @@
         const heading = make("h3", "");
         const sourceUrl = safeUrl(job.url);
         if (sourceUrl) {
-          const link = make("a", "", job.title);
+          const link = make("a", "", translateRuntimeText(job.title));
           link.href = sourceUrl;
           link.target = "_blank";
           link.rel = "noopener noreferrer";
           heading.append(link);
         } else {
-          heading.textContent = job.title;
+          heading.textContent = translateRuntimeText(job.title);
         }
-        titleRow.append(heading, make("span", "material-score", `FIT ${job.score}/10`));
+        titleRow.append(heading, make("span", "material-score", locale === "zh" ? `匹配 ${job.score}/10` : `FIT ${job.score}/10`));
         body.append(titleRow);
 
         const companyLine = make("div", "company-line");
-        companyLine.append(make("span", "", job.company));
+        companyLine.append(make("span", "", translateRuntimeText(job.company)));
         if (job.location) companyLine.append(make("span", "", job.location));
         body.append(companyLine);
 
         const statusGrid = make("div", "material-status-grid");
         statusGrid.append(
-          materialStatus("Resume", prepare.resume),
-          materialStatus("Cover letter", prepare.coverLetter),
-          materialStatus("Resume route", {
+          materialStatus(t("Resume"), prepare.resume),
+          materialStatus(t("Cover letter"), prepare.coverLetter),
+          materialStatus(t("Resume route"), {
             state: prepare.route?.state === "current"
               && prepare.route?.decision === "reuse_exact"
               && prepare.route?.artifact?.validationStatus === "machine_validated"
@@ -1190,15 +1574,17 @@
               && !(prepare.route?.gaps || []).length
               ? "ready" : "review",
             label: prepare.route?.state === "current"
-              ? `${prepare.route.decision || "recorded"} route`
-              : (prepare.route?.reason || "No current route recorded"),
+              ? (locale === "zh"
+                ? `${translateRuntimeText(prepare.route.decision || "recorded")}路由`
+                : `${prepare.route.decision || "recorded"} route`)
+              : translateRuntimeText(prepare.route?.reason || "No current route recorded"),
           }),
         );
         body.append(statusGrid);
-        body.append(make("p", "material-summary", prepare.label || "No material evidence recorded"));
+        body.append(make("p", "material-summary", translateRuntimeText(prepare.label || "No material evidence recorded")));
 
         const details = make("details", "material-details");
-        details.append(make("summary", "", "View recorded material evidence"));
+        details.append(make("summary", "", t("View recorded material evidence")));
         details.addEventListener("toggle", () => {
           if (!details.open || details.childElementCount > 1) return;
           const records = make("div", "evidence-records");
@@ -1207,23 +1593,23 @@
           const route = prepare.route || {};
           const artifact = route.artifact || {};
           records.append(
-            evidenceRecord("Resume status", [resume.status, resume.artifactName].filter(Boolean).join(" · ")),
-            evidenceRecord("Cover status", [cover.status, cover.artifactName].filter(Boolean).join(" · ")),
-            evidenceRecord("Route decision", [route.decision, route.reason].filter(Boolean).join(" · ")),
+            evidenceRecord(t("Resume status"), [translateRuntimeText(resume.status), resume.artifactName].filter(Boolean).join(" · ")),
+            evidenceRecord(t("Cover status"), [translateRuntimeText(cover.status), cover.artifactName].filter(Boolean).join(" · ")),
+            evidenceRecord(t("Route decision"), [translateRuntimeText(route.decision), translateRuntimeText(route.reason)].filter(Boolean).join(" · ")),
           );
           if (artifact.validationStatus || artifact.track || artifact.kind) {
             records.append(evidenceRecord(
-              "Artifact evidence",
-              [artifact.validationStatus, artifact.kind, artifact.track].filter(Boolean).join(" · "),
+              t("Artifact evidence"),
+              [translateRuntimeText(artifact.validationStatus), artifact.kind, artifact.track].filter(Boolean).join(" · "),
             ));
           }
           if ((route.gaps || []).length) {
-            records.append(evidenceRecord("Recorded gaps", route.gaps.join(", ")));
+            records.append(evidenceRecord(t("Recorded gaps"), route.gaps.join(", ")));
           }
           const applicationDecision = prepare.applicationDecision || {};
           records.append(evidenceRecord(
-            "Preflight evidence",
-            `${applicationDecision.state || "needs_review"} · ${applicationDecision.reason || "No decision evidence recorded"} (not authorization)`,
+            t("Preflight evidence"),
+            `${translateRuntimeText(applicationDecision.state || "needs_review")} · ${translateRuntimeText(applicationDecision.reason || "No decision evidence recorded")} (${t("not authorization")})`,
           ));
           details.append(records);
         }, { once: true });
@@ -1253,72 +1639,78 @@
         const heading = make("h3", "");
         const sourceUrl = safeUrl(job.url);
         if (sourceUrl) {
-          const link = make("a", "", job.title);
+          const link = make("a", "", translateRuntimeText(job.title));
           link.href = sourceUrl;
           link.target = "_blank";
           link.rel = "noopener noreferrer";
           heading.append(link);
         } else {
-          heading.textContent = job.title;
+          heading.textContent = translateRuntimeText(job.title);
         }
-        titleRow.append(heading, make("span", "material-score", job.score ? `FIT ${job.score}/10` : "UNSCORED"));
+        titleRow.append(heading, make("span", "material-score", job.score
+          ? (locale === "zh" ? `匹配 ${job.score}/10` : `FIT ${job.score}/10`)
+          : t("unscored").toLocaleUpperCase(locale === "zh" ? "zh-CN" : "en")));
         body.append(titleRow);
 
         const companyLine = make("div", "company-line");
-        companyLine.append(make("span", "", job.company));
+        companyLine.append(make("span", "", translateRuntimeText(job.company)));
         if (job.location) companyLine.append(make("span", "", job.location));
         body.append(companyLine);
 
         const statusGrid = make("div", "material-status-grid verify-status-grid");
         statusGrid.append(
-          materialStatus("Batch", {
+          materialStatus(t("Batch"), {
             state: batch.state === "recorded" ? "review" : "missing",
             label: batch.label || "No batch ledger recorded",
           }),
-          materialStatus("Authorization", {
+          materialStatus(t("Authorization"), {
             state: verify.authorization?.state === "reservation_recorded" ? "review" : "missing",
             label: verify.authorization?.label || "Not durably available",
           }),
-          materialStatus("Observation", {
+          materialStatus(t("Observation"), {
             state: observation.state === "recorded" ? "review" : observation.state === "unreadable" ? "blocked" : "missing",
             label: observation.label || "No observation recorded",
           }),
-          materialStatus("Receipt", {
+          materialStatus(t("Receipt"), {
             state: receipt.state === "durable" ? "ready" : ["confirmed", "reported"].includes(receipt.state) ? "review" : receipt.state === "pending" ? "blocked" : "missing",
             label: receipt.label || "No decisive receipt recorded",
           }),
         );
         body.append(statusGrid);
-        body.append(make("p", "material-summary", `${verify.label || "No verification evidence"}. This is not an employer outcome claim.`));
+        body.append(make("p", "material-summary", locale === "zh"
+          ? `${translateRuntimeText(verify.label || "No verification evidence")}。${t("This is not an employer outcome claim.")}`
+          : `${verify.label || "No verification evidence"}. This is not an employer outcome claim.`));
 
         const details = make("details", "material-details");
-        details.append(make("summary", "", "View recorded verification evidence"));
+        details.append(make("summary", "", t("View recorded verification evidence")));
         details.addEventListener("toggle", () => {
           if (!details.open || details.childElementCount > 1) return;
           const records = make("div", "evidence-records");
           records.append(
-            evidenceRecord("Reported status", verify.reportedStatus || "not_recorded"),
+            evidenceRecord(t("Reported status"), translateRuntimeText(verify.reportedStatus || "not_recorded")),
             evidenceRecord(
-              "Batch ledger",
+              t("Batch ledger"),
               batch.state === "recorded"
-                ? [batch.latestStatus, formatTime(batch.updatedAt)].filter(Boolean).join(" · ")
-                : "No durable reservation record",
+                ? [translateRuntimeText(batch.latestStatus), formatTime(batch.updatedAt)].filter(Boolean).join(" · ")
+                : t("No durable reservation record"),
             ),
             evidenceRecord(
-              "Observation flags",
+              t("Observation flags"),
               observation.state === "recorded"
                 ? [
-                    observation.submitClicked ? "submit click observed" : "no submit click recorded",
-                    observation.receiptVisible ? "receipt visible" : "no visible receipt recorded",
-                    observation.appliedBadgeVisible ? "Applied marker visible" : "no Applied marker recorded",
-                    observation.captchaVisible ? "verification gate observed" : "no verification gate recorded",
+                    t(observation.submitClicked ? "submit click observed" : "no submit click recorded"),
+                    t(observation.receiptVisible ? "receipt visible" : "no visible receipt recorded"),
+                    t(observation.appliedBadgeVisible ? "Applied marker visible" : "no Applied marker recorded"),
+                    t(observation.captchaVisible ? "verification gate observed" : "no verification gate recorded"),
                   ].join(" · ")
-                : observation.label,
+                : translateRuntimeText(observation.label),
             ),
-            evidenceRecord("Receipt evidence", [receipt.confidence, formatTime(receipt.recordedAt)].filter(Boolean).join(" · ")),
+            evidenceRecord(t("Receipt evidence"), [translateRuntimeText(receipt.confidence), formatTime(receipt.recordedAt)].filter(Boolean).join(" · ")),
             evidenceRecord(
-              "Attempt record",
-              `${verify.attempt?.count || 0} recorded · ${formatTime(verify.attempt?.lastAttemptedAt)} · ${verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded"}`,
+              t("Attempt record"),
+              locale === "zh"
+                ? `已记录 ${verify.attempt?.count || 0} 次 · ${formatTime(verify.attempt?.lastAttemptedAt)} · ${t(verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded")}`
+                : `${verify.attempt?.count || 0} recorded · ${formatTime(verify.attempt?.lastAttemptedAt)} · ${verify.attempt?.retryBlocked ? "manual stop recorded" : "no retry block recorded"}`,
             ),
           );
           details.append(records);
@@ -1354,14 +1746,14 @@
         matches.slice(pageStart, pageEnd).forEach(({ item }, index) => fragment.append(createDiscoverCard(item, index)));
         discoverList.replaceChildren(fragment);
         document.getElementById("discover-result-count").textContent = matches.length
-          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
-          : "0 of 0 shown";
+          ? (locale === "zh" ? `显示 ${pageStart + 1}–${pageEnd} / ${matches.length}` : `${pageStart + 1}–${pageEnd} of ${matches.length} shown`)
+          : t("0 of 0 shown");
         document.getElementById("discover-empty-state").classList.toggle("visible", matches.length === 0);
         document.getElementById("discover-empty-title").textContent = rawDiscoverItems.length
-          ? "No matching source evidence" : "No discovery snapshot yet";
+          ? t("No matching source evidence") : t("No discovery snapshot yet");
         document.getElementById("discover-empty-copy").textContent = rawDiscoverItems.length
-          ? "Try a broader search or another source filter."
-          : "Collect openings from the CLI; this page does not fetch sources by itself.";
+          ? t("Try a broader search or another source filter.")
+          : t("Collect openings from the CLI; this page does not fetch sources by itself.");
         document.getElementById("discover-page-previous").hidden = pageStart === 0;
         document.getElementById("discover-page-next").hidden = pageEnd >= matches.length;
       };
@@ -1391,16 +1783,16 @@
         list.replaceChildren(fragment);
 
         document.getElementById("result-count").textContent = matches.length
-          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
-          : "0 of 0 shown";
+          ? (locale === "zh" ? `显示 ${pageStart + 1}–${pageEnd} / ${matches.length}` : `${pageStart + 1}–${pageEnd} of ${matches.length} shown`)
+          : t("0 of 0 shown");
         const empty = document.getElementById("empty-state");
         empty.classList.toggle("visible", matches.length === 0);
         const systemState = (data.system || {}).state;
         const hasWorkspaceJobs = rawJobs.length > 0;
-        document.getElementById("empty-title").textContent = hasWorkspaceJobs ? "No matching opportunities" : "Nothing to rank yet";
+        document.getElementById("empty-title").textContent = t(hasWorkspaceJobs ? "No matching opportunities" : "Nothing to rank yet");
         document.getElementById("empty-copy").textContent = hasWorkspaceJobs
-          ? "Try a broader search or lower the minimum fit score."
-          : (systemState === "error" ? "Resolve the workspace issue above, then regenerate this page." : "Use the next safe action above to build the queue.");
+          ? t("Try a broader search or lower the minimum fit score.")
+          : t(systemState === "error" ? "Resolve the workspace issue above, then regenerate this page." : "Use the next safe action above to build the queue.");
 
         document.getElementById("page-previous").hidden = pageStart === 0;
         document.getElementById("page-next").hidden = pageEnd >= matches.length;
@@ -1437,16 +1829,16 @@
         materialList.replaceChildren(fragment);
 
         document.getElementById("prepare-result-count").textContent = matches.length
-          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
-          : "0 of 0 shown";
+          ? (locale === "zh" ? `显示 ${pageStart + 1}–${pageEnd} / ${matches.length}` : `${pageStart + 1}–${pageEnd} of ${matches.length} shown`)
+          : t("0 of 0 shown");
         const empty = document.getElementById("prepare-empty-state");
         empty.classList.toggle("visible", matches.length === 0);
         document.getElementById("prepare-empty-title").textContent = rawJobs.length
-          ? "No matching preparation evidence"
-          : "Nothing to prepare yet";
+          ? t("No matching preparation evidence")
+          : t("Nothing to prepare yet");
         document.getElementById("prepare-empty-copy").textContent = rawJobs.length
-          ? "Try a broader search or another evidence filter."
-          : "Build and review a shortlist first; this page does not create materials.";
+          ? t("Try a broader search or another evidence filter.")
+          : t("Build and review a shortlist first; this page does not create materials.");
         document.getElementById("prepare-page-previous").hidden = pageStart === 0;
         document.getElementById("prepare-page-next").hidden = pageEnd >= matches.length;
       };
@@ -1476,10 +1868,10 @@
 
       const renderVerifyJobs = () => {
         const matches = matchingVerifyJobs();
-        const pageCount = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        const pageCount = Math.max(1, Math.ceil(matches.length / VERIFY_PAGE_SIZE));
         verifyState.pageIndex = Math.min(verifyState.pageIndex, pageCount - 1);
-        const pageStart = verifyState.pageIndex * PAGE_SIZE;
-        const pageEnd = Math.min(pageStart + PAGE_SIZE, matches.length);
+        const pageStart = verifyState.pageIndex * VERIFY_PAGE_SIZE;
+        const pageEnd = Math.min(pageStart + VERIFY_PAGE_SIZE, matches.length);
         const fragment = document.createDocumentFragment();
         matches.slice(pageStart, pageEnd).forEach(({ job }, index) => {
           fragment.append(createVerifyCard(job, index));
@@ -1487,16 +1879,16 @@
         verifyList.replaceChildren(fragment);
 
         document.getElementById("verify-result-count").textContent = matches.length
-          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
-          : "0 of 0 shown";
+          ? (locale === "zh" ? `显示 ${pageStart + 1}–${pageEnd} / ${matches.length}` : `${pageStart + 1}–${pageEnd} of ${matches.length} shown`)
+          : t("0 of 0 shown");
         const empty = document.getElementById("verify-empty-state");
         empty.classList.toggle("visible", matches.length === 0);
         document.getElementById("verify-empty-title").textContent = rawVerifyJobs.length
-          ? "No matching verification evidence"
-          : "Nothing to verify yet";
+          ? t("No matching verification evidence")
+          : t("Nothing to verify yet");
         document.getElementById("verify-empty-copy").textContent = rawVerifyJobs.length
-          ? "Try a broader search or another evidence filter."
-          : "Opening or previewing a form does not create verification evidence.";
+          ? t("Try a broader search or another evidence filter.")
+          : t("Opening or previewing a form does not create verification evidence.");
         document.getElementById("verify-page-previous").hidden = pageStart === 0;
         document.getElementById("verify-page-next").hidden = pageEnd >= matches.length;
       };
@@ -1538,10 +1930,10 @@
           button.closest("li").classList.toggle("active", selected);
         });
         const copy = stageCopy[stage];
-        document.getElementById("page-eyebrow").textContent = copy.eyebrow;
-        document.getElementById("page-title").textContent = copy.title;
-        document.getElementById("page-copy").textContent = copy.copy;
-        document.title = `ApplyPilot Local — ${copy.eyebrow}`;
+        document.getElementById("page-eyebrow").textContent = t(copy.eyebrow);
+        document.getElementById("page-title").textContent = t(copy.title);
+        document.getElementById("page-copy").textContent = t(copy.copy);
+        document.title = `ApplyPilot Local — ${t(copy.eyebrow)}`;
         if (updateHash && location.hash !== `#${stage}`) {
           try { history.replaceState(null, "", `#${stage}`); }
           catch { location.hash = stage; }
@@ -1576,6 +1968,20 @@
           if (focusPanel) document.getElementById("queue-title").focus({ preventScroll: true });
         }
       };
+
+      const setLocale = (nextLocale) => {
+        if (!["zh", "en"].includes(nextLocale)) return;
+        locale = nextLocale;
+        try { localStorage.setItem(LOCALE_KEY, locale); }
+        catch { /* Language switching remains available for this page view. */ }
+        applyLocaleChrome();
+        renderSourceHealth();
+        setStage(state.stage, { updateHash: false });
+      };
+
+      document.querySelectorAll("[data-locale]").forEach((button) => {
+        button.addEventListener("click", () => setLocale(button.dataset.locale));
+      });
 
       document.querySelectorAll("[data-discover-filter]").forEach((button) => {
         button.addEventListener("click", () => {
@@ -1752,6 +2158,7 @@
         if (stage in stageCopy && stage !== state.stage) setStage(stage, { updateHash: false });
       });
 
+      applyLocaleChrome();
       renderScores();
       renderSources();
       renderSourceHealth();
