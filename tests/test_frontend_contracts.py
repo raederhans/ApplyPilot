@@ -4,7 +4,12 @@ import json
 
 from applypilot.apply.authorization import compute_job_fingerprint
 from applypilot.database import close_connection, init_db
-from applypilot.frontend.contracts import build_prepare_job, build_verify_job
+from applypilot.frontend.contracts import (
+    build_discover_item,
+    build_discover_summary,
+    build_prepare_job,
+    build_verify_job,
+)
 from applypilot.view import collect_dashboard_data, render_dashboard
 
 
@@ -24,6 +29,219 @@ def _job(**changes: object) -> dict[str, object]:
     }
     job.update(changes)
     return job
+
+
+def test_discover_contract_keeps_lineage_bounded_and_non_promotional() -> None:
+    item = build_discover_item(
+        {
+            "kind": "lead",
+            "title": "Product Analyst",
+            "company_name": "Example",
+            "url": "https://social.example.test/post/42",
+            "source": "Candidate-reviewed import",
+            "provider": "manual",
+            "source_count": 1,
+            "last_seen_at": "2026-08-27T01:00:00+00:00",
+            "payload_json": '{"private":"must not escape"}',
+            "content_fingerprint": "a" * 64,
+        }
+    )
+    summary = build_discover_summary([item], [], lineage_available=True)
+    serialized = json.dumps(item)
+
+    assert item["state"] == "lead"
+    assert item["pipeline"]["state"] == "new"
+    assert summary["stats"]["leads"] == 1
+    assert "must not escape" not in serialized
+    assert "a" * 64 not in serialized
+
+
+def test_discover_contract_preserves_missing_lineage_and_not_run_source_issue() -> None:
+    item = build_discover_item(
+        {
+            "kind": "listing",
+            "title": "Unlinked listing",
+            "url": "https://example.test/jobs/unlinked",
+            "source_count": 0,
+        }
+    )
+    summary = build_discover_summary(
+        [item],
+        [{"status": "not_run", "paginationComplete": None, "hasError": False}],
+        lineage_available=True,
+    )
+
+    assert item["sourceCount"] == 0
+    assert summary["stats"]["sourceIssues"] == 1
+    assert summary["system"]["state"] == "needs_evidence"
+
+
+def test_dashboard_collects_discovery_lineage_with_selects_only(tmp_path) -> None:
+    db_path = tmp_path / "discover.db"
+    conn = init_db(db_path)
+    job_url = "https://careers.example.test/jobs/official-42"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, location, source_site, site, "
+        "discovered_at, last_seen_at, fit_score, eligibility_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job_url,
+            "Data Analyst",
+            "Example",
+            "Singapore",
+            "official_careers",
+            "official_careers",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+            8,
+            "eligible",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO radar_sources (source_id, company_id, company_name, source_type, "
+        "provider, access_mode, priority_tier, active, registered_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (
+            "private-source-id",
+            "example",
+            "Example careers",
+            "official_careers",
+            "greenhouse",
+            "public_read",
+            "p1",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO radar_fetch_runs (run_id, source_id, started_at, finished_at, "
+        "status, pagination_complete, normalized_count, new_count, lead_count, error) "
+        "VALUES (?, ?, ?, ?, 'partial', 0, 2, 1, 1, ?)",
+        (
+            "private-run-id",
+            "private-source-id",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+            "C:/private/token-bearing-provider-error",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO radar_source_observations (observation_key, source_id, source_url, "
+        "canonical_url, title, company_name, location, published_at, first_seen_at, "
+        "last_seen_at, last_run_id, verification_status, content_fingerprint, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "private-observation-official",
+            "private-source-id",
+            job_url,
+            job_url,
+            "Data Analyst",
+            "Example",
+            "Singapore",
+            "2026-08-26T00:00:00+00:00",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+            "private-run-id",
+            "verified_official",
+            "b" * 64,
+            '{"private":"official payload"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO radar_job_sources (job_url, observation_key, source_id, is_primary, "
+        "linked_at) VALUES (?, ?, ?, 1, ?)",
+        (job_url, "private-observation-official", "private-source-id", "2026-08-27T01:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO radar_source_observations (observation_key, source_id, source_url, "
+        "title, company_name, location, first_seen_at, last_seen_at, last_run_id, "
+        "verification_status, content_fingerprint, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?)",
+        (
+            "private-observation-lead",
+            "private-source-id",
+            "https://social.example.test/post/7",
+            "Product Analyst",
+            "Example",
+            "Singapore",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+            "private-run-id",
+            "c" * 64,
+            '{"private":"lead payload"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO radar_leads (lead_id, observation_key, status, company_id, title, "
+        "location, source_url, verification_status, reason, first_seen_at, last_seen_at) "
+        "VALUES (?, ?, 'awaiting_official', ?, ?, ?, ?, 'unverified', ?, ?, ?)",
+        (
+            "private-lead-id",
+            "private-observation-lead",
+            "example",
+            "Product Analyst",
+            "Singapore",
+            "https://social.example.test/post/7",
+            "C:/private/reason-must-not-escape",
+            "2026-08-27T00:00:00+00:00",
+            "2026-08-27T01:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+    html = render_dashboard(data)
+
+    assert data["discover"]["stats"] == {
+        "candidates": 2,
+        "verified": 1,
+        "leads": 1,
+        "sourceIssues": 1,
+    }
+    assert {item["state"] for item in data["discover"]["items"]} == {"verified", "lead"}
+    assert data["discover"]["sources"][0]["status"] == "partial"
+    assert "private-source-id" not in html
+    assert "token-bearing-provider-error" not in html
+    assert "official payload" not in html
+    assert "lead payload" not in html
+    assert "reason-must-not-escape" not in html
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
+
+
+def test_missing_discovery_lineage_degrades_without_migration(tmp_path) -> None:
+    db_path = tmp_path / "legacy-discover.db"
+    conn = init_db(db_path)
+    conn.execute("DROP TABLE radar_leads")
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, source_site, site, discovered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "https://example.test/jobs/legacy",
+            "Legacy Analyst",
+            "Example",
+            "manual",
+            "manual",
+            "2026-08-27T00:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    data = collect_dashboard_data(conn)
+
+    assert data["discover"]["system"]["state"] == "needs_evidence"
+    assert data["discover"]["stats"]["candidates"] == 1
+    assert data["discover"]["items"][0]["state"] == "observed"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='radar_leads'"
+    ).fetchone()[0] == 0
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    close_connection(db_path)
 
 
 def test_prepare_contract_requires_validation_and_hides_local_paths() -> None:
@@ -158,9 +376,11 @@ def test_dashboard_collects_current_prepare_evidence_with_selects_only(tmp_path)
     html = render_dashboard(data)
 
     assert data["prepare"]["stats"]["ready"] == 1
+    assert data["discover"]["items"][0]["sourceCount"] == 0
     assert data["jobs"][0]["prepare"]["route"]["state"] == "current"
     assert data["jobs"][0]["prepare"]["route"]["artifact"]["hasPdfBinding"] is True
     assert "tailored-data.pdf" in html
+    assert "No linked source" in html
     assert "C:/private" not in html
     assert "a" * 64 not in html
     assert 'document.querySelectorAll("#decide-panel .filter")' in html

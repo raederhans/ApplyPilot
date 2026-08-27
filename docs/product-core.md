@@ -19,9 +19,20 @@ boundaries are the core of the product rather than implementation detail.
 
 ## Frontend information architecture
 
-The browser product follows the same four-stage workflow. The first delivered
-surface is the **Opportunity Workbench**, which covers Discover and Decide with
-existing read-only data:
+The browser product follows the same four-stage workflow. The **Discovery
+Workbench** exposes persisted source truth without collecting or promoting
+records:
+
+- official listings, unresolved leads, and listings without radar lineage stay
+  visibly distinct;
+- the latest persisted provider run reports coverage, pagination, and partial
+  status without exposing raw provider errors or payloads;
+- source search, evidence filtering, sorting, and bounded pagination remain
+  entirely client-side;
+- opening a listing or reviewing a lead does not promote, score, authorize, or
+  apply to it.
+
+The **Opportunity Workbench** covers Decide with existing read-only data:
 
 - a compact pipeline summary for eligible, ready, scored, and strong-fit roles;
 - ranked opportunities with fit evidence and source context;
@@ -50,7 +61,9 @@ receipt admission.
 - Dashboard generation does not initialize, refresh, or mutate database state; a missing or unreadable database becomes an actionable frontend state.
 - The packaged HTML owns layout, responsive behavior, accessibility, URL safety, and client-side filtering.
 - The complete ranked dataset remains searchable in the page payload, while the DOM renders at most 60 matching cards at a time.
-- Decide and Prepare share one accessible keyboard-navigable workflow, and only the active queue is rendered into the DOM.
+- Discover, Decide, Prepare, and Verify share one accessible keyboard-navigable workflow, and only the active queue is rendered into the DOM.
+- Every stage has isolated search, evidence filters, sorting, pagination, and actionable empty/error states; the URL hash preserves the selected stage without serializing private filter content.
+- Suggested CLI commands can be copied locally, but the browser never executes them.
 - Prepare serializes status, timestamps, safe filenames, and bounded evidence summaries; resume content, hashes, full local paths, and validation evidence payloads stay out of the page.
 - Verify serializes only bounded status, timing, boolean observation, and ledger summaries; raw manifest data, receipt identifiers and text, ledger evidence payloads, local paths, and security codes stay out of the page.
 - The frontend uses no remote fonts, scripts, analytics, or network assets.
@@ -62,5 +75,5 @@ receipt admission.
 A mature product slice should be installable in an isolated environment, expose
 one clear command, retain a local-data boundary, distinguish evidence from
 claims, and let a user understand the next safe action without reading the code.
-The release bundle and Opportunity Workbench are the first slice against that
-standard.
+The release bundle and four-stage local workbench are the first complete slice
+against that standard.

@@ -18,6 +18,110 @@ _BROWSER_CONFIRMATIONS = {
 }
 
 
+def build_discover_item(record: Mapping[str, object]) -> dict[str, Any]:
+    """Adapt one discovered listing or unresolved lead without raw lineage payloads."""
+    kind = _text(record.get("kind"), limit=24).casefold()
+    is_lead = kind == "lead"
+    verified = bool(record.get("verified_official")) and not is_lead
+    if verified:
+        state = "verified"
+        label = "Official listing verified"
+    elif is_lead:
+        state = "lead"
+        label = "Lead awaiting an official listing"
+    else:
+        state = "observed"
+        label = "Listing observed; official lineage not recorded"
+
+    fit_score = record.get("fit_score")
+    eligibility = _text(record.get("eligibility_status"), limit=40).casefold()
+    if eligibility == "ineligible":
+        pipeline_state = "excluded"
+        pipeline_label = "Excluded by recorded eligibility"
+    elif isinstance(fit_score, (int, float)) and fit_score >= 5:
+        pipeline_state = "shortlisted"
+        pipeline_label = "Available in the decision queue"
+    elif isinstance(fit_score, (int, float)):
+        pipeline_state = "scored"
+        pipeline_label = "Scored below the current shortlist"
+    else:
+        pipeline_state = "new"
+        pipeline_label = "Needs enrichment and fit evidence"
+
+    return {
+        "state": state,
+        "label": label,
+        "kind": "lead" if is_lead else "listing",
+        "title": _text(record.get("title"), limit=180) or "Untitled opportunity",
+        "company": _text(record.get("company_name"), limit=140) or "Unknown employer",
+        "location": _text(record.get("location"), limit=120),
+        "url": _text(record.get("url"), limit=2_000),
+        "source": _text(record.get("source"), limit=120) or "Unknown source",
+        "provider": _text(record.get("provider"), limit=80),
+        "sourceCount": max(0, int(record.get("source_count") or 0)),
+        "publishedAt": _text(record.get("published_at"), limit=80),
+        "firstSeenAt": _text(record.get("first_seen_at"), limit=80),
+        "lastSeenAt": _text(record.get("last_seen_at"), limit=80),
+        "pipeline": {"state": pipeline_state, "label": pipeline_label},
+    }
+
+
+def build_discover_summary(
+    items: list[Mapping[str, object]],
+    sources: list[Mapping[str, object]],
+    *,
+    lineage_available: bool,
+) -> dict[str, Any]:
+    """Summarize read-only discovery lineage and source-run health."""
+    states = [str(item.get("state") or "observed") for item in items]
+    source_issues = sum(
+        1
+        for source in sources
+        if source.get("status") != "complete"
+        or source.get("paginationComplete") is False
+        or source.get("hasError") is True
+    )
+    stats = {
+        "candidates": len(items),
+        "verified": states.count("verified"),
+        "leads": states.count("lead"),
+        "sourceIssues": source_issues,
+    }
+    if not items and not sources:
+        system = {
+            "state": "empty",
+            "title": "No discovery snapshot yet",
+            "message": "Collect current openings to create a local source snapshot. This page does not fetch or promote listings by itself.",
+            "actions": [{"label": "Collect openings", "command": "applypilot radar collect"}],
+            "detail": "",
+        }
+    elif not lineage_available:
+        system = {
+            "state": "needs_evidence",
+            "title": "Source lineage is not available",
+            "message": "Existing job records remain visible, but provider runs and unresolved leads cannot be verified from this workspace snapshot.",
+            "actions": [{"label": "Collect source evidence", "command": "applypilot radar collect"}],
+            "detail": "",
+        }
+    elif source_issues:
+        system = {
+            "state": "needs_evidence",
+            "title": f"{source_issues} source runs need attention",
+            "message": "Partial or incomplete source runs are kept visible and are not treated as complete coverage.",
+            "actions": [{"label": "Refresh sources", "command": "applypilot radar collect"}],
+            "detail": "",
+        }
+    else:
+        system = {
+            "state": "ready",
+            "title": "Discovery snapshot ready",
+            "message": "Listings, unresolved leads, and provider-run state reflect persisted local source evidence.",
+            "actions": [],
+            "detail": "",
+        }
+    return {"system": system, "stats": stats}
+
+
 def _text(value: object, *, limit: int = 240) -> str:
     return str(value or "").strip()[:limit]
 
