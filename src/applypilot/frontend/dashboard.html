@@ -25,6 +25,18 @@
     }
 
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
     html { scroll-behavior: smooth; }
     body {
       margin: 0;
@@ -36,7 +48,7 @@
     }
     button, input { font: inherit; }
     button, a { -webkit-tap-highlight-color: transparent; }
-    button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible {
+    button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible, h2:focus-visible {
       outline: 2px solid var(--mint);
       outline-offset: 3px;
     }
@@ -156,6 +168,40 @@
       border-radius: var(--radius);
       background: var(--panel);
     }
+    .system-panel {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: center;
+      padding: 22px;
+      border-bottom: 1px solid var(--line);
+      background: #111713;
+    }
+    .system-panel.state-error { background: #1a1210; }
+    .system-kicker {
+      margin: 0 0 6px;
+      color: var(--mint);
+      font: 10px/1.2 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .system-panel.state-error .system-kicker { color: var(--amber); }
+    .system-title { margin: 0; font-size: 16px; font-weight: 650; }
+    .system-copy { max-width: 720px; margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+    .system-detail { margin: 8px 0 0; color: var(--quiet); font: 10px/1.5 var(--mono); }
+    .system-actions { display: grid; gap: 7px; min-width: min(100%, 330px); }
+    .command-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--ink);
+    }
+    .command-row span { color: var(--quiet); font-size: 10px; }
+    .command-row code { overflow-x: auto; color: var(--text); font: 10px/1.4 var(--mono); white-space: nowrap; }
     .metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
     .metric { min-width: 0; padding: 20px 22px; }
     .metric + .metric { border-left: 1px solid var(--line); }
@@ -289,6 +335,21 @@
     .action:hover { background: #17221b; }
     .empty { display: none; padding: 54px 12px; border-top: 1px solid var(--line-soft); color: var(--muted); text-align: center; }
     .empty.visible { display: block; }
+    .empty strong { display: block; margin-bottom: 7px; color: var(--text); font-size: 14px; }
+    .empty span { display: block; font-size: 12px; }
+    .queue-footer { display: flex; justify-content: center; gap: 8px; padding-top: 18px; }
+    .page-button {
+      min-height: 38px;
+      padding: 8px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-raised);
+      color: var(--text);
+      cursor: pointer;
+      font: 10px/1 var(--mono);
+      letter-spacing: .06em;
+    }
+    .page-button:hover { border-color: #4b6b57; color: var(--mint); }
 
     .insights { min-width: 0; padding: 25px 22px; border-left: 1px solid var(--line); background: #0d100e; }
     .insight-block + .insight-block { margin-top: 34px; padding-top: 28px; border-top: 1px solid var(--line-soft); }
@@ -329,6 +390,7 @@
       .metric:nth-child(3) { border-left: 0; }
       .metric:nth-child(n+3) { border-top: 1px solid var(--line); }
       .toolbar { align-items: stretch; flex-direction: column; }
+      .system-panel { grid-template-columns: 1fr; }
       .search-wrap { flex-basis: auto; }
       .filters { display: grid; grid-template-columns: repeat(4, 1fr); }
       .filter { padding-inline: 4px; }
@@ -370,10 +432,19 @@
           <h1>Move evidence forward.</h1>
           <p class="head-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
         </div>
-        <div class="local-status"><span class="status-dot" aria-hidden="true"></span>LOCAL WORKSPACE</div>
+        <div class="local-status" id="workspace-status"><span class="status-dot" id="status-dot" aria-hidden="true"></span><span id="status-label">LOCAL WORKSPACE</span></div>
       </header>
 
       <section class="workbench" aria-label="Opportunity workbench">
+        <section class="system-panel" id="system-panel" aria-live="polite" hidden>
+          <div>
+            <p class="system-kicker" id="system-kicker">Workspace guidance</p>
+            <h2 class="system-title" id="system-title"></h2>
+            <p class="system-copy" id="system-copy"></p>
+            <p class="system-detail" id="system-detail" hidden></p>
+          </div>
+          <div class="system-actions" id="system-actions"></div>
+        </section>
         <div class="metrics" aria-label="Pipeline summary">
           <div class="metric"><strong class="metric-value" id="stat-total">0</strong><span class="metric-label">Eligible roles</span></div>
           <div class="metric"><strong class="metric-value" id="stat-ready">0</strong><span class="metric-label">Ready to review</span></div>
@@ -382,20 +453,24 @@
         </div>
 
         <div class="toolbar">
-          <label class="search-wrap"><span hidden>Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
+          <label class="search-wrap"><span class="sr-only">Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
           <div class="filters" aria-label="Minimum fit score">
-            <button class="filter active" type="button" data-min-score="5">ALL 5+</button>
-            <button class="filter" type="button" data-min-score="7">7+</button>
-            <button class="filter" type="button" data-min-score="8">8+</button>
-            <button class="filter" type="button" data-min-score="9">9+</button>
+            <button class="filter active" type="button" data-min-score="5" aria-pressed="true">ALL 5+</button>
+            <button class="filter" type="button" data-min-score="7" aria-pressed="false">7+</button>
+            <button class="filter" type="button" data-min-score="8" aria-pressed="false">8+</button>
+            <button class="filter" type="button" data-min-score="9" aria-pressed="false">9+</button>
           </div>
         </div>
 
         <div class="content-grid">
           <section class="queue" id="opportunities">
-            <div class="queue-head"><h2>Ranked opportunities</h2><span class="result-count" id="result-count">0 visible</span></div>
+            <div class="queue-head"><h2 id="queue-title" tabindex="-1">Ranked opportunities</h2><span class="result-count" id="result-count" aria-live="polite">0 of 0 shown</span></div>
             <div class="opportunity-list" id="opportunity-list"></div>
-            <div class="empty" id="empty-state">No opportunities match the current filter.</div>
+            <div class="empty" id="empty-state"><strong id="empty-title">No matching opportunities</strong><span id="empty-copy">Try a broader search or lower the minimum fit score.</span></div>
+            <nav class="queue-footer" aria-label="Opportunity pages">
+              <button class="page-button" id="page-previous" type="button" hidden>PREVIOUS PAGE</button>
+              <button class="page-button" id="page-next" type="button" hidden>NEXT PAGE</button>
+            </nav>
           </section>
 
           <aside class="insights" aria-label="Evidence overview">
@@ -420,8 +495,15 @@
     (() => {
       "use strict";
       const data = JSON.parse(document.getElementById("dashboard-data").textContent);
-      const state = { minimumScore: 5, query: "" };
+      const PAGE_SIZE = 60;
+      const state = { minimumScore: 5, query: "", pageIndex: 0 };
       const list = document.getElementById("opportunity-list");
+      const rawJobs = Array.isArray(data.jobs) ? data.jobs : [];
+      const indexedJobs = rawJobs.map((job) => ({
+        job,
+        search: [job.title, job.company, job.source, job.location, job.keywords]
+          .join(" ").toLocaleLowerCase(),
+      }));
 
       const make = (tag, className, text) => {
         const node = document.createElement(tag);
@@ -439,11 +521,39 @@
         if (text) parent.append(make("span", `tag ${className}`.trim(), text));
       };
 
+      const renderSystem = () => {
+        const system = data.system || { state: "ready" };
+        const panel = document.getElementById("system-panel");
+        const isReady = system.state === "ready";
+        panel.hidden = isReady;
+        panel.className = `system-panel state-${system.state || "ready"}`;
+        document.getElementById("system-kicker").textContent = system.state === "error" ? "Workspace issue" : "Next safe action";
+        document.getElementById("system-title").textContent = system.title || "Workspace status";
+        document.getElementById("system-copy").textContent = system.message || "";
+
+        const detail = document.getElementById("system-detail");
+        detail.textContent = system.detail || "";
+        detail.hidden = !system.detail;
+
+        const actions = document.getElementById("system-actions");
+        actions.replaceChildren();
+        for (const action of (system.actions || [])) {
+          const row = make("div", "command-row");
+          row.append(make("span", "", action.label), make("code", "", action.command));
+          actions.append(row);
+        }
+        actions.hidden = actions.childElementCount === 0;
+
+        const statusLabel = document.getElementById("status-label");
+        statusLabel.textContent = system.state === "error" ? "LOCAL DATA ISSUE" : "LOCAL WORKSPACE";
+        document.getElementById("status-dot").style.background = system.state === "error" ? "var(--amber)" : "var(--mint)";
+      };
+
       const stats = data.stats || {};
-      document.getElementById("stat-total").textContent = stats.total || 0;
-      document.getElementById("stat-ready").textContent = stats.ready || 0;
-      document.getElementById("stat-scored").textContent = stats.scored || 0;
-      document.getElementById("stat-high").textContent = stats.highFit || 0;
+      document.getElementById("stat-total").textContent = stats.total ?? 0;
+      document.getElementById("stat-ready").textContent = stats.ready ?? 0;
+      document.getElementById("stat-scored").textContent = stats.scored ?? 0;
+      document.getElementById("stat-high").textContent = stats.highFit ?? 0;
 
       const renderScores = () => {
         const target = document.getElementById("score-bars");
@@ -477,14 +587,9 @@
         }
       };
 
-      const renderJobs = () => {
-        const fragment = document.createDocumentFragment();
-        (data.jobs || []).forEach((job, index) => {
+      const createJobCard = (job, index) => {
           const card = make("article", "opportunity");
           card.style.setProperty("--index", index);
-          card.dataset.score = String(job.score || 0);
-          card.dataset.search = [job.title, job.company, job.source, job.location, job.keywords].join(" ").toLocaleLowerCase();
-
           card.append(make("div", `score ${job.score >= 7 ? "high" : ""}`.trim(), job.score));
           const body = make("div", "opportunity-body");
           const heading = make("h3", "opportunity-title");
@@ -535,39 +640,78 @@
             actions.append(apply);
           }
           card.append(actions);
-          fragment.append(card);
-        });
-        list.append(fragment);
+          return card;
       };
 
-      const applyFilters = () => {
-        let visible = 0;
+      const matchingJobs = () => {
         const query = state.query.toLocaleLowerCase();
-        list.querySelectorAll(".opportunity").forEach((card) => {
-          const matches = Number(card.dataset.score) >= state.minimumScore && (!query || card.dataset.search.includes(query));
-          card.classList.toggle("hidden", !matches);
-          if (matches) visible += 1;
+        return indexedJobs.filter(({ job, search }) => (
+          Number(job.score || 0) >= state.minimumScore && (!query || search.includes(query))
+        ));
+      };
+
+      const renderJobs = () => {
+        const matches = matchingJobs();
+        const pageCount = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        state.pageIndex = Math.min(state.pageIndex, pageCount - 1);
+        const pageStart = state.pageIndex * PAGE_SIZE;
+        const pageEnd = Math.min(pageStart + PAGE_SIZE, matches.length);
+        const fragment = document.createDocumentFragment();
+        matches.slice(pageStart, pageEnd).forEach(({ job }, index) => {
+          fragment.append(createJobCard(job, index));
         });
-        document.getElementById("result-count").textContent = `${visible} visible`;
-        document.getElementById("empty-state").classList.toggle("visible", visible === 0);
+        list.replaceChildren(fragment);
+
+        document.getElementById("result-count").textContent = matches.length
+          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
+          : "0 of 0 shown";
+        const empty = document.getElementById("empty-state");
+        empty.classList.toggle("visible", matches.length === 0);
+        const systemState = (data.system || {}).state;
+        const hasWorkspaceJobs = rawJobs.length > 0;
+        document.getElementById("empty-title").textContent = hasWorkspaceJobs ? "No matching opportunities" : "Nothing to rank yet";
+        document.getElementById("empty-copy").textContent = hasWorkspaceJobs
+          ? "Try a broader search or lower the minimum fit score."
+          : (systemState === "error" ? "Resolve the workspace issue above, then regenerate this page." : "Use the next safe action above to build the queue.");
+
+        document.getElementById("page-previous").hidden = pageStart === 0;
+        document.getElementById("page-next").hidden = pageEnd >= matches.length;
       };
 
       document.querySelectorAll(".filter").forEach((button) => {
         button.addEventListener("click", () => {
           state.minimumScore = Number(button.dataset.minScore);
-          document.querySelectorAll(".filter").forEach((candidate) => candidate.classList.toggle("active", candidate === button));
-          applyFilters();
+          document.querySelectorAll(".filter").forEach((candidate) => {
+            const isActive = candidate === button;
+            candidate.classList.toggle("active", isActive);
+            candidate.setAttribute("aria-pressed", String(isActive));
+          });
+          state.pageIndex = 0;
+          renderJobs();
         });
       });
       document.getElementById("search").addEventListener("input", (event) => {
         state.query = event.target.value.trim();
-        applyFilters();
+        state.pageIndex = 0;
+        renderJobs();
+      });
+      document.getElementById("page-previous").addEventListener("click", () => {
+        state.pageIndex = Math.max(0, state.pageIndex - 1);
+        renderJobs();
+        document.getElementById("opportunities").scrollIntoView({ block: "start" });
+        document.getElementById("queue-title").focus({ preventScroll: true });
+      });
+      document.getElementById("page-next").addEventListener("click", () => {
+        state.pageIndex += 1;
+        renderJobs();
+        document.getElementById("opportunities").scrollIntoView({ block: "start" });
+        document.getElementById("queue-title").focus({ preventScroll: true });
       });
 
+      renderSystem();
       renderScores();
       renderSources();
       renderJobs();
-      applyFilters();
     })();
   </script>
 </body>

@@ -1889,8 +1889,6 @@ def dashboard(
     ),
 ) -> None:
     """Generate the local HTML dashboard and optionally open it."""
-    _bootstrap()
-
     from applypilot.view import generate_dashboard, open_dashboard
 
     if open_browser:
@@ -1903,8 +1901,10 @@ def dashboard(
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
+    import sqlite3
 
     from applypilot.config import (
+        DB_PATH,
         PROFILE_PATH,
         RESUME_PATH,
         RESUME_PDF_PATH,
@@ -1941,6 +1941,25 @@ def doctor() -> None:
         results.append(("searches.yaml", ok_mark, str(SEARCH_CONFIG_PATH)))
     else:
         results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
+
+    # Local database (read-only; never initializes, migrates, or repairs it).
+    if not DB_PATH.is_file():
+        results.append(("job database", warn_mark, "Not created yet — collect opportunities first"))
+    else:
+        from applypilot.view import collect_dashboard_data
+
+        try:
+            dashboard_data = collect_dashboard_data()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            detail = f"{type(exc).__name__}: {exc}"[:120]
+            results.append((
+                "job database",
+                fail_mark,
+                f"{detail}; restore a known-good backup (automatic repair is disabled)",
+            ))
+        else:
+            total = dashboard_data["stats"]["total"]
+            results.append(("job database", ok_mark, f"Readable; {total} eligible roles"))
 
     # JobSpy is an optional capability rather than a core import dependency.
     try:

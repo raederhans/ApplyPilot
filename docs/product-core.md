@@ -37,7 +37,9 @@ resume routing, authorization, application execution, and receipt admission.
 ## Current frontend boundary
 
 - The Python adapter may query existing SQLite contracts and serialize a view model.
+- Dashboard generation does not initialize, refresh, or mutate database state; a missing or unreadable database becomes an actionable frontend state.
 - The packaged HTML owns layout, responsive behavior, accessibility, URL safety, and client-side filtering.
+- The complete ranked dataset remains searchable in the page payload, while the DOM renders at most 60 matching cards at a time.
 - The frontend uses no remote fonts, scripts, analytics, or network assets.
 - Profiles, resumes, credentials, receipt evidence, and unrestricted job data are never included in release archives.
 - No database schema, pipeline stage, application decision, or receipt rule is changed as part of the frontend work.
