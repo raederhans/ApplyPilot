@@ -5,8 +5,16 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Runtime artifacts
+.artifacts/
+.playwright-cli/
+output/
 *.db
 tailored_resumes/
 cover_letters/

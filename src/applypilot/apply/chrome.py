@@ -6,6 +6,7 @@ worker profile setup/cloning, and cross-platform process cleanup.
 
 import json
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ from applypilot import config
 logger = logging.getLogger(__name__)
 
 # CDP port base — each worker uses BASE_CDP_PORT + worker_id
-BASE_CDP_PORT = 9222
+BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
@@ -45,6 +46,7 @@ def _kill_process_tree(pid: int) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
+                check=False,
             )
         else:
             # Unix: kill entire process group
@@ -70,7 +72,7 @@ def _kill_on_port(port: int) -> None:
         if platform.system() == "Windows":
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             for line in result.stdout.splitlines():
                 if f":{port}" in line and "LISTENING" in line:
@@ -81,7 +83,7 @@ def _kill_on_port(port: int) -> None:
             # macOS / Linux
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             for pid_str in result.stdout.strip().splitlines():
                 pid_str = pid_str.strip()
@@ -111,6 +113,36 @@ def setup_worker_profile(worker_id: int) -> Path:
         Path to the worker's Chrome user-data directory.
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+
+    mode = os.environ.get("APPLYPILOT_BROWSER_PROFILE_MODE", "clone").lower()
+
+    # Preview runs must not inherit extensions, autofill data, or stale session
+    # state from either the user's daily profile or a previous experiment. Only
+    # the ApplyPilot-owned worker directory is ever removed here.
+    if mode == "fresh":
+        worker_root = config.CHROME_WORKER_DIR.resolve()
+        resolved_profile = profile_dir.resolve()
+        if resolved_profile.parent != worker_root or resolved_profile == worker_root:
+            raise ValueError(f"Unsafe browser worker profile path: {resolved_profile}")
+        if resolved_profile.exists():
+            shutil.rmtree(resolved_profile)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("[worker-%d] Using a fresh isolated browser profile", worker_id)
+        return profile_dir
+
+    # Persistent mode is an ApplyPilot-owned browser identity. It is created
+    # empty and then reused, so a one-time interactive login can survive later
+    # application runs without copying the user's daily Edge/Chrome profile.
+    if mode == "persistent":
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("[worker-%d] Using the persistent ApplyPilot browser profile", worker_id)
+        return profile_dir
+
+    if mode != "clone":
+        raise ValueError(
+            "APPLYPILOT_BROWSER_PROFILE_MODE must be fresh, persistent, or clone"
+        )
+
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
@@ -125,6 +157,14 @@ def setup_worker_profile(worker_id: int) -> Path:
             break
     if source is None:
         source = config.get_chrome_user_data()
+    if not source.exists():
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        logger.warning(
+            "[worker-%d] Browser profile source not found at %s; using a fresh profile",
+            worker_id,
+            source,
+        )
+        return profile_dir
 
     logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                 worker_id, source.name)
@@ -187,13 +227,15 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+                  headless: bool = False,
+                  start_url: str | None = None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        start_url: Optional initial page to open.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -226,6 +268,11 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--password-store=basic",
         "--disable-save-password-bubble",
         "--disable-popup-blocking",
+        # System-level external extension registrations can repopulate even a
+        # brand-new Edge profile. Disable extensions at launch so no third
+        # party can observe or rewrite application fields.
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
@@ -234,9 +281,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if headless:
         cmd.append("--headless=new")
+    if start_url:
+        cmd.append(start_url)
 
     # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
     if platform.system() != "Windows":
         import os
         kwargs["preexec_fn"] = os.setsid

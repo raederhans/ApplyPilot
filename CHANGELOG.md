@@ -2,6 +2,37 @@
 
 All notable changes to ApplyPilot will be documented in this file.
 
+## [0.4.0] - 2026-08-26
+
+### Changed
+
+- Established the independent **ApplyPilot Local** product identity while
+  retaining the `applypilot` import package and CLI for compatibility.
+- Reframed the product around local-first storage, explicit authorization,
+  source provenance, validated resume reuse, and receipt-backed application
+  status.
+- Moved broad third-party job-board discovery behind the optional
+  `jobboards` extra so the core product no longer inherits JobSpy's pinned
+  NumPy/Pandas dependency chain.
+- Added a single capability preflight before JobSpy expands its search matrix,
+  with explicit Python 3.11-3.12 compatibility guidance.
+- Replaced per-row Pandas Series construction in JobSpy ingestion and location
+  filtering with record/list operations for substantially lower batch overhead.
+- Restricted source distributions to an explicit release file set so local
+  research notes, experiments, receipts, and runtime data cannot be packaged.
+- Enabled automatic CI for pushes and pull requests, with lint, full tests,
+  clean package builds, and dependency caching.
+- Added a non-interactive, file-based onboarding path and browser-free
+  dashboard generation for deterministic clean-workspace checks.
+- Added a Windows release smoke job covering wheel install, initialization,
+  setup diagnosis, and packaged dashboard generation.
+- Gated tagged publishing on version parity and PyPI success before creating a
+  GitHub Release with wheel, source archive, verified bundle, and checksums.
+
+### Added
+
+- Fork provenance and AGPL network-deployment guidance in `NOTICE.md`.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

@@ -1,0 +1,102 @@
+# Candidate-operated LinkedIn Content Search presets.  These are URL-building
+# inputs only; ApplyPilot must not use them for unattended LinkedIn scraping.
+defaults:
+  window: past-24h
+  sort: latest
+  # Live comparison on 2026-08-24 found plain terms dominated by global spam;
+  # Singapore hiring hashtags plus one exact role phrase yielded local job posts.
+  query_style: hashtag_exact
+  hiring_terms:
+    - "#hiring"
+  location_terms:
+    - "#singaporejobs"
+  max_role_terms_per_query: 1
+
+tracks:
+  general_product_consulting:
+    product_management:
+      - product manager
+      - product analyst
+      - product owner
+    product_ops:
+      - product operations
+      - product ops
+    strategy_ops:
+      - strategy operations
+      - business operations
+      - strategy and operations
+    pre_sales_solution_consulting:
+      - solutions consultant
+      - solution engineer
+      - solutions engineer
+      - solutions architect
+      - pre-sales
+      - presales
+      - sales engineer
+    implementation_consulting:
+      - implementation consultant
+      - implementation specialist
+      - implementation manager
+      - technical consultant
+
+  data_bi_decision:
+    data_analytics:
+      - data analyst
+      - analytics consultant
+      - data analytics
+    business_intelligence:
+      - business intelligence
+      - BI analyst
+      - business intelligence analyst
+    business_operations_analysis:
+      - business analyst
+      - operations analyst
+      - decision analyst
+    planning_analytics:
+      - planning analyst
+      - demand planning analyst
+      - supply planning analyst
+    strategy_analytics:
+      - strategy analyst
+
+  ai_implementation:
+    ai_solutions:
+      - AI solutions
+      - AI solutions consultant
+      - AI engineer
+      - artificial intelligence engineer
+      - generative AI
+      - GenAI
+    forward_deployed_ai:
+      - forward deployed engineer
+      - forward deployed AI
+    workflow_automation:
+      - workflow automation
+      - automation analyst
+    ai_product_ops:
+      - AI product operations
+      - AI product ops
+    technical_pre_sales_ai:
+      - AI solution engineer
+      - AI sales engineer
+      - AI solutions architect
+
+  spatial:
+    urban_planning:
+      - urban planner
+      - urban planning
+      - urban designer
+    transport_planning:
+      - transport planner
+      - transport planning
+      - transportation planner
+    geospatial:
+      - geospatial
+      - GIS analyst
+      - GIS consultant
+    location_intelligence:
+      - location intelligence
+    digital_twin:
+      - digital twin
+    urban_technology:
+      - urban technology

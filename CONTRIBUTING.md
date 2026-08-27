@@ -1,6 +1,6 @@
-# Contributing to ApplyPilot
+# Contributing to ApplyPilot Local
 
-Thank you for your interest in contributing to ApplyPilot. This guide covers everything you need to get started.
+Thank you for your interest in contributing to ApplyPilot Local. This guide covers everything you need to get started.
 
 ## Development Setup
 
@@ -12,7 +12,7 @@ Thank you for your interest in contributing to ApplyPilot. This guide covers eve
 ### Clone and Install
 
 ```bash
-git clone https://github.com/Pickle-Pixel/ApplyPilot.git
+git clone https://github.com/raederhans/ApplyPilot.git
 cd ApplyPilot
 pip install -e ".[dev]"
 playwright install chromium
@@ -45,7 +45,7 @@ Workday employer portals are configured in `config/employers.yaml`. To add a new
   url: "https://company.wd5.myworkdaysite.com/en-US/recruiting"
 ```
 
-4. Test discovery: `applypilot discover --employer "Company Name"`
+4. Test the relevant official-radar collection path.
 5. Submit a PR with the new entry
 
 ### Adding New Career Sites
@@ -66,12 +66,12 @@ Direct career site scrapers are configured in `config/sites.yaml`. To add a new 
     description: ".job-description"
 ```
 
-3. Test: `applypilot discover --site "Company Name"`
+3. Test the relevant discovery provider and its source-state contract.
 4. Submit a PR
 
 ### Bug Fixes and Features
 
-1. Check existing [issues](https://github.com/Pickle-Pixel/ApplyPilot/issues) to avoid duplicating work
+1. Check existing [issues](https://github.com/raederhans/ApplyPilot/issues) to avoid duplicating work
 2. For new features, open an issue first to discuss the approach
 3. Fork the repo and create a feature branch from `main`
 4. Write your code with type hints and docstrings
@@ -98,7 +98,7 @@ ApplyPilot uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting.
 
 ```bash
 # Check for issues
-ruff check src/
+ruff check src
 
 # Auto-fix what can be fixed
 ruff check src/ --fix
@@ -113,7 +113,7 @@ ruff format src/
 - **Docstrings**: All public functions and classes must have docstrings (Google style)
 - **Naming**: snake_case for functions and variables, PascalCase for classes
 - **Imports**: Sorted by Ruff (isort-compatible)
-- **Line length**: 100 characters maximum
+- **Line length**: 120 characters maximum
 
 ## PR Guidelines
 
@@ -131,14 +131,12 @@ ApplyPilot/
 ├── src/applypilot/       # Main package
 │   ├── __init__.py
 │   ├── cli.py            # CLI entry points
-│   ├── discover/         # Stage 1: job discovery scrapers
-│   ├── enrich/           # Stage 2: description extraction
-│   ├── score/            # Stage 3: AI scoring
-│   ├── tailor/           # Stage 4: resume tailoring
-│   ├── cover/            # Stage 5: cover letter generation
+│   ├── discovery/        # Official radar and optional job-board discovery
+│   ├── enrichment/       # Description extraction
+│   ├── scoring/          # Fit, resume, cover-letter, and PDF validation
 │   ├── apply/            # Stage 6: browser automation
-│   └── utils/            # Shared utilities
-├── config/               # Default configuration files
+│   └── resume_library.py # Validated reusable resume artifacts
+├── src/applypilot/config/ # Packaged default configuration
 ├── tests/                # Test suite
 ├── docs/                 # Documentation
 └── pyproject.toml        # Package configuration

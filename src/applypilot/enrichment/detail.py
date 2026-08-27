@@ -16,15 +16,14 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from urllib.parse import urljoin
+from datetime import UTC, datetime
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.database import init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -59,7 +58,7 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     if not raw_url:
         return None
 
-    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+    if raw_url.startswith(("http://", "https://")):
         return raw_url
 
     if site == "WelcomeToTheJungle":
@@ -76,7 +75,7 @@ def resolve_url(raw_url: str, site: str) -> str | None:
         return None
 
     if ";jsessionid=" in raw_url:
-        raw_url = raw_url.split(";jsessionid=")[0]
+        raw_url = raw_url.split(";jsessionid=", maxsplit=1)[0]
 
     return urljoin(base, raw_url)
 
@@ -90,7 +89,7 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
 
     for row in rows:
         url, site = row[0], row[1]
-        if url.startswith("http://") or url.startswith("https://"):
+        if url.startswith(("http://", "https://")):
             already_absolute += 1
             continue
 
@@ -141,7 +140,7 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
             try:
                 algolia_data["response"] = json.loads(response.text())
             except Exception:
-                pass
+                log.debug("Ignoring malformed WTTJ Algolia response", exc_info=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -217,7 +216,7 @@ def collect_detail_intelligence(page) -> dict:
             data = json.loads(el.inner_text())
             intel["json_ld"].append(data)
         except Exception:
-            pass
+            log.debug("Ignoring malformed job-detail JSON-LD", exc_info=True)
 
     return intel
 
@@ -283,9 +282,9 @@ APPLY_SELECTORS = [
     'a[class*="apply"]',
     'a[aria-label*="pply"]',
     'button[data-testid*="apply"]',
-    'a#apply_button',
-    '.postings-btn-wrapper a',
-    'a.ashby-job-posting-apply-button',
+    "a#apply_button",
+    ".postings-btn-wrapper a",
+    "a.ashby-job-posting-apply-button",
     '#grnhse_app a[href*="apply"]',
     'a[data-qa="btn-apply"]',
     'a[class*="btn-apply"]',
@@ -294,29 +293,29 @@ APPLY_SELECTORS = [
 ]
 
 DESCRIPTION_SELECTORS = [
-    '#job-description',
-    '#job_description',
-    '#jobDescriptionText',
-    '.job-description',
-    '.job_description',
+    "#job-description",
+    "#job_description",
+    "#jobDescriptionText",
+    ".job-description",
+    ".job_description",
     '[class*="job-description"]',
     '[class*="jobDescription"]',
     '[data-testid*="description"]',
     '[data-testid="job-description"]',
-    '.posting-page .posting-categories + div',
-    '#content .posting-page',
-    '#app_body .content',
-    '#grnhse_app .content',
-    '.ashby-job-posting-description',
+    ".posting-page .posting-categories + div",
+    "#content .posting-page",
+    "#app_body .content",
+    "#grnhse_app .content",
+    ".ashby-job-posting-description",
     '[class*="posting-description"]',
     '[class*="job-detail"]',
     '[class*="jobDetail"]',
     '[class*="job-content"]',
     '[class*="job-body"]',
     '[role="main"] article',
-    'main article',
+    "main article",
     'article[class*="job"]',
-    '.job-posting-content',
+    ".job-posting-content",
 ]
 
 
@@ -336,6 +335,7 @@ def extract_apply_url_deterministic(page) -> str | None:
                         return parent_href
                     return page.url
         except Exception:
+            log.debug("Apply selector failed: %s", sel, exc_info=True)
             continue
 
     try:
@@ -347,9 +347,32 @@ def extract_apply_url_deterministic(page) -> str | None:
                 if href and href != "#" and "javascript:" not in href:
                     return href
     except Exception:
-        pass
+        log.debug("Fallback apply-link scan failed", exc_info=True)
 
     return None
+
+
+def sanitize_application_url(job_url: str, application_url: str | None) -> str | None:
+    """Reject authentication/navigation links that are not application targets."""
+    if not application_url or not str(application_url).strip():
+        return None
+    candidate = urljoin(job_url, str(application_url).strip())
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+
+    hostname = parsed.hostname.casefold()
+    path = parsed.path.casefold().rstrip("/")
+    if hostname == "linkedin.com" or hostname.endswith(".linkedin.com"):
+        blocked_prefixes = (
+            "/login",
+            "/signup",
+            "/authwall",
+            "/checkpoint",
+        )
+        if any(path == prefix or path.startswith(prefix + "/") for prefix in blocked_prefixes):
+            return None
+    return candidate
 
 
 def extract_description_deterministic(page) -> str | None:
@@ -362,6 +385,7 @@ def extract_description_deterministic(page) -> str | None:
                 if len(text) >= 100:
                     return clean_description(text)
         except Exception:
+            log.debug("Description selector failed: %s", sel, exc_info=True)
             continue
 
     return None
@@ -404,6 +428,7 @@ def extract_main_content(page) -> str:
                     if len(html) < 50000:
                         return clean_content_html(html)
         except Exception:
+            log.debug("Main-content selector failed: %s", sel, exc_info=True)
             continue
 
     try:
@@ -437,7 +462,7 @@ def clean_content_html(html: str) -> str:
                         new_attrs["class"] = " ".join(kept[:3])
                 else:
                     new_attrs[attr] = val
-            elif attr.startswith("data-") or attr.startswith("aria-"):
+            elif attr.startswith(("data-", "aria-")):
                 new_attrs[attr] = val
         tag.attrs = new_attrs
 
@@ -454,7 +479,7 @@ def extract_with_llm(page, url: str) -> dict:
     try:
         title = page.title()
     except Exception:
-        pass
+        log.debug("Unable to read page title for %s", url, exc_info=True)
 
     prompt = DETAIL_EXTRACT_PROMPT.format(
         url=url,
@@ -549,7 +574,7 @@ def scrape_detail_page(page, url: str) -> dict:
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
-            pass
+            log.debug("Network-idle wait expired for %s", url, exc_info=True)
     except Exception as e:
         err_str = str(e)
         if "timeout" in err_str.lower():
@@ -629,7 +654,7 @@ def scrape_site_batch(
     if own_conn:
         conn = init_db()
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     try:
         with sync_playwright() as p:
@@ -644,6 +669,12 @@ def scrape_site_batch(
                 log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
 
                 result = scrape_detail_page(page, url)
+                result["application_url"] = sanitize_application_url(
+                    url,
+                    result.get("application_url"),
+                )
+                if result.get("full_description") and not result.get("application_url"):
+                    result["status"] = "partial"
                 stats["processed"] += 1
 
                 tier = result.get("tier_used")
@@ -705,7 +736,7 @@ def _run_detail_scraper(
     skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
     where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
     rows = conn.execute(
-        f"SELECT url, title, site FROM jobs {where} ORDER BY site"
+        f"SELECT url, title, source_site, site FROM jobs {where} ORDER BY site"
     ).fetchall()
 
     if not rows:
@@ -713,13 +744,28 @@ def _run_detail_scraper(
         return {"processed": 0, "ok": 0, "partial": 0, "error": 0}
 
     site_jobs: dict[str, list[tuple]] = {}
+    skipped_manual = 0
+    now = datetime.now(UTC).isoformat()
     for row in rows:
-        url, title, site = row[0], row[1], row[2]
+        url, title, source_site, site = row[0], row[1], row[2], row[3]
         if sites and site not in sites:
             continue
+        portal_gate = config.portal_discovery_gate(
+            url, source_site=source_site, site=site
+        )
+        if portal_gate:
+            conn.execute(
+                "UPDATE jobs SET detail_error=?, detail_scraped_at=? WHERE url=?",
+                (portal_gate, now, url),
+            )
+            skipped_manual += 1
+            continue
         site_jobs.setdefault(site, []).append((url, title))
+    conn.commit()
 
     log.info("Pending: %d jobs across %d sites (workers=%d)", len(rows), len(site_jobs), workers)
+    if skipped_manual:
+        log.info("Skipped %d portal listing(s) that require human or authorised-source intake.", skipped_manual)
     for site, jobs in site_jobs.items():
         log.info("  %s: %d jobs", site, len(jobs))
 
@@ -730,7 +776,14 @@ def _run_detail_scraper(
     order = [s for s in known_order if s in site_jobs]
     order += [s for s in sorted(site_jobs.keys()) if s not in order]
 
-    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    total_stats: dict = {
+        "processed": 0,
+        "ok": 0,
+        "partial": 0,
+        "error": 0,
+        "skipped_manual": skipped_manual,
+        "tiers": {1: 0, 2: 0, 3: 0},
+    }
 
     def _merge_stats(stats: dict) -> None:
         for k in ("processed", "ok", "partial", "error"):
@@ -806,7 +859,7 @@ def stream_detail(
 
     url_stats = resolve_all_urls(conn)
     log.info("URL resolution: %d resolved, %d absolute",
-             url_stats['resolved'], url_stats['already_absolute'])
+             url_stats["resolved"], url_stats["already_absolute"])
 
     total_ok = 0
     total_err = 0
@@ -816,16 +869,27 @@ def stream_detail(
         while True:
             skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
             rows = conn.execute(
-                "SELECT url, title, site FROM jobs "
+                "SELECT url, title, source_site, site FROM jobs "
                 f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
                 "ORDER BY site LIMIT 200"
             ).fetchall()
 
             if rows:
                 site_jobs: dict[str, list[tuple]] = {}
+                now = datetime.now(UTC).isoformat()
                 for row in rows:
-                    url, title, site = row[0], row[1], row[2]
+                    url, title, source_site, site = row[0], row[1], row[2], row[3]
+                    portal_gate = config.portal_discovery_gate(
+                        url, source_site=source_site, site=site
+                    )
+                    if portal_gate:
+                        conn.execute(
+                            "UPDATE jobs SET detail_error=?, detail_scraped_at=? WHERE url=?",
+                            (portal_gate, now, url),
+                        )
+                        continue
                     site_jobs.setdefault(site, []).append((url, title))
+                conn.commit()
 
                 for site, jobs in site_jobs.items():
                     delay = SITE_DELAYS.get(site, 2.0)
@@ -836,7 +900,7 @@ def stream_detail(
                         total_ok += stats["ok"] + stats["partial"]
                         total_err += stats["error"]
                         log.info("%s: %d ok, %d partial, %d error",
-                                 site, stats['ok'], stats['partial'], stats['error'])
+                                 site, stats["ok"], stats["partial"], stats["error"])
                     except Exception as e:
                         log.error("%s: CRASHED: %s", site, e)
 

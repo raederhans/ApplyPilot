@@ -19,18 +19,15 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import quote_plus
 
-import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import get_stats, init_db, store_jobs
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -41,7 +38,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
-        pass
+        log.debug("Unable to reconfigure console encoding", exc_info=True)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
@@ -52,25 +49,12 @@ def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
     if search_cfg is None:
         search_cfg = config.load_search_config()
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.get_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -92,12 +76,12 @@ def _store_jobs_filtered(
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+    excluded_titles: list[str] | None = None,
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
-    new = 0
-    existing = 0
     filtered = 0
+    excluded_titles = excluded_titles or []
+    prepared_jobs: list[dict] = []
 
     for job in jobs:
         url = job.get("url")
@@ -106,21 +90,14 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            existing += 1
+        if config.title_is_excluded(job.get("title"), excluded_titles):
+            filtered += 1
+            continue
+        prepared_jobs.append(job)
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
-    conn.commit()
-    return new, existing
+    return store_jobs(conn, prepared_jobs, site, strategy)
 
 
 # -- Page intelligence collector ---------------------------------------------
@@ -150,7 +127,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 body = response.text()
                 try:
                     data = json.loads(body)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     data = None
                 captured_responses.append({
                     "url": rurl,
@@ -159,7 +136,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                     "data": data,
                 })
             except Exception:
-                pass
+                log.debug("Unable to capture API response from %s", rurl, exc_info=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -176,16 +153,16 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             try:
                 data = json.loads(el.inner_text())
                 intel["json_ld"].append(data)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                log.debug("Ignoring malformed JSON-LD on %s", url, exc_info=True)
 
         # 2. __NEXT_DATA__
         next_data = page.query_selector("script#__NEXT_DATA__")
         if next_data:
             try:
                 intel["next_data"] = json.loads(next_data.inner_text())
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                log.debug("Ignoring malformed __NEXT_DATA__ on %s", url, exc_info=True)
 
         # 3. data-testid attributes
         intel["data_testids"] = page.evaluate("""
@@ -303,7 +280,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 summary["type"] = "object"
                 summary["keys"] = list(data.keys())[:20]
 
-                def _explore_nested(obj, path_prefix, depth=0):
+                def _explore_nested(obj, path_prefix, output, depth=0):
                     if depth > 3 or not isinstance(obj, dict):
                         return
                     for key in list(obj.keys())[:15]:
@@ -329,10 +306,10 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                                         "keys": list(subval.keys())[:15],
                                         "sample": {k: str(v)[:150] for k, v in list(subval.items())[:8]},
                                     }
-                            summary[f"nested_{path}"] = info
+                            output[f"nested_{path}"] = info
                         elif isinstance(val, dict) and depth < 3:
-                            _explore_nested(val, path, depth + 1)
-                _explore_nested(data, "")
+                            _explore_nested(val, path, output, depth + 1)
+                _explore_nested(data, "", summary)
         intel["api_responses"].append(summary)
 
     return intel
@@ -424,7 +401,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -465,7 +442,7 @@ def format_strategy_briefing(intel: dict) -> str:
     if intel["data_testids"]:
         sections.append(f"\nDATA-TESTID ATTRIBUTES: {len(intel['data_testids'])} elements")
         for dt in intel["data_testids"][:15]:
-            text_preview = dt['text'].replace('\n', ' ')[:60]
+            text_preview = dt["text"].replace("\n", " ")[:60]
             sections.append(f"  <{dt['tag']} data-testid=\"{dt['testid']}\"> {text_preview}")
     else:
         sections.append("\nDATA-TESTID: none found")
@@ -655,7 +632,7 @@ def ask_llm(prompt: str) -> tuple[str, float, dict]:
 def extract_json(text: str) -> dict:
     """Extract JSON from LLM response, handling think tags and code fences."""
     if "<think>" in text:
-        after = text.split("</think>")[-1].strip()
+        after = text.rsplit("</think>", maxsplit=1)[-1].strip()
         if after:
             text = after
     if "```json" in text:
@@ -663,12 +640,12 @@ def extract_json(text: str) -> dict:
     elif "```" in text:
         text = text.split("```")[1].split("```")[0]
     text = text.strip()
-    text = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', text)
+    text = re.sub(r'\\([^"\\\/bfnrtu])', r"\1", text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    while text.endswith("}") or text.endswith("]"):
+    while text.endswith(("}", "]")):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -713,9 +690,9 @@ def resolve_json_path(data, path: str):
                 current = current[part]
         if isinstance(current, (str, int, float)):
             return str(current) if not isinstance(current, str) else current
-        elif isinstance(current, dict):
+        if isinstance(current, dict):
             return current.get("name", current.get("text", str(current)[:100]))
-        elif isinstance(current, list):
+        if isinstance(current, list):
             if current and isinstance(current[0], dict):
                 return ", ".join(str(item.get("name", item.get("text", ""))) for item in current[:3])
             return ", ".join(str(x) for x in current[:3])
@@ -799,7 +776,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
         log.error("LLM_ERROR in Phase 2: %s", e)
         return {}, []
 
-    log.info("Phase 2 LLM: %d chars, %.1fs", meta['response_chars'], elapsed)
+    log.info("Phase 2 LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
 
     try:
         selectors = extract_json(raw)
@@ -1016,6 +993,7 @@ def _run_all(
     targets: list[dict],
     accept_locs: list[str],
     reject_locs: list[str],
+    excluded_titles: list[str] | None = None,
     workers: int = 1,
 ) -> dict:
     """Run smart extract on all targets.
@@ -1038,7 +1016,8 @@ def _run_all(
         if jobs:
             new, existing = _store_jobs_filtered(conn, jobs, target["name"],
                                                   r.get("strategy", "?"),
-                                                  accept_locs, reject_locs)
+                                                  accept_locs, reject_locs,
+                                                  excluded_titles)
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
@@ -1103,6 +1082,7 @@ def run_smart_extract(
     """
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+    excluded_titles = config.get_excluded_title_patterns(search_cfg)
 
     targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
 
@@ -1115,4 +1095,10 @@ def run_smart_extract(
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
 
-    return _run_all(targets, accept_locs, reject_locs, workers=workers)
+    return _run_all(
+        targets,
+        accept_locs,
+        reject_locs,
+        excluded_titles=excluded_titles,
+        workers=workers,
+    )

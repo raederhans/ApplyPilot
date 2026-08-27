@@ -8,14 +8,17 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import multiprocessing
 import sqlite3
+import tempfile
 import time
-from datetime import datetime, timezone
-
-from jobspy import scrape_jobs
+import warnings
+from datetime import UTC, datetime
+from pathlib import Path
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.optional_dependencies import require_jobboards
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ def parse_proxy(proxy_str: str) -> dict:
                 "password": passwd,
             },
         }
-    elif len(parts) == 2:
+    if len(parts) == 2:
         host, port = parts
         return {
             "host": host,
@@ -49,20 +52,63 @@ def parse_proxy(proxy_str: str) -> dict:
             "jobspy": f"{host}:{port}",
             "playwright": {"server": f"http://{host}:{port}"},
         }
-    else:
-        raise ValueError(
-            f"Proxy format not recognized: {proxy_str}. "
-            f"Expected: host:port:user:pass or host:port"
-        )
+    raise ValueError(
+        f"Proxy format not recognized: {proxy_str}. "
+        f"Expected: host:port:user:pass or host:port"
+    )
 
 
 # -- Retry wrapper -----------------------------------------------------------
 
-def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0):
-    """Call scrape_jobs with retry on transient failures."""
+def _scrape_to_files(kwargs: dict, result_path: str, error_path: str) -> None:
+    """Child-process target used to make third-party scraping terminable."""
+    try:
+        scrape_jobs = require_jobboards().scrape_jobs
+        scrape_jobs(**kwargs).to_pickle(result_path)
+    except BaseException as exc:  # Child must report every failure to the parent.
+        Path(error_path).write_text(f"{type(exc).__name__}: {exc}", encoding="utf-8")
+
+
+def _scrape_once_with_timeout(kwargs: dict, timeout_seconds: float):
+    """Run one JobSpy request in a process that can be terminated on timeout."""
+    with tempfile.TemporaryDirectory(prefix="applypilot-jobspy-") as temp_dir:
+        result_path = Path(temp_dir) / "result.pkl"
+        error_path = Path(temp_dir) / "error.txt"
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_scrape_to_files,
+            args=(kwargs, str(result_path), str(error_path)),
+            daemon=True,
+        )
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            raise TimeoutError(f"JobSpy query exceeded {timeout_seconds:.0f}s wall-clock timeout")
+        if error_path.exists():
+            raise RuntimeError(error_path.read_text(encoding="utf-8"))
+        if not result_path.exists():
+            raise RuntimeError(f"JobSpy subprocess exited with code {process.exitcode} without a result")
+
+        import pandas as pd
+
+        return pd.read_pickle(result_path)
+
+
+def _scrape_with_retry(
+    kwargs: dict,
+    max_retries: int = 2,
+    backoff: float = 5.0,
+    timeout_seconds: float = 150.0,
+):
+    """Call scrape_jobs with bounded retries and a per-attempt wall-clock timeout."""
     for attempt in range(max_retries + 1):
         try:
-            return scrape_jobs(**kwargs)
+            return _scrape_once_with_timeout(kwargs, timeout_seconds)
         except Exception as e:
             err = str(e).lower()
             transient = any(k in err for k in ("timeout", "429", "proxy", "connection", "reset", "refused"))
@@ -81,9 +127,7 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
 
     Falls back to sensible defaults if not defined in the YAML.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.get_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
@@ -92,43 +136,35 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     Remote jobs are always accepted. Non-remote jobs must match an accept
     pattern and not match a reject pattern.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+    return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
+def store_jobspy_results(
+    conn: sqlite3.Connection,
+    df,
+    source_label: str,
+    excluded_titles: list[str] | None = None,
+) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
-    new = 0
-    existing = 0
+    now = datetime.now(UTC).isoformat()
+    excluded = 0
+    excluded_titles = excluded_titles or []
+    grouped: dict[str, list[dict]] = {}
 
-    for _, row in df.iterrows():
+    # DataFrame.iterrows constructs one Series per row and dominates ingestion
+    # time for larger result sets. A record conversion preserves the existing
+    # dynamic-column behavior while doing the column work in pandas once.
+    for row in df.to_dict(orient="records"):
         url = str(row.get("job_url", ""))
         if not url or url == "nan":
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
+        if config.title_is_excluded(title, excluded_titles):
+            excluded += 1
+            continue
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
@@ -154,8 +190,6 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
 
-        strategy = "jobspy"
-
         # If JobSpy gave us a full description, promote it directly
         full_description = None
         detail_scraped_at = None
@@ -165,20 +199,26 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        grouped.setdefault(site_label, []).append({
+            "url": url,
+            "title": title,
+            "salary": salary,
+            "description": description,
+            "location": location_str,
+            "company_name": company,
+            "full_description": full_description,
+            "application_url": apply_url,
+            "detail_scraped_at": detail_scraped_at,
+        })
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            existing += 1
-
-    conn.commit()
+    new = 0
+    existing = 0
+    for site_label, prepared_jobs in grouped.items():
+        added, duplicates = store_jobs(conn, prepared_jobs, site_label, "jobspy")
+        new += added
+        existing += duplicates
+    if excluded:
+        log.info("Filtered %d jobs by excluded title", excluded)
     return new, existing
 
 
@@ -195,6 +235,7 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    excluded_titles: list[str],
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -228,7 +269,11 @@ def _run_one_search(
         if "linkedin" in other_sites:
             kwargs["linkedin_fetch_description"] = True
         try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
+            df = _scrape_with_retry(
+                kwargs,
+                max_retries=max_retries,
+                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
+            )
             all_dfs.append(df)
         except Exception as e:
             log.error("[%s] (non-gd): %s", label, e)
@@ -249,7 +294,11 @@ def _run_one_search(
         if proxy_config:
             gd_kwargs["proxies"] = [proxy_config["jobspy"]]
         try:
-            gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
+            gd_df = _scrape_with_retry(
+                gd_kwargs,
+                max_retries=max_retries,
+                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
+            )
             all_dfs.append(gd_df)
         except Exception as e:
             log.error("[%s] (glassdoor): %s", label, e)
@@ -259,7 +308,7 @@ def _run_one_search(
         return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
 
     import pandas as pd
-    import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
@@ -270,14 +319,20 @@ def _run_one_search(
 
     # Filter by location before storing
     before = len(df)
-    df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
-    ), axis=1)]
+    locations = df["location"].tolist() if "location" in df.columns else [""] * len(df)
+    location_mask = [
+        _location_ok(
+            str(location) if str(location) != "nan" else None,
+            accept_locs,
+            reject_locs,
+        )
+        for location in locations
+    ]
+    df = df.loc[location_mask]
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(conn, df, s["query"], excluded_titles)
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
@@ -305,7 +360,7 @@ def search_jobs(
 
     proxy_config = parse_proxy(proxy) if proxy else None
 
-    log.info("Search: \"%s\" in %s | sites=%s | remote=%s", query, location, sites, remote_only)
+    log.info('Search: "%s" in %s | sites=%s | remote=%s', query, location, sites, remote_only)
 
     kwargs = {
         "site_name": sites,
@@ -328,7 +383,7 @@ def search_jobs(
         kwargs["linkedin_fetch_description"] = True
 
     try:
-        df = scrape_jobs(**kwargs)
+        df = _scrape_with_retry(kwargs, max_retries=2, timeout_seconds=150)
     except Exception as e:
         log.error("JobSpy search failed: %s", e)
         return {"error": str(e), "total": 0, "new": 0, "existing": 0}
@@ -375,8 +430,10 @@ def _full_crawl(
     queries = search_cfg.get("queries", [])
     locs = search_cfg.get("locations", [])
     defaults = search_cfg.get("defaults", {})
+    max_retries = int(defaults.get("max_retries", max_retries))
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    excluded_titles = config.get_excluded_title_patterns(search_cfg)
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -405,15 +462,12 @@ def _full_crawl(
     total_new = 0
     total_existing = 0
     total_errors = 0
-    completed = 0
-
-    for s in searches:
+    for completed, s in enumerate(searches, start=1):
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
-            accept_locs, reject_locs, glassdoor_map,
+            accept_locs, reject_locs, glassdoor_map, excluded_titles,
         )
-        completed += 1
         total_new += result["new"]
         total_existing += result["existing"]
         total_errors += result["errors"]
@@ -460,15 +514,29 @@ def run_discovery(cfg: dict | None = None) -> dict:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
+    # Validate the optional capability once before expanding the search matrix.
+    # Without this boundary, one missing dependency would spawn and fail a
+    # separate child process for every configured query/location pair.
+    require_jobboards()
+
+    # The shipped search schema and onboarding wizard use ``boards`` plus a
+    # top-level ``country``. Keep the older spellings working for existing
+    # installations, but make the current schema authoritative.
+    normalized_cfg = dict(cfg)
+    defaults = dict(cfg.get("defaults", {}))
+    if cfg.get("country") and not defaults.get("country_indeed"):
+        defaults["country_indeed"] = cfg["country"]
+    normalized_cfg["defaults"] = defaults
+
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
-    results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
-    hours_old = cfg.get("defaults", {}).get("hours_old", 72)
+    sites = cfg.get("boards") or cfg.get("sites")
+    results_per_site = defaults.get("results_per_site", 100)
+    hours_old = defaults.get("hours_old", 72)
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
 
     return _full_crawl(
-        search_cfg=cfg,
+        search_cfg=normalized_cfg,
         tiers=tiers,
         locations=locations,
         sites=sites,

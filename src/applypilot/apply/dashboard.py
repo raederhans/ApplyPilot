@@ -7,7 +7,7 @@ in a terminal dashboard using the Rich library.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -81,7 +81,7 @@ def add_event(msg: str) -> None:
     Args:
         msg: Rich markup string describing the event.
     """
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now().astimezone().strftime("%H:%M:%S")
     with _lock:
         _events.append(f"[dim]{ts}[/dim] {msg}")
         if len(_events) > MAX_EVENTS:

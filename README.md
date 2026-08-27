@@ -1,195 +1,197 @@
-<!-- logo here -->
+# ApplyPilot Local
 
-> **⚠️ ApplyPilot** is the original open-source project, created by [Pickle-Pixel](https://github.com/Pickle-Pixel) and first published on GitHub on **February 17, 2026**. We are **not affiliated** with applypilot.app, useapplypilot.com, or any other product using the "ApplyPilot" name. These sites are **not associated with this project** and may misrepresent what they offer. If you're looking for the autonomous, open-source job application agent — you're in the right place.
+**Local-first, evidence-driven job application workspace.**
 
-# ApplyPilot
+ApplyPilot Local helps a job seeker discover verifiable openings, score fit,
+reuse validated resume variants, prepare application materials, assist with
+browser-based forms under explicit authorization, and reconcile submission
+receipts. Candidate data, credentials, generated documents, and runtime logs
+stay on the user's machine by default.
 
-**Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
+This repository is an independent continuation of the inactive upstream
+[Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot). The
+Python import package and CLI remain `applypilot` for compatibility; the
+distribution and product identity are `ApplyPilot Local`.
 
-[![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Pickle-Pixel/ApplyPilot?style=social)](https://github.com/Pickle-Pixel/ApplyPilot)
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6S01UL5IO)
+## Product principles
 
+- **Evidence before status:** a clicked Submit control is not treated as a
+  successful application. Only decisive, identity-matched confirmation can
+  create a durable submitted record.
+- **Local-first privacy:** profiles, resumes, databases, credentials, browser
+  evidence, and generated artifacts are ignored by Git and remain local.
+- **Human authority:** unsupported answers, CAPTCHA, assessments, identity or
+  financial documents, account recovery, and security changes stop for review.
+- **Source truth:** official jobs stay separate from social or community leads
+  until a fresh authoritative listing verifies them.
+- **Reusable work:** validated resume artifacts can be reused only when the
+  job fingerprint and evidence coverage still match.
 
+## Capabilities
 
+| Surface | What it provides |
+| --- | --- |
+| Official radar | Structured company/ATS discovery with complete, partial, blocked, and skipped source states |
+| Job-board discovery | Optional JobSpy integration for Indeed, LinkedIn, Glassdoor, ZipRecruiter, and Google Jobs |
+| Fit and materials | LLM-assisted scoring, truthful resume tailoring, cover letters, PDF validation |
+| Resume library | Content-addressed artifacts, subtype routing, validation state, and hard-gap review |
+| Application runtime | Explicit authorization manifests, readiness decisions, isolated browser workers, manual takeover |
+| Receipt reconciliation | Exact job/company/title matching, decisive confirmation evidence, idempotent status updates |
+| Opportunity workbench | Local browser UI for eligible roles, fit evidence, source quality, and verified form links |
+| Local status | SQLite-backed application history, unanswered questions, source observations, and terminal dashboards |
 
-https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
+## Installation
 
-
----
-
-## What It Does
-
-ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
-
-Three commands. That's it.
-
-```bash
-pip install applypilot
-pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
-applypilot init          # one-time setup: resume, profile, preferences, API keys
-applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
-applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot apply         # autonomous browser-driven submission
-applypilot apply -w 3    # parallel apply (3 Chrome instances)
-applypilot apply --dry-run  # fill forms without submitting
-```
-
-> **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
-
----
-
-## Two Paths
-
-### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
-
-Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
-
-### Discovery + Tailoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
-
-Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
-
----
-
-## The Pipeline
-
-| Stage | What Happens |
-|-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
-| **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
-| **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
-| **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
-
-Each stage is independent. Run them all or pick what you need.
-
----
-
-## ApplyPilot vs The Alternatives
-
-| Feature | ApplyPilot | AIHawk | Manual |
-|---------|-----------|--------|--------|
-| Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
-| AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
-| Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
-| License | AGPL-3.0 | MIT | N/A |
-
----
-
-## Requirements
-
-| Component | Required For | Details |
-|-----------|-------------|---------|
-| Python 3.11+ | Everything | Core runtime |
-| Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
-| Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
-
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
-
-### Optional
-
-| Component | What It Does |
-|-----------|-------------|
-| CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
-
-> **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
-
----
-
-## Configuration
-
-All generated by `applypilot init`:
-
-### `profile.json`
-Your personal data in one structured file: contact info, work authorization, compensation, experience, skills, resume facts (preserved during tailoring), and EEO defaults. Powers scoring, tailoring, and form auto-fill.
-
-### `searches.yaml`
-Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
-
-### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
-
-### Package configs (shipped with ApplyPilot)
-- `config/employers.yaml` - Workday employer registry (48 preconfigured)
-- `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
-- `config/searches.example.yaml` - Example search configuration
-
----
-
-## How Stages Work
-
-### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
-
-### Enrich
-Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
-
-### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
-
-### Tailor
-Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
-
-### Cover Letter
-Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
-
-### Auto-Apply
-Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
-
-The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
+Python 3.11 or 3.12 is recommended for the complete workflow; the core and
+official radar also run on Python 3.13. The quickest released installation is
+an isolated command-line app managed by `pipx`:
 
 ```bash
-# Utility modes (no Chrome/Claude needed)
-applypilot apply --mark-applied URL    # manually mark a job as applied
-applypilot apply --mark-failed URL     # manually mark a job as failed
-applypilot apply --reset-failed        # reset all failed jobs for retry
-applypilot apply --gen --url URL       # generate prompt file for manual debugging
+pipx install applypilot-local
 ```
 
----
+Until the first tagged PyPI release, install the current repository directly:
 
-## CLI Reference
-
-```
-applypilot init                         # First-time setup wizard
-applypilot doctor                       # Verify setup, diagnose missing requirements
-applypilot run [stages...]              # Run pipeline stages (or 'all')
-applypilot run --workers 4              # Parallel discovery/enrichment
-applypilot run --stream                 # Concurrent stages (streaming mode)
-applypilot run --min-score 8            # Override score threshold
-applypilot run --dry-run                # Preview without executing
-applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
-applypilot run --validation strict      # Strictest validation (retries on any banned word)
-applypilot apply                        # Launch auto-apply
-applypilot apply --workers 3            # Parallel browser workers
-applypilot apply --dry-run              # Fill forms without submitting
-applypilot apply --continuous           # Run forever, polling for new jobs
-applypilot apply --headless             # Headless browser mode
-applypilot apply --url URL              # Apply to a specific job
-applypilot status                       # Pipeline statistics
-applypilot dashboard                    # Open HTML results dashboard
+```bash
+pipx install "git+https://github.com/raederhans/ApplyPilot.git"
 ```
 
----
+An extracted GitHub release bundle or source checkout also includes a guided,
+cross-platform installer. It bootstraps `pipx`, verifies a bundled wheel when
+present, and never copies local profiles, credentials, resumes, or databases:
 
-## Contributing
+```bash
+python install.py
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding standards, and PR guidelines.
+The broad third-party job-board connector is intentionally optional because
+its upstream package currently pins an older NumPy line:
 
----
+```bash
+python install.py --with-jobboards  # Python 3.11-3.12
+```
 
-## License
+Then initialize and verify the local workspace:
 
-ApplyPilot is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+```bash
+applypilot init
+applypilot doctor
+applypilot --version
+```
 
-You are free to use, modify, and distribute this software. If you deploy a modified version as a service, you must release your source code under the same license.
+For a repeatable import from files you already maintain, provide all three
+inputs together. ApplyPilot validates them, refuses to replace existing files
+unless `--force` is explicit, and does not collect API keys or browser
+credentials:
+
+```bash
+applypilot init --resume resume.txt --profile profile.json --searches searches.yaml
+applypilot dashboard --no-open
+```
+
+`applypilot doctor` reports optional capabilities separately; a missing
+JobSpy installation does not prevent the official-company radar, resume
+library, status tools, or manually imported jobs from working.
+
+## Common workflows
+
+### Discover and prepare
+
+```bash
+applypilot radar collect
+applypilot radar report --hours 24
+applypilot run discover enrich score tailor cover pdf
+```
+
+### Reuse validated resumes
+
+```bash
+applypilot resume-library-sync
+applypilot resume-library-status
+applypilot resume-route --url <verified-job-url>
+```
+
+### Review and apply
+
+```bash
+applypilot review-readiness
+applypilot apply --dry-run --url <verified-job-url>
+applypilot authorize-batch --url <verified-job-url>
+applypilot apply --authorization-file <batch-manifest.json>
+applypilot reconcile-receipts --file <receipt.json>
+```
+
+Dry-run and preview states are not submission receipts. The application
+runtime deliberately keeps uncertain outcomes as `submission_uncertain` until
+reconciliation proves the exact application was accepted.
+
+## Architecture
+
+```text
+official ATS / optional boards / manual imports
+                    |
+                    v
+        discovery observations + jobs
+                    |
+                    v
+        SQLite identity and state contracts
+          |            |             |
+          v            v             v
+      fit scoring  resume library  status history
+          \            |             /
+           \           v            /
+            readiness + authorization
+                       |
+                       v
+              isolated browser worker
+                       |
+                       v
+              receipt reconciliation
+```
+
+The architecture keeps discovery, preparation, authorization, browser
+execution, and receipt admission as separate boundaries. A producer cannot
+declare its own output successful merely because it completed without an
+exception.
+
+## Local data and security
+
+The default workspace is `~/.applypilot/`. Do not commit or share:
+
+- `profile.json`, resumes, generated PDFs, cover letters, or SQLite databases;
+- `.env`, API keys, credential records, browser profiles, or verification codes;
+- application screenshots, receipts, logs, or worker attachments.
+
+Credentials are read only at execution time. The project does not endorse
+CAPTCHA bypass, identity-document automation, account recovery, or hidden
+submission. Review [SECURITY.md](SECURITY.md) before reporting a vulnerability.
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+ruff check src
+pytest -q
+python scripts/build_release.py
+```
+
+The release builder audits archive contents and metadata, creates wheel and
+source distributions under `dist/python/`, produces a verified install bundle,
+and writes SHA-256 checksums. On Windows, `--no-isolation` is available when an
+antivirus aggressively scans temporary PEP 517 build environments. CI runs
+lint, the complete test suite, and these package checks on pushes and pull
+requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository conventions and
+[docs/product-core.md](docs/product-core.md) for the product and frontend boundary.
+
+## License and provenance
+
+ApplyPilot Local remains licensed under
+[GNU AGPL-3.0-only](LICENSE). The original ApplyPilot authors retain their
+copyright in the upstream work; fork modifications are distributed under the
+same license. See [NOTICE.md](NOTICE.md) for provenance and the network-source
+obligation that matters if this code is later offered as an interactive
+service.
+
+This repository is not affiliated with applypilot.app, useapplypilot.com, or
+other products using a similar name. “ApplyPilot Local” identifies this
+independent fork and its local-first operating model.

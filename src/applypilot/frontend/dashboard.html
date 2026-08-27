@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:,">
+  <title>ApplyPilot Local — Opportunity Workbench</title>
+  <style>
+    :root {
+      --ink: #0a0c0b;
+      --panel: #101310;
+      --panel-raised: #151915;
+      --line: #2a302b;
+      --line-soft: #1d221e;
+      --text: #ecf2ed;
+      --muted: #8e9a91;
+      --quiet: #667068;
+      --mint: #9ef5c4;
+      --blue: #8cbcff;
+      --amber: #f2c56b;
+      --radius: 14px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--ink);
+      color: var(--text);
+      font: 15px/1.5 var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible {
+      outline: 2px solid var(--mint);
+      outline-offset: 3px;
+    }
+
+    .app-shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100vh; }
+    .rail {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 28px 24px 22px;
+      border-right: 1px solid var(--line-soft);
+      background: #0d100e;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-bottom: 42px;
+      font-weight: 720;
+      letter-spacing: -0.02em;
+    }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 31px;
+      height: 31px;
+      border: 1px solid #4b6b57;
+      border-radius: 9px;
+      color: var(--mint);
+      font: 700 14px/1 var(--mono);
+    }
+    .brand small {
+      display: block;
+      color: var(--quiet);
+      font: 10px/1.2 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .rail-label {
+      margin: 0 0 14px;
+      color: var(--quiet);
+      font: 10px/1 var(--mono);
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    .workflow { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+    .workflow li {
+      position: relative;
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 8px;
+      padding: 10px 8px;
+      border-radius: 9px;
+      color: var(--muted);
+    }
+    .workflow li.active { background: var(--panel-raised); color: var(--text); }
+    .workflow li.active::before {
+      content: "";
+      position: absolute;
+      inset: 10px auto 10px -24px;
+      width: 2px;
+      background: var(--mint);
+    }
+    .step-number { padding-top: 2px; color: var(--quiet); font: 11px/1.4 var(--mono); }
+    .workflow strong { display: block; font-size: 13px; font-weight: 650; }
+    .workflow span:last-child span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+    .rail-note {
+      margin-top: auto;
+      padding-top: 18px;
+      border-top: 1px solid var(--line-soft);
+      color: var(--quiet);
+      font-size: 11px;
+    }
+    .rail-note strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font: 600 10px/1.2 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    main { min-width: 0; padding: 46px clamp(24px, 4vw, 64px) 70px; }
+    .page-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      max-width: 1320px;
+      margin: 0 auto 36px;
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--mint);
+      font: 11px/1.2 var(--mono);
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3vw, 46px);
+      font-weight: 650;
+      line-height: 1.05;
+      letter-spacing: -.045em;
+    }
+    .head-copy { max-width: 560px; margin: 13px 0 0; color: var(--muted); font-size: 14px; }
+    .local-status { flex: none; display: flex; align-items: center; gap: 8px; color: var(--muted); font: 11px/1 var(--mono); }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 4px #9ef5c414; }
+
+    .workbench {
+      max-width: 1320px;
+      margin: 0 auto;
+      overflow: clip;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
+    .metric { min-width: 0; padding: 20px 22px; }
+    .metric + .metric { border-left: 1px solid var(--line); }
+    .metric-value { display: block; font: 550 clamp(24px, 3vw, 34px)/1 var(--mono); letter-spacing: -.04em; }
+    .metric-label {
+      display: block;
+      margin-top: 9px;
+      color: var(--quiet);
+      font: 10px/1.2 var(--mono);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    .metric.emphasis .metric-value { color: var(--mint); }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #101310f2;
+      backdrop-filter: blur(12px);
+    }
+    .search-wrap { position: relative; flex: 1 1 320px; }
+    .search-wrap::before {
+      content: "⌕";
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      color: var(--quiet);
+      font: 18px/1 var(--mono);
+      pointer-events: none;
+      translate: 0 -53%;
+    }
+    .search {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 12px 8px 36px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--ink);
+      color: var(--text);
+    }
+    .search::placeholder { color: #555f58; }
+    .filters { display: flex; flex: none; gap: 5px; }
+    .filter {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: 11px/1 var(--mono);
+    }
+    .filter:hover { background: var(--panel-raised); color: var(--text); }
+    .filter.active { border-color: #45624f; background: #17221b; color: var(--mint); }
+
+    .content-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; min-height: 520px; }
+    .queue { min-width: 0; padding: 10px 22px 26px; }
+    .queue-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 2px 12px; }
+    .queue-head h2, .insights h2 { margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+    .result-count { color: var(--quiet); font: 10px/1 var(--mono); }
+    .opportunity-list { display: grid; }
+    .opportunity {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr) auto;
+      gap: 14px;
+      padding: 18px 2px;
+      border-top: 1px solid var(--line-soft);
+      animation: enter .35s both;
+      animation-delay: min(calc(var(--index) * 22ms), 280ms);
+    }
+    .opportunity.hidden { display: none; }
+    .score {
+      display: grid;
+      place-items: center;
+      align-self: start;
+      width: 42px;
+      height: 42px;
+      border: 1px solid #526259;
+      border-radius: 11px;
+      color: var(--text);
+      font: 600 16px/1 var(--mono);
+    }
+    .score.high { border-color: #518166; color: var(--mint); }
+    .opportunity-body { min-width: 0; }
+    .opportunity-title { margin: 0; font-size: 15px; font-weight: 620; line-height: 1.35; }
+    .opportunity-title a { color: var(--text); text-decoration: none; }
+    .opportunity-title a:hover { color: var(--mint); }
+    .company-line { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .company-line span + span::before { content: "·"; padding: 0 7px; color: var(--quiet); }
+    .evidence { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+    .tag { padding: 3px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--quiet); font: 10px/1.2 var(--mono); }
+    .tag.source { border-color: #304439; color: #a8c9b3; }
+    .tag.salary { border-color: #584c32; color: var(--amber); }
+    .reasoning { max-width: 720px; margin: 11px 0 0; color: #a7b1a9; font-size: 12px; }
+    .keywords { margin: 6px 0 0; color: var(--quiet); font-size: 11px; }
+    .description { margin-top: 9px; }
+    .description summary { width: max-content; color: var(--blue); cursor: pointer; font: 10px/1.4 var(--mono); list-style: none; }
+    .description summary::-webkit-details-marker { display: none; }
+    .description summary::before { content: "+ "; }
+    .description[open] summary::before { content: "− "; }
+    .description-copy {
+      max-height: 360px;
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 14px;
+      border-left: 2px solid var(--line);
+      background: #0c0f0d;
+      color: #aeb8b0;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .actions { display: flex; align-items: start; gap: 8px; }
+    .action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 7px 11px;
+      border: 1px solid #42604c;
+      border-radius: 8px;
+      color: var(--mint);
+      text-decoration: none;
+      font: 10px/1 var(--mono);
+    }
+    .action:hover { background: #17221b; }
+    .empty { display: none; padding: 54px 12px; border-top: 1px solid var(--line-soft); color: var(--muted); text-align: center; }
+    .empty.visible { display: block; }
+
+    .insights { min-width: 0; padding: 25px 22px; border-left: 1px solid var(--line); background: #0d100e; }
+    .insight-block + .insight-block { margin-top: 34px; padding-top: 28px; border-top: 1px solid var(--line-soft); }
+    .insight-kicker { margin: 5px 0 18px; color: var(--quiet); font-size: 11px; }
+    .score-bars { display: grid; gap: 8px; }
+    .bar-row { display: grid; grid-template-columns: 18px 1fr 28px; align-items: center; gap: 8px; color: var(--quiet); font: 10px/1 var(--mono); }
+    .bar-track { height: 5px; overflow: hidden; border-radius: 2px; background: #222823; }
+    .bar-fill { height: 100%; background: #617268; }
+    .bar-row.strong .bar-fill { background: var(--mint); }
+    .bar-row.strong .bar-label { color: var(--mint); }
+    .source-list { display: grid; gap: 13px; }
+    .source-row { display: grid; gap: 5px; }
+    .source-head { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; }
+    .source-head span:first-child { overflow: hidden; color: #b9c3bb; text-overflow: ellipsis; white-space: nowrap; }
+    .source-head span:last-child { flex: none; color: var(--quiet); font: 10px/1.5 var(--mono); }
+    .source-track { height: 3px; overflow: hidden; background: #222823; }
+    .source-fill { height: 100%; background: #698074; }
+
+    @keyframes enter { from { opacity: 0; transform: translateY(5px); } }
+    @media (max-width: 980px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .rail { position: static; height: auto; padding: 18px 22px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+      .brand { margin-bottom: 18px; }
+      .rail-label { display: none; }
+      .workflow { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .workflow li { grid-template-columns: 1fr; padding: 8px; }
+      .workflow li.active::before { inset: auto 8px -1px; width: auto; height: 2px; }
+      .workflow span:last-child span, .rail-note { display: none; }
+      main { padding-top: 32px; }
+      .content-grid { grid-template-columns: 1fr; }
+      .insights { border-top: 1px solid var(--line); border-left: 0; }
+    }
+    @media (max-width: 660px) {
+      main { padding: 26px 12px 40px; }
+      .page-head { align-items: start; flex-direction: column; margin-bottom: 24px; }
+      .local-status { display: none; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      .metric:nth-child(3) { border-left: 0; }
+      .metric:nth-child(n+3) { border-top: 1px solid var(--line); }
+      .toolbar { align-items: stretch; flex-direction: column; }
+      .search-wrap { flex-basis: auto; }
+      .filters { display: grid; grid-template-columns: repeat(4, 1fr); }
+      .filter { padding-inline: 4px; }
+      .queue { padding-inline: 14px; }
+      .opportunity { grid-template-columns: 42px minmax(0, 1fr); }
+      .actions { grid-column: 2; }
+      .workflow { gap: 0; }
+      .workflow li { font-size: 11px; }
+      .step-number { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="rail" aria-label="Product workflow">
+      <div class="brand"><span class="brand-mark">AP</span><span>ApplyPilot <small>Local</small></span></div>
+      <p class="rail-label">Core workflow</p>
+      <ol class="workflow">
+        <li><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span></li>
+        <li class="active"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span></li>
+        <li><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span></li>
+        <li><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></li>
+      </ol>
+      <div class="rail-note"><strong>Private by default</strong>Generated from your local SQLite workspace. No analytics or remote UI assets.</div>
+    </aside>
+
+    <main>
+      <header class="page-head">
+        <div>
+          <p class="eyebrow">Opportunity workbench</p>
+          <h1>Move evidence forward.</h1>
+          <p class="head-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
+        </div>
+        <div class="local-status"><span class="status-dot" aria-hidden="true"></span>LOCAL WORKSPACE</div>
+      </header>
+
+      <section class="workbench" aria-label="Opportunity workbench">
+        <div class="metrics" aria-label="Pipeline summary">
+          <div class="metric"><strong class="metric-value" id="stat-total">0</strong><span class="metric-label">Eligible roles</span></div>
+          <div class="metric"><strong class="metric-value" id="stat-ready">0</strong><span class="metric-label">Ready to review</span></div>
+          <div class="metric"><strong class="metric-value" id="stat-scored">0</strong><span class="metric-label">Fit scored</span></div>
+          <div class="metric emphasis"><strong class="metric-value" id="stat-high">0</strong><span class="metric-label">Strong fit 7+</span></div>
+        </div>
+
+        <div class="toolbar">
+          <label class="search-wrap"><span hidden>Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
+          <div class="filters" aria-label="Minimum fit score">
+            <button class="filter active" type="button" data-min-score="5">ALL 5+</button>
+            <button class="filter" type="button" data-min-score="7">7+</button>
+            <button class="filter" type="button" data-min-score="8">8+</button>
+            <button class="filter" type="button" data-min-score="9">9+</button>
+          </div>
+        </div>
+
+        <div class="content-grid">
+          <section class="queue" id="opportunities">
+            <div class="queue-head"><h2>Ranked opportunities</h2><span class="result-count" id="result-count">0 visible</span></div>
+            <div class="opportunity-list" id="opportunity-list"></div>
+            <div class="empty" id="empty-state">No opportunities match the current filter.</div>
+          </section>
+
+          <aside class="insights" aria-label="Evidence overview">
+            <section class="insight-block">
+              <h2>Fit distribution</h2>
+              <p class="insight-kicker">Scored candidates by evidence band</p>
+              <div class="score-bars" id="score-bars"></div>
+            </section>
+            <section class="insight-block">
+              <h2>Source quality</h2>
+              <p class="insight-kicker">Strong-fit share by discovery source</p>
+              <div class="source-list" id="source-list"></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script id="dashboard-data" type="application/json">__APPLYPILOT_DASHBOARD_DATA__</script>
+  <script>
+    (() => {
+      "use strict";
+      const data = JSON.parse(document.getElementById("dashboard-data").textContent);
+      const state = { minimumScore: 5, query: "" };
+      const list = document.getElementById("opportunity-list");
+
+      const make = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = String(text);
+        return node;
+      };
+      const safeUrl = (value) => {
+        try {
+          const url = new URL(value);
+          return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+        } catch { return ""; }
+      };
+      const appendTag = (parent, text, className = "") => {
+        if (text) parent.append(make("span", `tag ${className}`.trim(), text));
+      };
+
+      const stats = data.stats || {};
+      document.getElementById("stat-total").textContent = stats.total || 0;
+      document.getElementById("stat-ready").textContent = stats.ready || 0;
+      document.getElementById("stat-scored").textContent = stats.scored || 0;
+      document.getElementById("stat-high").textContent = stats.highFit || 0;
+
+      const renderScores = () => {
+        const target = document.getElementById("score-bars");
+        const distribution = data.scoreDistribution || {};
+        const maximum = Math.max(1, ...Object.values(distribution));
+        for (let score = 10; score >= 5; score -= 1) {
+          const count = Number(distribution[String(score)] || 0);
+          const row = make("div", `bar-row ${score >= 7 ? "strong" : ""}`.trim());
+          row.append(make("span", "bar-label", score));
+          const track = make("div", "bar-track");
+          const fill = make("div", "bar-fill");
+          fill.style.width = `${(count / maximum) * 100}%`;
+          track.append(fill);
+          row.append(track, make("span", "", count));
+          target.append(row);
+        }
+      };
+
+      const renderSources = () => {
+        const target = document.getElementById("source-list");
+        for (const source of (data.sources || []).slice(0, 8)) {
+          const row = make("div", "source-row");
+          const head = make("div", "source-head");
+          head.append(make("span", "", source.name), make("span", "", `${source.highFit}/${source.total}`));
+          const track = make("div", "source-track");
+          const fill = make("div", "source-fill");
+          fill.style.width = `${source.total ? (source.highFit / source.total) * 100 : 0}%`;
+          track.append(fill);
+          row.append(head, track);
+          target.append(row);
+        }
+      };
+
+      const renderJobs = () => {
+        const fragment = document.createDocumentFragment();
+        (data.jobs || []).forEach((job, index) => {
+          const card = make("article", "opportunity");
+          card.style.setProperty("--index", index);
+          card.dataset.score = String(job.score || 0);
+          card.dataset.search = [job.title, job.company, job.source, job.location, job.keywords].join(" ").toLocaleLowerCase();
+
+          card.append(make("div", `score ${job.score >= 7 ? "high" : ""}`.trim(), job.score));
+          const body = make("div", "opportunity-body");
+          const heading = make("h3", "opportunity-title");
+          const sourceUrl = safeUrl(job.url);
+          if (sourceUrl) {
+            const link = make("a", "", job.title);
+            link.href = sourceUrl;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            heading.append(link);
+          } else {
+            heading.textContent = job.title;
+          }
+          body.append(heading);
+
+          const companyLine = make("div", "company-line");
+          companyLine.append(make("span", "", job.company));
+          if (job.location) companyLine.append(make("span", "", job.location));
+          body.append(companyLine);
+
+          const evidence = make("div", "evidence");
+          appendTag(evidence, job.source, "source");
+          appendTag(evidence, job.salary, "salary");
+          appendTag(evidence, job.strategy);
+          appendTag(evidence, job.coverLetterStatus ? `cover: ${job.coverLetterStatus}` : "");
+          body.append(evidence);
+          if (job.reasoning) body.append(make("p", "reasoning", job.reasoning));
+          if (job.keywords) body.append(make("p", "keywords", job.keywords));
+
+          if (job.description) {
+            const details = make("details", "description");
+            details.append(make("summary", "", `Read source description · ${job.description.length.toLocaleString()} chars`));
+            details.addEventListener("toggle", () => {
+              if (details.open && details.childElementCount === 1) details.append(make("div", "description-copy", job.description));
+            }, { once: true });
+            body.append(details);
+          }
+          card.append(body);
+
+          const actions = make("div", "actions");
+          const applicationUrl = safeUrl(job.applicationUrl);
+          if (applicationUrl) {
+            const apply = make("a", "action", "OPEN FORM ↗");
+            apply.href = applicationUrl;
+            apply.target = "_blank";
+            apply.rel = "noopener noreferrer";
+            apply.setAttribute("aria-label", `Open application form for ${job.title}`);
+            actions.append(apply);
+          }
+          card.append(actions);
+          fragment.append(card);
+        });
+        list.append(fragment);
+      };
+
+      const applyFilters = () => {
+        let visible = 0;
+        const query = state.query.toLocaleLowerCase();
+        list.querySelectorAll(".opportunity").forEach((card) => {
+          const matches = Number(card.dataset.score) >= state.minimumScore && (!query || card.dataset.search.includes(query));
+          card.classList.toggle("hidden", !matches);
+          if (matches) visible += 1;
+        });
+        document.getElementById("result-count").textContent = `${visible} visible`;
+        document.getElementById("empty-state").classList.toggle("visible", visible === 0);
+      };
+
+      document.querySelectorAll(".filter").forEach((button) => {
+        button.addEventListener("click", () => {
+          state.minimumScore = Number(button.dataset.minScore);
+          document.querySelectorAll(".filter").forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+          applyFilters();
+        });
+      });
+      document.getElementById("search").addEventListener("input", (event) => {
+        state.query = event.target.value.trim();
+        applyFilters();
+      });
+
+      renderScores();
+      renderSources();
+      renderJobs();
+      applyFilters();
+    })();
+  </script>
+</body>
+</html>

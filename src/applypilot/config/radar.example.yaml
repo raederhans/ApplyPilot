@@ -1,0 +1,29 @@
+# Default policy for the Singapore multi-source opportunity radar.  A local
+# ~/.applypilot/radar.yaml overrides this file; an existing searches.yaml is
+# also honoured so current users do not need to duplicate their policy.
+location:
+  accept_patterns:
+    - Singapore
+    - APAC
+    - Asia Pacific
+  reject_patterns:
+    - United States only
+    - US only
+    - UK only
+    - Australia only
+    - India only
+
+allow_ambiguous_remote: false
+
+# Deliberately retains internships and early-career roles.  These exclusions
+# remove only clearly out-of-scope executive/principal titles by default.
+exclude_titles:
+  - Senior
+  - Sr.
+  - Staff
+  - Lead
+  - Senior Director
+  - Vice President
+  - Chief
+  - Principal
+  - Head of

@@ -1,0 +1,7 @@
+{
+  "applied_with_receipt": "RESULT:APPLIED\nSUBMISSION_EVIDENCE: {\"receipt_visible\": true, \"applied_badge_visible\": false, \"confirmation_text\": \"Your application has been submitted\", \"confirmation_url\": \"https://jobs.lever.co/example/1002/confirmation\"}",
+  "applied_without_receipt": "RESULT:APPLIED\nSUBMISSION_EVIDENCE: {\"receipt_visible\": false, \"applied_badge_visible\": false, \"confirmation_text\": \"\", \"confirmation_url\": \"https://jobs.lever.co/example/1002\"}",
+  "unanswered_question": "RESULT:FAILED:manual_review_required:work_authorization\nUNANSWERED_QUESTIONS: [{\"question\": \"Are you authorised to work in China?\", \"field_type\": \"select\", \"required\": true, \"reason\": \"No confirmed answer\"}]",
+  "assessment": "RESULT:FAILED:assessment_required",
+  "captcha": "RESULT:CAPTCHA"
+}

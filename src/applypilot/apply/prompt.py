@@ -5,6 +5,7 @@ how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -14,6 +15,23 @@ from pathlib import Path
 from applypilot import config
 
 logger = logging.getLogger(__name__)
+
+
+def _preferred_display_name(personal: dict) -> str:
+    """Return the configured display name without duplicating the surname."""
+    full_name = personal["full_name"]
+    configured = personal.get("preferred_display_name", "").strip()
+    if configured:
+        return configured
+
+    preferred = personal.get("preferred_name", "").strip()
+    if not preferred:
+        return full_name
+    if " " in preferred:
+        return preferred
+
+    last_name = full_name.split()[-1] if " " in full_name else ""
+    return f"{preferred} {last_name}".strip()
 
 
 def _build_profile_summary(profile: dict) -> str:
@@ -31,7 +49,8 @@ def _build_profile_summary(profile: dict) -> str:
     eeo = p.get("eeo_voluntary", {})
 
     lines = [
-        f"Name: {personal['full_name']}",
+        f"Legal Name: {personal['full_name']}",
+        f"Preferred/Display Name: {_preferred_display_name(personal)}",
         f"Email: {personal['email']}",
         f"Phone: {personal['phone']}",
     ]
@@ -39,6 +58,7 @@ def _build_profile_summary(profile: dict) -> str:
     # Address -- handle optional fields gracefully
     addr_parts = [
         personal.get("address", ""),
+        personal.get("address_line_2", ""),
         personal.get("city", ""),
         personal.get("province_state", ""),
         personal.get("country", ""),
@@ -54,6 +74,9 @@ def _build_profile_summary(profile: dict) -> str:
         lines.append(f"Portfolio: {personal['portfolio_url']}")
     if personal.get("website_url"):
         lines.append(f"Website: {personal['website_url']}")
+    citizenship = personal.get("citizenship") or personal.get("nationality")
+    if citizenship:
+        lines.append(f"Citizenship/Nationality: {citizenship}")
 
     # Work authorization
     lines.append(f"Work Auth: {work_auth.get('legally_authorized_to_work', 'See profile')}")
@@ -63,7 +86,10 @@ def _build_profile_summary(profile: dict) -> str:
 
     # Compensation
     currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    lines.append(f"Salary Strategy ({currency}): {comp['salary_expectation']}")
+
+    if personal.get("country_of_birth"):
+        lines.append(f"Country/Region of Birth: {personal['country_of_birth']}")
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -74,14 +100,45 @@ def _build_profile_summary(profile: dict) -> str:
     # Availability
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
 
-    # Standard responses
-    lines.extend([
-        "Age 18+: Yes",
-        "Background Check: Yes",
-        "Felony: No",
-        "Previously Worked Here: No",
-        "How Heard: Online Job Board",
-    ])
+    # Screening facts -- never invent defaults for legal or employer-specific
+    # questions. Missing facts remain manual-review items.
+    screening = p.get("screening", {})
+    screening_labels = (
+        ("Age 18+", "age_18_or_older"),
+        ("Background Check", "willing_to_complete_background_check"),
+        ("Drug Test", "willing_to_complete_drug_test"),
+        ("Criminal Convictions to Disclose", "criminal_convictions_to_disclose"),
+        ("Driver's License", "drivers_license"),
+        ("Has Transportation", "has_transportation"),
+        ("NDA", "willing_to_sign_nda"),
+        ("Employment Restrictions", "employment_or_non_compete_restrictions"),
+        ("Previously Worked Here", "previously_worked_for_target_employer"),
+    )
+    for label, key in screening_labels:
+        lines.append(f"{label}: {screening.get(key, 'Manual review')}")
+    lines.append("How Heard: Use the actual discovery source from the job record")
+
+    current = p.get("current_employment", {})
+    if current:
+        lines.append(f"Current Employment: {current.get('title', '')} at {current.get('company', '')}")
+        lines.append(f"Notice Period: {current.get('notice_period', 'Manual review')}")
+        lines.append(f"Contact Current Employer: {current.get('contact_current_employer', 'Manual review')}")
+
+    languages = p.get("languages", [])
+    if languages:
+        language_text = "; ".join(
+            f"{item.get('language')}: {item.get('proficiency')}" for item in languages
+        )
+        lines.append(f"Languages: {language_text}")
+
+    education = p.get("education", [])
+    for item in education:
+        date = item.get("expected_graduation") or item.get("graduation", "")
+        gpa = item.get("gpa", "")
+        detail = f"{item.get('institution')}: {item.get('degree')} ({date})"
+        if gpa and "leave blank" not in str(gpa).lower():
+            detail += f", GPA {gpa}"
+        lines.append(f"Education Record: {detail}")
 
     # EEO
     lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
@@ -120,46 +177,171 @@ Read the job page. Determine the work arrangement. Then decide:
 Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
 
 
+def _national_phone_digits(personal: dict) -> str:
+    """Return the phone number without a separately selected country prefix."""
+    configured = "".join(
+        character for character in str(personal.get("phone_national_number", ""))
+        if character.isdigit()
+    )
+    if configured:
+        return configured
+
+    digits = "".join(
+        character for character in str(personal.get("phone", ""))
+        if character.isdigit()
+    )
+    country_code = "".join(
+        character for character in str(personal.get("phone_country_code", ""))
+        if character.isdigit()
+    )
+    if not country_code and personal.get("country", "").casefold() == "singapore":
+        country_code = "65"
+    if country_code and digits.startswith(country_code) and len(digits) > len(country_code):
+        return digits[len(country_code):]
+    return digits
+
+
+def _build_availability_section(profile: dict) -> str:
+    """Build role-aware, advisory availability rules from current profile values."""
+    availability = profile.get("availability", {})
+    full_time_start = availability.get(
+        "credit_bearing_internship_start",
+        availability.get("generic_application_availability_date", "Manual review"),
+    )
+    generic_date = availability.get("generic_application_availability_date", full_time_start)
+    internship_end = availability.get("internship_end_date", "Manual review")
+    exact_period_rule = availability.get("exact_period_answer_rule", "")
+    non_credit_start = availability.get("non_credit_internship_start", "Manual review")
+    non_credit_hours = availability.get("non_credit_internship_hours_per_week_max", "Manual review")
+    full_time_hours = availability.get("credit_bearing_internship_hours_per_week", "40+")
+
+    return f"""== AVAILABILITY GUIDANCE (truthful, but usually negotiable) ==
+- Full-time approved programme-credit-bearing internship: earliest start = {full_time_start}; availability = {full_time_hours} hours/week.
+- Confirmed internship end date = {internship_end}. When an employer requires an exact internship end date, use this value rather than treating it as unknown.
+- Exact-period answer rule: {exact_period_rule or 'Use only the confirmed start and end dates above.'}
+- Non-credit internship: start = {non_credit_start}; maximum = {non_credit_hours} hours/week.
+- Generic form date when one date is required: {generic_date}.
+- Treat start dates, duration, and days per week as fit signals that may be discussed with the employer, not automatic rejection gates. Continue unless the posting states a hard legal eligibility condition that the profile cannot satisfy.
+- When a required question asks whether an exact period is available, answer truthfully from the facts above. Do not turn immediate part-time eligibility into immediate full-time eligibility.
+- If the form asks for free-text availability, state the shortest supported answer from these facts. Never revive an older date from a cover letter, experiment profile, cached answer, or resume."""
+
+
+def _build_work_authorization_section(profile: dict) -> str:
+    """Build explicit internship versus post-graduation work-auth branches."""
+    work_auth = profile.get("work_authorization", {})
+    policies = work_auth.get("form_answer_policy", {})
+    lines = ["== WORK AUTHORIZATION DECISION TREE =="]
+    if policies:
+        labels = (
+            ("programme_credit_bearing_internship", "Approved programme-credit-bearing internship"),
+            ("non_credit_internship", "Non-credit internship"),
+            ("post_graduation_full_time", "Post-graduation full-time employment"),
+        )
+        for key, label in labels:
+            policy = policies.get(key)
+            if not policy:
+                continue
+            lines.append(
+                f"- {label}: legally authorized = {policy.get('legally_authorized', 'Manual review')}; "
+                f"requires sponsorship = {policy.get('requires_sponsorship', 'Manual review')}; "
+                f"status/answer = {policy.get('status', policy.get('note', 'See profile'))}."
+            )
+    else:
+        lines.extend((
+            f"- Work authorization: {work_auth.get('legally_authorized_to_work', 'Manual review')}",
+            f"- Sponsorship: {work_auth.get('require_sponsorship', 'Manual review')}",
+        ))
+    lines.extend((
+        "- Classify the role before answering. Never reuse an internship answer for post-graduation full-time employment or the reverse.",
+        "- If the form combines several conditions into one ambiguous legal question and no branch above maps cleanly, stop with RESULT:FAILED:manual_review_required:work_authorization.",
+    ))
+    return "\n".join(lines)
+
+
+def _linkedin_resume_preference(profile: dict, job: dict) -> str:
+    """Choose a configured already-uploaded LinkedIn resume for the job text."""
+    linkedin = profile.get("linkedin_easy_apply", {})
+    variants = linkedin.get("uploaded_resume_variants", [])
+    haystack = " ".join(
+        str(job.get(key, "")) for key in ("title", "full_description", "description")
+    ).casefold()
+    best_filename = ""
+    best_matches = 0
+    for variant in variants:
+        matches = sum(
+            1 for keyword in variant.get("keywords", [])
+            if str(keyword).casefold() in haystack
+        )
+        if matches > best_matches:
+            best_matches = matches
+            best_filename = str(variant.get("filename", ""))
+    return best_filename
+
+
+def _build_application_facts_section(profile: dict) -> str:
+    """Render a deliberately small, context-aware confirmed-facts registry."""
+    facts = profile.get("application_facts", [])
+    if not facts:
+        return "== CONFIRMED APPLICATION FACTS ==\nNo additional contextual facts are registered."
+
+    lines = ["== CONFIRMED APPLICATION FACTS (use only in the stated context) =="]
+    for fact in facts:
+        key = str(fact.get("key", "")).strip()
+        if not key:
+            continue
+        value = fact.get("value", "Manual review")
+        context = str(fact.get("context", "general")).strip() or "general"
+        source = str(fact.get("source", "profile")).strip() or "profile"
+        confirmed_at = str(fact.get("confirmed_at", "not recorded")).strip()
+        lines.append(
+            f"- {key}: {value} | context: {context} | source: {source} | confirmed: {confirmed_at}"
+        )
+    lines.append(
+        "- Context is binding: never copy a credit-bearing internship answer into a "
+        "non-credit internship or post-graduation full-time question."
+    )
+    lines.append(
+        "- Key-answer review is guidance, not a rigid matrix: compare the question's meaning, "
+        "scope, and material consequence with the confirmed fact. Use a clear match, correct an "
+        "obvious mismatch, and record a genuinely unsupported material question for later review."
+    )
+    return "\n".join(lines)
+
+
 def _build_salary_section(profile: dict) -> str:
     """Build the salary negotiation instructions.
 
     Adapts floor, range, and currency from the profile's compensation section.
     """
     comp = profile["compensation"]
-    currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
-    conversion_note = comp.get("currency_conversion_note", "")
+    currency = comp.get("salary_currency", "SGD")
+    internship_default = comp.get("internship_monthly_default", 1750)
+    internship_min = comp.get("internship_monthly_min", 1500)
+    internship_max = comp.get("internship_monthly_max", 2000)
+    full_time_min = comp.get("full_time_annual_min", "")
+    full_time_max = comp.get("full_time_annual_max", "")
+    current = profile.get("current_employment", {})
+    current_monthly = current.get("current_salary_monthly")
+    current_currency = current.get("current_salary_currency", currency)
+    current_salary_rule = (
+        f"5. Current salary with an explicit monthly period and {current_currency} currency -> "
+        f"enter {current_monthly}. If the period or currency differs or is unclear, record it as an "
+        "unanswered question for confirmation."
+        if current_monthly not in (None, "")
+        else "5. Current salary -> record it as an unanswered question for confirmation."
+    )
 
-    # Compute example hourly rates at 3 salary levels
-    try:
-        floor_int = int(floor)
-        examples = [
-            (f"${floor_int // 1000}K", floor_int // 2080),
-            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
-            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
-        ]
-        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
-    except (ValueError, TypeError):
-        hourly_line = "Divide annual salary by 2080"
-
-    # Currency conversion guidance
-    if conversion_note:
-        convert_line = f"Posting is in a different currency? -> {conversion_note}"
-    else:
-        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
-
-    return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+    return f"""== COMPENSATION (no salary-based rejection) ==
+Finding a suitable role takes priority. Never reject or stop an application because compensation is below a stored preference.
 
 Decision tree:
-1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
-2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
-3. {convert_line}
-4. No salary info anywhere? -> Use ${floor} {currency}.
-5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
+1. Optional compensation field -> leave blank; if text is required, enter "Negotiable".
+2. Internship field requiring one monthly number -> enter {currency} {internship_default} per month.
+3. Internship field requesting a range -> enter {currency} {internship_min}-{internship_max} per month.
+4. Full-time field shows an employer range -> do not invent a floor or convert it. Use the employer's range only if the form accepts a range.
+{current_salary_rule}
+6. Full-time expected salary requiring one number -> record an unanswered question and stop before submission with RESULT:FAILED:manual_salary_review. Reference range is {currency} {full_time_min}-{full_time_max} per year, but it is not authorization to answer automatically.
+7. Never add a dollar sign automatically, never assume annual versus monthly, and never convert annual salary to hourly pay without explicit user review."""
 
 
 def _build_screening_section(profile: dict) -> str:
@@ -170,19 +352,47 @@ def _build_screening_section(profile: dict) -> str:
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
+    mobility = profile.get("mobility", {})
+    screening = profile.get("screening", {})
+    answer_policy = profile.get("screening_answer_policy", {})
+    related_yes_policy = answer_policy.get(
+        "required_experience_yes_policy",
+        "Answer Yes only when direct or sufficiently adjacent same-domain evidence reasonably supports the category.",
+    )
+    exact_tool_policy = answer_policy.get(
+        "exact_tool_policy",
+        "Do not claim an absent exact tool, duration, certification, license, or regulated qualification.",
+    )
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
+  - Location/relocation: lives in {city}; willing to relocate within Singapore: {mobility.get('willing_to_relocate_within_singapore', 'manual review')}; willing to relocate to another country: {mobility.get('willing_to_relocate_to_another_country', 'manual review')}
+  - Travel: {mobility.get('willing_to_travel', 'manual review')}, maximum {mobility.get('maximum_travel_percentage', 'manual review')}%
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
-  - Criminal/background: answer from profile only
+  - Criminal/background: convictions to disclose = {screening.get('criminal_convictions_to_disclose', 'manual review')}; background check = {screening.get('willing_to_complete_background_check', 'manual review')}
+  - Previous employment, relatives, or referrals at this employer: determine for this exact employer; never use a global default
 
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
+Required experience and skills -> use the APPLICANT PROFILE, RESUME TEXT, and configured evidence policy. This candidate is a {target_role} with {years} years total experience. {related_yes_policy} Umbrella categories may be supported by explicit adjacent work: for example, documented LLM, generative-AI, hybrid-RAG, tool-calling, agent, or AI-workflow work can justify YES to a broadly phrased LLM/GenAI/AI-automation experience question. Do not require an exact keyword match when the underlying same-domain work is clear.
+
+Precision boundary -> {exact_tool_policy} Do not convert general ML or AI familiarity into experience with a specifically named absent framework. Never invent exact years or months for a named technology. If a required answer has neither direct nor sufficiently adjacent same-domain support, output RESULT:FAILED:manual_review_required:unsupported_skill_answer. For open text, label transferable experience precisely rather than presenting it as identical experience.
 
 Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
 
 EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+
+
+def _build_routine_form_defaults_section(profile: dict) -> str:
+    """Render user-approved defaults for low-consequence form fields."""
+    personal = profile.get("personal", {})
+    source = profile.get("application_source", {})
+    country_of_birth = str(personal.get("country_of_birth") or "").strip()
+    preferred_source = str(source.get("form_source_default") or "Other").strip()
+    fallback_source = str(source.get("form_source_fallback") or "Company website").strip()
+    return f"""== ROUTINE FORM DEFAULTS ==
+- Country/Region of Birth -> {country_of_birth or 'leave blank unless a confirmed profile value is available'}.
+- "How did you hear about us?" / application-source fields are non-material. Prefer "{preferred_source}". If that option is absent, select "{fallback_source}" or the first truthful non-referral option. Do not stop or create an unanswered-question record for this field.
+- Never claim a named employee referral, agency referral, or former-employer relationship unless it is explicitly confirmed for this employer."""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -192,11 +402,9 @@ def _build_hard_rules(profile: dict) -> str:
 
     full_name = personal["full_name"]
     preferred_name = personal.get("preferred_name", full_name.split()[0])
-    preferred_last = full_name.split()[-1] if " " in full_name else ""
-    display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
+    display_name = _preferred_display_name(personal)
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -204,9 +412,16 @@ def _build_hard_rules(profile: dict) -> str:
     if permit_type:
         work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
 
-    name_rule = f'Name: Legal name = {full_name}.'
+    name_rule = (
+        f'Name: Legal name = {full_name}. Treat "Full name", "First/Given name", '
+        '"Last/Family name", and "Surname" as legal-name fields even when the word '
+        '"legal" is omitted.'
+    )
     if preferred_name and preferred_name != full_name.split()[0]:
-        name_rule += f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
+        name_rule += (
+            f' Preferred name = {preferred_name}; display name = "{display_name}". '
+            'Use those only when the field explicitly asks for preferred, chosen, or display name.'
+        )
 
     return f"""== HARD RULES (never break these) ==
 1. Never lie about: citizenship, work authorization, criminal history, education credentials, security clearance, licenses.
@@ -214,18 +429,112 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_captcha_section() -> str:
-    """Build the CAPTCHA detection and solving instructions.
+def _build_login_steps(profile: dict) -> str:
+    """Build a narrow, auditable authentication policy for the browser agent."""
+    authentication = profile.get("authentication", {})
+    google_reuse_authorized = bool(
+        authentication.get("google_sso_existing_session_authorized", False)
+    )
+    account_creation_authorized = bool(
+        authentication.get("ats_account_creation_authorized", False)
+    )
+    gmail_verification_authorized = bool(
+        authentication.get("gmail_verification_authorized", False)
+    )
+    email = authentication.get(
+        "ats_signup_email",
+        profile.get("personal", {}).get("email", "the configured email"),
+    )
+    mailbox = authentication.get("gmail_verification_mailbox", email)
 
-    Reads the CapSolver API key from environment. The CAPTCHA section
-    contains no personal data -- it's the same for every user.
+    if google_reuse_authorized or account_creation_authorized:
+        google_rule = (
+            f"You may use Continue with Google only by selecting the already signed-in account {email} and "
+            "granting basic identity/email access. Stop if Google asks for credentials, account recovery, MFA "
+            "enrollment, or broader OAuth scopes."
+            if google_reuse_authorized
+            else "Google SSO reuse is not authorized."
+        )
+        signup_rule = (
+            f"For an ordinary employer ATS only, account creation with {email} is authorized. Never type, print, "
+            "read aloud, copy into the prompt, or expose the password. Fill credentials only by running "
+            ".\\fill-ats-credentials.ps1 -Field email, password, or both from the worker directory. The relay "
+            "fills the browser directly and must not submit the form. If the relay is missing, unconfigured, "
+            "rejects the current host, or fails, stop with RESULT:FAILED:credential_relay_required."
+            if account_creation_authorized
+            else "Do not create a new account."
+        )
+        verification_rule = (
+            f"Email verification is authorized only through the read-only Gmail tools for mailbox {mailbox}. "
+            "Search narrowly for a message received within the last 10 minutes, addressed to that exact mailbox, "
+            "and confidently tied to the current employer/ATS domain. Read only the shortlisted verification "
+            "message, enter the one-time code directly, and never repeat the code in chat, reasoning, reports, "
+            "screenshots, or logs. If the mailbox differs, the message is stale/ambiguous, or the flow requests "
+            "phone/SMS verification, password reset, account recovery, security questions, or MFA enrollment, "
+            "stop with RESULT:LOGIN_ISSUE."
+            if gmail_verification_authorized
+            else "Do not open email or enter verification codes."
+        )
+        return (
+            "5. Authentication policy: "
+            + google_rule
+            + " "
+            + signup_rule
+            + " "
+            + verification_rule
+            + " After authentication navigation, list tabs and return to the application tab if needed."
+        )
+    return (
+        "5. If login, sign-up, email/SMS verification, SSO, OAuth, or account creation is required, do not "
+        "authenticate or create an account. Output RESULT:LOGIN_ISSUE and stop."
+    )
+
+
+def _build_portal_handoff_rule(job: dict) -> str:
+    """Describe the portal's external-ATS stop boundary for a browser prompt."""
+    policy = config.get_portal_policy(
+        job.get("application_url") or job.get("url"),
+        source_site=job.get("source_site"),
+        site=job.get("site"),
+    )
+    if not policy or policy.get("external_application_mode") != "manual_reconfirm":
+        return ""
+    name = str(policy.get("name") or "This portal")
+    domains = ", ".join(str(domain) for domain in policy.get("domains", []) if domain)
+    if not domains:
+        return ""
+    return (
+        f" This listing originated from {name}. If navigation leaves {domains} for an employer or "
+        "external ATS, stop immediately with RESULT:FAILED:manual_review_required:external_ats. "
+        "Do not fill, upload, or submit after that hand-off."
+    )
+
+
+def _build_captcha_section() -> str:
+    """Compatibility wrapper for the current click-and-observe guidance.
+
+    The legacy solver text remains below temporarily so older local diffs are
+    not destructively rewritten, but it is unreachable and no longer emitted.
     """
+    return _build_captcha_check_section()
+
+    # Legacy, unreachable text retained for a later dedicated cleanup.
     config.load_env()
-    capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    capsolver_configured = bool(os.environ.get("CAPSOLVER_API_KEY", ""))
+    # This literal is an instruction marker, never the secret. It keeps the
+    # legacy browser snippets non-secret while directing the runtime agent to
+    # obtain the credential from the process environment.
+    capsolver_key = "READ_FROM_CAPSOLVER_API_KEY_ENV_WITHOUT_ECHOING"
+    key_instruction = (
+        "Read CAPSOLVER_API_KEY from the process environment at execution time. "
+        "Never print, echo, persist, or include its value in tool output."
+        if capsolver_configured
+        else "CAPSOLVER_API_KEY is not configured. Use the manual fallback."
+    )
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
+Credential handling: {key_instruction}
 API base: https://api.capsolver.com
 
 CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
@@ -417,9 +726,54 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
+def _build_captcha_check_section() -> str:
+    """Describe the fail-closed CAPTCHA pause used by application runs."""
+    return """== CAPTCHA CHECK AND VERIFY ==
+A hidden/background CAPTCHA iframe is only a page signal; do not treat it as proof that the form is blocked.
+When a visible verification control blocks the ordinary application flow:
+1. Snapshot the page and save captcha-blocked.png.
+2. Do not click, solve, inject tokens, call a solver service, or use Submit to probe it.
+3. Output RESULT:CAPTCHA immediately so the application is blocked for manual review."""
+
+
+def _build_browser_observation_section(job: dict) -> str:
+    """Render launcher observations and their submission-gate meaning."""
+    observation = job.get("_browser_observation")
+    prior_status = str(job.get("apply_status") or "").strip()
+    if not isinstance(observation, dict) and prior_status != "submission_uncertain":
+        return ""
+    if not isinstance(observation, dict):
+        observation = {}
+    if observation.get("verification_resume") is True:
+        return """== MANUAL VERIFICATION RESUME ==
+The applicant was handed the visible CAPTCHA/email-verification gate and the launcher observed that the gate cleared. Do not read, retrieve, repeat, or log any verification code. Snapshot the current page and independently confirm that no verification gate remains. If the ordinary application form is visible, preserve all existing answers, re-scan any newly revealed conditional fields, and click the final control at most once only after every hard gate passes. If the gate remains or the page state is ambiguous, output RESULT:CAPTCHA without another submit click."""
+    if observation.get("repair_mode") is True:
+        validation_errors = observation.get("validation_errors")
+        if not isinstance(validation_errors, list):
+            validation_errors = []
+        rendered_errors = json.dumps(validation_errors[:12], ensure_ascii=False)
+        return f"""== ONE-TIME POST-SUBMIT VALIDATION REPAIR ==
+The previous final click was deterministically rejected by the still-visible form; no receipt was observed. This is not permission to retry merely because a receipt is absent.
+Observed validation errors: {rendered_errors}
+Snapshot the current page and confirm those errors are still visible. Re-scan the whole visible form because conditional questions may have appeared. Repair only ordinary fields whose answers are supported by the confirmed profile. A field labelled optional becomes conditionally required only when the live form validation explicitly blocks on it. Do not repair or satisfy media recording/upload, camera, microphone, assessment, identity-document, financial, verification-code, CAPTCHA, or unsupported-answer gates; stop for manual review instead.
+After all supported validation errors visibly clear, click the final control at most once. If the same errors remain, a new unsupported error appears, or the page has no decisive receipt, do not click again."""
+    issues = observation.get("issues")
+    issue_text = ", ".join(str(item) for item in issues) if isinstance(issues, list) else ""
+    return f"""== PRE-SUBMIT BROWSER GATE ==
+Prior local application state: {prior_status or 'not recorded'}
+Signal: {observation.get('signal') or observation.get('status') or 'unknown'}
+Observed details: {issue_text or 'no specific issue reported'}
+Any listed issue is a hard submission pause. Do not submit while it remains. A prior submission_uncertain state also requires manual review and must never trigger another submit click. Re-read the visible page only to confirm the current state; do not guess or bypass a gate."""
+
+
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False,
+                 worker_id: int = 0,
+                 worker_dir: Path | None = None,
+                 manual_captcha_relay: bool = False,
+                 resume_existing_page: bool = False,
+                 submission_phase: str = "submit") -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -431,6 +785,8 @@ def build_prompt(job: dict, tailored_resume: str,
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
+        worker_id: Worker identifier used to isolate upload artifacts.
+        worker_dir: Optional already-reset worker directory.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -438,6 +794,30 @@ def build_prompt(job: dict, tailored_resume: str,
     profile = config.load_profile()
     search_config = config.load_search_config()
     personal = profile["personal"]
+    submission_policy = profile.get("submission_policy", {})
+    if submission_phase not in {"prepare", "submit"}:
+        raise ValueError(f"Unknown submission phase: {submission_phase}")
+    if job.get("tailor_status") != "machine_validated":
+        raise ValueError(
+            "Tailored resume must be machine_validated before application preparation."
+        )
+    cover_not_required = job.get("cover_letter_status") == "not_required"
+    accepted_cover_statuses = {"human_approved", "agent_validated"}
+    runtime_cover_discovery = bool(
+        submission_policy.get("allow_runtime_cover_letter_discovery", False)
+        and not dry_run
+        and submission_phase == "prepare"
+    )
+    if (
+        not dry_run
+        and job.get("cover_letter_status") not in accepted_cover_statuses
+        and not cover_not_required
+        and not runtime_cover_discovery
+    ):
+        raise ValueError(
+            "Application prompt requires a human-approved cover letter; "
+            f"current state is {job.get('cover_letter_status') or 'unset'}."
+        )
 
     # --- Resolve resume PDF path ---
     resume_path = job.get("tailored_resume_path")
@@ -451,7 +831,8 @@ def build_prompt(job: dict, tailored_resume: str,
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
     name_slug = full_name.replace(" ", "_")
-    dest_dir = config.APPLY_WORKER_DIR / "current"
+    base_worker_dir = worker_dir or (config.APPLY_WORKER_DIR / f"worker-{worker_id}")
+    dest_dir = base_worker_dir / "attachments"
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
     shutil.copy(str(src_pdf), str(upload_pdf))
@@ -461,7 +842,8 @@ def build_prompt(job: dict, tailored_resume: str,
     cover_letter_text = cover_letter or ""
     cl_upload_path = ""
     cl_path = job.get("cover_letter_path")
-    if cl_path and Path(cl_path).exists():
+    cover_is_approved = job.get("cover_letter_status") in accepted_cover_statuses
+    if cover_is_approved and cl_path and Path(cl_path).exists():
         cl_src = Path(cl_path)
         # Read text from .txt sibling (PDF is binary)
         cl_txt = cl_src.with_suffix(".txt")
@@ -479,47 +861,263 @@ def build_prompt(job: dict, tailored_resume: str,
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
+    availability_section = _build_availability_section(profile)
+    work_authorization_section = _build_work_authorization_section(profile)
+    application_facts_section = _build_application_facts_section(profile)
+    routine_form_defaults_section = _build_routine_form_defaults_section(profile)
+    linkedin_preflight = profile.get("linkedin_easy_apply", {}).get(
+        "applied_preflight",
+        "Exclude an exact previously applied platform job ID or canonical URL. Treat a different ID with the same title and company as a possible repost, not an automatic duplicate.",
+    )
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
-    captcha_section = _build_captcha_section()
+    captcha_section = _build_captcha_check_section()
+    browser_observation_section = _build_browser_observation_section(job)
+    portal_handoff_rule = _build_portal_handoff_rule(job)
 
-    # Cover letter fallback text
-    city = personal.get("city", "the area")
-    if not cover_letter_text:
-        cl_display = (
-            f"None available. Skip if optional. If required, write 2 factual "
-            f"sentences: (1) relevant experience from the resume that matches "
-            f"this role, (2) available immediately and based in {city}."
-        )
+    if (
+        not dry_run
+        and not cover_letter_text
+        and not cover_not_required
+        and not runtime_cover_discovery
+    ):
+        raise ValueError("Approved cover-letter artifact is empty or unreadable; manual review required.")
+    if cover_not_required:
+        cl_display = "N/A -- this exact application form was manually verified to have no cover-letter field."
     else:
-        cl_display = cover_letter_text
+        cl_display = cover_letter_text or "N/A -- no human-approved cover letter is supplied for this preview."
 
     # Phone digits only (for fields with country prefix)
-    phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())
+    phone_digits = _national_phone_digits(personal)
 
-    # SSO domains the agent cannot sign into (loaded from config/sites.yaml)
-    from applypilot.config import load_blocked_sso
-    blocked_sso = load_blocked_sso()
+    authorized_login_steps = _build_login_steps(profile)
 
-    # Preferred display name
-    preferred_name = personal.get("preferred_name", full_name.split()[0])
-    last_name = full_name.split()[-1] if " " in full_name else ""
-    display_name = f"{preferred_name} {last_name}".strip()
-
-    # Dry-run: override submit instruction
-    if dry_run:
-        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+    # Preview mode is a separate workflow, not a weakened submission prompt.
+    linkedin_resume = _linkedin_resume_preference(profile, job)
+    if (job.get("source_site") or job.get("site") or "").casefold() == "linkedin" and linkedin_resume:
+        resume_step = (
+            f"6. In LinkedIn Easy Apply, first select the already-uploaded resume whose visible filename "
+            f'contains "{linkedin_resume}" when it is available. Verify the selected filename. '
+            "If clicking the resume radio/control only focuses a download button or leaves the prior resume "
+            "selected, click the visible filename or resume card once and verify that the Selected marker moves. "
+            "Do not remove or re-upload it, even when FILES also contains a newly tailored PDF. If the configured "
+            "variant is not available, upload the Resume PDF from FILES once, wait for parsing, and verify the "
+            "filename or remove/replace control before continuing. Never hand browser file selection to Windows "
+            "Computer Use or an OS-native picker; if the browser upload primitive cannot attach the PDF after the "
+            "bounded retry, output RESULT:FAILED:resume_upload for this job so the batch can continue."
+        )
     else:
-        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
+        resume_step = "6. Upload resume. If an old resume is visibly attached, remove it first; if the field is empty, do not look for a delete control. Click the upload control once, call browser_file_upload with the PDF path above, wait for parsing, then snapshot and verify that an uploaded filename or replacement/remove control is visible. Once verified, never click the upload control again. This is the tailored resume for THIS job. Non-negotiable."
+    field_review_steps = """8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
+   - \"Current Job Title\" or \"Most Recent Title\" -> use the Current Employment title from APPLICANT PROFILE, NOT the target job title or a resume-parser guess.
+   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
+9. Answer screening questions using the rules above."""
 
-    prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
+    if dry_run:
+        mission_instruction = "Fill and verify this application for human review without submitting it or causing any external communication."
+        mission_body = (
+            "Populate the real application form accurately from the supplied profile and validated resume, "
+            "then stop with the completed form visible for review."
+        )
+        unexpected_instruction = (
+            "Except for the narrowly authorized existing-session Google SSO described below, if the flow requires "
+            "account creation, email/SMS verification, an assessment, a complex CAPTCHA challenge, or any action that sends data "
+            "beyond ordinary field entry and file upload, stop and report it for manual review."
+            + portal_handoff_rule
+        )
+        apply_navigation = (
+            "Open the application form. You may click an initial Apply link only when it navigates to the form. "
+            "If the role accepts applications only by email, do not send email; output "
+            "RESULT:FAILED:manual_review_required:email_application."
+        )
+        login_steps = authorized_login_steps
+        cover_steps = (
+            "7. Use a cover letter only when the FILES section provides a human-approved PDF/text. "
+            "Otherwise leave an optional cover-letter field blank. If it is required, output "
+            "RESULT:FAILED:manual_review_required:cover_letter and stop."
+        )
+        final_steps = """10. Review every populated field against the APPLICANT PROFILE and TAILORED RESUME.
+11. STOP before clicking any final Submit, Send, Finish, Complete application, or equivalent control. Do not press Enter while a final submission control is focused, and do not use it to probe CAPTCHA state.
+12. Take a final screenshot named final-preview.png and leave the completed form at the final review point. Output exactly `RESULT:PREVIEWED` on one line, then `PREVIEW_AUDIT: {json}` on the next line without a Markdown code fence. The JSON object must contain filled_fields, skipped_optional_fields, manual_review_fields, resume_uploaded, cover_letter_used, final_control_label, and submission_attempted. submission_attempted must be false."""
+        result_codes = """RESULT:PREVIEWED -- form populated and reviewed without submission
+RESULT:EXPIRED -- job closed or no longer accepting applications
+RESULT:CAPTCHA -- a CAPTCHA blocks reaching the review point
+RESULT:LOGIN_ISSUE -- authentication or account creation is required
+RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
+RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:manual_review_required:reason -- a human decision or side effect is required
+RESULT:FAILED:reason -- any other failure (brief reason)"""
+        captcha_section = _build_captcha_check_section()
+        captcha_navigation_instruction = (
+            "browser_snapshot to read the page. Ignore hidden background CAPTCHA iframes, but if any visible "
+            "CAPTCHA blocks the form, do not interact with it and stop with RESULT:CAPTCHA."
+        )
+        captcha_efficiency_instruction = (
+            "CAPTCHA CHECK: a hidden iframe is only a signal; any visible CAPTCHA is a hard manual-review pause."
+        )
+        form_validation_tip = "If the page shows validation warnings before submission, capture a snapshot and screenshot, fix only fields supported by the profile, and never use the final submit control to probe for errors."
+    else:
+        mission_instruction = "Complete and submit this one application after all required checks pass."
+        mission_body = "Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format."
+        unexpected_instruction = (
+            "If an assessment, CAPTCHA, unknown required question, work-authorization ambiguity, "
+            "identity ambiguity, or any unlisted external side effect appears, stop for manual review."
+        )
+        apply_navigation = """Find and click the Apply button only when it opens the ordinary company application form.
+   If the role is email-only, do not send email; output RESULT:FAILED:manual_review_required:email_application.
+   After clicking Apply, snapshot the page. A visible CAPTCHA is a hard pause: output RESULT:CAPTCHA without interacting with it."""
+        login_steps = authorized_login_steps
+        if cover_not_required:
+            cover_steps = (
+                "7. This exact form was previously verified to have no cover-letter field. "
+                "If one is now required, output RESULT:FAILED:manual_review_required:cover_letter and stop."
+            )
+        elif cover_letter_text:
+            cover_steps = "7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path."
+        else:
+            cover_steps = (
+                "7. Inspect the real ATS form before deciding whether a cover letter is needed. "
+                "If no required cover-letter text or file field exists, preserve the current form and output "
+                "RESULT:COVER_NOT_REQUIRED. If a cover-letter text or file field is required, preserve the "
+                "current form and output RESULT:COVER_LETTER_REQUIRED. Do not invent a letter in this turn; "
+                "the launcher will generate a validated job-specific artifact from the JD and selected resume, "
+                "then resume this same page."
+            )
+        final_steps = """10. BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. A missing resume, any required unfilled field, assessment, visible CAPTCHA, unknown required question, or unresolved identity/work-authorization answer is a hard pause. Record unknown questions in UNANSWERED_QUESTIONS JSON and output RESULT:FAILED:manual_review_required:reason without submitting.
+11. Only after every hard gate is clear, click the final submission control exactly once, then snapshot and check new tabs. Never click Submit a second time merely because the receipt is absent.
+12. Output RESULT:APPLIED only when a visible receipt/success page or platform Applied marker exists. On the next line output `SUBMISSION_EVIDENCE: {\"receipt_visible\": true_or_false, \"applied_badge_visible\": true_or_false, \"confirmation_text\": \"exact visible confirmation text\", \"confirmation_url\": \"current confirmation URL\"}` without a Markdown code fence. confirmation_text must be non-empty. If decisive evidence is absent, output RESULT:SUBMISSION_UNCERTAIN."""
+        result_codes = """RESULT:APPLIED -- submitted successfully
+RESULT:SUBMISSION_UNCERTAIN -- final action occurred but no decisive receipt was visible
+RESULT:EXPIRED -- job closed or no longer accepting applications
+RESULT:CAPTCHA -- any visible CAPTCHA blocks the application
+RESULT:LOGIN_ISSUE -- could not sign in or create account
+RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
+RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:reason -- any other failure (brief reason)"""
+        captcha_navigation_instruction = (
+            "browser_snapshot to read the page. If a visible CAPTCHA blocks the form, do not interact with it; "
+            "save evidence and output RESULT:CAPTCHA."
+        )
+        captcha_efficiency_instruction = (
+            "CAPTCHA AWARENESS: hidden iframes are only signals, but any visible blocking control requires "
+            "RESULT:CAPTCHA without clicks, token injection, or retries."
+        )
+        form_validation_tip = "After a final click, retry only when the still-visible form shows specific validation errors proving that submission was rejected. Fix supported ordinary fields and allow at most one repair click. No receipt by itself never authorizes another click."
+
+    if not dry_run and submission_phase == "prepare":
+        mission_instruction = "Prepare and review this one application, but do not submit it."
+        mission_body = (
+            "Populate the real application form accurately from the supplied profile and validated resume, "
+            "verify every required field, and stop before the final submission control."
+        )
+        unexpected_instruction = (
+            "Do not cause external submission or communication. Any visible CAPTCHA, assessment, unknown required "
+            "question, or identity/work-authorization ambiguity requires an immediate manual-review stop."
+        )
+        apply_navigation = (
+            "Open the ordinary application form without submitting it. If the role accepts applications only by "
+            "email, do not send email; output RESULT:FAILED:manual_review_required:email_application."
+        )
+        final_steps = """10. BEFORE any submission action, snapshot and review EVERY field. Verify legal name, email, phone, Singapore location, current company, work authorization, availability answers, required screening responses, and the uploaded resume. If any required field is empty or unknown, the resume is not visibly uploaded, an assessment/CAPTCHA is present, or identity/work authorization is ambiguous, record any unknown questions and output RESULT:FAILED:manual_review_required:reason. Otherwise fix supported errors and save a screenshot named pre-submit-review.png.
+11. STOP before clicking Submit/Apply/Send/Finish/Complete application or any equivalent final control. Do not press Enter while that control is focused.
+12. Output RESULT:READY_TO_SUBMIT when the completed form is visible at the final review point. The launcher will capture an advisory browser observation before a separate submission phase."""
+        result_codes = """RESULT:READY_TO_SUBMIT -- form completed and waiting for an advisory browser observation
+RESULT:EXPIRED -- job closed or no longer accepting applications
+RESULT:CAPTCHA -- a visible CAPTCHA blocks ordinary form interaction
+RESULT:LOGIN_ISSUE -- could not sign in or create account
+RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
+RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:reason -- any other failure (brief reason)"""
+
+    if not dry_run and submission_phase == "submit":
+        mission_instruction = "Review the prepared application against hard safety gates, then submit it exactly once only when every gate passes."
+        mission_body = (
+            "The visible application form has already been populated. The launcher may provide an advisory "
+            "snapshot, but the browser agent remains responsible for interpreting the current page."
+        )
+        resume_step = "6. Preserve the selected resume unless the visible page clearly shows it is missing or wrong; use confirmed profile facts to correct an obvious mismatch."
+        field_review_steps = """8. Snapshot the current page and use the launcher observation to focus review. A visible CAPTCHA, missing resume, required unfilled field, assessment, or identity/work-authorization ambiguity is a hard pause, not advisory.
+9. Compare every required answer with confirmed facts. For any unknown required question, emit UNANSWERED_QUESTIONS JSON and stop with RESULT:FAILED:manual_review_required:unknown_required_question. Never guess or negotiate an identity or work-right answer."""
+
+    if manual_captcha_relay:
+        captcha_section = _build_captcha_check_section()
+        captcha_navigation_instruction = (
+            "browser_snapshot to read the page. If a visible verification checkbox or button blocks the form, "
+            "do not interact with it; output RESULT:CAPTCHA immediately."
+        )
+        captcha_efficiency_instruction = (
+            "CAPTCHA CHECK: hidden iframes alone are not decisive, but any visible CAPTCHA is a hard pause. "
+            "Do not click, solve, inject, or loop on it."
+        )
+        if not dry_run:
+            apply_navigation = (
+                "Find and click the Apply button only when it navigates to the ordinary application form. "
+                "After navigation, snapshot the form. If a visible CAPTCHA blocks it, output RESULT:CAPTCHA "
+                "without interacting. Email-only applications "
+                "require manual review; do not send email."
+            )
+            login_steps = authorized_login_steps
+            if submission_phase == "prepare":
+                final_steps = """10. Snapshot and review EVERY field. Verify legal name, email, phone, Singapore location, current company, availability answers, required screening responses, and the uploaded resume. Fix supported errors, then save pre-submit-review.png.
+11. STOP before clicking the final submission control. Do not press Enter while it is focused.
+12. Output RESULT:READY_TO_SUBMIT when the form is complete and ready for the launcher's advisory observation."""
+                result_codes = """RESULT:READY_TO_SUBMIT -- form completed and waiting for advisory observation
+RESULT:EXPIRED -- job closed or no longer accepting applications
+RESULT:CAPTCHA -- a visible CAPTCHA blocks ordinary form interaction
+RESULT:LOGIN_ISSUE -- authentication or account creation is required
+RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
+RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:reason -- any other failure (brief reason)"""
+            else:
+                final_steps = """10. Snapshot the prepared form. Any launcher issue, visible CAPTCHA, assessment, missing resume, required unfilled field, unknown required question, or unresolved identity/work-right answer is a hard pause with RESULT:FAILED:manual_review_required:reason.
+11. If every gate is clear, click the final submission control exactly once and snapshot immediately. Never click Submit a second time merely because the receipt is absent.
+12. Output RESULT:APPLIED only with a visible receipt or Applied marker, followed on the next line by `SUBMISSION_EVIDENCE: {\"receipt_visible\": true_or_false, \"applied_badge_visible\": true_or_false, \"confirmation_text\": \"exact visible confirmation text\", \"confirmation_url\": \"current confirmation URL\"}`. Otherwise output RESULT:SUBMISSION_UNCERTAIN."""
+                result_codes = """RESULT:APPLIED -- visible receipt or Applied marker observed
+RESULT:SUBMISSION_UNCERTAIN -- final action occurred without decisive confirmation
+RESULT:CAPTCHA -- a complex visible CAPTCHA remains after one normal verification attempt
+RESULT:FAILED:reason -- another failure occurred"""
+
+    if runtime_cover_discovery and not cover_not_required and not cover_letter_text:
+        result_codes += """
+RESULT:COVER_NOT_REQUIRED -- the opened ATS has no required cover-letter field
+RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a file"""
+
+    if resume_existing_page:
+        opening_steps = (
+            "1. Do not navigate or reload. The visible Edge session is already on this exact application after "
+            "a previous controlled step. Snapshot the current page first. If an application confirmation is already "
+            "visible, output RESULT:APPLIED immediately without clicking Submit again.\n"
+            "2. If the application form is visible, continue from its current state without clearing existing fields. "
+            "In prepare phase, finish and verify the form; in submit phase, use the advisory observation and current page state."
+        )
+    else:
+        opening_steps = (
+            "1. Snapshot the current page first. The launcher normally opens the exact job URL for you. "
+            "If the current URL already matches the JOB URL, do not reload it. Otherwise use browser_navigate "
+            "to the JOB URL directly; do not wait for the user to type it into the address bar.\n"
+            f"2. {captcha_navigation_instruction}"
+        )
+
+    prompt = f"""You are a job application assistant. {mission_instruction}
+
+== REQUIRED BROWSER CONTROL ==
+The `playwright` MCP server is already attached to the visible isolated Edge session. Use only its browser_* MCP tools for all browser interaction. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or any other browser automation route. If the attached browser MCP is unavailable, output RESULT:FAILED:browser_mcp_unavailable and stop.
+
+== FIELD IDENTITY RULES ==
+- Full name and all first/given/last/family/surname fields use the legal identity from APPLICANT PROFILE. Preferred/display name is used only when the label explicitly asks for it.
+- Current location/city/country fields use Singapore. Use the full street address only when the form actually asks for address fields.
+- Current company and current title use the Current Employment record, not a resume-parser guess.
+- For a full-time internship tied to a stated start month, answer Yes only if the exact full-time availability in the current profile meets that month. Dates and duration are generally negotiable fit signals, not automatic rejection gates; answer required questions truthfully and continue unless a hard legal condition is unmet.
 
 == JOB ==
 URL: {job.get('application_url') or job['url']}
 Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
+Company: {job.get('company_name') or 'Unknown employer'}
+Discovery source: {job.get('source_site') or job.get('site') or 'Unknown'}
 Fit Score: {job.get('fit_score', 'N/A')}/10
+
+{browser_observation_section}
 
 == FILES ==
 Resume PDF (upload this): {pdf_path}
@@ -535,9 +1133,9 @@ Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 {profile_summary}
 
 == YOUR MISSION ==
-Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format.
+{mission_body}
 
-If something unexpected happens and these instructions don't cover it, figure it out yourself. You are autonomous. Navigate pages, read content, try buttons, explore the site. The goal is always the same: submit the application. Do whatever it takes to reach that goal.
+{unexpected_instruction}
 
 {hard_rules}
 
@@ -545,7 +1143,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
 - NEVER set up a freelancing profile (Mercor, Toptal, Upwork, Fiverr, Turing, etc.). These are contractor marketplaces, not job applications -> RESULT:FAILED:not_a_job_application
-- NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows. You are applying for FULL-TIME salaried positions only.
+- NEVER set up a contractor/freelancer rate or availability-calendar profile. This workflow may apply to internships or full-time employment, but not long-term contractor marketplaces. A short-term practice contract requires manual review.
 - NEVER install browser extensions, download executables, or run assessment software.
 - NEVER enter payment info, bank details, or SSN/SIN.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
@@ -553,70 +1151,75 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 {location_check}
 
+{availability_section}
+
+{work_authorization_section}
+
+{application_facts_section}
+
+{routine_form_defaults_section}
+
+== LINKEDIN APPLIED / REPOST RULE ==
+{linkedin_preflight}
+- Never skip a new LinkedIn job ID solely because the company and title resemble an older application. Flag it as a possible repost and continue reviewing it.
+- Never submit when the exact LinkedIn job ID or canonical listing URL is already present in Applied.
+
 {salary_section}
 
 {screening_section}
 
 == STEP-BY-STEP ==
-1. browser_navigate to the job URL.
-2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
+{opening_steps}
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
-4. Find and click the Apply button. If email-only (page says "email resume to X"):
-   - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
-   - Output RESULT:APPLIED. Done.
-   After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
-5. Login wall?
-   5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
-   5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
-   5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-   5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code.
-   5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-   5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
-6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
-7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
-8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
-   - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
-   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
-9. Answer screening questions using the rules above.
-10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
-12. Output your result.
+4. {apply_navigation}
+{login_steps}
+{resume_step}
+{cover_steps}
+{field_review_steps}
+{final_steps}
 
 == RESULT CODES (output EXACTLY one) ==
-RESULT:APPLIED -- submitted successfully
-RESULT:EXPIRED -- job closed or no longer accepting applications
-RESULT:CAPTCHA -- blocked by unsolvable captcha
-RESULT:LOGIN_ISSUE -- could not sign in or create account
-RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
-RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
-RESULT:FAILED:reason -- any other failure (brief reason)
+{result_codes}
+
+The RESULT marker must be one standalone plain-text line and must appear exactly once in your entire output. Do not quote, repeat, summarize, or place a RESULT marker in Markdown. During submit phase, never emit RESULT:READY_TO_SUBMIT: the launcher has already crossed that boundary and any non-final or ambiguous result will be locked as submission uncertain.
+
+Immediately after the RESULT line, output one compact JSON line in this format:
+UNANSWERED_QUESTIONS: []
+If a required or useful application question could not be answered from confirmed facts, put an object in the list with question, field_type, required, reason, and proposed_context. Do not include passwords, verification codes, EEO answers, or other secrets. This list is recorded after the run so the applicant can answer it and deliberately expand the confirmed-facts registry.
 
 == BROWSER EFFICIENCY ==
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
-- Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
+- Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue, then wait for a visible state change in URL, heading, progress indicator, or field set before acting again. Re-scan all visible fields after every answer and every page transition because conditional questions can appear dynamically. If the same page signature appears twice without progress, make one corrective attempt; if it still does not change, output RESULT:FAILED:stuck instead of looping.
+- Optional fields: leave unsupported optional fields blank. A field labelled optional becomes conditionally required only when the live form later shows a specific blocking validation error; fill it only when it is an ordinary field backed by confirmed facts. Recording/media, camera/microphone, identity-document, financial, assessment, verification-code, and CAPTCHA requirements are never optional automation work even when the label is contradictory.
 - Fill ALL fields in ONE browser_fill_form call. Not one at a time.
 - Keep your thinking SHORT. Don't repeat page structure back.
-- CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
+- {captcha_efficiency_instruction}
 
 == FORM TRICKS ==
+- LinkedIn job detail: the primary Easy Apply control may be an `a` link, not a button. Select only the control whose accessible name/aria-label is exactly or starts with "Easy Apply to this job" for the current JOB URL. Do not click an "Easy Apply" job-type chip or a similar-job card. Click the exact control once and snapshot. If no application dialog opens, read that control's href and browser_navigate to it only when its path is the current exact job URL plus `/apply/` and its query contains `openSDUIApplyFlow=true`; otherwise stop with RESULT:FAILED:linkedin_apply_entry_mismatch.
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
-- File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
-- Dropdown won't fill? browser_click to open it, then browser_click the option.
+- LinkedIn/SmartRecruiters city autocomplete: type the confirmed city, wait for the visible suggestions, select the exact matching city/country option, and verify that the validation alert disappears before continuing. Typed text alone is not a valid selection.
+- Greenhouse/React Select location controls: after an exact suggestion is selected, the editable input may legitimately clear while the selected city moves into a visible value chip/container. Treat that visible selected value as the selection evidence; do not refill the textbox merely because its raw input value is empty. If the required-location alert still remains after one normal validation/submit attempt, stop with RESULT:FAILED:manual_review_required:location_validation instead of repeatedly selecting or submitting.
+- Email/security-code verification: an 8-character code split across one-character inputs is a CAPTCHA/identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
+- Video/audio upload contradiction: if a field is labelled optional but native/site validation blocks submission until a recording or media file is provided, the validation behaviour is authoritative. Stop with RESULT:FAILED:unsafe_verification; never activate camera/microphone or fabricate media to satisfy it.
+- File upload verification: after browser_file_upload, wait and snapshot. Continue only when the filename or a remove/replace control proves the file is attached. Do not click the upload area again after success. If no proof appears, retry the click-plus-upload sequence once, snapshot again, then fail with RESULT:FAILED:resume_upload if still empty.
+- Browser upload boundary: use only browser_file_upload/the browser file-chooser primitive. Never switch to Windows Computer Use or an OS-native file picker for a browser upload; the independent browser-URL safety gate is not an application workaround. A bounded upload failure belongs to the affected job and must not stop unrelated jobs in the batch.
+- Native dropdown/combobox: use browser_select_option directly with the exact visible option text. Snapshot afterward and verify the selected option. Use click-the-option only for a custom non-native dropdown.
+- React/controlled text and number inputs: after a bulk fill, verify the visible value or the review-page answer. If one field clears itself or reports a format error despite a supported answer, retry only that field once by focusing it, selecting any existing text, and typing the value sequentially. Do not repeat the whole form, use DOM value injection, or loop. A review page that displays the intended answer is decisive persistence evidence even when the form snapshot omits raw input values.
+- Lever ordinary application form: select native comboboxes first, upload and verify the resume second, then populate all visible text fields in one browser_fill_form call. Select radio answers with browser_click, fill long-answer textboxes, and snapshot once to verify that required fields are no longer blank. If fields remain blank, retry the failed operation once using the new refs from that snapshot; do not repeat unrelated clicks or declare progress without visible state change.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
-- Date fields: {datetime.now().strftime('%m/%d/%Y')}
-- Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
+- Date fields: {datetime.now().astimezone().strftime('%m/%d/%Y')}
+- {form_validation_tip}
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
 
 {captcha_section}
 
 == WHEN TO GIVE UP ==
-- Same page after 3 attempts with no progress -> RESULT:FAILED:stuck
+- Same page signature after one corrective attempt with no progress -> RESULT:FAILED:stuck
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
 - Page is broken/500 error/blank -> RESULT:FAILED:page_error
 Stop immediately. Output your RESULT code. Do not loop."""
