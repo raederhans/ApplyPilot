@@ -86,6 +86,7 @@ jobs:
             dist/python/*.tar.gz \
             dist/*-bundle.zip \
             dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
