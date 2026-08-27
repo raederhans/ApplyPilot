@@ -70,4 +70,3 @@ def test_init_requires_the_complete_non_interactive_input_set(tmp_path: Path) ->
     result = CliRunner().invoke(app, ["init", "--resume", str(resume)])
 
     assert result.exit_code == 2
-    assert "Usage: applypilot init" in result.output

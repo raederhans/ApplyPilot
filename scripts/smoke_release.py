@@ -73,6 +73,7 @@ def smoke_release(wheel: Path) -> None:
         python = _venv_python(environment)
         child_env = os.environ.copy()
         child_env["APPLYPILOT_DIR"] = str(workspace)
+        child_env["PYTHONUTF8"] = "1"
         for secret_name in (
             "GEMINI_API_KEY",
             "OPENAI_API_KEY",
