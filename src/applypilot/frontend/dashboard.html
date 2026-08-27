@@ -99,13 +99,24 @@
     .workflow { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
     .workflow li {
       position: relative;
-      display: grid;
-      grid-template-columns: 28px 1fr;
-      gap: 8px;
-      padding: 10px 8px;
       border-radius: 9px;
       color: var(--muted);
     }
+    .workflow button {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 8px;
+      width: 100%;
+      min-height: 48px;
+      padding: 10px 8px;
+      border: 0;
+      border-radius: inherit;
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    .workflow button:disabled { cursor: default; }
     .workflow li.active { background: var(--panel-raised); color: var(--text); }
     .workflow li.active::before {
       content: "";
@@ -368,6 +379,79 @@
     .source-track { height: 3px; overflow: hidden; background: #222823; }
     .source-fill { height: 100%; background: #698074; }
 
+    .material-list { display: grid; }
+    .material-card {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 14px;
+      padding: 18px 2px;
+      border-top: 1px solid var(--line-soft);
+      animation: enter .35s both;
+      animation-delay: min(calc(var(--index) * 22ms), 280ms);
+    }
+    .material-state {
+      display: grid;
+      place-items: center;
+      align-self: start;
+      width: 42px;
+      height: 42px;
+      border: 1px solid #596057;
+      border-radius: 11px;
+      color: var(--muted);
+      font: 650 11px/1 var(--mono);
+    }
+    .material-state.ready { border-color: #518166; color: var(--mint); }
+    .material-state.review, .material-state.blocked { border-color: #765f35; color: var(--amber); }
+    .material-title-row { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+    .material-title-row h3 { margin: 0; font-size: 15px; font-weight: 620; }
+    .material-title-row a { color: var(--text); text-decoration: none; }
+    .material-title-row a:hover { color: var(--mint); }
+    .material-score { flex: none; color: var(--quiet); font: 11px/1.5 var(--mono); }
+    .material-status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .material-status-row {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: #0d100e;
+    }
+    .material-status-row strong {
+      display: block;
+      color: var(--quiet);
+      font: 10px/1.2 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .material-status-row span { display: block; margin-top: 6px; color: #b5beb7; font-size: 11px; }
+    .material-status-row.state-ready { border-color: #294435; }
+    .material-status-row.state-review, .material-status-row.state-blocked { border-color: #574724; }
+    .material-summary { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+    .material-details { margin-top: 11px; }
+    .material-details summary { width: max-content; color: var(--blue); cursor: pointer; font: 10px/1.4 var(--mono); list-style: none; }
+    .material-details summary::-webkit-details-marker { display: none; }
+    .material-details summary::before { content: "+ "; }
+    .material-details[open] summary::before { content: "− "; }
+    .evidence-records { display: grid; gap: 8px; margin-top: 12px; }
+    .evidence-record {
+      display: grid;
+      grid-template-columns: 130px minmax(0, 1fr);
+      gap: 12px;
+      padding: 9px 10px;
+      border-left: 2px solid var(--line);
+      background: #0c0f0d;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .evidence-record strong { color: var(--quiet); font: 10px/1.5 var(--mono); text-transform: uppercase; }
+    .prepare-note { color: var(--muted); font-size: 12px; }
+    .prepare-note strong { display: block; margin-bottom: 8px; color: var(--text); font-size: 12px; }
+    .prepare-note code { display: block; overflow-x: auto; margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--ink); color: var(--text); font: 10px/1.5 var(--mono); }
+
     @keyframes enter { from { opacity: 0; transform: translateY(5px); } }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; }
@@ -375,7 +459,7 @@
       .brand { margin-bottom: 18px; }
       .rail-label { display: none; }
       .workflow { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .workflow li { grid-template-columns: 1fr; padding: 8px; }
+      .workflow button { grid-template-columns: 1fr; padding: 8px; }
       .workflow li.active::before { inset: auto 8px -1px; width: auto; height: 2px; }
       .workflow span:last-child span, .rail-note { display: none; }
       main { padding-top: 32px; }
@@ -400,6 +484,10 @@
       .workflow { gap: 0; }
       .workflow li { font-size: 11px; }
       .step-number { display: none; }
+      .material-status-grid { grid-template-columns: 1fr; }
+      .material-title-row { display: block; }
+      .material-score { margin-top: 4px; }
+      .evidence-record { grid-template-columns: 1fr; gap: 4px; }
     }
     @media (prefers-reduced-motion: reduce) {
       html { scroll-behavior: auto; }
@@ -416,11 +504,11 @@
     <aside class="rail" aria-label="Product workflow">
       <div class="brand"><span class="brand-mark">AP</span><span>ApplyPilot <small>Local</small></span></div>
       <p class="rail-label">Core workflow</p>
-      <ol class="workflow">
-        <li><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span></li>
-        <li class="active"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span></li>
-        <li><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span></li>
-        <li><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></li>
+      <ol class="workflow" role="tablist" aria-label="Workbench stage">
+        <li role="presentation"><button type="button" role="tab" aria-disabled="true" disabled><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span></button></li>
+        <li class="active" role="presentation"><button id="decide-tab" type="button" role="tab" aria-selected="true" aria-controls="decide-panel" data-stage="decide"><span class="step-number">02</span><span><strong>Decide</strong><span>Fit &amp; eligibility</span></span></button></li>
+        <li role="presentation"><button id="prepare-tab" type="button" role="tab" aria-selected="false" aria-controls="prepare-panel" data-stage="prepare" tabindex="-1"><span class="step-number">03</span><span><strong>Prepare</strong><span>Resumes &amp; materials</span></span></button></li>
+        <li role="presentation"><button type="button" role="tab" aria-disabled="true" disabled><span class="step-number">04</span><span><strong>Verify</strong><span>Authority &amp; receipts</span></span></button></li>
       </ol>
       <div class="rail-note"><strong>Private by default</strong>Generated from your local SQLite workspace. No analytics or remote UI assets.</div>
     </aside>
@@ -428,9 +516,9 @@
     <main>
       <header class="page-head">
         <div>
-          <p class="eyebrow">Opportunity workbench</p>
-          <h1>Move evidence forward.</h1>
-          <p class="head-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
+          <p class="eyebrow" id="page-eyebrow">Opportunity workbench</p>
+          <h1 id="page-title">Move evidence forward.</h1>
+          <p class="head-copy" id="page-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
         </div>
         <div class="local-status" id="workspace-status"><span class="status-dot" id="status-dot" aria-hidden="true"></span><span id="status-label">LOCAL WORKSPACE</span></div>
       </header>
@@ -445,47 +533,92 @@
           </div>
           <div class="system-actions" id="system-actions"></div>
         </section>
-        <div class="metrics" aria-label="Pipeline summary">
-          <div class="metric"><strong class="metric-value" id="stat-total">0</strong><span class="metric-label">Eligible roles</span></div>
-          <div class="metric"><strong class="metric-value" id="stat-ready">0</strong><span class="metric-label">Ready to review</span></div>
-          <div class="metric"><strong class="metric-value" id="stat-scored">0</strong><span class="metric-label">Fit scored</span></div>
-          <div class="metric emphasis"><strong class="metric-value" id="stat-high">0</strong><span class="metric-label">Strong fit 7+</span></div>
-        </div>
-
-        <div class="toolbar">
-          <label class="search-wrap"><span class="sr-only">Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
-          <div class="filters" aria-label="Minimum fit score">
-            <button class="filter active" type="button" data-min-score="5" aria-pressed="true">ALL 5+</button>
-            <button class="filter" type="button" data-min-score="7" aria-pressed="false">7+</button>
-            <button class="filter" type="button" data-min-score="8" aria-pressed="false">8+</button>
-            <button class="filter" type="button" data-min-score="9" aria-pressed="false">9+</button>
+        <section id="decide-panel" role="tabpanel" aria-labelledby="decide-tab">
+          <div class="metrics" aria-label="Pipeline summary">
+            <div class="metric"><strong class="metric-value" id="stat-total">0</strong><span class="metric-label">Eligible roles</span></div>
+            <div class="metric"><strong class="metric-value" id="stat-ready">0</strong><span class="metric-label">Ready to review</span></div>
+            <div class="metric"><strong class="metric-value" id="stat-scored">0</strong><span class="metric-label">Fit scored</span></div>
+            <div class="metric emphasis"><strong class="metric-value" id="stat-high">0</strong><span class="metric-label">Strong fit 7+</span></div>
           </div>
-        </div>
 
-        <div class="content-grid">
-          <section class="queue" id="opportunities">
-            <div class="queue-head"><h2 id="queue-title" tabindex="-1">Ranked opportunities</h2><span class="result-count" id="result-count" aria-live="polite">0 of 0 shown</span></div>
-            <div class="opportunity-list" id="opportunity-list"></div>
-            <div class="empty" id="empty-state"><strong id="empty-title">No matching opportunities</strong><span id="empty-copy">Try a broader search or lower the minimum fit score.</span></div>
-            <nav class="queue-footer" aria-label="Opportunity pages">
-              <button class="page-button" id="page-previous" type="button" hidden>PREVIOUS PAGE</button>
-              <button class="page-button" id="page-next" type="button" hidden>NEXT PAGE</button>
-            </nav>
-          </section>
+          <div class="toolbar">
+            <label class="search-wrap"><span class="sr-only">Search opportunities</span><input id="search" class="search" type="search" autocomplete="off" placeholder="Search role, company, source, location…"></label>
+            <div class="filters" aria-label="Minimum fit score">
+              <button class="filter active" type="button" data-min-score="5" aria-pressed="true">ALL 5+</button>
+              <button class="filter" type="button" data-min-score="7" aria-pressed="false">7+</button>
+              <button class="filter" type="button" data-min-score="8" aria-pressed="false">8+</button>
+              <button class="filter" type="button" data-min-score="9" aria-pressed="false">9+</button>
+            </div>
+          </div>
 
-          <aside class="insights" aria-label="Evidence overview">
-            <section class="insight-block">
-              <h2>Fit distribution</h2>
-              <p class="insight-kicker">Scored candidates by evidence band</p>
-              <div class="score-bars" id="score-bars"></div>
+          <div class="content-grid">
+            <section class="queue" id="opportunities">
+              <div class="queue-head"><h2 id="queue-title" tabindex="-1">Ranked opportunities</h2><span class="result-count" id="result-count" aria-live="polite">0 of 0 shown</span></div>
+              <div class="opportunity-list" id="opportunity-list"></div>
+              <div class="empty" id="empty-state"><strong id="empty-title">No matching opportunities</strong><span id="empty-copy">Try a broader search or lower the minimum fit score.</span></div>
+              <nav class="queue-footer" aria-label="Opportunity pages">
+                <button class="page-button" id="page-previous" type="button" hidden>PREVIOUS PAGE</button>
+                <button class="page-button" id="page-next" type="button" hidden>NEXT PAGE</button>
+              </nav>
             </section>
-            <section class="insight-block">
-              <h2>Source quality</h2>
-              <p class="insight-kicker">Strong-fit share by discovery source</p>
-              <div class="source-list" id="source-list"></div>
+
+            <aside class="insights" aria-label="Evidence overview">
+              <section class="insight-block">
+                <h2>Fit distribution</h2>
+                <p class="insight-kicker">Scored candidates by evidence band</p>
+                <div class="score-bars" id="score-bars"></div>
+              </section>
+              <section class="insight-block">
+                <h2>Source quality</h2>
+                <p class="insight-kicker">Strong-fit share by discovery source</p>
+                <div class="source-list" id="source-list"></div>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <section id="prepare-panel" role="tabpanel" aria-labelledby="prepare-tab" hidden>
+          <div class="metrics" aria-label="Preparation summary">
+            <div class="metric"><strong class="metric-value" id="prepare-shortlisted">0</strong><span class="metric-label">Shortlisted roles</span></div>
+            <div class="metric emphasis"><strong class="metric-value" id="prepare-ready">0</strong><span class="metric-label">Material-ready</span></div>
+            <div class="metric"><strong class="metric-value" id="prepare-attention">0</strong><span class="metric-label">Needs evidence</span></div>
+            <div class="metric"><strong class="metric-value" id="prepare-unrecorded">0</strong><span class="metric-label">No material set</span></div>
+          </div>
+
+          <div class="toolbar">
+            <label class="search-wrap"><span class="sr-only">Search preparation evidence</span><input id="prepare-search" class="search" type="search" autocomplete="off" placeholder="Search role, company, material status…"></label>
+            <div class="filters" aria-label="Preparation evidence status">
+              <button class="filter active" type="button" data-prepare-filter="all" aria-pressed="true">ALL</button>
+              <button class="filter" type="button" data-prepare-filter="ready" aria-pressed="false">READY</button>
+              <button class="filter" type="button" data-prepare-filter="attention" aria-pressed="false">REVIEW</button>
+              <button class="filter" type="button" data-prepare-filter="missing" aria-pressed="false">MISSING</button>
+            </div>
+          </div>
+
+          <div class="content-grid">
+            <section class="queue" id="preparation">
+              <div class="queue-head"><h2 id="prepare-title" tabindex="-1">Preparation queue</h2><span class="result-count" id="prepare-result-count" aria-live="polite">0 of 0 shown</span></div>
+              <div class="material-list" id="material-list"></div>
+              <div class="empty" id="prepare-empty-state"><strong id="prepare-empty-title">No matching preparation evidence</strong><span id="prepare-empty-copy">Try a broader search or another evidence filter.</span></div>
+              <nav class="queue-footer" aria-label="Preparation pages">
+                <button class="page-button" id="prepare-page-previous" type="button" hidden>PREVIOUS PAGE</button>
+                <button class="page-button" id="prepare-page-next" type="button" hidden>NEXT PAGE</button>
+              </nav>
             </section>
-          </aside>
-        </div>
+
+            <aside class="insights" aria-label="Preparation evidence boundary">
+              <section class="insight-block prepare-note">
+                <strong>Read-only evidence</strong>
+                Status comes from records already persisted in your local workspace. This page does not route, generate, validate, authorize, or submit materials.
+              </section>
+              <section class="insight-block prepare-note">
+                <strong>Inspect before acting</strong>
+                A recorded path alone is not treated as validation. Use the CLI to inspect the resume library before changing material state.
+                <code>applypilot resume-library-status</code>
+              </section>
+            </aside>
+          </div>
+        </section>
       </section>
     </main>
   </div>
@@ -496,12 +629,18 @@
       "use strict";
       const data = JSON.parse(document.getElementById("dashboard-data").textContent);
       const PAGE_SIZE = 60;
-      const state = { minimumScore: 5, query: "", pageIndex: 0 };
+      const state = { stage: "decide", minimumScore: 5, query: "", pageIndex: 0 };
+      const prepareState = { filter: "all", query: "", pageIndex: 0 };
       const list = document.getElementById("opportunity-list");
+      const materialList = document.getElementById("material-list");
       const rawJobs = Array.isArray(data.jobs) ? data.jobs : [];
       const indexedJobs = rawJobs.map((job) => ({
         job,
-        search: [job.title, job.company, job.source, job.location, job.keywords]
+        search: [
+          job.title, job.company, job.source, job.location, job.keywords,
+          job.prepare?.label, job.prepare?.resume?.label,
+          job.prepare?.coverLetter?.label, job.prepare?.route?.decision,
+        ]
           .join(" ").toLocaleLowerCase(),
       }));
 
@@ -521,8 +660,7 @@
         if (text) parent.append(make("span", `tag ${className}`.trim(), text));
       };
 
-      const renderSystem = () => {
-        const system = data.system || { state: "ready" };
+      const renderSystem = (system = data.system || { state: "ready" }) => {
         const panel = document.getElementById("system-panel");
         const isReady = system.state === "ready";
         panel.hidden = isReady;
@@ -554,6 +692,11 @@
       document.getElementById("stat-ready").textContent = stats.ready ?? 0;
       document.getElementById("stat-scored").textContent = stats.scored ?? 0;
       document.getElementById("stat-high").textContent = stats.highFit ?? 0;
+      const prepareStats = data.prepare?.stats || {};
+      document.getElementById("prepare-shortlisted").textContent = prepareStats.shortlisted ?? 0;
+      document.getElementById("prepare-ready").textContent = prepareStats.ready ?? 0;
+      document.getElementById("prepare-attention").textContent = prepareStats.attention ?? 0;
+      document.getElementById("prepare-unrecorded").textContent = prepareStats.unrecorded ?? 0;
 
       const renderScores = () => {
         const target = document.getElementById("score-bars");
@@ -643,6 +786,100 @@
           return card;
       };
 
+      const materialStatus = (label, item) => {
+        const row = make("div", `material-status-row state-${item?.state || "missing"}`);
+        row.append(make("strong", "", label), make("span", "", item?.label || "Not recorded"));
+        return row;
+      };
+
+      const evidenceRecord = (label, value) => {
+        const row = make("div", "evidence-record");
+        row.append(make("strong", "", label), make("span", "", value || "Not recorded"));
+        return row;
+      };
+
+      const createMaterialCard = (job, index) => {
+        const prepare = job.prepare || {};
+        const card = make("article", "material-card");
+        card.style.setProperty("--index", index);
+        const marker = prepare.state === "ready" ? "OK" : prepare.state === "missing" ? "—" : "!";
+        card.append(make("div", `material-state ${prepare.state || "missing"}`, marker));
+
+        const body = make("div", "opportunity-body");
+        const titleRow = make("div", "material-title-row");
+        const heading = make("h3", "");
+        const sourceUrl = safeUrl(job.url);
+        if (sourceUrl) {
+          const link = make("a", "", job.title);
+          link.href = sourceUrl;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          heading.append(link);
+        } else {
+          heading.textContent = job.title;
+        }
+        titleRow.append(heading, make("span", "material-score", `FIT ${job.score}/10`));
+        body.append(titleRow);
+
+        const companyLine = make("div", "company-line");
+        companyLine.append(make("span", "", job.company));
+        if (job.location) companyLine.append(make("span", "", job.location));
+        body.append(companyLine);
+
+        const statusGrid = make("div", "material-status-grid");
+        statusGrid.append(
+          materialStatus("Resume", prepare.resume),
+          materialStatus("Cover letter", prepare.coverLetter),
+          materialStatus("Resume route", {
+            state: prepare.route?.state === "current"
+              && prepare.route?.decision === "reuse_exact"
+              && prepare.route?.artifact?.validationStatus === "machine_validated"
+              && prepare.route?.artifact?.hasPdfBinding === true
+              && !(prepare.route?.gaps || []).length
+              ? "ready" : "review",
+            label: prepare.route?.state === "current"
+              ? `${prepare.route.decision || "recorded"} route`
+              : (prepare.route?.reason || "No current route recorded"),
+          }),
+        );
+        body.append(statusGrid);
+        body.append(make("p", "material-summary", prepare.label || "No material evidence recorded"));
+
+        const details = make("details", "material-details");
+        details.append(make("summary", "", "View recorded material evidence"));
+        details.addEventListener("toggle", () => {
+          if (!details.open || details.childElementCount > 1) return;
+          const records = make("div", "evidence-records");
+          const resume = prepare.resume || {};
+          const cover = prepare.coverLetter || {};
+          const route = prepare.route || {};
+          const artifact = route.artifact || {};
+          records.append(
+            evidenceRecord("Resume status", [resume.status, resume.artifactName].filter(Boolean).join(" · ")),
+            evidenceRecord("Cover status", [cover.status, cover.artifactName].filter(Boolean).join(" · ")),
+            evidenceRecord("Route decision", [route.decision, route.reason].filter(Boolean).join(" · ")),
+          );
+          if (artifact.validationStatus || artifact.track || artifact.kind) {
+            records.append(evidenceRecord(
+              "Artifact evidence",
+              [artifact.validationStatus, artifact.kind, artifact.track].filter(Boolean).join(" · "),
+            ));
+          }
+          if ((route.gaps || []).length) {
+            records.append(evidenceRecord("Recorded gaps", route.gaps.join(", ")));
+          }
+          const applicationDecision = prepare.applicationDecision || {};
+          records.append(evidenceRecord(
+            "Preflight evidence",
+            `${applicationDecision.state || "needs_review"} · ${applicationDecision.reason || "No decision evidence recorded"} (not authorization)`,
+          ));
+          details.append(records);
+        }, { once: true });
+        body.append(details);
+        card.append(body);
+        return card;
+      };
+
       const matchingJobs = () => {
         const query = state.query.toLocaleLowerCase();
         return indexedJobs.filter(({ job, search }) => (
@@ -678,10 +915,90 @@
         document.getElementById("page-next").hidden = pageEnd >= matches.length;
       };
 
+      const matchingPrepareJobs = () => {
+        const query = prepareState.query.toLocaleLowerCase();
+        return indexedJobs.filter(({ job, search }) => {
+          const materialState = job.prepare?.state || "missing";
+          const matchesFilter = prepareState.filter === "all"
+            || materialState === prepareState.filter
+            || (prepareState.filter === "attention" && ["review", "blocked"].includes(materialState));
+          return matchesFilter && (!query || search.includes(query));
+        });
+      };
+
+      const renderPrepareJobs = () => {
+        const matches = matchingPrepareJobs();
+        const pageCount = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        prepareState.pageIndex = Math.min(prepareState.pageIndex, pageCount - 1);
+        const pageStart = prepareState.pageIndex * PAGE_SIZE;
+        const pageEnd = Math.min(pageStart + PAGE_SIZE, matches.length);
+        const fragment = document.createDocumentFragment();
+        matches.slice(pageStart, pageEnd).forEach(({ job }, index) => {
+          fragment.append(createMaterialCard(job, index));
+        });
+        materialList.replaceChildren(fragment);
+
+        document.getElementById("prepare-result-count").textContent = matches.length
+          ? `${pageStart + 1}–${pageEnd} of ${matches.length} shown`
+          : "0 of 0 shown";
+        const empty = document.getElementById("prepare-empty-state");
+        empty.classList.toggle("visible", matches.length === 0);
+        document.getElementById("prepare-empty-title").textContent = rawJobs.length
+          ? "No matching preparation evidence"
+          : "Nothing to prepare yet";
+        document.getElementById("prepare-empty-copy").textContent = rawJobs.length
+          ? "Try a broader search or another evidence filter."
+          : "Build and review a shortlist first; this page does not create materials.";
+        document.getElementById("prepare-page-previous").hidden = pageStart === 0;
+        document.getElementById("prepare-page-next").hidden = pageEnd >= matches.length;
+      };
+
+      const stageCopy = {
+        decide: {
+          eyebrow: "Opportunity workbench",
+          title: "Move evidence forward.",
+          copy: "Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.",
+        },
+        prepare: {
+          eyebrow: "Preparation workbench",
+          title: "Inspect material evidence.",
+          copy: "See which persisted resumes, cover-letter decisions, and routing records are available before running any preparation command.",
+        },
+      };
+
+      const setStage = (stage, { focus = true } = {}) => {
+        if (!(stage in stageCopy)) return;
+        state.stage = stage;
+        document.getElementById("decide-panel").hidden = stage !== "decide";
+        document.getElementById("prepare-panel").hidden = stage !== "prepare";
+        document.querySelectorAll(".workflow button[data-stage]").forEach((button) => {
+          const selected = button.dataset.stage === stage;
+          button.setAttribute("aria-selected", String(selected));
+          button.tabIndex = selected ? 0 : -1;
+          button.closest("li").classList.toggle("active", selected);
+        });
+        const copy = stageCopy[stage];
+        document.getElementById("page-eyebrow").textContent = copy.eyebrow;
+        document.getElementById("page-title").textContent = copy.title;
+        document.getElementById("page-copy").textContent = copy.copy;
+        if (stage === "prepare") {
+          list.replaceChildren();
+          renderPrepareJobs();
+          renderSystem(data.prepare?.system || { state: "ready" });
+          if (focus) document.getElementById("prepare-title").focus({ preventScroll: true });
+        } else {
+          materialList.replaceChildren();
+          renderJobs();
+          renderSystem(data.system || { state: "ready" });
+          if (focus) document.getElementById("queue-title").focus({ preventScroll: true });
+        }
+      };
+
       document.querySelectorAll(".filter").forEach((button) => {
+        if (button.dataset.prepareFilter) return;
         button.addEventListener("click", () => {
           state.minimumScore = Number(button.dataset.minScore);
-          document.querySelectorAll(".filter").forEach((candidate) => {
+          document.querySelectorAll("#decide-panel .filter").forEach((candidate) => {
             const isActive = candidate === button;
             candidate.classList.toggle("active", isActive);
             candidate.setAttribute("aria-pressed", String(isActive));
@@ -694,6 +1011,23 @@
         state.query = event.target.value.trim();
         state.pageIndex = 0;
         renderJobs();
+      });
+      document.querySelectorAll("[data-prepare-filter]").forEach((button) => {
+        button.addEventListener("click", () => {
+          prepareState.filter = button.dataset.prepareFilter;
+          document.querySelectorAll("[data-prepare-filter]").forEach((candidate) => {
+            const isActive = candidate === button;
+            candidate.classList.toggle("active", isActive);
+            candidate.setAttribute("aria-pressed", String(isActive));
+          });
+          prepareState.pageIndex = 0;
+          renderPrepareJobs();
+        });
+      });
+      document.getElementById("prepare-search").addEventListener("input", (event) => {
+        prepareState.query = event.target.value.trim();
+        prepareState.pageIndex = 0;
+        renderPrepareJobs();
       });
       document.getElementById("page-previous").addEventListener("click", () => {
         state.pageIndex = Math.max(0, state.pageIndex - 1);
@@ -708,10 +1042,38 @@
         document.getElementById("queue-title").focus({ preventScroll: true });
       });
 
-      renderSystem();
+      document.getElementById("prepare-page-previous").addEventListener("click", () => {
+        prepareState.pageIndex = Math.max(0, prepareState.pageIndex - 1);
+        renderPrepareJobs();
+        document.getElementById("preparation").scrollIntoView({ block: "start" });
+        document.getElementById("prepare-title").focus({ preventScroll: true });
+      });
+      document.getElementById("prepare-page-next").addEventListener("click", () => {
+        prepareState.pageIndex += 1;
+        renderPrepareJobs();
+        document.getElementById("preparation").scrollIntoView({ block: "start" });
+        document.getElementById("prepare-title").focus({ preventScroll: true });
+      });
+
+      const stageTabs = [...document.querySelectorAll(".workflow button[data-stage]")];
+      stageTabs.forEach((button, index) => {
+        button.addEventListener("click", () => setStage(button.dataset.stage));
+        button.addEventListener("keydown", (event) => {
+          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+          event.preventDefault();
+          let nextIndex = index;
+          if (event.key === "ArrowRight") nextIndex = (index + 1) % stageTabs.length;
+          if (event.key === "ArrowLeft") nextIndex = (index - 1 + stageTabs.length) % stageTabs.length;
+          if (event.key === "Home") nextIndex = 0;
+          if (event.key === "End") nextIndex = stageTabs.length - 1;
+          stageTabs[nextIndex].focus();
+          setStage(stageTabs[nextIndex].dataset.stage, { focus: false });
+        });
+      });
+
       renderScores();
       renderSources();
-      renderJobs();
+      setStage("decide", { focus: false });
     })();
   </script>
 </body>
