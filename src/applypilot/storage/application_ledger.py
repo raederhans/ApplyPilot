@@ -8,6 +8,7 @@ while the application-specific schema and SQL have a single focused home.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             batch_id           TEXT NOT NULL,
             job_url            TEXT NOT NULL,
             claimed_at         TEXT NOT NULL,
+            claimed_at_epoch   REAL,
             state              TEXT NOT NULL,
             updated_at         TEXT NOT NULL,
             audit_fingerprint  TEXT,
@@ -49,6 +51,33 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             evidence_json      TEXT
         )
     """)
+    gate_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(application_submission_gates)"
+        ).fetchall()
+    }
+    if "claimed_at_epoch" not in gate_columns:
+        connection.execute(
+            "ALTER TABLE application_submission_gates ADD COLUMN claimed_at_epoch REAL"
+        )
+    stale_claims = connection.execute(
+        "SELECT gate_id, claimed_at FROM application_submission_gates "
+        "WHERE claimed_at_epoch IS NULL"
+    ).fetchall()
+    for row in stale_claims:
+        try:
+            claimed = datetime.fromisoformat(str(row[1]))
+            if claimed.tzinfo is None or claimed.utcoffset() is None:
+                continue
+            claimed_epoch = claimed.astimezone(UTC).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            continue
+        connection.execute(
+            "UPDATE application_submission_gates SET claimed_at_epoch=? "
+            "WHERE gate_id=? AND claimed_at_epoch IS NULL",
+            (claimed_epoch, str(row[0])),
+        )
     connection.execute("""
         CREATE INDEX IF NOT EXISTS idx_application_submission_gates_rate
             ON application_submission_gates(claimed_at, state)
@@ -86,6 +115,24 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute("""
         CREATE INDEX IF NOT EXISTS idx_application_receipts_job
             ON application_receipts(job_url, admitted_at)
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS application_receipt_gate_bindings (
+            receipt_source TEXT NOT NULL,
+            receipt_id     TEXT NOT NULL,
+            gate_id        TEXT NOT NULL,
+            batch_id       TEXT NOT NULL,
+            job_url        TEXT NOT NULL,
+            attempt_id     TEXT NOT NULL,
+            bound_at_epoch REAL NOT NULL,
+            PRIMARY KEY (receipt_source, receipt_id)
+        )
+    """)
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_receipt_gate_bindings_exact
+            ON application_receipt_gate_bindings(
+                gate_id, batch_id, job_url, attempt_id
+            )
     """)
     connection.execute("""
         CREATE TABLE IF NOT EXISTS application_risk_events (
@@ -439,6 +486,7 @@ def claim_submission_gate(
     max_submissions: int,
     attempt_id: str,
     *,
+    success_target: int | None = None,
     hourly_maximum: int = 15,
     minimum_gap_seconds: float = 20,
     audit_fingerprint: str | None = None,
@@ -461,6 +509,15 @@ def claim_submission_gate(
         or max_submissions <= 0
     ):
         raise ValueError("max_submissions must be a positive integer")
+    if (
+        success_target is not None
+        and (
+            isinstance(success_target, bool)
+            or not isinstance(success_target, int)
+            or success_target <= 0
+        )
+    ):
+        raise ValueError("success_target must be a positive integer when provided")
     if isinstance(hourly_maximum, bool) or not isinstance(hourly_maximum, int):
         raise TypeError("hourly_maximum must be an integer")
     if hourly_maximum < 0 or minimum_gap_seconds < 0:
@@ -470,7 +527,9 @@ def claim_submission_gate(
     current = now or datetime.now(UTC)
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
+    current = current.astimezone(UTC)
     current_text = current.isoformat()
+    current_epoch = current.timestamp()
     gate_uuid = uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"{batch_id}|{attempt_id}|{job_url}",
@@ -538,20 +597,79 @@ def claim_submission_gate(
                 connection.rollback()
             return {"claimed": False, "reason": "submission_gate_attempt_lease_expired"}
 
-        cutoff = (current - timedelta(hours=1)).isoformat()
+        # This check intentionally runs in the same write transaction as the
+        # reservation below.  A terminal gate alone is not success: a durable,
+        # admitted receipt for that job is required.
+        if success_target is not None:
+            confirmed_successes = connection.execute(
+                "SELECT COUNT(DISTINCT c.job_url) "
+                "FROM application_batch_consumptions c "
+                "JOIN application_submission_gates g "
+                "ON g.batch_id=c.batch_id AND g.job_url=c.job_url "
+                "JOIN application_receipt_gate_bindings b "
+                "ON b.gate_id=g.gate_id AND b.batch_id=g.batch_id "
+                "AND b.job_url=g.job_url AND b.attempt_id=g.attempt_id "
+                "JOIN application_receipts r "
+                "ON r.receipt_source=b.receipt_source AND r.receipt_id=b.receipt_id "
+                "WHERE c.batch_id=? AND c.status='applied' AND g.state='applied' "
+                "AND g.claimed_at_epoch IS NOT NULL "
+                "AND b.bound_at_epoch>=g.claimed_at_epoch",
+                (batch_id,),
+            ).fetchone()[0]
+            if confirmed_successes >= success_target:
+                if owns_transaction:
+                    connection.rollback()
+                return {"claimed": False, "reason": "run_success_target_reached"}
+
+        # Batch target and authorization capacity are one ordered decision:
+        # success wins first, then exact-job replay conflict, then slot cap.
+        existing = connection.execute(
+            "SELECT 1 FROM application_batch_consumptions WHERE batch_id=? AND job_url=?",
+            (batch_id, job_url),
+        ).fetchone()
+        used = connection.execute(
+            "SELECT COUNT(*) FROM application_batch_consumptions WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()[0]
+        if existing is not None:
+            if owns_transaction:
+                connection.rollback()
+            return {
+                "claimed": False,
+                "reason": (
+                    "job_already_reserved"
+                    if success_target is not None
+                    else "authorization_batch_reservation_denied"
+                ),
+            }
+        if used >= max_submissions:
+            if owns_transaction:
+                connection.rollback()
+            return {
+                "claimed": False,
+                "reason": (
+                    "authorization_batch_capacity_exhausted"
+                    if success_target is not None
+                    else "authorization_batch_reservation_denied"
+                ),
+            }
+
+        cutoff_epoch = (current - timedelta(hours=1)).timestamp()
         recent_gate_rows = connection.execute(
-            "SELECT claimed_at FROM application_submission_gates "
-            "WHERE claimed_at>=? AND state!='cancelled_before_action' ORDER BY claimed_at",
-            (cutoff,),
+            "SELECT claimed_at_epoch FROM application_submission_gates "
+            "WHERE claimed_at_epoch>=? AND state!='cancelled_before_action' "
+            "ORDER BY claimed_at_epoch",
+            (cutoff_epoch,),
         ).fetchall()
         represented_urls = {
             str(row[0])
             for row in connection.execute(
                 "SELECT job_url FROM application_submission_gates "
-                "WHERE claimed_at>=? AND state!='cancelled_before_action'",
-                (cutoff,),
+                "WHERE claimed_at_epoch>=? AND state!='cancelled_before_action'",
+                (cutoff_epoch,),
             ).fetchall()
         }
+        cutoff = (current - timedelta(hours=1)).isoformat()
         historical_rows = connection.execute(
             "SELECT url, applied_at FROM jobs WHERE applied_at IS NOT NULL AND applied_at>=?",
             (cutoff,),
@@ -561,18 +679,20 @@ def claim_submission_gate(
         ]
         recent_count = len(recent_gate_rows) + len(unrepresented_applied)
         if hourly_maximum > 0 and recent_count >= hourly_maximum:
-            timestamps = [str(row[0]) for row in recent_gate_rows] + [
-                str(row[1]) for row in unrepresented_applied
+            timestamps = [
+                datetime.fromtimestamp(float(row[0]), tz=UTC)
+                for row in recent_gate_rows
             ]
             retry_after = 0.0
-            parsed = []
-            for value in timestamps:
+            parsed = list(timestamps)
+            for value in (str(row[1]) for row in unrepresented_applied):
                 try:
                     parsed_value = datetime.fromisoformat(value)
-                    if parsed_value.tzinfo is None:
-                        parsed_value = parsed_value.replace(tzinfo=UTC)
+                    if parsed_value.tzinfo is None or parsed_value.utcoffset() is None:
+                        continue
+                    parsed_value = parsed_value.astimezone(UTC)
                     parsed.append(parsed_value)
-                except ValueError:
+                except (ValueError, OverflowError):
                     continue
             if parsed:
                 retry_after = max(
@@ -588,16 +708,18 @@ def claim_submission_gate(
             }
 
         latest_candidates: list[datetime] = []
-        for value in [
-            *(str(row[0]) for row in recent_gate_rows),
-            *(str(row[1]) for row in unrepresented_applied),
-        ]:
+        latest_candidates.extend(
+            datetime.fromtimestamp(float(row[0]), tz=UTC)
+            for row in recent_gate_rows
+        )
+        for value in (str(row[1]) for row in unrepresented_applied):
             try:
                 parsed_value = datetime.fromisoformat(value)
-                if parsed_value.tzinfo is None:
-                    parsed_value = parsed_value.replace(tzinfo=UTC)
+                if parsed_value.tzinfo is None or parsed_value.utcoffset() is None:
+                    continue
+                parsed_value = parsed_value.astimezone(UTC)
                 latest_candidates.append(parsed_value)
-            except ValueError:
+            except (ValueError, OverflowError):
                 continue
         if latest_candidates and minimum_gap_seconds > 0:
             remaining = minimum_gap_seconds - (
@@ -612,18 +734,31 @@ def claim_submission_gate(
                     "retry_after_seconds": remaining,
                 }
 
-        existing = connection.execute(
-            "SELECT 1 FROM application_batch_consumptions WHERE batch_id=? AND job_url=?",
-            (batch_id, job_url),
+        active_writer = connection.execute(
+            "SELECT g.attempt_id, a.lease_expires_at "
+            "FROM application_submission_gates g "
+            "JOIN application_attempts a ON a.attempt_id=g.attempt_id "
+            "WHERE g.state='claimed' AND g.attempt_id!=? "
+            "AND a.status='in_progress' AND a.lease_expires_at>? "
+            "ORDER BY g.claimed_at_epoch LIMIT 1",
+            (attempt_id, current_text),
         ).fetchone()
-        used = connection.execute(
-            "SELECT COUNT(*) FROM application_batch_consumptions WHERE batch_id=?",
-            (batch_id,),
-        ).fetchone()[0]
-        if existing is not None or used >= max_submissions:
+        if active_writer is not None:
+            try:
+                active_until = datetime.fromisoformat(str(active_writer[1]))
+                if active_until.tzinfo is None:
+                    active_until = active_until.replace(tzinfo=UTC)
+                remaining = max(0.25, (active_until - current).total_seconds())
+            except (TypeError, ValueError):
+                remaining = 1.0
             if owns_transaction:
                 connection.rollback()
-            return {"claimed": False, "reason": "authorization_batch_reservation_denied"}
+            return {
+                "claimed": False,
+                "reason": "submit_writer_busy",
+                "retry_after_seconds": min(5.0, remaining),
+                "active_attempt_id": str(active_writer[0]),
+            }
 
         connection.execute(
             "INSERT INTO application_batch_consumptions "
@@ -633,15 +768,17 @@ def claim_submission_gate(
         )
         connection.execute(
             "INSERT INTO application_submission_gates "
-            "(gate_id, attempt_id, batch_id, job_url, claimed_at, state, updated_at, "
+            "(gate_id, attempt_id, batch_id, job_url, claimed_at, claimed_at_epoch, "
+            "state, updated_at, "
             "audit_fingerprint, idempotency_key, evidence_json) "
-            "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, NULL)",
+            "VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, NULL)",
             (
                 gate_id,
                 attempt_id,
                 batch_id,
                 job_url,
                 current_text,
+                current_epoch,
                 current_text,
                 str(audit_fingerprint or "") or None,
                 idempotency_key,
@@ -693,6 +830,252 @@ def update_submission_gate_state(
     if owns_transaction:
         connection.commit()
     return cursor.rowcount == 1
+
+
+def record_attempt_performance(
+    connection: sqlite3.Connection,
+    attempt_id: str | None,
+    performance: object,
+) -> bool:
+    """Merge final bounded orchestration timings into one terminal attempt."""
+    if not attempt_id or not isinstance(performance, dict):
+        return False
+    if performance.get("version") != 1:
+        return False
+    allowed = {
+        "metrics": {
+            "pre_submit_audit_ms",
+            "submission_gate_wait_ms",
+            "submit_agent_ms",
+            "post_submit_observer_ms",
+            "prepare_repair_agent_ms",
+            "validation_repair_agent_ms",
+            "submit_lane_wait_ms",
+            "submit_lane_hold_ms",
+            "submit_lane_acquisitions",
+        },
+        "acquisition": {
+            "stale_recovery_ms",
+            "profile_load_ms",
+            "eligibility_refresh_ms",
+            "transaction_wait_ms",
+            "candidate_fetch_ms",
+            "candidate_rows",
+            "admission_scan_ms",
+            "admission_rows_scanned",
+            "total_ms",
+            "worker_call_ms",
+        },
+    }
+    bounded: dict[str, object] = {"version": 1}
+    for section, keys in allowed.items():
+        supplied = performance.get(section)
+        values: dict[str, float] = {}
+        if isinstance(supplied, dict):
+            for key in keys:
+                value = supplied.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                numeric = float(value)
+                if math.isfinite(numeric) and numeric >= 0:
+                    values[key] = round(min(numeric, 86_400_000.0), 3)
+        bounded[section] = values
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT evidence_json FROM application_attempts "
+        "WHERE attempt_id=? AND status!='in_progress'",
+        (attempt_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        existing = json.loads(row[0]) if row[0] else {}
+    except (TypeError, json.JSONDecodeError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    existing["orchestration_performance"] = bounded
+    cursor = connection.execute(
+        "UPDATE application_attempts SET evidence_json=?, updated_at=? "
+        "WHERE attempt_id=? AND status!='in_progress'",
+        (
+            _json_text(existing),
+            datetime.now(UTC).isoformat(),
+            attempt_id,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def has_admitted_submission_receipt(
+    connection: sqlite3.Connection,
+    batch_id: str,
+    job_url: str,
+    attempt_id: str,
+) -> bool:
+    """Verify a receipt explicitly bound to this exact submission claim."""
+    batch_id = str(batch_id or "").strip()
+    job_url = str(job_url or "").strip()
+    attempt_id = str(attempt_id or "").strip()
+    if not batch_id or not job_url or not attempt_id:
+        return False
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT 1 FROM application_submission_gates g "
+        "JOIN application_receipt_gate_bindings b "
+        "ON b.gate_id=g.gate_id AND b.batch_id=g.batch_id "
+        "AND b.job_url=g.job_url AND b.attempt_id=g.attempt_id "
+        "JOIN application_receipts r "
+        "ON r.receipt_source=b.receipt_source AND r.receipt_id=b.receipt_id "
+        "WHERE g.batch_id=? AND g.job_url=? AND g.attempt_id=? "
+        "AND g.claimed_at_epoch IS NOT NULL "
+        "AND b.bound_at_epoch>=g.claimed_at_epoch LIMIT 1",
+        (batch_id, job_url, attempt_id),
+    ).fetchone()
+    return row is not None
+
+
+def bind_admitted_receipt_to_gate(
+    connection: sqlite3.Connection,
+    receipt_source: str,
+    receipt_id: str,
+    gate_id: str,
+    batch_id: str,
+    job_url: str,
+    attempt_id: str,
+    *,
+    bound_at: datetime | None = None,
+) -> bool:
+    """Atomically bind an admitted receipt to one exact, valid gate identity."""
+    values = tuple(
+        str(value or "").strip()
+        for value in (
+            receipt_source,
+            receipt_id,
+            gate_id,
+            batch_id,
+            job_url,
+            attempt_id,
+        )
+    )
+    if any(not value for value in values):
+        return False
+    source, receipt, gate, batch, url, attempt = values
+    admitted = bound_at or datetime.now(UTC)
+    if admitted.tzinfo is None or admitted.utcoffset() is None:
+        return False
+    try:
+        bound_epoch = admitted.astimezone(UTC).timestamp()
+    except (OverflowError, OSError, ValueError):
+        return False
+    ensure_schema(connection)
+    gate_row = connection.execute(
+        "SELECT claimed_at_epoch FROM application_submission_gates "
+        "WHERE gate_id=? AND batch_id=? AND job_url=? AND attempt_id=?",
+        (gate, batch, url, attempt),
+    ).fetchone()
+    if gate_row is None or gate_row[0] is None:
+        return False
+    try:
+        claimed_epoch = float(gate_row[0])
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if bound_epoch < claimed_epoch:
+        return False
+    receipt_row = connection.execute(
+        "SELECT job_url FROM application_receipts "
+        "WHERE receipt_source=? AND receipt_id=?",
+        (source, receipt),
+    ).fetchone()
+    if receipt_row is None or str(receipt_row[0]) != url:
+        return False
+    existing = connection.execute(
+        "SELECT gate_id, batch_id, job_url, attempt_id "
+        "FROM application_receipt_gate_bindings "
+        "WHERE receipt_source=? AND receipt_id=?",
+        (source, receipt),
+    ).fetchone()
+    expected = (gate, batch, url, attempt)
+    if existing is not None:
+        return tuple(str(value) for value in existing) == expected
+    connection.execute(
+        "INSERT INTO application_receipt_gate_bindings "
+        "(receipt_source, receipt_id, gate_id, batch_id, job_url, attempt_id, "
+        "bound_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (source, receipt, gate, batch, url, attempt, bound_epoch),
+    )
+    return True
+
+
+def mark_bound_submission_receipt_applied(
+    connection: sqlite3.Connection,
+    receipt_source: str,
+    receipt_id: str,
+    gate_id: str,
+    batch_id: str,
+    job_url: str,
+    attempt_id: str,
+) -> bool:
+    """Close one exact uncertain gate after its bound receipt is admitted.
+
+    The caller owns the transaction. Mixed states and every state other than
+    ``submission_uncertain``/``applied`` fail closed so reconciliation cannot
+    upgrade a different or merely prepared submission.
+    """
+    values = tuple(
+        str(value or "").strip()
+        for value in (
+            receipt_source,
+            receipt_id,
+            gate_id,
+            batch_id,
+            job_url,
+            attempt_id,
+        )
+    )
+    if any(not value for value in values):
+        return False
+    source, receipt, gate, batch, url, attempt = values
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT g.state, c.status FROM application_submission_gates g "
+        "JOIN application_batch_consumptions c "
+        "ON c.batch_id=g.batch_id AND c.job_url=g.job_url "
+        "JOIN application_receipt_gate_bindings b "
+        "ON b.gate_id=g.gate_id AND b.batch_id=g.batch_id "
+        "AND b.job_url=g.job_url AND b.attempt_id=g.attempt_id "
+        "JOIN application_receipts r "
+        "ON r.receipt_source=b.receipt_source AND r.receipt_id=b.receipt_id "
+        "WHERE b.receipt_source=? AND b.receipt_id=? AND g.gate_id=? "
+        "AND g.batch_id=? AND g.job_url=? AND g.attempt_id=? "
+        "AND g.claimed_at_epoch IS NOT NULL "
+        "AND b.bound_at_epoch>=g.claimed_at_epoch",
+        (source, receipt, gate, batch, url, attempt),
+    ).fetchone()
+    if row is None:
+        return False
+    gate_state, consumption_status = str(row[0]), str(row[1])
+    if gate_state == "applied" and consumption_status == "applied":
+        return True
+    if (
+        gate_state != "submission_uncertain"
+        or consumption_status != "submission_uncertain"
+    ):
+        return False
+    updated_at = datetime.now(UTC).isoformat()
+    gate_cursor = connection.execute(
+        "UPDATE application_submission_gates SET state='applied', updated_at=? "
+        "WHERE gate_id=? AND batch_id=? AND job_url=? AND attempt_id=? "
+        "AND state='submission_uncertain'",
+        (updated_at, gate, batch, url, attempt),
+    )
+    consumption_cursor = connection.execute(
+        "UPDATE application_batch_consumptions "
+        "SET status='applied', updated_at=? "
+        "WHERE batch_id=? AND job_url=? AND status='submission_uncertain'",
+        (updated_at, batch, url),
+    )
+    return gate_cursor.rowcount == 1 and consumption_cursor.rowcount == 1
 
 
 def update_batch_submission_status(

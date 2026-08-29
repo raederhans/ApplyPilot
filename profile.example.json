@@ -61,6 +61,7 @@
   "submission_policy": {
     "mode": "auto_submit_when_preflight_passes",
     "allowed_submission_surfaces": [
+      "linkedin_apply_entry",
       "linkedin_native_easy_apply",
       "linkedin_to_official_ats",
       "official_company_careers",

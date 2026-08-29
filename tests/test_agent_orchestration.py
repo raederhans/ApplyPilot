@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,19 @@ from applypilot.apply.contracts import (
     agent_turn_result_from_mapping,
 )
 from applypilot.apply.orchestration import execute_proposal_waves, plan_proposal_waves
+
+
+def test_agent_event_clock_advances_when_wall_clock_collides(monkeypatch) -> None:
+    fixed = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(launcher, "_agent_event_clock", lambda: fixed)
+
+    started = launcher._ordered_agent_event_time()
+    proposals = launcher._ordered_agent_event_time(started)
+    completed = launcher._ordered_agent_event_time(proposals)
+
+    assert started == fixed
+    assert proposals == fixed + timedelta(microseconds=1)
+    assert completed == fixed + timedelta(microseconds=2)
 
 
 def proposal(
@@ -441,6 +455,15 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
             messages = [
                 {
                     "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "playwright",
+                        "tool": "browser_snapshot",
+                        "status": "completed",
+                    },
+                },
+                {
+                    "type": "item.completed",
                     "item": {"type": "agent_message", "text": "RESULT:READY_TO_SUBMIT"},
                 },
                 {"type": "turn.completed", "usage": {}},
@@ -493,7 +516,8 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     )
     conn = database.get_connection(db_path)
     events = conn.execute(
-        "SELECT event_type FROM agent_events WHERE attempt_id=? ORDER BY occurred_at, event_id",
+        "SELECT event_type, payload_json FROM agent_events "
+        "WHERE attempt_id=? ORDER BY occurred_at, event_id",
         ("attempt-1",),
     ).fetchall()
 
@@ -504,6 +528,9 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
         "agent.proposals.executed",
         "agent.turn.completed",
     ]
+    completed_payload = json.loads(events[-1][1])
+    assert completed_payload["metrics"]["browser_tool_call_count"] == 1
+    assert completed_payload["metrics"]["browser_tool_success_count"] == 1
     assert conn.execute("SELECT COUNT(*) FROM agent_checkpoints").fetchone()[0] == 1
     assert "mcp_servers.applypilot_control.command" in " ".join(captured_command)
     assert "mcp_servers.applypilot_ats.command" in " ".join(captured_command)

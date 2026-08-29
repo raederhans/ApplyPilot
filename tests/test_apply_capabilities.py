@@ -74,7 +74,8 @@ def test_make_mcp_config_preserves_default_and_records_resolved_surface() -> Non
     config = agent_runtime.make_mcp_config(9432, runtime_metadata=metadata)
 
     playwright = config["mcpServers"]["playwright"]
-    assert playwright["args"][:2] == ["-y", "@playwright/mcp@latest"]
+    assert playwright["args"][:2] == ["-y", "@playwright/mcp@0.0.79"]
+    assert all("@latest" not in str(value) for value in playwright["args"])
     assert "applypilot_control" in config["mcpServers"]
     assert config["mcpServers"]["applypilot_ats"]["args"] == [
         "-m",

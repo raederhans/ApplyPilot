@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from applypilot.commands.apply import _select_runnable_browser_backend
+from applypilot.commands.apply import (
+    _select_runnable_browser_backend,
+    _worker_summary_lines,
+)
 from applypilot.runtime_settings import load_runtime_settings
 
 
@@ -72,3 +75,47 @@ def test_auto_browser_backend_preserves_fallback_when_both_are_available() -> No
 
     assert selected == "auto"
     assert unavailable == {}
+
+
+def test_dry_run_worker_summary_preserves_bounded_queue_preview_concurrency() -> None:
+    lines, effective_workers = _worker_summary_lines(
+        {
+            "requested_workers": 4,
+            "bound_candidates": 0,
+            "executable_candidates": 0,
+            "blocked_candidates": 0,
+            "effective_workers": 2,
+        },
+        dry_run=True,
+        preview_selection="queue",
+        preview_candidates=2,
+    )
+
+    assert lines == [
+        "  Preview selection:       queue",
+        "  Preview candidates cap:  2",
+        "  Workers passed to launcher: 2",
+    ]
+    assert effective_workers == 2
+    assert all("Executable" not in line for line in lines)
+
+
+def test_submission_worker_summary_preserves_manifest_admission_counts() -> None:
+    lines, effective_workers = _worker_summary_lines(
+        {
+            "requested_workers": 4,
+            "bound_candidates": 3,
+            "executable_candidates": 2,
+            "blocked_candidates": 1,
+            "effective_workers": 2,
+        },
+        dry_run=False,
+    )
+
+    assert lines == [
+        "  Manifest-bound:     3",
+        "  Executable:         2",
+        "  Blocked:            1",
+        "  Workers effective:  2",
+    ]
+    assert effective_workers == 2

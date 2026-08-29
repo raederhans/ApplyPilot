@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 CAPABILITY_SCHEMA_VERSION = "1"
-DEFAULT_PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@latest"
+DEFAULT_PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.79"
 
 
 # Keep one canonical tool contract across discovery, runtime configuration, and

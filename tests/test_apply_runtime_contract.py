@@ -7,8 +7,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from applypilot import config
-from applypilot.apply import agent_runtime, launcher, prompt, router
+from applypilot.apply import (
+    agent_runtime,
+    launcher,
+    page_observation,
+    prompt,
+    router,
+    worker_orchestration,
+)
 from applypilot.apply.email_routing import MailboxMcpSpec, mailbox_prepare_duplicate_receipt
+from applypilot.apply.run_progress import RunProgress
 from applypilot.database import init_db
 
 
@@ -162,6 +170,7 @@ def test_submit_prompt_is_a_compact_phase_delta_without_resume_body() -> None:
     ("output", "expected"),
     [
         ("RESULT:READY_TO_SUBMIT", ("READY_TO_SUBMIT", None)),
+        ("RESULT:LINKEDIN_LOGIN_COMPLETED", ("LINKEDIN_LOGIN_COMPLETED", None)),
         ("RESULT:FAILED:manual_review_required", ("FAILED", "manual_review_required")),
         ("I would output RESULT:APPLIED now", None),
         ("RESULT:APPLIED\nRESULT:APPLIED", None),
@@ -244,6 +253,45 @@ def test_computer_use_is_a_prepare_only_external_handoff() -> None:
         phase="prepare",
         submit_started=False,
     )
+    assert router.computer_use_handoff_allowed(
+        "failed:browser_interaction_unavailable",
+        interaction_mode="auto",
+        phase="prepare",
+        submit_started=False,
+    )
+
+
+def test_browser_mcp_failure_is_refined_after_a_successful_browser_call() -> None:
+    status, context = launcher._normalize_browser_runtime_failure(
+        "failed:browser_mcp_unavailable",
+        browser_tool_call_count=4,
+        browser_tool_success_count=3,
+        failure_context=None,
+    )
+
+    assert status == "failed:browser_interaction_unavailable"
+    assert context == {
+        "category": "browser_interaction_unavailable",
+        "recoverability": "requires_capability",
+        "missing_capability": "site_specific_browser_interaction_or_app_handoff",
+        "next_action": "inspect_page_state_or_route_to_authorized_app_browser",
+        "visible_state": (
+            "3 browser tool call(s) succeeded before the site interaction became unavailable"
+        ),
+        "attempts": 4,
+    }
+
+
+def test_browser_mcp_failure_stays_unavailable_without_a_successful_call() -> None:
+    status, context = launcher._normalize_browser_runtime_failure(
+        "failed:browser_mcp_unavailable",
+        browser_tool_call_count=2,
+        browser_tool_success_count=0,
+        failure_context={"category": "browser_mcp_unavailable"},
+    )
+
+    assert status == "failed:browser_mcp_unavailable"
+    assert context == {"category": "browser_mcp_unavailable"}
 
 
 def test_auto_keeps_edge_workers_parallel_while_explicit_cloak_is_bounded() -> None:
@@ -441,6 +489,11 @@ def test_mailbox_environment_values_stay_out_of_codex_command(tmp_path) -> None:
     ("phase", "output", "expected"),
     [
         ("prepare", "RESULT:READY_TO_SUBMIT", "ready_to_submit"),
+        (
+            "prepare",
+            "RESULT:LINKEDIN_LOGIN_COMPLETED",
+            "linkedin_login_completed",
+        ),
         ("prepare", "RESULT:COVER_NOT_REQUIRED", "cover_not_required"),
         ("prepare", "RESULT:COVER_LETTER_REQUIRED", "cover_letter_required"),
         ("prepare", "RESULT:FAILED:manual_review_required", "failed:manual_review_required"),
@@ -677,6 +730,24 @@ def test_application_page_selection_scores_each_surface_once() -> None:
     assert [first.evaluate_calls, second.evaluate_calls] == [1, 1]
 
 
+def test_linkedin_handoff_selector_ignores_the_richer_linkedin_tab() -> None:
+    class Page:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def evaluate(self, _script: str) -> dict:
+            raise AssertionError("handoff route selection must not score or inspect forms")
+
+    linkedin = Page("https://www.linkedin.com/jobs/view/4455274411/")
+    workday = Page(
+        "https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/role?source=linkedin"
+    )
+
+    assert page_observation._linkedin_external_handoff_pages(
+        [linkedin, workday]
+    ) == [workday]
+
+
 def test_application_frame_selection_prefers_populated_child_frame() -> None:
     class Surface:
         def __init__(self, signals: dict) -> None:
@@ -882,9 +953,29 @@ def _run_worker_contract(
     verification_calls: list[dict] | None = None,
     use_target_url: bool = True,
     limit: int = 1,
+    dry_run: bool = False,
     audit_results: list[tuple[str | None, dict]] | None = None,
     email_application: dict | None = None,
     staged_attachment: str | None = None,
+    job_overrides: dict | None = None,
+    route_gate_result: tuple[bool, str] | None = None,
+    route_gate_calls: list[tuple[dict, dict]] | None = None,
+    release_calls: list[tuple[str, str | None]] | None = None,
+    ats_binding_results: list[dict | None] | None = None,
+    ats_binding_calls: list[dict] | None = None,
+    run_job_calls: list[dict] | None = None,
+    causal_click_calls: list[dict] | None = None,
+    causal_click_results: list[tuple[str | None, dict]] | None = None,
+    login_guard_results: list[tuple[bool, str]] | None = None,
+    route_binding_has_attestation: bool = True,
+    run_progress=None,
+    prepare_hook=None,
+    receipt_admitted: bool = True,
+    snapshot_error: Exception | None = None,
+    restore_calls: list[dict] | None = None,
+    performance_clock: list[float] | None = None,
+    final_performance_records: list[dict] | None = None,
+    acquire_error: Exception | None = None,
 ):
     job = {
         "url": "https://jobs.example.test/role",
@@ -893,6 +984,8 @@ def _run_worker_contract(
         "company_name": "Example",
         "description": "Apply by email to jobs@example.test for this role.",
     }
+    if job_overrides:
+        job.update(job_overrides)
     if staged_attachment:
         job["_staged_resume_path"] = staged_attachment
     run_phases: list[str] = []
@@ -903,8 +996,12 @@ def _run_worker_contract(
 
     def fake_run(current_job, *args, **kwargs):
         nonlocal prepare_index, submit_index
+        if run_job_calls is not None:
+            run_job_calls.append(dict(current_job))
         assert current_job.get("_browser_backend") in {"edge", "cloak"}
         phase = kwargs["submission_phase"]
+        if performance_clock is not None:
+            performance_clock[0] += 0.02 if phase == "prepare" else 0.03
         expected_driver = (
             "mailbox"
             if phase == "submit" and email_application is not None
@@ -914,6 +1011,8 @@ def _run_worker_contract(
         assert current_job["_control_contract"]["browser_runtime"] == current_job["_browser_backend"]
         run_phases.append(phase)
         if phase == "prepare":
+            if prepare_hook is not None:
+                prepare_hook(current_job)
             if email_application is not None:
                 current_job["_agent_observations"] = {
                     "email_application": dict(email_application)
@@ -982,6 +1081,8 @@ def _run_worker_contract(
     observed = list(observer_results or [])
 
     def fake_observer(*args, **kwargs):
+        if performance_clock is not None:
+            performance_clock[0] += 0.05
         if observed:
             return observed.pop(0)
         return {
@@ -996,19 +1097,64 @@ def _run_worker_contract(
     monkeypatch.setattr(config, "load_profile", dict)
     monkeypatch.setattr(launcher, "_submission_rate_status", lambda *args: (True, 0, "ready"))
     monkeypatch.setattr(launcher, "get_connection", lambda: object())
-    queued = iter(queued_jobs or [job])
+    queued = iter([job] if queued_jobs is None else queued_jobs)
     def fake_acquire(**kwargs):
         if acquire_calls is not None:
             acquire_calls.append(dict(kwargs))
-        return next(queued, None)
+        selected = next(queued, None)
+        sink = kwargs.get("performance_sink")
+        if isinstance(sink, dict):
+            supplied = (
+                selected.get("_acquisition_performance", {})
+                if isinstance(selected, dict)
+                else {}
+            )
+            if isinstance(supplied, dict):
+                sink.update(supplied)
+            sink.setdefault("outcome", "acquired" if selected is not None else "empty")
+        if performance_clock is not None:
+            performance_clock[0] += 0.01
+        if acquire_error is not None:
+            if isinstance(sink, dict):
+                sink["outcome"] = "error"
+            raise acquire_error
+        return selected
 
     monkeypatch.setattr(launcher, "acquire_job", fake_acquire)
+    if performance_clock is not None:
+        monkeypatch.setattr(
+            worker_orchestration.time,
+            "perf_counter",
+            lambda: performance_clock[0],
+        )
+
+        def fake_acquire_submit_lane(_worker_id: int) -> bool:
+            performance_clock[0] += 0.01
+            return launcher._submit_writer_lane.acquire(timeout=0)
+
+        monkeypatch.setattr(
+            launcher,
+            "_acquire_submit_writer_lane",
+            fake_acquire_submit_lane,
+        )
     def fake_launch(*args, **kwargs):
         if launch_calls is not None:
             launch_calls.append((args, kwargs))
         return object()
 
     monkeypatch.setattr(launcher, "launch_chrome", fake_launch)
+    if snapshot_error is not None:
+        monkeypatch.setattr(
+            launcher,
+            "_snapshot_worker_evidence",
+            lambda _worker_id: (_ for _ in ()).throw(snapshot_error),
+        )
+    else:
+        monkeypatch.setattr(
+            launcher,
+            "_snapshot_worker_evidence",
+            lambda _worker_id: {},
+        )
     monkeypatch.setattr(
         launcher,
         "_open_bound_application_target",
@@ -1027,22 +1173,116 @@ def _run_worker_contract(
         "restore_browser_session",
         lambda *args, **kwargs: 1,
     )
+    if restore_calls is not None:
+        monkeypatch.setattr(
+            launcher,
+            "restore_preview_state",
+            lambda supplied: restore_calls.append(dict(supplied)),
+        )
     monkeypatch.setattr(launcher, "run_job", fake_run)
+
+    pending_clicks = list(causal_click_results or [])
+
+    def fake_causal_click(_port, _worker_id, current_job):
+        if causal_click_calls is not None:
+            causal_click_calls.append(dict(current_job))
+        current_job["_linkedin_causal_apply_attestation"] = {
+            "version": 1,
+            "attestation_id": "private-attestation",
+            "source_target_id": "application-root",
+            "target_id": "causal-target",
+            "target_id_digest": "a" * 64,
+        }
+        if pending_clicks:
+            return pending_clicks.pop(0)
+        if audits and audits[0][1].get("disposition") == "linkedin_external_handoff":
+            return None, {
+                "disposition": "linkedin_external_handoff",
+                "page_url": audits[0][1].get("page_url"),
+            }
+        return None, {"disposition": "linkedin_native_apply_opened"}
+
+    monkeypatch.setattr(
+        launcher,
+        "_click_linkedin_main_apply_causally",
+        fake_causal_click,
+    )
+    pending_guards = list(login_guard_results or [])
+    monkeypatch.setattr(
+        launcher,
+        "_verify_linkedin_post_login_state",
+        lambda *_args: pending_guards.pop(0)
+        if pending_guards
+        else (True, "linkedin_login_guard:verified"),
+    )
     audits = list(audit_results or [])
 
     def fake_audit(*args):
+        if performance_clock is not None:
+            performance_clock[0] += 0.04
         if audits:
             return audits.pop(0)
         return None, {"status": "clear", "disposition": "clear"}
 
     monkeypatch.setattr(launcher, "_audit_live_pre_submit_page", fake_audit)
-    monkeypatch.setattr(launcher, "_reserve_manifest_submission", lambda *args: (True, "reserved"))
+    monkeypatch.setattr(
+        launcher,
+        "_observe_linkedin_external_handoff_page",
+        fake_audit,
+    )
+    def fake_linkedin_route_gate(current_job, observation, _profile, **_kwargs):
+        if route_gate_calls is not None:
+            route_gate_calls.append((dict(current_job), dict(observation)))
+        resolved = route_gate_result or (True, "runtime_route_already_bound")
+        if resolved in {
+            (False, "linkedin_external_handoff_preview_verified"),
+            (False, "linkedin_external_handoff_reauthorized"),
+        }:
+            target = observation.get("page_url")
+            current_job["_discovered_application_url"] = target
+            current_job["_linkedin_runtime_route_binding"] = {
+                "lineage_verified": True,
+                "target_application_url": target,
+                **({"causal_apply_attestation": {
+                    "version": 1,
+                    "verified": True,
+                    "target_id_digest": "a" * 64,
+                }} if route_binding_has_attestation else {}),
+            }
+        return resolved
+
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_linkedin_route_gate",
+        fake_linkedin_route_gate,
+    )
+    pending_ats_bindings = list(ats_binding_results or [])
+
+    def fake_resolve_ats_binding(current_job):
+        if ats_binding_calls is not None:
+            ats_binding_calls.append(dict(current_job))
+        return pending_ats_bindings.pop(0) if pending_ats_bindings else None
+
+    monkeypatch.setattr(
+        launcher,
+        "_resolve_ats_application_binding",
+        fake_resolve_ats_binding,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_reserve_manifest_submission",
+        lambda *args, **kwargs: (True, "reserved"),
+    )
     monkeypatch.setattr(
         launcher,
         "_observe_post_submit_page",
         fake_observer,
     )
-    monkeypatch.setattr(launcher, "_archive_worker_evidence", lambda *args: [])
+    monkeypatch.setattr(
+        launcher,
+        "_archive_worker_evidence",
+        lambda *args, **kwargs: [],
+    )
     def fake_verification_wait(*args, **kwargs):
         if verification_calls is not None:
             verification_calls.append(dict(kwargs))
@@ -1080,8 +1320,32 @@ def _run_worker_contract(
     )
     monkeypatch.setattr(
         launcher,
-        "mark_result",
-        lambda *args, **kwargs: marked.append((args, kwargs)),
+        "_has_admitted_submission_receipt",
+        lambda *_args, **_kwargs: receipt_admitted,
+    )
+    def fake_mark_result(*args, **kwargs):
+        marked.append((args, kwargs))
+        if performance_clock is not None:
+            performance_clock[0] += 0.06
+
+    monkeypatch.setattr(launcher, "mark_result", fake_mark_result)
+    monkeypatch.setattr(
+        launcher,
+        "record_application_attempt_performance",
+        lambda _attempt_id, performance: (
+            final_performance_records.append(performance)
+            if final_performance_records is not None
+            else False
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "release_lock",
+        lambda job_url, task_id=None: (
+            release_calls.append((job_url, task_id))
+            if release_calls is not None
+            else None
+        ),
     )
     monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
@@ -1090,12 +1354,448 @@ def _run_worker_contract(
         worker_id=0,
         limit=limit,
         target_url=job["url"] if use_target_url else None,
-        dry_run=False,
+        dry_run=dry_run,
         manual_captcha_relay=manual_captcha_relay,
         browser_backend=browser_backend,
         authorization_manifest={"batch_id": "batch-1", "max_submissions": 1},
+        run_progress=run_progress,
     )
     return result, run_phases, ledger, marked
+
+
+def test_worker_continues_linkedin_external_handoff_to_official_ats(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    workday_url = (
+        "https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/"
+        "Singapore-South-West-Singapore/College-Intern---Data-Engineering---AI_UNI4131-1"
+    )
+    route_calls: list[tuple[dict, dict]] = []
+    release_calls: list[tuple[str, str | None]] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                    "submit_control_count": 0,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        route_gate_calls=route_calls,
+        release_calls=release_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "applied"
+    assert marked[0][0][1] == "applied"
+    assert route_calls[0][1]["page_url"] == workday_url
+    assert release_calls == []
+
+
+def test_worker_launcher_clicks_main_apply_before_first_agent_turn(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    click_calls: list[dict] = []
+    run_calls: list[dict] = []
+
+    _result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["login_issue"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            ("linkedin_handoff_observer:no_external_bound_page", {})
+        ],
+        causal_click_calls=click_calls,
+        run_job_calls=run_calls,
+    )
+
+    assert phases == ["prepare"]
+    assert len(click_calls) == 1
+    assert run_calls[0]["_linkedin_causal_apply_attestation"][
+        "target_id_digest"
+    ] == "a" * 64
+
+
+def test_linkedin_entry_failure_survives_dry_run_restore(monkeypatch) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    restored: list[dict] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=[],
+        dry_run=True,
+        restore_calls=restored,
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        causal_click_results=[
+            ("linkedin_apply_click:exact_job_page_count:0", {}),
+        ],
+        audit_results=[("linkedin_handoff_observer:causal_attestation_required", {})],
+    )
+
+    assert result == (0, 1)
+    assert phases == []
+    assert ledger == []
+    assert marked == []
+    preview_evidence = restored[0]["_preview_attempt_evidence"]
+    assert {
+        key: preview_evidence[key]
+        for key in ("version", "stage", "reason_code", "submit_started")
+    } == {
+        "version": 1,
+        "stage": "first_apply",
+        "reason_code": "linkedin_apply_click:exact_job_page_count:0",
+        "submit_started": False,
+    }
+    assert preview_evidence["orchestration_performance"]["acquisition"][
+        "worker_call_ms"
+    ] >= 0
+
+
+def test_linkedin_login_turn_is_guarded_then_launcher_clicks_again(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    workday_url = "https://example.wd5.myworkdayjobs.com/External/job/role"
+    click_calls: list[dict] = []
+    run_calls: list[dict] = []
+
+    result, phases, ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["linkedin_login_completed", "ready_to_submit"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        causal_click_calls=click_calls,
+        causal_click_results=[
+            (None, {"disposition": "linkedin_login_required"}),
+            (
+                None,
+                {
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                },
+            ),
+        ],
+        login_guard_results=[(True, "linkedin_login_guard:verified")],
+        audit_results=[
+            (
+                None,
+                {
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        run_job_calls=run_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert len(click_calls) == 2
+    assert run_calls[0]["_linkedin_login_only"] is True
+    assert run_calls[1].get("_linkedin_login_only") is not True
+    assert ledger[0][0] == "applied"
+
+
+def test_linkedin_login_agent_external_navigation_fails_closed(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    click_calls: list[dict] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["linkedin_login_completed"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        causal_click_calls=click_calls,
+        causal_click_results=[
+            (None, {"disposition": "linkedin_login_required"}),
+        ],
+        login_guard_results=[
+            (False, "linkedin_login_guard:external_target_created")
+        ],
+        audit_results=[("linkedin_handoff_observer:causal_attestation_required", {})],
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert len(click_calls) == 1
+    assert ledger == []
+    assert "linkedin_login_guard:external_target_created" in marked[0][0][2]
+
+
+def test_worker_does_not_resume_linkedin_alias_without_causal_attestation(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    workday_url = "https://example.wd5.myworkdayjobs.com/External/job/role"
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=[],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        route_binding_has_attestation=False,
+    )
+
+    assert result == (0, 0)
+    assert phases == []
+    assert ledger == []
+    assert marked == []
+
+
+def test_worker_observes_launcher_attested_linkedin_external_route(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    workday_url = (
+        "https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/"
+        "Singapore-South-West-Singapore/College-Intern---Data-Engineering---AI_UNI4131-1"
+    )
+    route_calls: list[tuple[dict, dict]] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                    "submit_control_count": 0,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        route_gate_calls=route_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert route_calls[0][1]["page_url"] == workday_url
+    assert ledger[0][0] == "applied"
+    assert marked[0][0][1] == "applied"
+
+
+def test_worker_requires_smartrecruiters_identity_before_linkedin_route_resume(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    smartrecruiters_url = (
+        "https://jobs.smartrecruiters.com/Grab/744000145885499-data-science-intern"
+    )
+    binding_calls: list[dict] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=[],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": smartrecruiters_url,
+                    "submit_control_count": 0,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        ats_binding_results=[
+            {
+                "provider": "smartrecruiters",
+                "tenant": "Grab",
+                "posting_id": "744000145885499",
+                "resolved": False,
+                "reason": "identity_lookup_http_unavailable",
+            }
+        ],
+        ats_binding_calls=binding_calls,
+    )
+
+    assert result == (0, 0)
+    assert phases == []
+    assert ledger == []
+    assert binding_calls[0]["application_url"] == smartrecruiters_url
+    assert marked == []
+
+
+def test_worker_binds_smartrecruiters_identity_before_linkedin_route_resume(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    smartrecruiters_url = (
+        "https://jobs.smartrecruiters.com/Grab/744000145885499-data-science-intern"
+    )
+    resolved_binding = {
+        "provider": "smartrecruiters",
+        "tenant": "Grab",
+        "posting_id": "744000145885499",
+        "publication_id": "69b76a4f-b78a-4f91-bfff-cf18c698213e",
+        "resolved": True,
+    }
+    run_calls: list[dict] = []
+
+    result, phases, ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": smartrecruiters_url,
+                    "submit_control_count": 0,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_reauthorized"),
+        ats_binding_results=[resolved_binding],
+        run_job_calls=run_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert run_calls[0]["application_url"] == smartrecruiters_url
+    assert run_calls[0]["_ats_application_binding"] == resolved_binding
+    assert ledger[0][0] == "applied"
+
+
+def test_worker_preserves_agent_result_when_linkedin_has_no_external_page(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    route_calls: list[tuple[dict, dict]] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["login_issue"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                "linkedin_handoff_observer:no_external_bound_page",
+                {},
+            )
+        ],
+        route_gate_calls=route_calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert route_calls == []
+    assert ledger == []
+    assert marked[0][0][2].startswith("login_issue")
+
+
+def test_dry_run_continues_linkedin_handoff_without_persisting_or_submitting(
+    monkeypatch,
+) -> None:
+    linkedin_url = "https://www.linkedin.com/jobs/view/4455274411/"
+    workday_url = (
+        "https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/"
+        "Singapore-South-West-Singapore/College-Intern---Data-Engineering---AI_UNI4131-1"
+    )
+    route_calls: list[tuple[dict, dict]] = []
+    release_calls: list[tuple[str, str | None]] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        dry_run=True,
+        submit_results=["previewed"],
+        job_overrides={
+            "url": linkedin_url,
+            "application_url": linkedin_url,
+            "source_site": "linkedin",
+        },
+        audit_results=[
+            (
+                None,
+                {
+                    "status": "attention",
+                    "disposition": "linkedin_external_handoff",
+                    "page_url": workday_url,
+                    "submit_control_count": 0,
+                },
+            )
+        ],
+        route_gate_result=(False, "linkedin_external_handoff_preview_verified"),
+        route_gate_calls=route_calls,
+        release_calls=release_calls,
+    )
+
+    assert result == (0, 0)
+    assert phases == ["submit"]
+    assert ledger == []
+    assert marked[0][0][1] == "previewed"
+    assert route_calls[0][0]["application_url"] == linkedin_url
+    assert route_calls[0][1]["page_url"] == workday_url
+    assert release_calls == []
 
 
 def test_worker_reenters_prepare_once_for_repairable_audit_state(monkeypatch) -> None:
@@ -1184,6 +1884,90 @@ def test_direct_email_submission_evidence_requires_send_and_sent_copy() -> None:
     assert evidence is not None
     assert evidence["channel"] == "direct_email"
     assert launcher._validate_submission_evidence(incomplete) is None
+
+
+def test_worker_performance_metrics_are_attempt_bound_and_run_aggregated(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=1,
+    )
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        run_progress=progress,
+        job_overrides={
+            "_acquisition_performance": {
+                "version": 1,
+                "candidate_rows": 4,
+                "admission_rows_scanned": 2,
+                "total_ms": 12.5,
+                "unbounded_text": "must not persist",
+            }
+        },
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    performance = marked[0][1]["evidence"]["orchestration_performance"]
+    assert performance["version"] == 1
+    assert performance["acquisition"]["candidate_rows"] == 4.0
+    assert performance["acquisition"]["admission_rows_scanned"] == 2.0
+    assert performance["acquisition"]["total_ms"] == 12.5
+    assert performance["acquisition"]["worker_call_ms"] >= 0
+    assert "unbounded_text" not in performance["acquisition"]
+    assert performance["metrics"]["submit_agent_ms"] == 10
+    assert performance["metrics"]["submit_lane_acquisitions"] == 1
+    assert performance["metrics"]["submit_lane_wait_ms"] >= 0
+    assert performance["metrics"]["submit_lane_hold_ms"] >= 0
+    run_performance = progress.snapshot()["performance"]
+    assert run_performance["job_sample_count"] == 1
+    assert run_performance["acquisition"]["attempt_count"] == 1
+    assert run_performance["acquisition"]["outcomes"] == {"acquired": 1}
+    assert run_performance["acquisition"]["totals"]["candidate_rows"] == 4
+    assert run_performance["acquisition"]["totals"][
+        "admission_rows_scanned"
+    ] == 2
+
+
+def test_final_attempt_performance_includes_every_submit_lane_hold_segment(
+    monkeypatch,
+) -> None:
+    clock = [0.0]
+    final_records: list[dict] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            (
+                "pre_submit_audit:required_field_empty:phone",
+                {
+                    "disposition": "retry_prepare",
+                    "repairable_issues": ["required_field_empty:phone"],
+                },
+            ),
+            (None, {"disposition": "clear"}),
+        ],
+        performance_clock=clock,
+        final_performance_records=final_records,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    persisted_before_release = marked[0][1]["evidence"][
+        "orchestration_performance"
+    ]["metrics"]
+    final_metrics = final_records[0]["metrics"]
+    assert final_metrics["submit_lane_acquisitions"] == 2
+    assert final_metrics["submit_lane_wait_ms"] == pytest.approx(20.0)
+    assert final_metrics["submit_lane_hold_ms"] == pytest.approx(220.0)
+    assert final_metrics["submit_lane_hold_ms"] - persisted_before_release[
+        "submit_lane_hold_ms"
+    ] == pytest.approx(60.0)
 
 
 def test_lossy_degree_and_work_status_mappings_are_audited_without_blocking() -> None:
@@ -1366,6 +2150,11 @@ def test_dry_run_timeout_restores_pre_preview_state(monkeypatch) -> None:
     monkeypatch.setattr(launcher, "acquire_job", lambda **kwargs: job)
     monkeypatch.setattr(launcher, "launch_chrome", lambda *args, **kwargs: object())
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        launcher,
+        "_open_bound_application_target",
+        lambda _port, _url: {"application-root"},
+    )
     monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
     monkeypatch.setattr(launcher, "release_cdp_port", lambda _worker_id: None)
     monkeypatch.setattr(launcher, "run_job", lambda *args, **kwargs: ("timeout", 480000))
@@ -1388,6 +2177,19 @@ def test_dry_run_timeout_restores_pre_preview_state(monkeypatch) -> None:
 
     assert result == (0, 1)
     assert restored == [job]
+    preview_evidence = restored[0]["_preview_attempt_evidence"]
+    assert {
+        key: preview_evidence[key]
+        for key in ("version", "stage", "reason_code", "submit_started")
+    } == {
+        "version": 1,
+        "stage": "dry_run",
+        "reason_code": "timeout",
+        "submit_started": False,
+    }
+    assert preview_evidence["orchestration_performance"]["acquisition"][
+        "worker_call_ms"
+    ] >= 0
     assert marked == []
 
 
@@ -1437,6 +2239,216 @@ def test_real_batch_replaces_pre_submit_failure_until_success_target(monkeypatch
     assert marked[-1][0][:2] == (second["url"], "applied")
 
 
+def test_shared_run_progress_work_steals_replacement_after_prepare_failure(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=2,
+    )
+    jobs = [
+        {
+            "url": f"https://jobs.example.test/global-{index}",
+            "application_url": f"https://jobs.example.test/global-{index}/apply",
+            "title": f"Role {index}",
+            "company_name": "Example",
+        }
+        for index in range(2)
+    ]
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        queued_jobs=jobs,
+        use_target_url=False,
+        limit=1,
+        prepare_results=["expired", "ready_to_submit"],
+        run_progress=progress,
+    )
+
+    assert result == (1, 1)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert progress.snapshot()["receipt_confirmed_successes"] == 1
+    assert progress.snapshot()["authorization_slots_used"] == 1
+
+
+def test_empty_acquire_attempt_is_counted_before_manifest_exhaustion(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=2,
+    )
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        queued_jobs=[],
+        use_target_url=False,
+        limit=1,
+        run_progress=progress,
+    )
+
+    snapshot = progress.snapshot()
+    assert result == (0, 0)
+    assert phases == []
+    assert ledger == []
+    assert marked == []
+    assert snapshot["manifest_exhausted"] is True
+    assert snapshot["authorization_slots_used"] == 0
+    assert snapshot["performance"]["job_sample_count"] == 0
+    assert snapshot["performance"]["acquisition"]["attempt_count"] == 1
+    assert snapshot["performance"]["acquisition"]["outcomes"] == {"empty": 1}
+
+
+def test_acquire_exception_is_counted_then_propagated_without_authority_change(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=2,
+    )
+
+    with pytest.raises(RuntimeError, match="sqlite busy"):
+        _run_worker_contract(
+            monkeypatch,
+            queued_jobs=[],
+            use_target_url=False,
+            limit=1,
+            run_progress=progress,
+            acquire_error=RuntimeError("sqlite busy"),
+        )
+
+    snapshot = progress.snapshot()
+    acquisition = snapshot["performance"]["acquisition"]
+    assert acquisition["attempt_count"] == 1
+    assert acquisition["outcomes"] == {"error": 1}
+    assert acquisition["totals"]["worker_call_ms"] >= 0
+    assert snapshot["manifest_exhausted"] is False
+    assert snapshot["authorization_slots_used"] == 0
+
+
+def test_preview_ticket_is_consumed_only_after_successful_browser_preview(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=True,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=1,
+    )
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        dry_run=True,
+        submit_result="previewed",
+        run_progress=progress,
+    )
+
+    assert result == (0, 0)
+    assert phases == ["submit"]
+    assert marked[0][0][1] == "previewed"
+    assert progress.snapshot()["previews_consumed"] == 1
+    assert progress.snapshot()["preview_tickets_claimed"] == 0
+
+
+def test_ready_worker_stops_before_reservation_after_peer_receipt(monkeypatch) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=2,
+    )
+
+    def peer_finishes(_job) -> None:
+        progress.record_terminal("job:peer", "applied", receipt_confirmed=True)
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_hook=peer_finishes,
+        run_progress=progress,
+    )
+
+    assert result == (0, 0)
+    assert phases == ["prepare"]
+    assert ledger == []
+    assert marked == []
+    assert progress.snapshot()["authorization_slots_used"] == 0
+
+
+def test_uncertain_submission_holds_global_slot_and_blocks_replacement(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=1,
+    )
+    provider_error = {
+        "confirmed": False,
+        "provider_submission_error_visible": True,
+        "provider_submission_error_text": "Submission status could not be confirmed.",
+        "validation_error_count": 0,
+    }
+
+    first, phases, ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="submission_uncertain",
+        observer_results=[provider_error],
+        run_progress=progress,
+    )
+
+    assert first == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "submission_uncertain"
+    assert progress.snapshot()["receipt_confirmed_successes"] == 0
+    assert progress.snapshot()["authorization_slots_used"] == 1
+    assert progress.should_acquire() is False
+    assert progress.snapshot()["authorization_capacity_exhausted"] is True
+    assert progress.snapshot()["partial"] is True
+
+
+def test_manifest_exhaustion_reports_partial_after_all_replacements_fail(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=2,
+        preview_target=2,
+        authorization_slot_cap=3,
+    )
+    jobs = [
+        {
+            "url": f"https://jobs.example.test/partial-{index}",
+            "application_url": f"https://jobs.example.test/partial-{index}/apply",
+            "title": f"Partial {index}",
+            "company_name": "Example",
+        }
+        for index in range(2)
+    ]
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        queued_jobs=jobs,
+        use_target_url=False,
+        limit=2,
+        prepare_results=["expired", "expired"],
+        run_progress=progress,
+    )
+
+    assert result == (0, 2)
+    assert phases == ["prepare", "prepare"]
+    snapshot = progress.snapshot()
+    assert snapshot["manifest_exhausted"] is True
+    assert snapshot["partial"] is True
+    assert snapshot["terminal_items"] == 2
+
+
 def test_worker_marks_applied_only_after_independent_observer(monkeypatch) -> None:
     result, phases, ledger, marked = _run_worker_contract(monkeypatch)
 
@@ -1483,6 +2495,42 @@ def test_exact_duplicate_preflight_skips_before_browser_launch(monkeypatch) -> N
     assert marked[0][1]["permanent"] is True
 
 
+def test_material_enforce_block_stops_before_browser_launch(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        launcher,
+        "_run_read_only_preflight",
+        lambda _job: {
+            "provider": "greenhouse",
+            "material_specialist_mode": "enforce",
+            "material_enforced_block": True,
+            "material_task_id": "task-material",
+            "material_proposal_id": "proposal-material",
+            "material_readiness": {
+                "state": "blocked",
+                "ready": False,
+                "missing_kinds": ["resume_byte_binding_mismatch"],
+                "human_reason_codes": [],
+                "unknown_required_labels": [],
+            },
+            "task_statuses": {},
+        },
+    )
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        launch_calls=launches,
+    )
+
+    assert result == (0, 1)
+    assert phases == []
+    assert launches == []
+    assert marked[0][0][1] == "failed"
+    assert marked[0][0][2].startswith("material_readiness_blocked")
+    assert marked[0][1]["permanent"] is False
+    assert marked[0][1]["evidence"]["material_task_id"] == "task-material"
+
+
 @pytest.mark.parametrize("discovery_result", ["cover_not_required", "cover_letter_required"])
 def test_worker_resolves_cover_material_after_opening_ats(
     monkeypatch, discovery_result: str
@@ -1508,6 +2556,65 @@ def test_worker_never_marks_applied_when_ledger_update_fails(monkeypatch) -> Non
     assert ledger[0][0] == "applied"
     assert marked[0][0][1] == "submission_uncertain"
     assert marked[0][1]["evidence"]["reason"] == "submission_ledger_update_failed"
+
+
+def test_worker_does_not_count_visible_applied_without_durable_receipt(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=False,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=1,
+    )
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        run_progress=progress,
+        receipt_admitted=False,
+    )
+
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "submission_uncertain"
+    assert marked[0][0][1] == "submission_uncertain"
+    assert progress.snapshot()["receipt_confirmed_successes"] == 0
+    assert progress.snapshot()["submission_uncertain"] == 1
+
+
+def test_preview_initialization_error_releases_ticket_and_restores_job(
+    monkeypatch,
+) -> None:
+    progress = RunProgress(
+        dry_run=True,
+        success_target=1,
+        preview_target=1,
+        authorization_slot_cap=1,
+    )
+    restored: list[dict] = []
+
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        _run_worker_contract(
+            monkeypatch,
+            dry_run=True,
+            run_progress=progress,
+            snapshot_error=OSError("snapshot unavailable"),
+            restore_calls=restored,
+        )
+
+    assert len(restored) == 1
+    assert progress.snapshot()["preview_tickets_claimed"] == 0
+    assert progress.should_acquire() is True
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        dry_run=True,
+        submit_result="previewed",
+        run_progress=progress,
+    )
+    assert result == (0, 0)
+    assert phases == ["submit"]
+    assert progress.snapshot()["previews_consumed"] == 1
 
 
 def test_worker_exception_after_submit_start_is_never_retryable_failed(monkeypatch) -> None:

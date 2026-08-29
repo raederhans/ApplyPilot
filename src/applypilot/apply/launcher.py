@@ -16,10 +16,12 @@ import platform
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -27,7 +29,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from rich.console import Console
 from rich.live import Live
@@ -40,6 +42,7 @@ from applypilot.apply import ats as ats_mod
 from applypilot.apply import orchestration as orchestration_mod
 from applypilot.apply import page_observation as page_observation_mod
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
@@ -87,6 +90,7 @@ from applypilot.apply.dashboard import (
 from applypilot.apply.email_routing import (
     MailboxMcpSpec,
     direct_email_send_is_reserved,
+    mailbox_mcp_for_phase,
     mailbox_prepare_duplicate_receipt,
     mailbox_read_input_matches_message,
     mailbox_search_message_id,
@@ -96,6 +100,7 @@ from applypilot.apply.email_routing import (
     normalize_sent_receipt,
     resolve_mailbox_mcp_spec,
 )
+from applypilot.apply.execution_scheduler import PhaseDemand, build_execution_plan
 from applypilot.apply.failure_taxonomy import classify_failure
 from applypilot.apply.retention import (
     archive_new_evidence,
@@ -110,6 +115,13 @@ from applypilot.apply.router import (
     initial_route,  # noqa: F401 - injected worker port
     prompt_control_contract,
     resolve_interaction_mode,
+)
+from applypilot.apply.run_progress import RunProgress
+from applypilot.apply.specialists import (
+    prompt_safe_ats_fill_plan,
+    run_durable_ats_fill_plan_specialist,
+    run_durable_material_specialist,
+    run_system_specialist,
 )
 from applypilot.database import get_connection
 from applypilot.runtime_settings import load_runtime_settings
@@ -130,6 +142,126 @@ _validate_submission_evidence = agent_output_mod.validate_submission_evidence
 _reconcile_agent_turn_outputs = agent_output_mod.reconcile_agent_turn_outputs
 _application_fact_value = page_observation_mod._application_fact_value
 _audit_live_pre_submit_page = page_observation_mod._audit_live_pre_submit_page
+_observe_linkedin_external_handoff_page = (
+    page_observation_mod._observe_linkedin_external_handoff_page
+)
+_click_linkedin_main_apply_causally = (
+    page_observation_mod._click_linkedin_main_apply_causally
+)
+_verify_linkedin_post_login_state = (
+    page_observation_mod._verify_linkedin_post_login_state
+)
+
+
+def _prepare_ats_fill_plan_repair(
+    job: Mapping[str, object], audit_report: Mapping[str, object]
+) -> dict[str, object]:
+    """Execute the durable repair-only specialist and return prompt-safe state."""
+    repairable = audit_report.get("repairable_issues")
+    if not isinstance(repairable, list) or not any(
+        str(issue).startswith("required_field_empty:") for issue in repairable
+    ):
+        raise ValueError("ATS fill-plan repair requires an ordinary empty field")
+    snapshot = audit_report.get("ats_fill_plan_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("ATS fill-plan repair has no launcher-owned snapshot")
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    if not attempt_id:
+        raise ValueError("ATS fill-plan repair requires an attempt id")
+    workflow_id = f"{attempt_id}:ats-fill-repair"
+    connection = get_connection()
+    try:
+        run = run_durable_ats_fill_plan_specialist(
+            connection,
+            snapshot,
+            attempt_id=attempt_id,
+            workflow_id=workflow_id,
+        )
+    finally:
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
+    safe_plan = prompt_safe_ats_fill_plan(run.result)
+    return {
+        "context": safe_plan,
+        "feedback": {
+            "task_id": run.task_id,
+            "proposal_id": run.proposal_id,
+            "attempt_id": attempt_id,
+            "workflow_id": workflow_id,
+            "snapshot_ref": str(run.result.get("snapshot_ref") or ""),
+            "snapshot_sha256": str(run.result.get("snapshot_sha256") or ""),
+            "plan_sha256": str(run.result.get("plan_sha256") or ""),
+            "replay": run.replay,
+            "before_disposition": str(audit_report.get("disposition") or ""),
+            "before_issue_count": len(repairable),
+        },
+    }
+
+
+def _record_ats_fill_plan_feedback(
+    feedback: Mapping[str, object],
+    *,
+    event: str,
+    audit_report: Mapping[str, object] | None = None,
+) -> None:
+    """Persist actual consumption/decision feedback without page-controlled text."""
+    from applypilot.database import append_agent_event
+
+    if event not in {"consumed", "changed_decision"}:
+        raise ValueError("unsupported ATS fill-plan feedback event")
+    task_id = str(feedback.get("task_id") or "")
+    attempt_id = str(feedback.get("attempt_id") or "")
+    workflow_id = str(feedback.get("workflow_id") or "")
+    if not task_id or not attempt_id or not workflow_id:
+        raise ValueError("ATS fill-plan feedback identity is incomplete")
+    payload: dict[str, object] = {
+        key: feedback[key]
+        for key in (
+            "task_id",
+            "proposal_id",
+            "snapshot_ref",
+            "snapshot_sha256",
+            "plan_sha256",
+            "replay",
+        )
+        if key in feedback
+    }
+    event_type = f"agent.proposal.{event}"
+    if event == "changed_decision":
+        if not isinstance(audit_report, Mapping):
+            raise ValueError("changed_decision requires the second audit")
+        after_disposition = str(audit_report.get("disposition") or "")
+        after_issues = audit_report.get("repairable_issues")
+        after_issue_count = len(after_issues) if isinstance(after_issues, list) else 0
+        before_disposition = str(feedback.get("before_disposition") or "")
+        before_issue_count = int(feedback.get("before_issue_count") or 0)
+        changed = (
+            before_disposition == "retry_prepare"
+            and after_disposition in {"clear", "proceed_with_advisories"}
+            and after_issue_count < before_issue_count
+        )
+        payload.update(
+            {
+                "before_disposition": before_disposition,
+                "after_disposition": after_disposition,
+                "before_issue_count": before_issue_count,
+                "after_issue_count": after_issue_count,
+                "changed": changed,
+            }
+        )
+    append_agent_event(
+        ApplicationEvent(
+            event_id=f"{task_id}:{event}",
+            attempt_id=attempt_id,
+            run_id=workflow_id,
+            phase="prepare",
+            actor="agent-orchestrator",
+            event_type=event_type,
+            payload=payload,
+            idempotency_key=f"{task_id}:{event}",
+        )
+    )
 _bound_application_pages = page_observation_mod._bound_application_pages
 _captcha_response_present = page_observation_mod._captcha_response_present
 _classify_post_submit_observation = page_observation_mod._classify_post_submit_observation
@@ -194,6 +326,37 @@ def _runtime_timeout_status(*, submission_phase: str, dry_run: bool) -> str:
     if submission_phase == "submit" and not dry_run:
         return "submission_uncertain"
     return "failed:agent_runtime_timeout"
+
+
+def _normalize_browser_runtime_failure(
+    status: str,
+    *,
+    browser_tool_call_count: int,
+    browser_tool_success_count: int,
+    failure_context: dict[str, object] | None,
+) -> tuple[str, dict[str, object] | None]:
+    """Distinguish an absent browser MCP from a later site interaction failure."""
+    if (
+        status.strip().casefold() != "failed:browser_mcp_unavailable"
+        or browser_tool_success_count < 1
+    ):
+        return status, failure_context
+
+    context = dict(failure_context or {})
+    context.update(
+        {
+            "category": "browser_interaction_unavailable",
+            "recoverability": "requires_capability",
+            "missing_capability": "site_specific_browser_interaction_or_app_handoff",
+            "next_action": "inspect_page_state_or_route_to_authorized_app_browser",
+            "visible_state": (
+                f"{browser_tool_success_count} browser tool call(s) succeeded before "
+                "the site interaction became unavailable"
+            ),
+            "attempts": min(max(browser_tool_call_count, 0), 10),
+        }
+    )
+    return "failed:browser_interaction_unavailable", context
 
 
 def _build_agent_command(
@@ -297,16 +460,28 @@ def _resolve_mailbox_tool_surface(
     )
 
 
+_agent_event_clock = lambda: datetime.now(UTC)
+
+
+def _ordered_agent_event_time(previous: datetime | None = None) -> datetime:
+    """Keep one run's durable lifecycle ordered on coarse wall clocks."""
+    current = _agent_event_clock()
+    if previous is not None and current <= previous:
+        return previous + timedelta(microseconds=1)
+    return current
+
+
 def _persist_agent_turn_started(
     request: AgentRunRequest,
     *,
     backend: str,
     model: str,
     runtime_metadata: dict,
-) -> None:
+) -> datetime:
     """Best-effort control telemetry; never becomes application authority."""
     from applypilot.database import append_agent_event
 
+    occurred_at = _ordered_agent_event_time()
     event = ApplicationEvent(
         event_id=f"{request.run_id}:started",
         attempt_id=request.attempt_id,
@@ -322,11 +497,13 @@ def _persist_agent_turn_started(
             "runtime": runtime_metadata,
         },
         idempotency_key=f"{request.run_id}:started",
+        occurred_at=occurred_at,
     )
     try:
         append_agent_event(event)
     except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
         logger.warning("Could not persist Agent turn start %s: %s", request.run_id, exc)
+    return occurred_at
 
 
 def _persist_agent_turn_completed(
@@ -337,7 +514,8 @@ def _persist_agent_turn_completed(
     duration_ms: int,
     source: str,
     metrics: Mapping[str, object] | None = None,
-) -> None:
+    occurred_after: datetime | None = None,
+) -> datetime:
     """Atomically save the terminal control event and resumable checkpoint."""
     from applypilot.database import record_agent_turn_control
 
@@ -350,6 +528,7 @@ def _persist_agent_turn_completed(
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
         bounded_metrics[_bounded_control_text(key, maximum=80)] = max(0, value)
+    occurred_at = _ordered_agent_event_time(occurred_after)
     event = ApplicationEvent(
         event_id=f"{request.run_id}:completed",
         attempt_id=request.attempt_id,
@@ -371,6 +550,7 @@ def _persist_agent_turn_completed(
         },
         evidence_refs=(),
         idempotency_key=f"{request.run_id}:completed",
+        occurred_at=occurred_at,
     )
     checkpoint = AgentCheckpoint(
         checkpoint_id=f"{request.run_id}:checkpoint:1",
@@ -402,6 +582,7 @@ def _persist_agent_turn_completed(
         record_agent_turn_control(event, checkpoint, human_request)
     except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
         logger.warning("Could not persist Agent turn completion %s: %s", request.run_id, exc)
+    return occurred_at
 
 
 def _bounded_control_text(value: object, *, maximum: int = 200) -> str:
@@ -656,7 +837,8 @@ def _persist_agent_proposal_outcomes(
     outcomes: Mapping[str, Mapping[str, object]],
     *,
     max_workers: int,
-) -> None:
+    occurred_after: datetime | None = None,
+) -> datetime:
     """Persist outcome metadata, never specialist return values or page content."""
     from applypilot.database import append_agent_event
 
@@ -675,6 +857,7 @@ def _persist_agent_proposal_outcomes(
         for proposal_id, outcome in outcomes.items()
         if outcome.get("status") == "blocked"
     ]
+    occurred_at = _ordered_agent_event_time(occurred_after)
     event = ApplicationEvent(
         event_id=f"{request.run_id}:proposals:1",
         attempt_id=request.attempt_id,
@@ -689,11 +872,13 @@ def _persist_agent_proposal_outcomes(
             "max_workers": max_workers,
         },
         idempotency_key=f"{request.run_id}:proposals:1",
+        occurred_at=occurred_at,
     )
     try:
         append_agent_event(event)
     except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
         logger.warning("Could not persist Agent proposal outcomes %s: %s", request.run_id, exc)
+    return occurred_at
 
 
 def acquire_job(
@@ -704,6 +889,7 @@ def acquire_job(
     authorization_manifest: dict | None = None,
     exclude_urls: set[str] | None = None,
     application_lease_minutes: int | None = None,
+    performance_sink: dict[str, object] | None = None,
 ) -> dict | None:
     if application_lease_minutes is None:
         application_lease_minutes = load_runtime_settings().application_lease_minutes
@@ -715,9 +901,22 @@ def acquire_job(
         preview_only=preview_only,
         authorization_manifest=authorization_manifest,
         exclude_urls=exclude_urls,
+        performance_sink=performance_sink,
         load_blocked=_load_blocked,
         application_lease_minutes=application_lease_minutes,
     )
+
+
+def record_application_attempt_performance(
+    attempt_id: str | None,
+    performance: object,
+) -> bool:
+    """Compatibility port for final attempt-bound orchestration telemetry."""
+    from applypilot.database import (
+        record_application_attempt_performance as record_performance,
+    )
+
+    return record_performance(attempt_id, performance)
 
 
 def mark_result(
@@ -776,6 +975,7 @@ def worker_loop(
     authorization_manifest: dict | None = None,
     attempted_urls: set[str] | None = None,
     attempted_urls_lock: threading.Lock | None = None,
+    run_progress: RunProgress | None = None,
 ) -> tuple[int, int]:
     return worker_orchestration_mod.worker_loop(
         sys.modules[__name__],
@@ -793,6 +993,7 @@ def worker_loop(
         authorization_manifest=authorization_manifest,
         attempted_urls=attempted_urls,
         attempted_urls_lock=attempted_urls_lock,
+        run_progress=run_progress,
     )
 
 logger = logging.getLogger(__name__)
@@ -905,35 +1106,115 @@ def _resolve_ats_application_binding(
 
 
 def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
-    """Run independent duplicate and provider-identity reads before browser work."""
+    """Run system-seeded deterministic reads before browser/Agent work."""
     provider = ats_mod.detect_ats_site(
         str(job.get("application_url") or job.get("url") or "")
     )
-    if provider != "smartrecruiters":
-        return {"provider": provider, "task_statuses": {}}
+    try:
+        profile = config.load_profile()
+    except FileNotFoundError:
+        # Library-level/static preflight remains usable before local profile
+        # initialization; production runs already require a profile upstream.
+        profile = {}
+    runtime = profile.get("agent_runtime", {}) if isinstance(profile, Mapping) else {}
+    orchestration = (
+        runtime.get("orchestration", {}) if isinstance(runtime, Mapping) else {}
+    )
+    configured_mode = (
+        orchestration.get("material_specialist_mode", "shadow")
+        if isinstance(orchestration, Mapping)
+        else "shadow"
+    )
+    mode = str(job.get("_material_specialist_mode") or configured_mode)
+    material_job = dict(job)
+    submission_policy = (
+        profile.get("submission_policy", {}) if isinstance(profile, Mapping) else {}
+    )
+    if isinstance(submission_policy, Mapping):
+        material_job.setdefault(
+            "_allow_runtime_cover_letter",
+            bool(
+                submission_policy.get(
+                    "allow_runtime_cover_letter_discovery",
+                    False,
+                )
+            ),
+        )
+
     tasks = [
         TaskSpec(
-            task_id="duplicate-snapshot",
-            kind="duplicate-check",
-            objective="Read the durable application ledger for an exact duplicate.",
-            inputs={"job_url": str(job.get("url") or "")},
+            task_id="material-readiness",
+            kind="material-readiness",
+            objective="Consume the deterministic system-seeded material result.",
+            inputs={"specialist": "material-readiness-v1", "mode": mode},
             effect_class="read",
-            resource_claims=(ResourceClaim("database-read"),),
+            resource_claims=(ResourceClaim("local-read"),),
         )
     ]
-    tasks.append(
-        TaskSpec(
-            task_id="ats-identity",
-            kind="ats-identity",
-            objective="Resolve the immutable public posting identity.",
-            inputs={"provider": provider},
-            effect_class="read",
-            resource_claims=(ResourceClaim("network-read"),),
+    if provider == "smartrecruiters":
+        tasks.extend(
+            (
+                TaskSpec(
+                    task_id="duplicate-snapshot",
+                    kind="duplicate-check",
+                    objective="Read the durable application ledger for an exact duplicate.",
+                    inputs={"job_url": str(job.get("url") or "")},
+                    effect_class="read",
+                    resource_claims=(ResourceClaim("database-read"),),
+                ),
+                TaskSpec(
+                    task_id="ats-identity",
+                    kind="ats-identity",
+                    objective="Resolve the immutable public posting identity.",
+                    inputs={"provider": provider},
+                    effect_class="read",
+                    resource_claims=(ResourceClaim("network-read"),),
+                ),
+            )
         )
-    )
 
     def runner(task: TaskSpec, _context: object) -> TaskResult:
         started = time.perf_counter()
+        if task.task_id == "material-readiness":
+            attempt_id = str(
+                job.get("_attempt_id")
+                or f"preflight-{hashlib.sha256(str(job.get('url') or '').encode()).hexdigest()[:16]}"
+            )
+            workflow_id = f"{attempt_id}:material-preflight"
+            connection = get_connection()
+            try:
+                if isinstance(connection, sqlite3.Connection):
+                    material_run = run_durable_material_specialist(
+                        connection,
+                        material_job,
+                        mode=mode,
+                        attempt_id=attempt_id,
+                        workflow_id=workflow_id,
+                    )
+                else:
+                    # Compatibility for injected read-only test ports. Real
+                    # database connections always use the durable path above.
+                    material_run = run_system_specialist(
+                        "material-readiness-v1",
+                        material_job,
+                        mode=mode,
+                    )
+            finally:
+                close = getattr(connection, "close", None)
+                if callable(close):
+                    close()
+            output = {
+                "material_readiness": None if material_run is None else material_run.result,
+                "mode": mode,
+                "enforced": False if material_run is None else material_run.enforced,
+                "proposal_feedback": (
+                    [] if material_run is None else list(material_run.telemetry)
+                ),
+                "replay": False if material_run is None else material_run.replay,
+                "task_id": None if material_run is None else material_run.task_id,
+                "proposal_id": None if material_run is None else material_run.proposal_id,
+            }
+            return TaskResult(task_id=task.task_id, status="completed", output=output)
         if task.task_id == "ats-identity":
             binding = _resolve_ats_application_binding(job)
             return TaskResult(
@@ -974,6 +1255,8 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
         task: TaskSpec,
         task_result: TaskResult,
     ) -> None:
+        if task.task_id == "material-readiness":
+            return
         statuses = state.setdefault("task_statuses", {})
         if isinstance(statuses, dict):
             statuses[task.task_id] = {
@@ -987,14 +1270,40 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
         runner,
         reducer,
         max_workers=len(tasks),
-        resource_capacities={"database-read": 1, "network-read": 1},
+        resource_capacities={
+            "local-read": 1,
+            "database-read": 1,
+            "network-read": 1,
+        },
     )
     result: dict[str, object] = {
         "provider": provider,
         "task_statuses": outcome.reduced_state.get("task_statuses", {}),
     }
-    duplicate_result = outcome.results["duplicate-snapshot"]
-    if duplicate_result.succeeded:
+    material_result = outcome.results["material-readiness"]
+    material_readiness = material_result.output.get("material_readiness")
+    normalized_mode = mode.casefold().strip()
+    fail_closed_mode = normalized_mode not in {"off", "shadow"}
+    if not material_result.succeeded:
+        material_readiness = {
+            "state": "blocked",
+            "ready": False,
+            "missing_kinds": ["material_specialist_unavailable"],
+            "failure_category": material_result.failure_category,
+            "error_type": material_result.output.get("error_type"),
+        }
+    result["material_readiness"] = material_readiness
+    result["material_specialist_mode"] = mode
+    result["material_enforced_block"] = bool(
+        material_result.output.get("enforced")
+        or (fail_closed_mode and not material_result.succeeded)
+    )
+    result["proposal_feedback"] = material_result.output.get("proposal_feedback", [])
+    result["material_specialist_replay"] = bool(material_result.output.get("replay"))
+    result["material_task_id"] = material_result.output.get("task_id")
+    result["material_proposal_id"] = material_result.output.get("proposal_id")
+    duplicate_result = outcome.results.get("duplicate-snapshot")
+    if duplicate_result is not None and duplicate_result.succeeded:
         result["duplicate"] = duplicate_result.output.get("duplicate")
     binding_result = outcome.results.get("ats-identity")
     if binding_result is not None and binding_result.succeeded:
@@ -1007,6 +1316,7 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 _cloak_lane = threading.Semaphore(1)
+_submit_writer_lane = threading.Semaphore(1)
 
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
@@ -1022,6 +1332,19 @@ def _acquire_cloak_lane(worker_id: int) -> bool:
         if _cloak_lane.acquire(timeout=0.5):
             return True
     raise InterruptedError("CloakBrowser lane wait interrupted")
+
+
+def _acquire_submit_writer_lane(worker_id: int) -> bool:
+    """Wait interruptibly for the sole final-submit/receipt ownership lane."""
+    update_state(
+        worker_id,
+        status="waiting",
+        last_action="waiting for final submit lane",
+    )
+    while not _stop_event.is_set():
+        if _submit_writer_lane.acquire(timeout=0.5):
+            return True
+    return False
 
 
 def _route_for_phase(
@@ -1166,6 +1489,8 @@ _WORKER_EVIDENCE_NAMES = (
     "submission-confirmation.png",
     "submission-confirmation-observer.png",
     "submission-confirmation-observer-attempt-2.png",
+    "post-submit-observer.png",
+    "post-submit-observer-attempt-2.png",
     "captcha-blocked.png",
 )
 _evidence_retention_lock = threading.Lock()
@@ -1181,19 +1506,42 @@ def _record_evidence_retention(
     destination: Path,
     archived: list[Path],
     job: Mapping[str, object],
+    *,
+    disposition: str | None = None,
+    receipt_admitted: bool | None = None,
 ) -> None:
-    """Mark preview artifacts as transient; never let maintenance alter an apply result."""
+    """Classify evidence from an explicit outcome, never from a filename."""
     global _evidence_retention_checked
     try:
-        persistent_receipt = any(
-            path.name.startswith("submission-confirmation") for path in archived
+        normalized_disposition = str(
+            disposition or job.get("_post_submit_disposition") or ""
+        ).casefold()
+        durable_receipt = bool(
+            job.get("_durable_receipt_admitted")
+            if receipt_admitted is None
+            else receipt_admitted
         )
+        if durable_receipt:
+            artifact_kind, artifact_state = "application_evidence", "applied"
+        elif normalized_disposition == "historical_duplicate":
+            artifact_kind, artifact_state = (
+                "application_evidence",
+                "historical_duplicate",
+            )
+        elif normalized_disposition in {
+            "uncertain",
+            "submission_uncertain",
+            "conflicting_post_submit_status",
+        }:
+            artifact_kind, artifact_state = "job_transient", "submission_uncertain"
+        else:
+            artifact_kind, artifact_state = "job_transient", "previewed"
         mark_owned_directory(
             destination,
             root=config.LOG_DIR / "application-evidence",
-            kind=("application_evidence" if persistent_receipt else "job_transient"),
+            kind=artifact_kind,
             owner_id=str(job.get("_attempt_id") or job.get("url") or "preview"),
-            state=("applied" if persistent_receipt else "previewed"),
+            state=artifact_state,
             completed_at=time.time(),
         )
         with _evidence_retention_lock:
@@ -1227,6 +1575,9 @@ def _archive_worker_evidence(
     job: dict,
     worker_id: int,
     timestamp: str,
+    *,
+    disposition: str | None = None,
+    receipt_admitted: bool | None = None,
 ) -> list[Path]:
     """Preserve browser evidence before the next run resets the worker directory."""
     company = _safe_log_slug(job.get("company_name") or "unknown", 40)
@@ -1248,7 +1599,13 @@ def _archive_worker_evidence(
         _WORKER_EVIDENCE_NAMES,
     )
     if archived:
-        _record_evidence_retention(destination, archived, job)
+        _record_evidence_retention(
+            destination,
+            archived,
+            job,
+            disposition=disposition,
+            receipt_admitted=receipt_admitted,
+        )
     return archived
 
 
@@ -1304,10 +1661,403 @@ def _submission_audit_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+_LINKEDIN_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "gh_src",
+        "li_fat_id",
+        "referrer",
+        "trackingid",
+        "trk",
+    }
+)
+_LINKEDIN_TRACKING_SOURCE_VALUES = frozenset(
+    {"linkedin", "linkedin.com", "linkedin_jobs", "linkedin-jobs"}
+)
+_COMPANY_SUFFIX_TOKENS = frozenset(
+    {"co", "company", "corp", "corporation", "group", "holdings", "inc", "limited", "ltd", "plc", "pte"}
+)
+
+
+def _sanitize_linkedin_external_target(observed) -> str:
+    """Drop known campaign parameters without erasing posting identity."""
+    retained_query: list[tuple[str, str]] = []
+    for key, value in parse_qsl(observed.query, keep_blank_values=True):
+        normalized_key = key.casefold().strip()
+        normalized_value = value.casefold().strip()
+        if normalized_key.startswith("utm_"):
+            continue
+        if normalized_key in _LINKEDIN_TRACKING_QUERY_KEYS:
+            continue
+        if (
+            normalized_key in {"source", "src"}
+            and normalized_value in _LINKEDIN_TRACKING_SOURCE_VALUES
+        ):
+            continue
+        retained_query.append((key, value))
+
+    host = (observed.hostname or "").casefold().rstrip(".")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = f":{observed.port}" if observed.port else ""
+    return observed._replace(
+        netloc=f"{host}{port}",
+        query=urlencode(retained_query, doseq=True),
+    ).geturl()
+
+
+def _identity_tokens(value: object) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    aliases = {
+        "engineering": "engineer",
+        "engineers": "engineer",
+        "internship": "intern",
+        "internships": "intern",
+        "interns": "intern",
+    }
+    return tuple(aliases.get(token, token) for token in tokens)
+
+
+def _normalize_linkedin_page_identity(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping) or value.get("version") != 1:
+        return None
+    page_title = " ".join(str(value.get("page_title") or "").split())[:300]
+    raw_headings = value.get("primary_headings")
+    headings = (
+        [" ".join(str(item).split())[:300] for item in raw_headings[:6]]
+        if isinstance(raw_headings, list)
+        else []
+    )
+    headings = [item for item in headings if item]
+    if not page_title and not headings:
+        return None
+    return {
+        "version": 1,
+        "page_title": page_title,
+        "primary_headings": headings,
+    }
+
+
+def _linkedin_external_identity_matches(
+    job: Mapping[str, object], identity: Mapping[str, object]
+) -> bool:
+    """Require both the authorized title and company on the external job page."""
+    title_tokens = _identity_tokens(job.get("title"))
+    company_tokens = tuple(
+        token
+        for token in _identity_tokens(
+            job.get("company_name") or job.get("company")
+        )
+        if token not in _COMPANY_SUFFIX_TOKENS
+    )
+    if not title_tokens or not company_tokens:
+        return False
+    evidence_tokens = set(
+        _identity_tokens(
+            " ".join(
+                [
+                    str(identity.get("page_title") or ""),
+                    *(
+                        str(item)
+                        for item in identity.get("primary_headings", [])
+                        if item
+                    ),
+                ]
+            )
+        )
+    )
+    return set(title_tokens).issubset(evidence_tokens) and set(company_tokens).issubset(
+        evidence_tokens
+    )
+
+
+def _linkedin_identity_evidence_digest(identity: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _linkedin_causal_attestation_matches(
+    job: Mapping[str, object], observed: object
+) -> dict[str, object] | None:
+    private = job.get("_linkedin_causal_apply_attestation")
+    if not isinstance(private, Mapping) or not isinstance(observed, Mapping):
+        return None
+    if private.get("version") != 1 or observed.get("version") != 1:
+        return None
+    source_job_id = page_observation_mod._linkedin_job_id(
+        job.get("url") or job.get("application_url")
+    )
+    if not source_job_id or private.get("source_job_id") != source_job_id:
+        return None
+    if (
+        private.get("lineage_complete") is not True
+        or observed.get("lineage_complete") is not True
+    ):
+        return None
+    mode = str(observed.get("mode") or "")
+    if mode not in {"same_target_navigation", "new_popup_from_source"}:
+        return None
+    expected_attestation_digest = hashlib.sha256(
+        str(private.get("attestation_id") or "").encode("utf-8")
+    ).hexdigest()
+    if observed.get("attestation_id_digest") != expected_attestation_digest:
+        return None
+    if observed.get("source_target_id_digest") != hashlib.sha256(
+        str(private.get("source_target_id") or "").encode("utf-8")
+    ).hexdigest():
+        return None
+    if observed.get("target_id_digest") != private.get("target_id_digest"):
+        return None
+    if mode != private.get("mode"):
+        return None
+    if str(observed.get("final_url") or "") != str(private.get("final_url") or ""):
+        return None
+    observed_lineage = observed.get("redirect_lineage")
+    private_lineage = private.get("redirect_lineage")
+    if (
+        not isinstance(observed_lineage, list)
+        or not isinstance(private_lineage, list)
+        or observed_lineage != private_lineage
+        or not observed_lineage
+        or str(observed_lineage[-1]) != str(observed.get("final_url") or "")
+    ):
+        return None
+    return {
+        "version": 1,
+        "verified": True,
+        "attestation_id_digest": expected_attestation_digest,
+        "source_target_id_digest": str(observed["source_target_id_digest"]),
+        "target_id_digest": str(observed["target_id_digest"]),
+        "mode": mode,
+        "initial_url": str(observed.get("initial_url") or "")[:2000],
+        "final_url": str(observed.get("final_url") or "")[:2000],
+        "redirect_lineage": [str(value)[:2000] for value in observed_lineage[:12]],
+        "lineage_complete": True,
+    }
+
+
+def _runtime_linkedin_route_gate(
+    job: dict,
+    audit_report: Mapping[str, object] | None,
+    profile: Mapping[str, object],
+    *,
+    persist_external_handoff: bool = True,
+) -> tuple[bool, str]:
+    """Resolve a LinkedIn landing page to native apply or an exact safe handoff.
+
+    A newly observed external target is persisted for the next authorization
+    manifest, so the current manifest never silently expands to a different
+    host. Native LinkedIn forms may continue only after a live form audit.
+    """
+    landing_url = str(job.get("application_url") or job.get("url") or "").strip()
+    landing = urlparse(landing_url)
+    landing_host = (landing.hostname or "").casefold().rstrip(".")
+    if not (
+        landing_host == "linkedin.com" or landing_host.endswith(".linkedin.com")
+    ):
+        return True, "runtime_route_already_bound"
+
+    audit = audit_report if isinstance(audit_report, Mapping) else {}
+    observed_url = str(audit.get("page_url") or "").strip()
+    observed = urlparse(observed_url)
+    observed_host = (observed.hostname or "").casefold().rstrip(".")
+    if (
+        observed.scheme != "https"
+        or not observed_host
+        or observed.username
+        or observed.password
+    ):
+        return False, "linkedin_apply_target_not_observed"
+
+    if observed_host == "linkedin.com" or observed_host.endswith(".linkedin.com"):
+        if int(audit.get("submit_control_count") or 0) < 1:
+            return False, "linkedin_native_application_form_not_observed"
+        allowed, reason = submission_surfaces_mod.surface_allowed(
+            "linkedin_native_easy_apply",
+            profile,
+        )
+        if not allowed:
+            return False, reason
+        job["_linkedin_runtime_surface"] = "linkedin_native_easy_apply"
+        return True, "linkedin_native_application_observed"
+
+    try:
+        observed_port = observed.port
+    except ValueError:
+        return False, "linkedin_apply_target_port_invalid"
+    del observed_port  # validated above; the sanitizer reads the parsed port again
+    sanitized_url = _sanitize_linkedin_external_target(observed)
+    runtime_job = dict(job)
+    runtime_job["application_url"] = sanitized_url
+    verified, verification = submission_surfaces_mod.linkedin_target_verification(
+        runtime_job,
+        profile,
+    )
+    if not verified:
+        return False, verification
+    allowed, reason = submission_surfaces_mod.surface_allowed(
+        "linkedin_to_official_ats",
+        profile,
+    )
+    if not allowed:
+        return False, reason
+
+    causal_attestation = _linkedin_causal_attestation_matches(
+        job, audit.get("causal_apply_attestation")
+    )
+    if causal_attestation is None:
+        return False, "linkedin_external_causal_apply_attestation_required"
+
+    identity_evidence = _normalize_linkedin_page_identity(audit.get("page_identity"))
+    if (
+        audit.get("disposition") != "linkedin_external_handoff"
+        or identity_evidence is None
+        or not _linkedin_external_identity_matches(job, identity_evidence)
+    ):
+        return False, "linkedin_external_job_identity_unverified"
+
+    from applypilot.apply.authorization import compute_job_fingerprint
+
+    source_job = dict(job)
+    source_job["application_url"] = landing_url
+    runtime_binding = {
+        "version": 4,
+        "attempt_id": str(job.get("_attempt_id") or ""),
+        "job_url": str(job.get("url") or ""),
+        "source_application_url": landing_url,
+        "target_application_url": sanitized_url,
+        "source_job_fingerprint": compute_job_fingerprint(source_job),
+        "target_host": observed_host,
+        "verification": verification,
+        "lineage_verified": True,
+        "identity_evidence": identity_evidence,
+        "identity_evidence_sha256": _linkedin_identity_evidence_digest(
+            identity_evidence
+        ),
+        "causal_apply_attestation": causal_attestation,
+    }
+    job["_discovered_application_url"] = sanitized_url
+    job["_linkedin_target_verification"] = verification
+    job["_linkedin_runtime_route_binding"] = runtime_binding
+    if not persist_external_handoff:
+        return False, "linkedin_external_handoff_preview_verified"
+
+    connection = get_connection()
+    if connection.in_transaction:
+        return False, "linkedin_handoff_persistence_transaction_busy"
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = connection.execute(
+            "UPDATE jobs SET application_url=?, apply_error=NULL WHERE url=? "
+            "AND (COALESCE(application_url, '')='' OR application_url=?)",
+            (sanitized_url, str(job.get("url") or ""), landing_url),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False, "linkedin_handoff_persistence_conflict"
+        attempt_id = str(job.get("_attempt_id") or "")
+        if runtime_binding["lineage_verified"] and attempt_id:
+            from applypilot.database import update_application_attempt
+
+            if not update_application_attempt(
+                attempt_id,
+                phase="route_handoff",
+                submit_started=False,
+                evidence={"linkedin_runtime_route_binding": runtime_binding},
+                conn=connection,
+            ):
+                connection.rollback()
+                return False, "linkedin_handoff_attempt_inactive"
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    return False, "linkedin_external_handoff_reauthorized"
+
+
+def _authorize_linkedin_runtime_route(
+    manifest: dict,
+    job: dict,
+    profile: Mapping[str, object],
+) -> tuple[bool, str]:
+    """Validate one attempt-bound LinkedIn-to-ATS route without mutating a manifest."""
+    binding = job.get("_linkedin_runtime_route_binding")
+    if (
+        not isinstance(binding, Mapping)
+        or binding.get("version") != 4
+        or binding.get("lineage_verified") is not True
+    ):
+        return False, "linkedin_runtime_route_binding_required"
+    if binding.get("attempt_id") != str(job.get("_attempt_id") or ""):
+        return False, "linkedin_runtime_route_attempt_mismatch"
+    if binding.get("job_url") != str(job.get("url") or ""):
+        return False, "linkedin_runtime_route_job_mismatch"
+    if binding.get("target_application_url") != str(job.get("application_url") or ""):
+        return False, "linkedin_runtime_route_target_mismatch"
+    target = urlparse(str(job.get("application_url") or ""))
+    target_host = (target.hostname or "").casefold().rstrip(".")
+    if not target_host or binding.get("target_host") != target_host:
+        return False, "linkedin_runtime_route_target_host_mismatch"
+
+    source_application_url = str(binding.get("source_application_url") or "")
+    source = urlparse(source_application_url)
+    source_host = (source.hostname or "").casefold().rstrip(".")
+    if source_host != "linkedin.com" and not source_host.endswith(".linkedin.com"):
+        return False, "linkedin_runtime_route_source_invalid"
+
+    from applypilot.apply.authorization import authorize_job, compute_job_fingerprint
+
+    source_job = dict(job)
+    source_job["application_url"] = source_application_url
+    if binding.get("source_job_fingerprint") != compute_job_fingerprint(source_job):
+        return False, "linkedin_runtime_route_source_fingerprint_mismatch"
+    if authorize_job(manifest, source_job) is None:
+        return False, "authorization_manifest_source_job_mismatch"
+
+    identity_evidence = _normalize_linkedin_page_identity(
+        binding.get("identity_evidence")
+    )
+    if (
+        identity_evidence is None
+        or binding.get("identity_evidence_sha256")
+        != _linkedin_identity_evidence_digest(identity_evidence)
+    ):
+        return False, "linkedin_runtime_route_identity_evidence_mismatch"
+    if not _linkedin_external_identity_matches(source_job, identity_evidence):
+        return False, "linkedin_runtime_route_job_identity_unverified"
+    causal_attestation = _linkedin_causal_attestation_matches(
+        source_job, binding.get("causal_apply_attestation")
+    )
+    if causal_attestation is None:
+        return False, "linkedin_runtime_route_causal_attestation_mismatch"
+
+    verified, verification = submission_surfaces_mod.linkedin_target_verification(
+        job,
+        profile,
+    )
+    if not verified or verification != binding.get("verification"):
+        return False, "linkedin_runtime_route_target_verification_failed"
+    allowed, reason = submission_surfaces_mod.surface_allowed(
+        "linkedin_to_official_ats",
+        profile,
+    )
+    if not allowed:
+        return False, reason
+    return True, "linkedin_runtime_route_authorized"
+
+
 def _reserve_manifest_submission(
     manifest: dict | None,
     job: dict,
     audit_report: Mapping[str, object] | None = None,
+    *,
+    success_target: int | None = None,
 ) -> tuple[bool, str]:
     """Re-authorize bytes and atomically claim final submission authority."""
     if manifest is None:
@@ -1319,9 +2069,22 @@ def _reserve_manifest_submission(
         from applypilot.apply.authorization import authorize_job, freeze_submission_materials
         from applypilot.database import claim_submission_gate, reserve_batch_submission
 
-        if authorize_job(manifest, job) is None:
-            return False, "authorization_manifest_job_mismatch"
         profile = config.load_profile()
+        if authorize_job(manifest, job) is None:
+            if not isinstance(job.get("_linkedin_runtime_route_binding"), Mapping):
+                return False, "authorization_manifest_job_mismatch"
+            route_authorized, route_authorization_reason = (
+                _authorize_linkedin_runtime_route(manifest, job, profile)
+            )
+            if not route_authorized:
+                return False, route_authorization_reason
+        runtime_route_allowed, runtime_route_reason = _runtime_linkedin_route_gate(
+            job,
+            audit_report,
+            profile,
+        )
+        if not runtime_route_allowed:
+            return False, runtime_route_reason
         material_binding = freeze_submission_materials(job, profile)
         job["_bound_submission_materials"] = material_binding
         attempt_id = str(job.get("_attempt_id") or "").strip()
@@ -1350,6 +2113,7 @@ def _reserve_manifest_submission(
                     str(job.get("url") or ""),
                     int(manifest.get("max_submissions") or 0),
                     attempt_id,
+                    success_target=success_target,
                     hourly_maximum=int(
                         policy.get("maximum_verified_submissions_per_rolling_hour", 15)
                     ),
@@ -1363,6 +2127,12 @@ def _reserve_manifest_submission(
                 if claim.get("claimed") is not True:
                     connection.rollback()
                     return False, str(claim.get("reason") or "submission_gate_denied")
+                job["_submission_gate_binding"] = {
+                    "gate_id": str(claim.get("gate_id") or ""),
+                    "batch_id": str(manifest.get("batch_id") or ""),
+                    "job_url": str(job.get("url") or ""),
+                    "attempt_id": attempt_id,
+                }
                 connection.commit()
             except Exception:
                 if connection.in_transaction:
@@ -1451,6 +2221,23 @@ def _update_submission_ledger(
         return False
 
 
+def _has_admitted_submission_receipt(
+    manifest: Mapping[str, object] | None,
+    job: Mapping[str, object],
+) -> bool:
+    """Check durable receipt admission for this exact authorized attempt."""
+    if not isinstance(manifest, Mapping):
+        return False
+    from applypilot.database import has_admitted_submission_receipt
+
+    return has_admitted_submission_receipt(
+        str(manifest.get("batch_id") or ""),
+        str(job.get("url") or ""),
+        str(job.get("_attempt_id") or ""),
+        conn=get_connection(),
+    )
+
+
 def _admit_direct_email_receipt(job: dict, receipt: object) -> dict[str, object]:
     """Admit one provider message id before a direct-email success is recorded."""
     if not isinstance(receipt, dict):
@@ -1460,6 +2247,11 @@ def _admit_direct_email_receipt(job: dict, receipt: object) -> dict[str, object]
     return admit_direct_email_sent_receipt(
         str(job.get("url") or ""),
         receipt,
+        gate_binding=(
+            job.get("_submission_gate_binding")
+            if isinstance(job.get("_submission_gate_binding"), Mapping)
+            else None
+        ),
     )
 
 
@@ -1862,11 +2654,38 @@ def _build_ats_application_context(
     if isinstance(observation, Mapping):
         form_context = observation.get("ats_adapter_context")
         if isinstance(form_context, Mapping):
-            context["observed_form"] = dict(form_context)
+            safe_form = dict(form_context)
+            raw_fields = safe_form.get("fields")
+            if isinstance(raw_fields, list):
+                safe_fields: list[dict[str, object]] = []
+                for raw_field in raw_fields:
+                    if not isinstance(raw_field, Mapping):
+                        continue
+                    options = raw_field.get("options")
+                    option_values = options if isinstance(options, list) else []
+                    safe_field = {
+                        key: value
+                        for key, value in raw_field.items()
+                        if key not in {"options", "options_truncated"}
+                    }
+                    safe_field["options_sha256"] = hashlib.sha256(
+                        json.dumps(
+                            option_values,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    safe_fields.append(safe_field)
+                safe_form["fields"] = safe_fields
+            context["observed_form"] = safe_form
             context["adapter"] = str(form_context.get("adapter") or adapter)
         workday_context = observation.get("workday_state")
         if isinstance(workday_context, Mapping):
             context["workday_state"] = dict(workday_context)
+    fill_plan = job.get("_ats_fill_plan_context")
+    if isinstance(fill_plan, Mapping):
+        context["fill_plan"] = dict(fill_plan)
     return context
 
 
@@ -1937,6 +2756,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             runtime_state.add("reserved")
     if submission_phase == "submit" and job.get("_submission_gate"):
         runtime_state.add("reserved")
+    mailbox_mcp = mailbox_mcp_for_phase(
+        mailbox_mcp,
+        submission_phase=submission_phase,
+        direct_email_send_authorized=direct_email_send_authorized,
+        verification_resume="verification_resumed" in runtime_state,
+    )
     runtime_ats_adapter = ats_mod.detect_ats_site(_safe_ats_target_url(job))
     runtime_state.add(
         "ats_unknown"
@@ -2141,6 +2966,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 ats_context.get("schema_version") or ats_mod.ATS_SCHEMA_VERSION
             ),
             **(
+                {
+                    "ats_fill_plan_ref": str(
+                        ats_context["fill_plan"].get("snapshot_ref") or ""
+                    ),
+                    "ats_fill_plan_snapshot_sha256": str(
+                        ats_context["fill_plan"].get("snapshot_sha256") or ""
+                    ),
+                    "ats_fill_plan_sha256": str(
+                        ats_context["fill_plan"].get("plan_sha256") or ""
+                    ),
+                }
+                if isinstance(ats_context.get("fill_plan"), Mapping)
+                else {}
+            ),
+            **(
                 {"workday_state": ats_context["workday_state"]}
                 if isinstance(ats_context.get("workday_state"), Mapping)
                 else {}
@@ -2180,6 +3020,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     watchdog: threading.Timer | None = None
     timed_out = threading.Event()
     agent_process_started = False
+    last_agent_event_at: datetime | None = None
     turn_result: AgentTurnResult | None = None
     turn_application_status: str | None = None
     turn_duration_ms: int | None = None
@@ -2199,6 +3040,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     last_tool_at: float | None = None
     tool_call_count = 0
     unique_tools: set[str] = set()
+    browser_tool_call_count = 0
+    browser_tool_success_count = 0
+    pending_browser_tools: set[str] = set()
     prepare_search_events: list[tuple[object, object]] = []
     if submission_phase == "prepare":
         job.pop("_mailbox_prepare_duplicate_receipt", None)
@@ -2277,7 +3121,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             _claude_procs[worker_id] = proc
         agent_process_started = True
         timed_out, watchdog = _start_timeout_watchdog(proc, agent_timeout_seconds)
-        _persist_agent_turn_started(
+        last_agent_event_at = _persist_agent_turn_started(
             agent_request,
             backend=agent_backend,
             model=model,
@@ -2322,6 +3166,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 last_tool_at = now_tool
                                 tool_call_count += 1
                                 unique_tools.add(str(raw_name))
+                                if str(raw_name).startswith("mcp__playwright__"):
+                                    browser_tool_call_count += 1
+                                    browser_tool_id = str(block.get("id") or "")
+                                    if browser_tool_id:
+                                        pending_browser_tools.add(browser_tool_id)
                                 name = (
                                     raw_name
                                     .replace("mcp__playwright__", "")
@@ -2351,8 +3200,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         for block in msg.get("message", {}).get("content", []):
                             if block.get("type") != "tool_result":
                                 continue
+                            tool_use_id = str(block.get("tool_use_id") or "")
+                            if tool_use_id in pending_browser_tools:
+                                pending_browser_tools.discard(tool_use_id)
+                                if block.get("is_error") is not True:
+                                    browser_tool_success_count += 1
                             pending = pending_mailbox_tools.pop(
-                                str(block.get("tool_use_id") or ""),
+                                tool_use_id,
                                 {},
                             )
                             tool_name = str(pending.get("name") or "")
@@ -2390,6 +3244,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             last_tool_at = now_tool
                             tool_call_count += 1
                             unique_tools.add(f"{server}:{tool}")
+                            browser_tool = (
+                                "playwright" in str(server).casefold()
+                                and str(tool).casefold().startswith("browser_")
+                            )
+                            if browser_tool:
+                                browser_tool_call_count += 1
+                                if (
+                                    item.get("error") in (None, "")
+                                    and str(item.get("status") or "completed").casefold()
+                                    in {"completed", "success", "succeeded"}
+                                ):
+                                    browser_tool_success_count += 1
                             desc = f"{server}:{tool}"
                             lf.write(f"  >> {desc}\n")
                             _record_worker_action(worker_id, desc)
@@ -2579,6 +3445,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if structured_report_invalid:
             result_source = f"legacy_after_invalid_structured:{result_source}"
         failure_context = _parse_failure_context(output)
+        normalized_status, failure_context = _normalize_browser_runtime_failure(
+            status,
+            browser_tool_call_count=browser_tool_call_count,
+            browser_tool_success_count=browser_tool_success_count,
+            failure_context=failure_context,
+        )
+        if normalized_status != status:
+            status = normalized_status
+            result_source = f"{result_source}:runtime_browser_evidence"
         if failure_context is not None:
             job["_failure_context"] = failure_context
         if evidence is not None:
@@ -2594,6 +3469,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             summary=f"Legacy Agent output resolved to {status}",
             observations=observations,
         )
+        if turn_result.status.strip().casefold() != status.strip().casefold():
+            normalized_observations = dict(turn_result.observations)
+            if failure_context is not None:
+                normalized_observations["failure_context"] = failure_context
+            turn_result = AgentTurnResult(
+                run_id=turn_result.run_id,
+                status=status,
+                summary=turn_result.summary,
+                proposals=turn_result.proposals,
+                observations=normalized_observations,
+                requested_human_input=turn_result.requested_human_input,
+                completed_at=turn_result.completed_at,
+            )
         turn_application_status = status
         turn_duration_ms = duration_ms
         turn_source = result_source
@@ -2611,10 +3499,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 turn_result,
             )
             if proposal_outcomes:
-                _persist_agent_proposal_outcomes(
+                last_agent_event_at = _persist_agent_proposal_outcomes(
                     agent_request,
                     proposal_outcomes,
                     max_workers=proposal_workers,
+                    occurred_after=last_agent_event_at,
                 )
         elif turn_result.proposals:
             proposal_ids = tuple(
@@ -2626,6 +3515,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             else:
                 job["_agent_proposals_rejected"] = proposal_ids
                 job["_agent_proposal_deferred_reason"] = "untrusted_result"
+        fill_plan_context = job.get("_ats_fill_plan_context")
+        if agent_process_started and isinstance(fill_plan_context, Mapping):
+            job["_ats_fill_plan_consumed"] = {
+                "accepted": True,
+                "run_id": run_id,
+                "snapshot_ref": str(fill_plan_context.get("snapshot_ref") or ""),
+                "snapshot_sha256": str(
+                    fill_plan_context.get("snapshot_sha256") or ""
+                ),
+                "plan_sha256": str(fill_plan_context.get("plan_sha256") or ""),
+            }
         display_status = status.split(":", 1)[0]
         add_event(f"[W{worker_id}] {display_status.upper()} ({elapsed}s): {job['title'][:30]}")
         update_state(
@@ -2705,6 +3605,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 application_status=final_status,
                 duration_ms=final_duration_ms,
                 source=turn_source,
+                occurred_after=last_agent_event_at,
                 metrics={
                     **setup_metrics,
                     **stats,
@@ -2725,6 +3626,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     ),
                     "tool_call_count": tool_call_count,
                     "unique_tool_count": len(unique_tools),
+                    "browser_tool_call_count": browser_tool_call_count,
+                    "browser_tool_success_count": browser_tool_success_count,
                 },
             )
         if report_path.exists():
@@ -2848,6 +3751,8 @@ def main(limit: int = 1, target_url: str | None = None,
         )
         workers = 1
 
+    if dry_run and continuous:
+        raise ValueError("Continuous dry-run is not supported; use a finite limit.")
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
@@ -2868,9 +3773,22 @@ def main(limit: int = 1, target_url: str | None = None,
             raise ValueError("Authorization manifest has no positive submission allowance.")
         if effective_limit == 0:
             effective_limit = manifest_cap
-        else:
-            effective_limit = min(effective_limit, manifest_cap)
-        mode_label = f"{effective_limit} manifest-authorized confirmed submissions"
+        mode_label = (
+            f"{effective_limit} confirmed submissions with "
+            f"{manifest_cap} manifest-authorized slot(s)"
+        )
+
+    authorization_slot_cap = (
+        int(authorization_manifest.get("max_submissions", 0))
+        if authorization_manifest is not None
+        else effective_limit
+    )
+    run_progress = RunProgress(
+        dry_run=dry_run,
+        success_target=effective_limit,
+        preview_target=effective_limit,
+        authorization_slot_cap=authorization_slot_cap,
+    )
 
     target_workers = _workers_for_target(workers, effective_limit)
     if target_workers != workers:
@@ -2879,6 +3797,33 @@ def main(limit: int = 1, target_url: str | None = None,
             f"{effective_limit}; zero-allocation workers are not started.[/dim]"
         )
         workers = target_workers
+
+    execution_plan = build_execution_plan(
+        [
+            *(
+                PhaseDemand(
+                    task_id=f"worker-{worker_id}:prepare",
+                    phase="prepare",
+                    browser_profile=f"{requested_browser_backend}:worker-{worker_id}",
+                )
+                for worker_id in range(workers)
+            ),
+            *(
+                PhaseDemand(
+                    task_id=f"worker-{worker_id}:submit",
+                    phase="submit",
+                    browser_profile=f"{requested_browser_backend}:worker-{worker_id}",
+                    submit_writer=True,
+                )
+                for worker_id in range(workers)
+            ),
+        ],
+        requested_workers=workers,
+        browser_capacity=workers,
+        mailbox_capacity=1,
+        submit_writer_capacity=1,
+    )
+    workers = min(workers, execution_plan.effective_workers)
 
     # Initialize dashboard for all workers
     attempted_urls: set[str] = set()
@@ -2891,6 +3836,12 @@ def main(limit: int = 1, target_url: str | None = None,
         f"Launching apply pipeline ({mode_label}, {worker_label}, "
         f"browser={requested_browser_backend}, interaction={requested_interaction_mode}, "
         f"poll every {POLL_INTERVAL}s)..."
+    )
+    console.print(
+        "[dim]Phase capacity: "
+        f"prepare={execution_plan.phase_concurrency.get('prepare', 0)}, "
+        f"submit={execution_plan.phase_concurrency.get('submit', 0)} "
+        "(single durable submit writer)[/dim]"
     )
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
@@ -2949,24 +3900,16 @@ def main(limit: int = 1, target_url: str | None = None,
                     authorization_manifest=authorization_manifest,
                     attempted_urls=attempted_urls,
                     attempted_urls_lock=attempted_urls_lock,
+                    run_progress=run_progress,
                 )
             else:
-                # Multi-worker — distribute limit across workers
-                if effective_limit:
-                    base = effective_limit // workers
-                    extra = effective_limit % workers
-                    limits = [base + (1 if i < extra else 0)
-                              for i in range(workers)]
-                else:
-                    limits = [0] * workers  # continuous mode
-
                 with ThreadPoolExecutor(max_workers=workers,
                                         thread_name_prefix="apply-worker") as executor:
                     futures = {
                         executor.submit(
                             worker_loop,
                             worker_id=i,
-                            limit=limits[i],
+                            limit=effective_limit,
                             target_url=target_url,
                             min_score=min_score,
                             headless=headless,
@@ -2979,6 +3922,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             authorization_manifest=authorization_manifest,
                             attempted_urls=attempted_urls,
                             attempted_urls_lock=attempted_urls_lock,
+                            run_progress=run_progress,
                         ): i
                         for i in range(workers)
                     }
@@ -3000,10 +3944,71 @@ def main(limit: int = 1, target_url: str | None = None,
             live.update(render_full())
 
         totals = get_totals()
+        progress_snapshot = run_progress.snapshot()
         console.print(
             f"\n[bold]Done: {total_applied} applied, {total_failed} failed "
             f"(${totals['cost']:.3f})[/bold]"
         )
+        if progress_snapshot["partial"]:
+            console.print(
+                "[yellow]Run ended partial: manifest or authorization capacity "
+                "was exhausted before the target was reached.[/yellow]"
+            )
+        performance = progress_snapshot.get("performance", {})
+        performance_totals = (
+            performance.get("totals", {})
+            if isinstance(performance, dict)
+            else {}
+        )
+        performance_samples = int(
+            performance.get("job_sample_count", 0)
+            if isinstance(performance, dict)
+            else 0
+        )
+        acquisition_performance = (
+            performance.get("acquisition", {})
+            if isinstance(performance, dict)
+            else {}
+        )
+        acquisition_totals = (
+            acquisition_performance.get("totals", {})
+            if isinstance(acquisition_performance, dict)
+            else {}
+        )
+        acquisition_attempts = int(
+            acquisition_performance.get("attempt_count", 0)
+            if isinstance(acquisition_performance, dict)
+            else 0
+        )
+        if (
+            acquisition_attempts > 0
+            and isinstance(performance_totals, dict)
+            and isinstance(acquisition_totals, dict)
+        ):
+            acquire_average = (
+                float(acquisition_totals.get("worker_call_ms", 0.0))
+                / acquisition_attempts
+            )
+            acquisition_outcomes = acquisition_performance.get("outcomes", {})
+            acquisition_outcomes = (
+                acquisition_outcomes
+                if isinstance(acquisition_outcomes, dict)
+                else {}
+            )
+            console.print(
+                "Performance: "
+                f"{acquisition_attempts} acquire attempts "
+                f"({int(acquisition_outcomes.get('acquired', 0))} acquired/"
+                f"{int(acquisition_outcomes.get('empty', 0))} empty), "
+                f"{performance_samples} job samples; "
+                f"acquire avg {acquire_average:.1f} ms; "
+                "submit lane wait/hold "
+                f"{float(performance_totals.get('submit_lane_wait_ms', 0.0)):.1f}/"
+                f"{float(performance_totals.get('submit_lane_hold_ms', 0.0)):.1f} ms; "
+                "submit Agent/observer "
+                f"{float(performance_totals.get('submit_agent_ms', 0.0)):.1f}/"
+                f"{float(performance_totals.get('post_submit_observer_ms', 0.0)):.1f} ms"
+            )
         console.print(f"Logs: {config.LOG_DIR}")
 
     except KeyboardInterrupt:

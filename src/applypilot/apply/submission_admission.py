@@ -43,6 +43,8 @@ def evaluate_submission_admission(
     """
     surface = classify_submission_surface(job)
     surface_metadata: dict[str, object] = {"surface": surface}
+    if surface == "linkedin_apply_entry":
+        surface_metadata["requires_runtime_linkedin_apply_route_resolution"] = True
     if surface == "linkedin_native_easy_apply":
         surface_metadata["requires_runtime_easy_apply_verification"] = True
     if surface == "linkedin_to_official_ats":
@@ -183,9 +185,13 @@ def evaluate_submission_admission(
         "admitted": True,
         "decision": "ready_to_apply",
         "reason": (
-            "requires_runtime_easy_apply_verification"
-            if surface == "linkedin_native_easy_apply"
-            else result.get("reason") or "submission admission passed"
+            "requires_runtime_linkedin_apply_route_resolution"
+            if surface == "linkedin_apply_entry"
+            else (
+                "requires_runtime_easy_apply_verification"
+                if surface == "linkedin_native_easy_apply"
+                else result.get("reason") or "submission admission passed"
+            )
         ),
         "surface": surface,
         "metadata": surface_metadata,

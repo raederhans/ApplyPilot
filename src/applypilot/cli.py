@@ -1110,9 +1110,16 @@ def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()
 
-    from applypilot.database import get_stats
+    from applypilot import config as app_config
+    from applypilot.database import get_connection, get_stats
+    from applypilot.services.application import count_submission_ready_jobs
 
     stats = get_stats()
+    admission_ready = count_submission_ready_jobs(
+        get_connection(),
+        dry_run=False,
+        profile=app_config.load_profile(),
+    )
 
     console.print("\n[bold]ApplyPilot Pipeline Status[/bold]\n")
 
@@ -1131,11 +1138,16 @@ def status() -> None:
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
     summary.add_row("Cover letters", str(stats["with_cover_letter"]))
-    summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
+    summary.add_row("Prepared candidates (raw)", str(stats["ready_to_apply"]))
+    summary.add_row("Admission-ready (pre-manifest)", str(admission_ready))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
 
     console.print(summary)
+    console.print(
+        "[dim]Admission-ready still requires an exact authorization manifest and "
+        "runtime route verification before submission.[/dim]"
+    )
 
     # Score distribution
     if stats["score_distribution"]:

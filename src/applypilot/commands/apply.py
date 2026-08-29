@@ -41,6 +41,34 @@ def _select_runnable_browser_backend(
     return requested, {}
 
 
+def _worker_summary_lines(
+    allocation: dict[str, int],
+    *,
+    dry_run: bool,
+    preview_selection: str | None = None,
+    preview_candidates: int = 0,
+) -> tuple[list[str], int]:
+    """Describe the worker pool without mixing preview and submission counts."""
+    if dry_run:
+        return (
+            [
+                f"  Preview selection:       {preview_selection or 'queue'}",
+                f"  Preview candidates cap:  {preview_candidates}",
+                f"  Workers passed to launcher: {allocation['effective_workers']}",
+            ],
+            allocation["effective_workers"],
+        )
+    return (
+        [
+            f"  Manifest-bound:     {allocation['bound_candidates']}",
+            f"  Executable:         {allocation['executable_candidates']}",
+            f"  Blocked:            {allocation['blocked_candidates']}",
+            f"  Workers effective:  {allocation['effective_workers']}",
+        ],
+        allocation["effective_workers"],
+    )
+
+
 def run_apply(
     runtime: ModuleType,
     *,
@@ -104,8 +132,8 @@ def run_apply(
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 
-    if dry_run and not url:
-        console.print("[red]--dry-run requires one explicit --url.[/red]")
+    if dry_run and continuous:
+        console.print("[red]Continuous dry-run is not supported; use a finite --limit.[/red]")
         raise typer.Exit(code=1)
     profile = load_profile(_profile_path)
     standing_auto_authorize = _standing_auto_authorization_enabled(profile)
@@ -252,6 +280,7 @@ def run_apply(
 
     # Check 3: Submission needs an approved cover letter. A fill-only preview
     # can proceed with a validated resume and leave an optional letter blank.
+    ready = 0
     if not (gen and url):
         ready = count_submission_ready_jobs(
             get_connection(),
@@ -341,7 +370,34 @@ def run_apply(
         "blocked_candidates": 0,
         "effective_workers": workers,
     }
-    if not dry_run:
+    preview_candidates = 0
+    preview_selection = None
+    if dry_run:
+        preview_selection = "exact URL" if url else "queue"
+        preview_candidates = (
+            min(1, ready)
+            if url
+            else min(ready, max(0, effective_limit))
+        )
+        try:
+            preview_worker_cap = int(
+                submission_policy.get("maximum_workers", workers)
+                if isinstance(submission_policy, dict)
+                else workers
+            )
+        except (TypeError, ValueError):
+            preview_worker_cap = workers
+        worker_allocation["effective_workers"] = min(
+            max(0, workers),
+            max(0, preview_worker_cap),
+            preview_candidates,
+        )
+        if worker_allocation["effective_workers"] < 1:
+            console.print(
+                "[red]No preview-admitted candidates remain; refusing to start browser workers.[/red]"
+            )
+            raise typer.Exit(code=1)
+    else:
         worker_allocation = summarize_worker_allocation(
             get_connection(),
             profile,
@@ -354,20 +410,28 @@ def run_apply(
                 "[red]No executable authorized candidates remain; refusing to start browser workers.[/red]"
             )
             raise typer.Exit(code=2)
-        workers = worker_allocation["effective_workers"]
+
+    worker_summary_lines, workers = _worker_summary_lines(
+        worker_allocation,
+        dry_run=dry_run,
+        preview_selection=preview_selection,
+        preview_candidates=preview_candidates,
+    )
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Success target: {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers requested:  {worker_allocation['requested_workers']}")
-    console.print(f"  Bound candidates:   {worker_allocation['bound_candidates']}")
-    console.print(f"  Executable:         {worker_allocation['executable_candidates']}")
-    console.print(f"  Blocked:            {worker_allocation['blocked_candidates']}")
-    console.print(f"  Workers effective:  {workers}")
+    for summary_line in worker_summary_lines:
+        console.print(summary_line)
     console.print(f"  Backend:  {backend}")
     console.print(f"  Control:  {effective_interaction_mode}")
     console.print(f"  Model:    {effective_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    if dry_run:
+        console.print(
+            "  Preview boundary: form filling/uploads may occur; final submission is disabled"
+        )
     console.print(f"  CAPTCHA:  {'manual relay' if manual_captcha_relay else 'stop on blocker'}")
     if url:
         console.print(f"  Target:   {url}")

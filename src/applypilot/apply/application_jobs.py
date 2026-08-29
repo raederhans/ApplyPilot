@@ -10,12 +10,17 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
 from applypilot import config
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
 
 
 def revalidate_duplicate_before_submit(
@@ -101,6 +106,7 @@ def acquire_job(
     authorization_manifest: dict | None = None,
     exclude_urls: set[str] | None = None,
     *,
+    performance_sink: dict[str, object] | None = None,
     load_blocked: Callable[[], tuple[list[str], list[str]]],
     application_lease_minutes: int,
 ) -> dict | None:
@@ -115,6 +121,12 @@ def acquire_job(
     Returns:
         Job dict or None if the queue is empty.
     """
+    acquisition_started = time.perf_counter()
+    acquisition_performance = (
+        performance_sink if performance_sink is not None else {}
+    )
+    acquisition_performance.clear()
+    acquisition_performance.update({"version": 1, "outcome": "pending"})
     conn = connection
     excluded = {str(url) for url in (exclude_urls or set()) if str(url)}
     from applypilot.apply.submission_admission import resolve_max_apply_attempts
@@ -123,15 +135,23 @@ def acquire_job(
         start_application_attempt,
     )
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
+    phase_started = time.perf_counter()
     recover_stale_application_attempts(conn)
+    acquisition_performance["stale_recovery_ms"] = _elapsed_ms(phase_started)
+    phase_started = time.perf_counter()
     try:
         profile = config.load_profile()
     except FileNotFoundError:
         profile = {}
+    acquisition_performance["profile_load_ms"] = _elapsed_ms(phase_started)
     max_apply_attempts = resolve_max_apply_attempts(profile)
+    phase_started = time.perf_counter()
     refresh_job_eligibility(conn, profile=profile)
+    acquisition_performance["eligibility_refresh_ms"] = _elapsed_ms(phase_started)
     try:
+        phase_started = time.perf_counter()
         conn.execute("BEGIN IMMEDIATE")
+        acquisition_performance["transaction_wait_ms"] = _elapsed_ms(phase_started)
 
         submission_policy = profile.get("submission_policy", {})
         if not isinstance(submission_policy, dict):
@@ -139,6 +159,7 @@ def acquire_job(
         allow_runtime_cover = bool(
             submission_policy.get("allow_runtime_cover_letter_discovery", False)
         )
+        phase_started = time.perf_counter()
         if target_url:
             material_clause = """
                   AND tailored_resume_path IS NOT NULL
@@ -204,6 +225,8 @@ def acquire_job(
                   {url_clauses}
                 ORDER BY fit_score DESC, url
             """, [max_apply_attempts] + params).fetchall()
+        acquisition_performance["candidate_fetch_ms"] = _elapsed_ms(phase_started)
+        acquisition_performance["candidate_rows"] = len(rows)
 
         row = None
         authorized_entry = None
@@ -222,7 +245,10 @@ def acquire_job(
             if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at:
                 rows = []
 
+        admission_rows_scanned = 0
+        phase_started = time.perf_counter()
         for candidate in rows:
+            admission_rows_scanned += 1
             candidate_job = dict(candidate)
             candidate_job["application_url"] = (
                 candidate_job.get("application_url") or candidate_job.get("url")
@@ -248,6 +274,7 @@ def acquire_job(
                     conn.commit()
                     logger.info("Portal policy paused browser application: %s", candidate_job["url"][:80])
                     if target_url:
+                        acquisition_performance["outcome"] = "blocked"
                         return None
                 continue
             if authorization_manifest is not None:
@@ -260,8 +287,11 @@ def acquire_job(
                 authorized_entry = authorized
             row = candidate
             break
+        acquisition_performance["admission_scan_ms"] = _elapsed_ms(phase_started)
+        acquisition_performance["admission_rows_scanned"] = admission_rows_scanned
 
         if not row:
+            acquisition_performance["outcome"] = "empty"
             conn.rollback()
             return None
 
@@ -273,6 +303,7 @@ def acquire_job(
             preview_only=preview_only,
         )
         if portal_gate:
+            acquisition_performance["outcome"] = "blocked"
             conn.execute(
                 "UPDATE jobs SET apply_status = 'manual', apply_error = ? WHERE url = ?",
                 (portal_gate, row["url"]),
@@ -301,6 +332,7 @@ def acquire_job(
                     f"{policy_min_score}"
                 )
             if auto_issue:
+                acquisition_performance["outcome"] = "blocked"
                 conn.rollback()
                 logger.warning("Automatic submission paused for %s: %s", row["url"], auto_issue)
                 return None
@@ -329,14 +361,20 @@ def acquire_job(
 
         acquired = dict(row)
         acquired["_attempt_id"] = attempt_id
+        acquisition_performance["outcome"] = "acquired"
+        acquisition_performance["total_ms"] = _elapsed_ms(acquisition_started)
+        acquired["_acquisition_performance"] = dict(acquisition_performance)
         if authorized_entry is not None:
             acquired["_authorization_entry"] = dict(authorized_entry)
         if ats_capability_hint:
             acquired["_ats_capability_hint"] = ats_capability_hint
         return acquired
     except Exception:
+        acquisition_performance["outcome"] = "error"
         conn.rollback()
         raise
+    finally:
+        acquisition_performance["total_ms"] = _elapsed_ms(acquisition_started)
 
 
 def mark_result(
@@ -533,7 +571,13 @@ def restore_preview_state(connection: sqlite3.Connection, job: dict) -> None:
     from applypilot.database import finalize_application_attempt
 
     if cursor.rowcount:
-        finalize_application_attempt(job.get("_attempt_id"), "previewed", conn=conn)
+        evidence = job.get("_preview_attempt_evidence")
+        finalize_application_attempt(
+            job.get("_attempt_id"),
+            "previewed",
+            evidence=evidence if isinstance(evidence, dict) else None,
+            conn=conn,
+        )
     conn.commit()
 
 

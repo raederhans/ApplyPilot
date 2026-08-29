@@ -10,9 +10,11 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+from applypilot.apply import human_handoff as _human_handoff
 from applypilot.apply.contracts import AgentCheckpoint, ApplicationEvent, HumanRequest
 from applypilot.config import DB_PATH
 from applypilot.storage import agent_control as _agent_control
@@ -21,6 +23,7 @@ from applypilot.storage import job_identity as _job_identity
 from applypilot.storage import job_stats as _job_stats
 from applypilot.storage import radar as _radar
 from applypilot.storage import submission_receipts as _submission_receipts
+from applypilot.storage import task_journal as _task_journal
 
 canonicalize_job_url = _job_identity.canonicalize_job_url
 extract_platform_job_id = _job_identity.extract_platform_job_id
@@ -73,11 +76,14 @@ def admit_direct_email_sent_receipt(
     job_url: str,
     evidence: dict,
     conn: sqlite3.Connection | None = None,
+    *,
+    gate_binding: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return _submission_receipts.admit_direct_email_sent_receipt(
         conn or get_connection(),
         job_url,
         evidence,
+        gate_binding=gate_binding,
     )
 
 
@@ -470,6 +476,8 @@ def ensure_application_batch_schema(conn: sqlite3.Connection | None = None) -> N
     connection = conn or get_connection()
     _application_ledger.ensure_schema(connection)
     _agent_control.ensure_schema(connection)
+    _task_journal.ensure_schema(connection)
+    _human_handoff.ensure_schema(connection)
 
 
 def append_agent_event(
@@ -637,6 +645,27 @@ def finalize_application_attempt(
     return finalized
 
 
+def record_application_attempt_performance(
+    attempt_id: str | None,
+    performance: object,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Persist final bounded timing evidence after the submit lane is released."""
+    if not attempt_id:
+        return False
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    recorded = _application_ledger.record_attempt_performance(
+        connection,
+        attempt_id,
+        performance,
+    )
+    if owns_transaction:
+        connection.commit()
+    return recorded
+
+
 def recover_stale_application_attempts(
     conn: sqlite3.Connection | None = None,
     *,
@@ -722,6 +751,7 @@ def claim_submission_gate(
     max_submissions: int,
     attempt_id: str,
     *,
+    success_target: int | None = None,
     hourly_maximum: int = 15,
     minimum_gap_seconds: float = 20,
     audit_fingerprint: str | None = None,
@@ -735,6 +765,7 @@ def claim_submission_gate(
         job_url,
         max_submissions,
         attempt_id,
+        success_target=success_target,
         hourly_maximum=hourly_maximum,
         minimum_gap_seconds=minimum_gap_seconds,
         audit_fingerprint=audit_fingerprint,
@@ -754,6 +785,45 @@ def update_submission_gate_state(
         attempt_id,
         state,
         evidence,
+    )
+
+
+def has_admitted_submission_receipt(
+    batch_id: str,
+    job_url: str,
+    attempt_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Verify a durable receipt for one exact batch/job/attempt claim."""
+    return _application_ledger.has_admitted_submission_receipt(
+        conn or get_connection(),
+        batch_id,
+        job_url,
+        attempt_id,
+    )
+
+
+def bind_admitted_receipt_to_gate(
+    receipt_source: str,
+    receipt_id: str,
+    gate_id: str,
+    batch_id: str,
+    job_url: str,
+    attempt_id: str,
+    *,
+    bound_at: datetime | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Bind an admitted receipt to one exact gate; legacy receipts stay unbound."""
+    return _application_ledger.bind_admitted_receipt_to_gate(
+        conn or get_connection(),
+        receipt_source,
+        receipt_id,
+        gate_id,
+        batch_id,
+        job_url,
+        attempt_id,
+        bound_at=bound_at,
     )
 
 

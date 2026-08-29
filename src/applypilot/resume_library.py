@@ -723,6 +723,65 @@ def _record_validation(
     return validation_id
 
 
+def record_content_revalidation(
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+    status: str,
+    job: Mapping[str, object],
+    evidence: Mapping[str, object] | None = None,
+) -> bool:
+    """Synchronize a job-specific verdict to the matching shared artifact.
+
+    A failed verdict revokes reuse for identical normalized text bytes. A
+    successful verdict may restore reuse only while the content-addressed
+    artifact's own PDF binding is still current.
+    """
+    ensure_resume_library_schema(conn)
+    artifact_row = conn.execute(
+        "SELECT * FROM resume_artifacts WHERE content_sha256=?",
+        (_content_digest(text),),
+    ).fetchone()
+    if artifact_row is None:
+        return False
+
+    artifact = dict(artifact_row)
+    now = _now()
+    effective_status = status
+    active = 0
+    if status == "machine_validated" and _artifact_is_current(artifact):
+        active = 1
+    elif status == "machine_validated":
+        effective_status = "failed_artifact_binding"
+
+    conn.execute(
+        "UPDATE resume_artifacts SET validation_status=?, active=?, "
+        "validated_at=CASE WHEN ?=1 THEN ? ELSE validated_at END, updated_at=? "
+        "WHERE artifact_id=?",
+        (
+            effective_status,
+            active,
+            active,
+            now,
+            now,
+            artifact["artifact_id"],
+        ),
+    )
+    job_url = str(job.get("url") or "").strip()
+    _record_validation(
+        conn,
+        artifact_id=str(artifact["artifact_id"]),
+        validation_kind="job_specific_revalidation",
+        status=effective_status,
+        job_profile={
+            "job_url": job_url,
+            "job_fingerprint": compute_job_fingerprint(dict(job)),
+        },
+        evidence={"requested_status": status, **dict(evidence or {})},
+    )
+    return active == 1
+
+
 def _add_coverage_cell(
     conn: sqlite3.Connection,
     artifact_id: str,

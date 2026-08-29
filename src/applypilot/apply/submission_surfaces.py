@@ -15,6 +15,7 @@ from applypilot.apply.ats import detect_ats_site
 
 SURFACES = frozenset(
     {
+        "linkedin_apply_entry",
         "linkedin_native_easy_apply",
         "linkedin_to_official_ats",
         "official_company_careers",
@@ -35,7 +36,8 @@ LEGACY_SURFACE_ALIASES = {
     "official_ats": "official_ats",
     "direct_email": "official_direct_email",
     "official_direct_email": "official_direct_email",
-    "linkedin": "linkedin_native_easy_apply",
+    "linkedin": "linkedin_apply_entry",
+    "linkedin_apply_entry": "linkedin_apply_entry",
     "linkedin_easy_apply": "linkedin_native_easy_apply",
     "linkedin_to_ats": "linkedin_to_official_ats",
     "linkedin_to_official_ats": "linkedin_to_official_ats",
@@ -50,6 +52,7 @@ LEGACY_SURFACE_ALIASES = {
 # unknown surfaces remain governed by their dedicated gates.
 DEFAULT_ALLOWED_SURFACES = frozenset(
     {
+        "linkedin_apply_entry",
         "linkedin_native_easy_apply",
         "linkedin_to_official_ats",
         "official_company_careers",
@@ -79,7 +82,26 @@ def _configured_host(value: object) -> str:
 
 def _is_linkedin_source(job: Mapping[str, object]) -> bool:
     source = " ".join(_text(job.get(key)) for key in ("source_site", "site"))
-    return "linkedin" in source
+    if "linkedin" in source:
+        return True
+    return any(
+        (host == "linkedin.com" or host.endswith(".linkedin.com"))
+        for host in (_host(job.get("url")), _host(job.get("application_url")))
+        if host
+    )
+
+
+def _linkedin_native_is_explicit(job: Mapping[str, object]) -> bool:
+    if job.get("linkedin_easy_apply") is True:
+        return True
+    method = _text(job.get("apply_method") or job.get("linkedin_apply_method"))
+    if method in {"easy_apply", "linkedin_easy_apply", "native"}:
+        return True
+    observation = job.get("_browser_observation")
+    return bool(
+        isinstance(observation, Mapping)
+        and observation.get("linkedin_native_application_observed") is True
+    )
 
 
 def _email_route(job: Mapping[str, object]) -> bool:
@@ -133,7 +155,11 @@ def classify_submission_surface(job: Mapping[str, object]) -> str:
     source_is_linkedin = _is_linkedin_source(job)
     if source_is_linkedin:
         if target_host == "linkedin.com" or target_host.endswith(".linkedin.com"):
-            return "linkedin_native_easy_apply"
+            return (
+                "linkedin_native_easy_apply"
+                if _linkedin_native_is_explicit(job)
+                else "linkedin_apply_entry"
+            )
         if ats != "generic" or portal_surface == "restricted_portal_authorized_handoff":
             return "linkedin_to_official_ats"
         # Keep the source/target distinction even when the target host is a

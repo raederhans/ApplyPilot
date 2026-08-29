@@ -118,6 +118,20 @@ def classify_failure(result: str) -> FailureDescriptor:
             "route_to_authorized_visual_control_before_submit",
             missing_capability="visual_control",
         )
+    if "browser_interaction_unavailable" in reason:
+        return FailureDescriptor(
+            "browser_interaction_unavailable",
+            "requires_capability",
+            "inspect_page_state_or_route_to_authorized_app_browser",
+            missing_capability="site_specific_browser_interaction_or_app_handoff",
+        )
+    if "browser_mcp_unavailable" in reason:
+        return FailureDescriptor(
+            "browser_mcp_unavailable",
+            "requires_capability",
+            "repair_or_attach_playwright_mcp_before_retry",
+            missing_capability="playwright_mcp",
+        )
     if any(token in reason for token in ("site_blocked", "cloudflare", "cloak_backend")):
         return FailureDescriptor(
             "browser_runtime_blocked",

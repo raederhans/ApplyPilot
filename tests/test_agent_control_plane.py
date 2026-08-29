@@ -223,7 +223,13 @@ def test_init_db_wires_control_schema_without_changing_jobs(tmp_path) -> None:
         )
     }
 
-    assert tables == {"agent_events", "agent_checkpoints", "agent_human_requests"}
+    assert tables == {
+        "agent_events",
+        "agent_checkpoints",
+        "agent_human_requests",
+        "agent_human_responses",
+        "agent_tasks",
+    }
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 

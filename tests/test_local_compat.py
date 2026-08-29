@@ -1015,6 +1015,16 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "read-only mailbox tools" in steps
     assert "within the last 10 minutes" in steps
     assert "credential_relay_required" in steps
+    assert "actively make one bounded ordinary authentication attempt" in steps
+    assert "click the ordinary Sign in, Log in, or Continue control" in steps
+    assert "reuse an already authenticated browser session" in steps
+    assert "already signed-in Google account" in steps
+    assert "already signed-in Google or LinkedIn account" not in steps
+    assert "Do not use LinkedIn as a third-party ATS OAuth provider" in steps
+    assert "Do not return RESULT:LOGIN_ISSUE merely because a login page appears" in steps
+    assert "credential relay for an ordinary sign-in" in steps
+    assert "Only after that one bounded attempt fails" in steps
+    assert "account recovery, unavailable authorized credentials, or broader OAuth scopes" in steps
 
     claude_steps = prompt._build_login_steps(
         _application_profile(),
@@ -1025,6 +1035,104 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "never repeat the code" in claude_steps
     assert "within the last 10 minutes" in claude_steps
     assert "password reset" in claude_steps
+
+
+def test_linkedin_ordinary_login_policy_defers_apply_to_launcher() -> None:
+    steps = prompt._build_login_steps(
+        _application_profile(),
+        application_url="https://www.linkedin.com/jobs/view/4455274411/",
+    )
+
+    assert "current host is linkedin.com" in steps
+    assert "Continue with Google" in steps
+    assert "launcher exclusively owns" in steps
+    assert "Do not click that control in an ordinary Agent turn" in steps
+    assert "unexpected login dialog requires RESULT:LOGIN_ISSUE" in steps
+    assert "MFA, account recovery" in steps
+
+
+def test_linkedin_login_only_prompt_forbids_agent_apply_and_navigation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", _application_profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    job = {
+        "url": "https://www.linkedin.com/jobs/view/4455274411/",
+        "application_url": "https://www.linkedin.com/jobs/view/4455274411/",
+        "title": "Data Analyst Intern",
+        "company_name": "Example",
+        "source_site": "linkedin",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+        "_linkedin_login_only": True,
+        "_linkedin_login_entry_stage": "pre_entry_authwall",
+    }
+
+    built = prompt.build_prompt(job, "Verified resume", dry_run=False)
+
+    assert "through Google 继续" not in built
+    assert "通过 Google 继续" in built
+    assert "before any Apply control was clicked" in built
+    assert "ordinary Sign in or 登录" in built
+    assert "Do not click Join now" in built
+    assert "Do not click Apply, Easy Apply, 申请, 轻松申请" in built
+    assert "Do not call browser_navigate" in built
+    assert "launcher owns the second causal Apply click" in built
+    assert "RESULT:LINKEDIN_LOGIN_COMPLETED" in built
+    assert "Upload the bound Resume PDF" not in built
+
+    job["_linkedin_login_entry_stage"] = "pre_entry_login_dialog"
+    dialog_prompt = prompt.build_prompt(job, "Verified resume", dry_run=False)
+    assert "presented a login dialog before any Apply control was clicked" in dialog_prompt
+    assert "already clicked the exact current job's primary Apply control" not in dialog_prompt
+
+
+def test_ats_account_creation_does_not_authorize_google_or_linkedin_sso() -> None:
+    profile = _application_profile()
+    profile["authentication"]["google_sso_existing_session_authorized"] = False
+
+    steps = prompt._build_login_steps(
+        profile,
+        application_url="https://careers.example.com/jobs/123",
+    )
+
+    assert "Google SSO reuse is not authorized" in steps
+    assert "credential relay for an ordinary sign-in or account creation" in steps
+    assert "Do not use LinkedIn as a third-party ATS OAuth provider" in steps
+
+
+def test_authorized_login_result_code_requires_a_bounded_attempt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    job = {
+        "url": "https://example.com/job",
+        "title": "Data Analyst Intern",
+        "company_name": "Example",
+        "source_site": "lever",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_path": None,
+        "cover_letter_status": "not_required",
+    }
+
+    built = prompt.build_prompt(job, "Verified resume", dry_run=False)
+
+    assert (
+        "RESULT:LOGIN_ISSUE -- one bounded authorized sign-in/account attempt failed, "
+        "or MFA, recovery, unavailable authorized credentials, or abnormal OAuth scope blocked it"
+        in built
+    )
 
 
 def test_login_policy_stops_when_google_reuse_is_not_authorized() -> None:
@@ -2123,7 +2231,8 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
     monkeypatch.setenv("CAPSOLVER_API_KEY", "must-not-appear")
     job = {
-        "url": "https://example.com/job",
+        "url": "https://www.linkedin.com/jobs/view/123456",
+        "application_url": "https://www.linkedin.com/jobs/view/123456",
         "title": "AI Automation Intern",
         "full_description": "Build LLM automation workflows.",
         "company_name": "Example Semiconductor",
@@ -2168,6 +2277,10 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "A filename or remove/replace control under Cover letter" in built
     assert "FAILURE_CONTEXT" in built
     assert "LinkedIn/SmartRecruiters city autocomplete" in built
+    assert "launcher exclusively owns" in built
+    assert "linkedin_launcher_entry_required" in built
+    assert "current host is linkedin.com" not in built
+    assert "launcher already performed the only authorized" in built
     assert "SmartRecruiters dual upload controls" not in built
     assert "Greenhouse/React Select location controls" not in built
     assert "manual_review_required:location_validation" not in built
@@ -2189,6 +2302,21 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     worker_attachment = tmp_path / "workers" / "worker-3" / "attachments" / "Taylor_Chen_Resume.pdf"
     assert worker_attachment.exists()
     assert not (tmp_path / "workers" / "current").exists()
+
+    rebound_job = {
+        **job,
+        "application_url": "https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/role",
+        "_ats_adapter_context": {"adapter": "workday"},
+    }
+    rebound = prompt.build_prompt(
+        rebound_job,
+        "Verified resume",
+        dry_run=True,
+        worker_id=4,
+    )
+    assert "do not fill a field, sign in, upload a file" not in rebound
+    assert "current host is linkedin.com" not in rebound
+    assert "linkedin_launcher_entry_required" not in rebound
 
 
 def test_apply_prompt_scopes_one_time_validation_repair() -> None:
@@ -3212,6 +3340,31 @@ def test_exact_submission_acquisition_accepts_verified_no_cover(
 
     assert acquired is not None
     assert acquired["cover_letter_status"] == "not_required"
+    acquisition = acquired["_acquisition_performance"]
+    assert acquisition["version"] == 1
+    assert acquisition["candidate_rows"] == 1
+    assert acquisition["admission_rows_scanned"] == 1
+    assert all(
+        acquisition[key] >= 0
+        for key in (
+            "stale_recovery_ms",
+            "eligibility_refresh_ms",
+            "transaction_wait_ms",
+            "candidate_fetch_ms",
+            "admission_scan_ms",
+            "total_ms",
+        )
+    )
+    empty_acquisition: dict[str, object] = {}
+    assert launcher.acquire_job(
+        target_url="https://example.com/missing",
+        preview_only=False,
+        performance_sink=empty_acquisition,
+    ) is None
+    assert empty_acquisition["outcome"] == "empty"
+    assert empty_acquisition["candidate_rows"] == 0
+    assert empty_acquisition["admission_rows_scanned"] == 0
+    assert empty_acquisition["total_ms"] >= 0
 
 
 def test_submission_uncertain_requires_manual_review_and_is_not_reacquired(

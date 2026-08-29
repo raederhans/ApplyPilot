@@ -487,6 +487,83 @@ def test_exact_unchanged_job_keeps_its_machine_validated_artifact(
     assert pdf_path.read_bytes() == pdf_before
 
 
+def test_failed_job_revalidation_deactivates_same_content_library_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.scoring import pdf as pdf_renderer
+    from applypilot.scoring import tailor as tailor_module
+    from applypilot.scoring import validator as validator_module
+
+    database_path = tmp_path / "library.db"
+    conn = init_db(database_path)
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    history_url = _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    monkeypatch.setattr(single_job, "get_connection", lambda: conn)
+    monkeypatch.setattr(single_job, "load_profile", lambda: profile)
+    monkeypatch.setattr(
+        validator_module,
+        "validate_tailored_resume",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        tailor_module,
+        "judge_tailored_resume",
+        lambda *args, **kwargs: {"passed": False, "issues": ["job mismatch"]},
+    )
+
+    revalidation = single_job.revalidate_tailored_resume_for_url(history_url)
+
+    assert revalidation["status"] == "failed_judge"
+    conn = init_db(database_path)
+    artifact = conn.execute(
+        "SELECT active, validation_status FROM resume_artifacts WHERE kind='tailored'"
+    ).fetchone()
+    assert tuple(artifact) == (0, "failed_judge")
+
+    new_job = {
+        "url": "https://careers.example.test/new-data-after-failure",
+        "title": "Data Analyst",
+        "full_description": (
+            "Required: SQL. Build dashboards and reporting for business decisions."
+        ),
+        "eligibility_status": "eligible",
+    }
+    route = route_resume_for_job(conn, new_job, profile)
+
+    assert route["decision"] == "create_variant"
+    assert route["candidates"] == []
+
+    restore_conn = init_db(database_path)
+    monkeypatch.setattr(single_job, "get_connection", lambda: restore_conn)
+    monkeypatch.setattr(
+        tailor_module,
+        "judge_tailored_resume",
+        lambda *args, **kwargs: {"passed": True, "issues": []},
+    )
+
+    def render_to_requested_path(path, output_path=None):
+        output = Path(output_path)
+        output.write_bytes(b"%PDF-restored-job-binding")
+        return output
+
+    monkeypatch.setattr(pdf_renderer, "convert_to_pdf", render_to_requested_path)
+
+    restored = single_job.revalidate_tailored_resume_for_url(history_url)
+
+    assert restored["status"] == "machine_validated"
+    verify = init_db(database_path)
+    artifact = verify.execute(
+        "SELECT active, validation_status FROM resume_artifacts WHERE kind='tailored'"
+    ).fetchone()
+    assert tuple(artifact) == (1, "machine_validated")
+    restored_route = route_resume_for_job(verify, new_job, profile)
+    assert restored_route["decision"] == "reuse_exact"
+
+
 def test_new_subtype_creates_variant_and_unsupported_hard_skill_needs_review(
     tmp_path: Path,
 ) -> None:

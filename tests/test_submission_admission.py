@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from applypilot.apply.submission_admission import (
     evaluate_submission_admission,
@@ -55,10 +56,37 @@ def test_surface_classifier_keeps_linkedin_source_separate_from_target_surface()
             url="https://www.linkedin.com/jobs/view/1001",
             application_url="https://www.linkedin.com/jobs/view/1001",
         )
-    ) == "linkedin_native_easy_apply"
+    ) == "linkedin_apply_entry"
     assert classify_submission_surface(
         _job(source_site="linkedin", site="linkedin")
     ) == "linkedin_to_official_ats"
+
+
+def test_linkedin_url_is_authoritative_when_source_metadata_is_missing() -> None:
+    assert classify_submission_surface(
+        _job(
+            source_site="",
+            site="",
+            url="https://www.linkedin.com/jobs/view/1001",
+            application_url="https://www.linkedin.com/jobs/view/1001",
+        )
+    ) == "linkedin_apply_entry"
+
+    result = evaluate_submission_admission(
+        _job(
+            source_site="",
+            site="",
+            url="https://www.linkedin.com/jobs/view/1001",
+            application_url="https://www.linkedin.com/jobs/view/1001",
+            linkedin_easy_apply=True,
+        ),
+        _profile(allowed_submission_surfaces=["official_company_careers"]),
+        minimum_fit_score=6,
+    )
+    assert result["admitted"] is False
+    assert result["reason"] == (
+        "submission_surface_not_allowed:linkedin_native_easy_apply"
+    )
 
 
 def test_surface_classifier_covers_official_and_direct_email_routes() -> None:
@@ -101,7 +129,8 @@ def test_missing_surface_policy_preserves_normal_channels() -> None:
     )
     result = evaluate_submission_admission(job, {}, minimum_fit_score=6)
     assert result["admitted"] is True
-    assert result["surface"] == "linkedin_native_easy_apply"
+    assert result["surface"] == "linkedin_apply_entry"
+    assert result["reason"] == "requires_runtime_linkedin_apply_route_resolution"
 
 
 def test_explicit_surface_policy_and_email_authorization_are_enforced() -> None:
@@ -115,7 +144,7 @@ def test_explicit_surface_policy_and_email_authorization_are_enforced() -> None:
         linkedin, _profile(), minimum_fit_score=6
     )
     assert blocked["admitted"] is False
-    assert blocked["reason"] == "submission_surface_not_allowed:linkedin_native_easy_apply"
+    assert blocked["reason"] == "submission_surface_not_allowed:linkedin_apply_entry"
 
     email = _job(email_application={"route": "direct_email"})
     email_blocked = evaluate_submission_admission(
@@ -219,6 +248,7 @@ def test_linkedin_native_admission_requires_runtime_verification() -> None:
         site="linkedin",
         url="https://www.linkedin.com/jobs/view/1001",
         application_url="https://www.linkedin.com/jobs/view/1001",
+        linkedin_easy_apply=True,
     )
     result = evaluate_submission_admission(native, {}, minimum_fit_score=6)
     assert result["admitted"] is True
@@ -259,6 +289,53 @@ def test_ready_count_uses_attempt_and_retry_admission_gates(tmp_path: Path) -> N
         profile=_profile(),
         minimum_fit_score=6,
     ) == 1
+
+
+def test_status_distinguishes_raw_prepared_from_canonical_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from applypilot import cli, config, database
+    from applypilot.services import application
+
+    stats = {
+        "total": 8,
+        "excluded_ineligible": 0,
+        "with_description": 8,
+        "pending_detail": 0,
+        "detail_errors": 0,
+        "scored": 8,
+        "unscored": 0,
+        "tailored": 8,
+        "untailored_eligible": 0,
+        "with_cover_letter": 0,
+        "ready_to_apply": 8,
+        "applied": 0,
+        "apply_errors": 0,
+        "score_distribution": [],
+        "by_site": [],
+    }
+    connection = object()
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setattr(database, "get_stats", lambda: stats)
+    monkeypatch.setattr(database, "get_connection", lambda: connection)
+    monkeypatch.setattr(config, "load_profile", lambda: {"submission_policy": {}})
+
+    def _count(conn, *, dry_run, profile):
+        assert conn is connection
+        assert dry_run is False
+        assert profile == {"submission_policy": {}}
+        return 1
+
+    monkeypatch.setattr(application, "count_submission_ready_jobs", _count)
+
+    result = CliRunner().invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0
+    assert "Prepared candidates (raw)" in result.output
+    assert "8" in result.output
+    assert "Admission-ready (pre-manifest)" in result.output
+    assert "1" in result.output
+    assert "exact authorization manifest" in result.output
 
 
 def test_worker_summary_counts_manifest_bound_and_executable_jobs(tmp_path: Path) -> None:

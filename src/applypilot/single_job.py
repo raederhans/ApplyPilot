@@ -423,6 +423,7 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
     final_pdf: Path | None = None
     temporary_pdf: Path | None = None
     previous_pdf: Path | None = None
+    tailored_text: str | None = None
     shared_artifact = False
     token = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     try:
@@ -503,15 +504,16 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
 
         if not tailored_path.is_file():
             raise FileNotFoundError(f"Tailored resume text not found: {tailored_path}")
+        tailored_text = tailored_path.read_text(encoding="utf-8")
         if not source_path.is_file():
             raise FileNotFoundError(f"Tailoring source resume not found: {source_path}")
 
+        from applypilot.resume_library import record_content_revalidation
         from applypilot.scoring.pdf import convert_to_pdf
         from applypilot.scoring.tailor import judge_tailored_resume
         from applypilot.scoring.validator import validate_tailored_resume
 
         profile = load_profile()
-        tailored_text = tailored_path.read_text(encoding="utf-8")
         source_text = read_resume_source(source_path)
         deterministic = validate_tailored_resume(
             tailored_text,
@@ -575,6 +577,13 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
             "revalidated_at": datetime.now(UTC).isoformat(),
         }
         _write_json_atomic(report_path, report, token)
+        record_content_revalidation(
+            conn,
+            text=tailored_text,
+            status=status,
+            job=job,
+            evidence={"report_path": str(report_path), "error": error},
+        )
         now = datetime.now(UTC).isoformat()
         conn.execute(
             "UPDATE jobs SET tailor_status=?, tailor_error=?, tailor_report_path=?, "
@@ -612,6 +621,16 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
                 pass
         if job is not None:
             try:
+                if tailored_text is not None:
+                    from applypilot.resume_library import record_content_revalidation
+
+                    record_content_revalidation(
+                        conn,
+                        text=tailored_text,
+                        status="failed_revalidation",
+                        job=job,
+                        evidence={"error": error},
+                    )
                 conn.execute(
                     "UPDATE jobs SET tailor_status='failed_revalidation', "
                     "tailor_error=?, tailor_report_path=NULL, tailored_at=NULL "

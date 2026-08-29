@@ -123,7 +123,8 @@ def validate_submission_evidence(output: str) -> dict | None:
 
 _RESULT_LINE = re.compile(
     r"^RESULT:(READY_TO_SUBMIT|PREVIEWED|APPLIED|SUBMISSION_UNCERTAIN|"
-    r"COVER_NOT_REQUIRED|COVER_LETTER_REQUIRED|EXPIRED|CAPTCHA|LOGIN_ISSUE|FAILED)(?::([^\r\n]+))?$"
+    r"COVER_NOT_REQUIRED|COVER_LETTER_REQUIRED|LINKEDIN_LOGIN_COMPLETED|"
+    r"EXPIRED|CAPTCHA|LOGIN_ISSUE|FAILED)(?::([^\r\n]+))?$"
 )
 
 
@@ -165,6 +166,11 @@ def interpret_agent_output(
     marker, reason = parsed
     blockers = {"EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "FAILED"}
     if dry_run:
+        if (
+            marker == "LINKEDIN_LOGIN_COMPLETED"
+            and submission_phase == "prepare"
+        ):
+            return "linkedin_login_completed", None
         if marker == "PREVIEWED":
             audit_error = validate_preview_audit(output)
             return (
@@ -179,6 +185,8 @@ def interpret_agent_output(
         return "failed:invalid_preview_result", None
 
     if submission_phase == "prepare":
+        if marker == "LINKEDIN_LOGIN_COMPLETED":
+            return "linkedin_login_completed", None
         if marker in {"READY_TO_SUBMIT", "PREVIEWED"}:
             return "ready_to_submit", None
         if marker == "COVER_NOT_REQUIRED":
@@ -227,6 +235,7 @@ def interpret_agent_turn_result(
     if status == "previewed" and not dry_run and submission_phase == "prepare":
         status = "ready_to_submit"
     marker_by_status = {
+        "linkedin_login_completed": "LINKEDIN_LOGIN_COMPLETED",
         "ready_to_submit": "READY_TO_SUBMIT",
         "previewed": "PREVIEWED",
         "applied": "APPLIED",

@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from applypilot.storage import application_ledger
@@ -40,7 +41,8 @@ def record_submission_observation(
         "page_url": str(observation.get("page_url", "")).strip()[:1000],
         "note": str(observation.get("note", "")).strip()[:500],
     }
-    now = datetime.now(UTC).isoformat()
+    now_value = datetime.now(UTC)
+    now = now_value.isoformat()
     observed_status = row["apply_status"]
     decisive_receipt = cleaned["receipt_visible"] and (
         cleaned["receipt_structured"]
@@ -94,6 +96,8 @@ def admit_direct_email_sent_receipt(
     conn: sqlite3.Connection,
     job_url: str,
     evidence: dict,
+    *,
+    gate_binding: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Uniquely bind one provider Sent message to one exact application."""
     job_url = str(job_url or "").strip()
@@ -145,6 +149,7 @@ def admit_direct_email_sent_receipt(
             "WHERE receipt_source='direct_email_sent' AND receipt_id=?",
             (provider_message_id,),
         ).fetchone()
+        now = datetime.now(UTC)
         if existing is not None:
             existing_url = existing["job_url"] if isinstance(existing, sqlite3.Row) else existing[0]
             existing_digest = (
@@ -158,19 +163,50 @@ def admit_direct_email_sent_receipt(
                     "reason": "receipt_replay_conflict",
                     "job_url": job_url,
                 }
-            if owns_transaction:
-                conn.commit()
-            return {"status": "already_admitted", "job_url": job_url}
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO application_receipts "
-            "(receipt_source, receipt_id, job_url, observed_at, admitted_at, receipt_digest) "
-            "VALUES ('direct_email_sent', ?, ?, ?, ?, ?)",
-            (provider_message_id, job_url, now, now, digest),
-        )
+        inserted = existing is None
+        if inserted:
+            now_text = now.isoformat()
+            conn.execute(
+                "INSERT INTO application_receipts "
+                "(receipt_source, receipt_id, job_url, observed_at, admitted_at, "
+                "receipt_digest) VALUES ('direct_email_sent', ?, ?, ?, ?, ?)",
+                (provider_message_id, job_url, now_text, now_text, digest),
+            )
+        gate_bound = False
+        if gate_binding is not None:
+            gate_bound = application_ledger.bind_admitted_receipt_to_gate(
+                conn,
+                "direct_email_sent",
+                provider_message_id,
+                str(gate_binding.get("gate_id") or ""),
+                str(gate_binding.get("batch_id") or ""),
+                job_url,
+                str(gate_binding.get("attempt_id") or ""),
+                bound_at=now,
+            )
+            if not gate_bound:
+                if inserted:
+                    conn.execute(
+                        "DELETE FROM application_receipts "
+                        "WHERE receipt_source='direct_email_sent' AND receipt_id=?",
+                        (provider_message_id,),
+                    )
+                if owns_transaction:
+                    conn.rollback()
+                return {
+                    "status": "rejected",
+                    "reason": "submission_gate_binding_invalid",
+                    "job_url": job_url,
+                }
         if owns_transaction:
             conn.commit()
-        return {"status": "admitted", "job_url": job_url}
+        result: dict[str, object] = {
+            "status": "already_admitted" if existing is not None else "admitted",
+            "job_url": job_url,
+        }
+        if gate_binding is not None:
+            result["gate_bound"] = gate_bound
+        return result
     except Exception:
         if owns_transaction:
             conn.rollback()
@@ -294,19 +330,35 @@ def reconcile_submission_receipt(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    now = datetime.now(UTC).isoformat()
+    now_value = datetime.now(UTC)
+    now = now_value.isoformat()
     application_ledger.ensure_schema(conn)
     owns_transaction = not conn.in_transaction
     if owns_transaction:
         conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute("SAVEPOINT reconcile_submission_receipt")
+
+    def rollback_reconciliation() -> None:
+        if owns_transaction:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO SAVEPOINT reconcile_submission_receipt")
+            conn.execute("RELEASE SAVEPOINT reconcile_submission_receipt")
+
+    def commit_reconciliation() -> None:
+        if owns_transaction:
+            conn.commit()
+        else:
+            conn.execute("RELEASE SAVEPOINT reconcile_submission_receipt")
+
     try:
         locked_row = conn.execute(
             "SELECT apply_status FROM jobs WHERE url=?",
             (job_url,),
         ).fetchone()
         if locked_row is None:
-            if owns_transaction:
-                conn.rollback()
+            rollback_reconciliation()
             return {"status": "not_found", "job_url": job_url}
 
         existing = conn.execute(
@@ -317,14 +369,14 @@ def reconcile_submission_receipt(
         if existing is not None and (
             existing["job_url"] != job_url or existing["receipt_digest"] != receipt_digest
         ):
-            if owns_transaction:
-                conn.rollback()
+            rollback_reconciliation()
             return {
                 "status": "rejected",
                 "reason": "receipt_replay_conflict",
                 "job_url": job_url,
             }
-        if existing is None:
+        inserted = existing is None
+        if inserted:
             conn.execute(
                 "INSERT INTO application_receipts "
                 "(receipt_source, receipt_id, job_url, observed_at, admitted_at, receipt_digest) "
@@ -339,12 +391,59 @@ def reconcile_submission_receipt(
                 ),
             )
 
+        gate_identity = {
+            "gate_id": str(evidence.get("gate_id") or "").strip(),
+            "batch_id": str(evidence.get("batch_id") or "").strip(),
+            "attempt_id": str(evidence.get("attempt_id") or "").strip(),
+        }
+        binding_requested = any(gate_identity.values())
+        if binding_requested:
+            gate_bound = application_ledger.bind_admitted_receipt_to_gate(
+                conn,
+                source,
+                receipt_id,
+                gate_identity["gate_id"],
+                gate_identity["batch_id"],
+                job_url,
+                gate_identity["attempt_id"],
+                bound_at=now_value,
+            )
+            if not gate_bound:
+                rollback_reconciliation()
+                return {
+                    "status": "rejected",
+                    "reason": "submission_gate_binding_invalid",
+                    "job_url": job_url,
+                }
+            gate_closed = application_ledger.mark_bound_submission_receipt_applied(
+                conn,
+                source,
+                receipt_id,
+                gate_identity["gate_id"],
+                gate_identity["batch_id"],
+                job_url,
+                gate_identity["attempt_id"],
+            )
+            if not gate_closed:
+                rollback_reconciliation()
+                return {
+                    "status": "rejected",
+                    "reason": "submission_gate_transition_invalid",
+                    "job_url": job_url,
+                }
+
         locked_status = locked_row["apply_status"]
         if locked_status == "applied":
             if existing is not None:
-                if owns_transaction:
-                    conn.commit()
-                return {"status": "applied", "job_url": job_url, "changed": False}
+                commit_reconciliation()
+                result: dict[str, object] = {
+                    "status": "applied",
+                    "job_url": job_url,
+                    "changed": False,
+                }
+                if binding_requested:
+                    result["gate_bound"] = True
+                return result
             cursor = conn.execute(
                 """
                 UPDATE jobs SET verification_confidence = 'durable_receipt_reconciled',
@@ -384,8 +483,7 @@ def reconcile_submission_receipt(
                 ),
             )
         if cursor.rowcount != 1:
-            if owns_transaction:
-                conn.rollback()
+            rollback_reconciliation()
             return {
                 "status": "ignored",
                 "reason": "job_state_changed_during_reconciliation",
@@ -396,23 +494,23 @@ def reconcile_submission_receipt(
             job_url,
             categories=("duplicate_submission_risk",),
         )
-        if owns_transaction:
-            conn.commit()
-        return {
+        commit_reconciliation()
+        result = {
             "status": "applied",
             "job_url": job_url,
             "changed": True,
             "source": source,
         }
+        if binding_requested:
+            result["gate_bound"] = True
+        return result
     except sqlite3.IntegrityError:
-        if owns_transaction:
-            conn.rollback()
+        rollback_reconciliation()
         return {
             "status": "rejected",
             "reason": "receipt_replay_conflict",
             "job_url": job_url,
         }
     except Exception:
-        if owns_transaction:
-            conn.rollback()
+        rollback_reconciliation()
         raise

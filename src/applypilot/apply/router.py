@@ -26,6 +26,7 @@ EXPLICIT_BROWSER_BLOCK_PREFIXES: tuple[str, ...] = (
 
 COMPUTER_USE_HANDOFF_REASONS: tuple[str, ...] = (
     "browser_mcp_unavailable",
+    "browser_interaction_unavailable",
     "computer_use_handoff_required",
     "native_dialog_required",
     "visual_only_control",

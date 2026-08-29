@@ -14,7 +14,7 @@ import os
 import re
 import shlex
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -166,6 +166,31 @@ def resolve_mailbox_mcp_spec(
         tool_timeout_seconds=int(values.get("tool_timeout_seconds") or 60),
         enabled=enabled,
         source=source,
+    )
+
+
+def mailbox_mcp_for_phase(
+    spec: MailboxMcpSpec,
+    *,
+    submission_phase: str,
+    direct_email_send_authorized: bool = False,
+    verification_resume: bool = False,
+) -> MailboxMcpSpec:
+    """Disable mailbox startup for ordinary browser-submit turns.
+
+    Prepare turns may need receipt or verification discovery. Submit turns only
+    retain the server for an exact direct-email reservation or an observed
+    verification-resume flow.
+    """
+    enabled = spec.enabled and (
+        submission_phase.casefold() != "submit"
+        or direct_email_send_authorized
+        or verification_resume
+    )
+    return (
+        spec
+        if enabled == spec.enabled
+        else replace(spec, enabled=enabled, source="phase-scoped")
     )
 
 

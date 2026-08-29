@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from applypilot import config
@@ -95,11 +96,32 @@ def test_portal_policy_allows_bound_external_ats_but_keeps_portal_boundaries(
     acquired_external = launcher.acquire_job(target_url=jobstreet_url, preview_only=True)
     assert acquired_external is not None
     assert acquired_external["application_url"] == "https://careers.example.com/apply/123"
+    attempt_id = acquired_external["_attempt_id"]
+    acquired_external["_preview_attempt_evidence"] = {
+        "version": 1,
+        "stage": "linkedin_entry",
+        "reason_code": "linkedin_apply_click:exact_job_page_count:0",
+        "submit_started": False,
+    }
     launcher.restore_preview_state(acquired_external)
+    attempt = conn.execute(
+        "SELECT status, evidence_json FROM application_attempts WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    assert attempt["status"] == "previewed"
+    assert json.loads(attempt["evidence_json"])["reason_code"] == (
+        "linkedin_apply_click:exact_job_page_count:0"
+    )
 
     internsg_url = "https://www.internsg.com/job-apply/456/"
     _store_ready_job(conn, url=internsg_url, source_site="InternSG")
-    assert launcher.acquire_job(target_url=internsg_url, preview_only=False) is None
+    blocked_performance: dict[str, object] = {}
+    assert launcher.acquire_job(
+        target_url=internsg_url,
+        preview_only=False,
+        performance_sink=blocked_performance,
+    ) is None
+    assert blocked_performance["outcome"] == "blocked"
     internsg_row = conn.execute(
         "SELECT apply_status, apply_error FROM jobs WHERE url=?", (internsg_url,)
     ).fetchone()

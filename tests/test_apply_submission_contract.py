@@ -18,6 +18,7 @@ from applypilot.database import (
     init_db,
     prune_application_runtime_history,
     reconcile_submission_receipt,
+    record_application_attempt_performance,
     record_unanswered_questions,
     recover_stale_application_attempts,
     reserve_batch_submission,
@@ -870,6 +871,57 @@ def test_attempt_lease_recovery_distinguishes_pre_and_post_submit(tmp_path: Path
     assert finalize_application_attempt(post_id, "applied", conn=conn) is False
 
 
+def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "attempt-performance.db")
+    attempt_id = start_application_attempt("job:performance", "worker-1", conn=conn)
+    assert finalize_application_attempt(
+        attempt_id,
+        "applied",
+        evidence={"receipt": {"confirmed": True}},
+        conn=conn,
+    )
+
+    recorded = record_application_attempt_performance(
+        attempt_id,
+        {
+            "version": 1,
+            "metrics": {
+                "submit_lane_wait_ms": 20,
+                "submit_lane_hold_ms": 220,
+                "unknown": "drop",
+            },
+            "acquisition": {
+                "candidate_rows": 4,
+                "worker_call_ms": 12.5,
+                "raw_url": "drop",
+            },
+        },
+        conn=conn,
+    )
+
+    stored = conn.execute(
+        "SELECT status, evidence_json FROM application_attempts WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    evidence = json.loads(stored["evidence_json"])
+    assert recorded is True
+    assert stored["status"] == "applied"
+    assert evidence["receipt"] == {"confirmed": True}
+    assert evidence["orchestration_performance"] == {
+        "version": 1,
+        "metrics": {
+            "submit_lane_wait_ms": 20.0,
+            "submit_lane_hold_ms": 220.0,
+        },
+        "acquisition": {
+            "candidate_rows": 4.0,
+            "worker_call_ms": 12.5,
+        },
+    }
+
+
 def test_prune_history_is_preview_first_and_preserves_uncertainty(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "prune.db")
     old = (NOW - timedelta(days=200)).isoformat()
@@ -1042,8 +1094,16 @@ def test_final_material_freeze_rejects_staged_resume_byte_drift(tmp_path: Path) 
         authorization.freeze_submission_materials(job, {})
 
 
-def test_default_non_dry_apply_without_url_or_manifest_is_rejected(monkeypatch) -> None:
+def test_default_non_dry_apply_without_url_or_manifest_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps({"submission_policy": {}}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr("applypilot.cli._bootstrap", lambda: None)
+    monkeypatch.setattr("applypilot.config.PROFILE_PATH", profile)
     monkeypatch.setenv("APPLYPILOT_AUTO_SUBMIT", "1")
 
     result = CliRunner().invoke(app, ["apply"])
