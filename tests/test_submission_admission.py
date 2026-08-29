@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from applypilot.apply.submission_admission import (
     evaluate_submission_admission,
     summarize_worker_allocation,
 )
-from applypilot.apply.submission_surfaces import classify_submission_surface
+from applypilot.apply.submission_surfaces import (
+    classify_submission_surface,
+    normalize_allowed_submission_surfaces,
+)
 from applypilot.database import init_db
+from applypilot.services.application import count_submission_ready_jobs
 
 
 def _job(**overrides: object) -> dict[str, object]:
@@ -130,12 +136,129 @@ def test_explicit_surface_policy_and_email_authorization_are_enforced() -> None:
     assert email_allowed["admitted"] is True
 
 
+def test_malformed_explicit_surface_policy_fails_closed() -> None:
+    profile = _profile(allowed_submission_surfaces={"official_ats": True})
+    assert normalize_allowed_submission_surfaces(profile) == frozenset()
+    result = evaluate_submission_admission(_job(), profile, minimum_fit_score=6)
+    assert result["admitted"] is False
+    assert result["reason"] == "submission_surface_not_allowed:official_ats"
+
+
 def test_admission_rejects_exhausted_attempts() -> None:
     result = evaluate_submission_admission(
         _job(apply_attempts=3), _profile(), minimum_fit_score=6
     )
     assert result["admitted"] is False
     assert result["reason"] == "maximum application attempts reached"
+
+
+def test_admission_uses_profile_attempt_ceiling() -> None:
+    result = evaluate_submission_admission(
+        _job(apply_attempts=1),
+        _profile(maximum_apply_attempts=1),
+        minimum_fit_score=6,
+    )
+    assert result["admitted"] is False
+    assert result["reason"] == "maximum application attempts reached"
+
+
+def test_invalid_profile_attempt_ceiling_fails_closed() -> None:
+    result = evaluate_submission_admission(
+        _job(), _profile(maximum_apply_attempts=0), minimum_fit_score=6
+    )
+    assert result["admitted"] is False
+    assert result["reason"] == (
+        "submission_policy.maximum_apply_attempts must be a positive integer"
+    )
+
+
+def test_unknown_retry_block_is_always_review_blocked() -> None:
+    result = evaluate_submission_admission(
+        _job(apply_retry_blocked=1, apply_retry_reason="future_unknown_reason"),
+        _profile(),
+        minimum_fit_score=6,
+    )
+    assert result["admitted"] is False
+    assert result["reason"] == "apply_retry_blocked_requires_review"
+
+
+def test_linkedin_external_target_requires_verification_or_trust() -> None:
+    generic = _job(
+        source_site="linkedin",
+        site="linkedin",
+        url="https://www.linkedin.com/jobs/view/1001",
+        application_url="https://careers.acme.example/jobs/data",
+    )
+    profile = _profile(
+        allowed_submission_surfaces=["linkedin_to_official_ats"],
+    )
+    blocked = evaluate_submission_admission(generic, profile, minimum_fit_score=6)
+    assert blocked["admitted"] is False
+    assert blocked["reason"] == "unverified_linkedin_external_target"
+
+    greenhouse = dict(generic, application_url="https://boards.greenhouse.io/acme/jobs/1")
+    allowed_ats = evaluate_submission_admission(greenhouse, profile, minimum_fit_score=6)
+    assert allowed_ats["admitted"] is True
+    assert allowed_ats["metadata"]["target_verification"] == "recognized_ats"
+
+    trusted = evaluate_submission_admission(
+        generic,
+        _profile(
+            allowed_submission_surfaces=["linkedin_to_official_ats"],
+            trusted_external_application_hosts=["careers.acme.example"],
+        ),
+        minimum_fit_score=6,
+    )
+    assert trusted["admitted"] is True
+    assert trusted["metadata"]["target_verification"] == "explicitly_trusted_external_host"
+
+
+def test_linkedin_native_admission_requires_runtime_verification() -> None:
+    native = _job(
+        source_site="linkedin",
+        site="linkedin",
+        url="https://www.linkedin.com/jobs/view/1001",
+        application_url="https://www.linkedin.com/jobs/view/1001",
+    )
+    result = evaluate_submission_admission(native, {}, minimum_fit_score=6)
+    assert result["admitted"] is True
+    assert result["reason"] == "requires_runtime_easy_apply_verification"
+    assert result["metadata"]["requires_runtime_easy_apply_verification"] is True
+
+
+def test_ready_count_uses_attempt_and_retry_admission_gates(tmp_path: Path) -> None:
+    connection = init_db(tmp_path / "ready-count.db")
+    base = _job()
+    for job in (
+        base,
+        dict(base, url="https://careers.example.test/jobs/exhausted", apply_attempts=3),
+        dict(
+            base,
+            url="https://careers.example.test/jobs/retry-blocked",
+            apply_retry_blocked=1,
+            apply_retry_reason="future_unknown_reason",
+        ),
+    ):
+        connection.execute(
+            "INSERT INTO jobs (url, application_url, source_site, site, title, company_name, "
+            "full_description, fit_score, eligibility_status, tailored_resume_path, tailor_status, "
+            "cover_letter_status, apply_attempts, apply_retry_blocked, apply_retry_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job["url"], job["application_url"], job["source_site"], job["site"],
+                job["title"], job["company_name"], job["full_description"], job["fit_score"],
+                job["eligibility_status"], job["tailored_resume_path"], job["tailor_status"],
+                job["cover_letter_status"], job["apply_attempts"], job["apply_retry_blocked"],
+                job.get("apply_retry_reason"),
+            ),
+        )
+    connection.commit()
+    assert count_submission_ready_jobs(
+        connection,
+        dry_run=True,
+        profile=_profile(),
+        minimum_fit_score=6,
+    ) == 1
 
 
 def test_worker_summary_counts_manifest_bound_and_executable_jobs(tmp_path: Path) -> None:
@@ -172,3 +295,15 @@ def test_worker_summary_counts_manifest_bound_and_executable_jobs(tmp_path: Path
         "blocked_candidates": 0,
         "effective_workers": 1,
     }
+
+
+def test_worker_summary_requires_manifest(tmp_path: Path) -> None:
+    connection = init_db(tmp_path / "no-manifest.db")
+    with pytest.raises(ValueError, match="authorization manifest"):
+        summarize_worker_allocation(
+            connection,
+            _profile(),
+            None,
+            requested_workers=1,
+            minimum_fit_score=6,
+        )

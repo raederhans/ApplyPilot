@@ -3321,6 +3321,11 @@ def test_exact_url_acquisition_requires_human_approval_and_accepts_null_status(
     )
     conn.commit()
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(
+        config,
+        "load_profile",
+        lambda: {"submission_policy": {"trusted_external_application_hosts": ["example.com"]}},
+    )
 
     acquired = launcher.acquire_job(target_url=url, worker_id=2)
 

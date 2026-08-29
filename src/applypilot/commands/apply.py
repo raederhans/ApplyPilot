@@ -257,6 +257,7 @@ def run_apply(
             get_connection(),
             dry_run=dry_run,
             profile=profile,
+            minimum_fit_score=min_score,
         )
         if ready == 0:
             if dry_run:

@@ -7,6 +7,8 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
+from applypilot import config
+from applypilot.apply.submission_admission import evaluate_submission_admission
 from applypilot.runtime_settings import load_runtime_settings
 
 
@@ -41,28 +43,28 @@ def count_submission_ready_jobs(
     *,
     dry_run: bool,
     profile: dict,
+    minimum_fit_score: int | None = None,
 ) -> int:
-    """Count jobs satisfying the existing preview or submission material contract."""
-    if dry_run:
-        return int(conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-            "AND tailor_status = 'machine_validated' AND applied_at IS NULL "
-            "AND COALESCE(eligibility_status, 'eligible') != 'ineligible'"
-        ).fetchone()[0])
-
-    allow_runtime_cover = bool(
-        profile.get("submission_policy", {}).get(
-            "allow_runtime_cover_letter_discovery", False
-        )
+    """Count jobs through the shared admission predicate without writing state."""
+    policy = profile.get("submission_policy", {})
+    configured_score = (
+        policy.get("minimum_fit_score", config.DEFAULTS.get("min_score", 4))
+        if isinstance(policy, Mapping)
+        else config.DEFAULTS.get("min_score", 4)
     )
-    return int(conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND tailor_status = 'machine_validated' "
-        "AND applied_at IS NULL "
-        + (
-            ""
-            if allow_runtime_cover
-            else "AND ((cover_letter_path IS NOT NULL AND cover_letter_status IN "
-            "('human_approved', 'agent_validated')) OR cover_letter_status = 'not_required')"
-        )
-    ).fetchone()[0])
+    score = minimum_fit_score if minimum_fit_score is not None else configured_score
+    if isinstance(score, bool) or not isinstance(score, int):
+        raise TypeError("minimum_fit_score must be an integer")
+    score = max(1, min(score, 10))
+    ready = 0
+    for row in conn.execute("SELECT * FROM jobs").fetchall():
+        job = dict(row)
+        job["application_url"] = job.get("application_url") or job.get("url")
+        if evaluate_submission_admission(
+            job,
+            profile,
+            minimum_fit_score=score,
+            preview_only=dry_run,
+        ).get("admitted"):
+            ready += 1
+    return ready

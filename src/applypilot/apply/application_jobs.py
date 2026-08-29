@@ -117,6 +117,7 @@ def acquire_job(
     """
     conn = connection
     excluded = {str(url) for url in (exclude_urls or set()) if str(url)}
+    from applypilot.apply.submission_admission import resolve_max_apply_attempts
     from applypilot.database import (
         recover_stale_application_attempts,
         start_application_attempt,
@@ -127,11 +128,14 @@ def acquire_job(
         profile = config.load_profile()
     except FileNotFoundError:
         profile = {}
+    max_apply_attempts = resolve_max_apply_attempts(profile)
     refresh_job_eligibility(conn, profile=profile)
     try:
         conn.execute("BEGIN IMMEDIATE")
 
         submission_policy = profile.get("submission_policy", {})
+        if not isinstance(submission_policy, dict):
+            submission_policy = {}
         allow_runtime_cover = bool(
             submission_policy.get("allow_runtime_cover_letter_discovery", False)
         )
@@ -152,7 +156,7 @@ def acquire_job(
             target_params = (
                 target_url,
                 target_url,
-                config.DEFAULTS["max_apply_attempts"],
+                max_apply_attempts,
                 minimum_fit_score,
             )
             rows = conn.execute(f"""
@@ -199,9 +203,10 @@ def acquire_job(
                   {site_clause}
                   {url_clauses}
                 ORDER BY fit_score DESC, url
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
+            """, [max_apply_attempts] + params).fetchall()
 
         row = None
+        authorized_entry = None
         from applypilot.apply.submission_admission import evaluate_submission_admission
 
         minimum_fit_score = max(1, min(int(min_score), 10))
@@ -252,6 +257,7 @@ def acquire_job(
                     continue
                 if authorized is None:
                     continue
+                authorized_entry = authorized
             row = candidate
             break
 
@@ -323,6 +329,8 @@ def acquire_job(
 
         acquired = dict(row)
         acquired["_attempt_id"] = attempt_id
+        if authorized_entry is not None:
+            acquired["_authorization_entry"] = dict(authorized_entry)
         if ats_capability_hint:
             acquired["_ats_capability_hint"] = ats_capability_hint
         return acquired

@@ -354,7 +354,27 @@ def test_manifest_queue_claims_only_authorized_job_and_is_idempotent(
 
     assert claimed is not None
     assert claimed["url"] == authorized["url"]
+    assert claimed["_authorization_entry"] == manifest["jobs"][0]
     assert second_claim is None
+
+
+def test_manifest_queue_uses_profile_attempt_ceiling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = init_db(tmp_path / "attempt-ceiling.db")
+    job = _job("https://careers.example.test/jobs/attempt-ceiling")
+    manifest = authorization.load_manifest(_manifest_path(tmp_path, job), now=NOW)
+    _insert_ready_job(conn, job, Path(manifest["jobs"][0]["resume_path"]))
+    conn.execute("UPDATE jobs SET apply_attempts=1 WHERE url=?", (job["url"],))
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(
+        launcher.config,
+        "load_profile",
+        lambda: {"submission_policy": {"maximum_apply_attempts": 1}},
+    )
+
+    assert launcher.acquire_job(worker_id=0, authorization_manifest=manifest) is None
 
 
 def test_optional_unanswered_question_does_not_block_authorized_acquisition(

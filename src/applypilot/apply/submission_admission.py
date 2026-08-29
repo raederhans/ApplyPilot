@@ -8,8 +8,24 @@ from applypilot import config
 from applypilot.apply import decision
 from applypilot.apply.submission_surfaces import (
     classify_submission_surface,
+    linkedin_target_verification,
     surface_allowed,
 )
+
+
+def resolve_max_apply_attempts(profile: Mapping[str, object]) -> int:
+    """Return the configured attempt ceiling, failing closed on bad policy."""
+    policy = profile.get("submission_policy", {})
+    raw = (
+        policy.get("maximum_apply_attempts", config.DEFAULTS["max_apply_attempts"])
+        if isinstance(policy, Mapping)
+        else config.DEFAULTS["max_apply_attempts"]
+    )
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise ValueError(
+            "submission_policy.maximum_apply_attempts must be a positive integer"
+        )
+    return raw
 
 
 def evaluate_submission_admission(
@@ -25,6 +41,31 @@ def evaluate_submission_admission(
     pure decision and portal gates, adding the attempt ceiling and canonical
     submission surface in one place.
     """
+    surface = classify_submission_surface(job)
+    surface_metadata: dict[str, object] = {"surface": surface}
+    if surface == "linkedin_native_easy_apply":
+        surface_metadata["requires_runtime_easy_apply_verification"] = True
+    if surface == "linkedin_to_official_ats":
+        verified, verification = linkedin_target_verification(job, profile)
+        surface_metadata["target_verification"] = verification
+        if not verified:
+            return {
+                "admitted": False,
+                "decision": "needs_review",
+                "reason": "unverified_linkedin_external_target",
+                "surface": surface,
+                "metadata": surface_metadata,
+            }
+
+    if job.get("apply_retry_blocked"):
+        return {
+            "admitted": False,
+            "decision": "needs_review",
+            "reason": "apply_retry_blocked_requires_review",
+            "surface": surface,
+            "metadata": surface_metadata,
+        }
+
     result = decision.evaluate(
         dict(job),
         minimum_fit_score=minimum_fit_score,
@@ -39,15 +80,25 @@ def evaluate_submission_admission(
             )
         ),
     )
-    surface = classify_submission_surface(job)
     if result.get("decision") != "ready_to_apply":
         return {
             "admitted": False,
             "decision": result.get("decision"),
             "reason": result.get("reason") or "application decision did not pass",
             "surface": surface,
+            "metadata": surface_metadata,
         }
 
+    try:
+        max_attempts = resolve_max_apply_attempts(profile)
+    except ValueError as exc:
+        return {
+            "admitted": False,
+            "decision": "needs_review",
+            "reason": str(exc),
+            "surface": surface,
+            "metadata": surface_metadata,
+        }
     try:
         attempts = int(job.get("apply_attempts") or 0)
     except (TypeError, ValueError):
@@ -56,13 +107,15 @@ def evaluate_submission_admission(
             "decision": "needs_review",
             "reason": "apply_attempts is malformed",
             "surface": surface,
+            "metadata": surface_metadata,
         }
-    if attempts >= int(config.DEFAULTS["max_apply_attempts"]):
+    if attempts >= max_attempts:
         return {
             "admitted": False,
             "decision": "needs_review",
             "reason": "maximum application attempts reached",
             "surface": surface,
+            "metadata": surface_metadata,
         }
 
     application_url = str(job.get("application_url") or job.get("url") or "")
@@ -78,6 +131,7 @@ def evaluate_submission_admission(
             "decision": "needs_review",
             "reason": portal_reason,
             "surface": surface,
+            "metadata": surface_metadata,
         }
 
     # Manual ATS and explicitly review-only/authorized portal routes retain
@@ -89,6 +143,7 @@ def evaluate_submission_admission(
             "decision": "ready_to_apply",
             "reason": "manual ATS remains a runtime capability boundary",
             "surface": surface,
+            "metadata": surface_metadata,
         }
     if surface == "manual_ats":
         return {
@@ -96,6 +151,7 @@ def evaluate_submission_admission(
             "decision": "needs_review",
             "reason": "manual ATS requires candidate-operated submission",
             "surface": surface,
+            "metadata": surface_metadata,
         }
     if surface.startswith("restricted_portal_"):
         return {
@@ -103,6 +159,7 @@ def evaluate_submission_admission(
             "decision": "ready_to_apply",
             "reason": "restricted portal gate permits this bounded route",
             "surface": surface,
+            "metadata": surface_metadata,
         }
 
     direct_email_authorized = bool(
@@ -120,12 +177,18 @@ def evaluate_submission_admission(
             "decision": "needs_review",
             "reason": allowed_reason,
             "surface": surface,
+            "metadata": surface_metadata,
         }
     return {
         "admitted": True,
         "decision": "ready_to_apply",
-        "reason": result.get("reason") or "submission admission passed",
+        "reason": (
+            "requires_runtime_easy_apply_verification"
+            if surface == "linkedin_native_easy_apply"
+            else result.get("reason") or "submission admission passed"
+        ),
         "surface": surface,
+        "metadata": surface_metadata,
     }
 
 
@@ -139,6 +202,8 @@ def summarize_worker_allocation(
     preview_only: bool = False,
 ) -> dict[str, int]:
     """Count bound/executable jobs and derive the worker count before launch."""
+    if manifest is None:
+        raise ValueError("worker allocation requires an authorization manifest")
     entries = manifest.get("jobs", []) if isinstance(manifest, Mapping) else []
     if not isinstance(entries, list):
         entries = []
@@ -157,7 +222,7 @@ def summarize_worker_allocation(
             continue
         job = dict(rows[0])
         job["application_url"] = job.get("application_url") or job.get("url")
-        if manifest is not None and authorize_job(dict(manifest), job) is None:
+        if authorize_job(dict(manifest), job) is None:
             continue
         if evaluate_submission_admission(
             job,

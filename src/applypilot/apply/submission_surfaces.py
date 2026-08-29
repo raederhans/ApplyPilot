@@ -70,6 +70,13 @@ def _host(url: object) -> str:
         return ""
 
 
+def _configured_host(value: object) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    return _host(text) or _host(f"https://{text}")
+
+
 def _is_linkedin_source(job: Mapping[str, object]) -> bool:
     source = " ".join(_text(job.get(key)) for key in ("source_site", "site"))
     return "linkedin" in source
@@ -154,19 +161,43 @@ def normalize_allowed_submission_surfaces(profile: Mapping[str, object]) -> froz
     policy = profile.get("submission_policy", {})
     if not isinstance(policy, Mapping):
         return DEFAULT_ALLOWED_SURFACES
-    raw = policy.get("allowed_submission_surfaces")
-    if raw is None:
+    if "allowed_submission_surfaces" not in policy:
         return DEFAULT_ALLOWED_SURFACES
+    raw = policy["allowed_submission_surfaces"]
     if isinstance(raw, str):
         raw = (raw,)
     if not isinstance(raw, (list, tuple, set, frozenset)):
-        return DEFAULT_ALLOWED_SURFACES
+        return frozenset()
     normalized = {
         LEGACY_SURFACE_ALIASES.get(_text(value), _text(value))
         for value in raw
         if _text(value)
     }
     return frozenset(value for value in normalized if value in SURFACES)
+
+
+def linkedin_target_verification(
+    job: Mapping[str, object], profile: Mapping[str, object]
+) -> tuple[bool, str]:
+    """Verify a LinkedIn external target using an ATS or explicit host trust."""
+    application_url = str(job.get("application_url") or job.get("url") or "").strip()
+    target_host = _host(application_url)
+    if detect_ats_site(application_url) != "generic":
+        return True, "recognized_ats"
+    portal = _portal_surface(job, application_url)
+    if portal == "restricted_portal_authorized_handoff":
+        return True, "authorized_portal_handoff"
+    policy = profile.get("submission_policy", {})
+    trusted = policy.get("trusted_external_application_hosts", ()) if isinstance(policy, Mapping) else ()
+    if isinstance(trusted, str):
+        trusted = (trusted,)
+    if isinstance(trusted, (list, tuple, set, frozenset)):
+        trusted_hosts = {
+            _configured_host(value) for value in trusted if _configured_host(value)
+        }
+        if target_host and target_host in trusted_hosts:
+            return True, "explicitly_trusted_external_host"
+    return False, "unverified_linkedin_external_target"
 
 
 def surface_allowed(

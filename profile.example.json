@@ -67,6 +67,7 @@
       "official_ats",
       "official_direct_email"
     ],
+    "trusted_external_application_hosts": [],
     "direct_email_application_authorized": false,
     "maximum_workers": 1,
     "maximum_apply_attempts": 3
