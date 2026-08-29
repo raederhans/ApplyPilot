@@ -85,8 +85,8 @@ def _build_standing_authorization_manifest(
     min_score: int,
 ) -> dict:
     """Bind the next eligible jobs to a short-lived standing authorization."""
-    from applypilot import config as app_config
-    from applypilot.apply import authorization, decision
+    from applypilot.apply import authorization
+    from applypilot.apply.submission_admission import evaluate_submission_admission
 
     policy = profile.get("submission_policy", {})
     if not isinstance(policy, dict) or not _standing_auto_authorization_enabled(profile):
@@ -140,15 +140,13 @@ def _build_standing_authorization_manifest(
     for row in rows:
         job = dict(row)
         job["application_url"] = job.get("application_url") or job.get("url")
-        decision_result = decision.evaluate(
+        decision_result = evaluate_submission_admission(
             job,
+            profile,
             minimum_fit_score=minimum_fit_score,
-            allow_runtime_readiness=bool(policy.get("allow_runtime_readiness_review", False)),
-            allow_runtime_cover_letter=bool(
-                policy.get("allow_runtime_cover_letter_discovery", False)
-            ),
+            preview_only=False,
         )
-        if decision_result.get("decision") != "ready_to_apply":
+        if not decision_result.get("admitted"):
             if target_url:
                 reason = str(decision_result.get("reason") or "Readiness gate did not pass.")
                 if not str(job.get("full_description") or "").strip():
@@ -172,20 +170,6 @@ def _build_standing_authorization_manifest(
                 else:
                     next_step = f"applypilot apply --dry-run --url \"{target_url}\""
                 exact_blocker = {"reason": reason, "next_step": next_step}
-            continue
-        if not str(job.get("company_name") or "").strip():
-            continue
-        if not str(job.get("full_description") or "").strip():
-            continue
-        application_url = str(job["application_url"])
-        if app_config.portal_application_gate(
-            application_url,
-            source_site=job.get("source_site"),
-            site=job.get("site"),
-            preview_only=False,
-        ):
-            continue
-        if app_config.is_manual_ats(application_url):
             continue
         selected.append(job)
         if len(selected) == candidate_cap:
@@ -779,7 +763,8 @@ def authorize_batch(
     """Record the initial approval for one exact, short-lived application batch."""
     _bootstrap()
     from applypilot import config as app_config
-    from applypilot.apply import authorization, decision
+    from applypilot.apply import authorization
+    from applypilot.apply.submission_admission import evaluate_submission_admission
     from applypilot.database import get_connection
 
     batch_root = (app_config.APP_DIR / "application-batches").resolve()
@@ -808,9 +793,6 @@ def authorize_batch(
             "minimum_fit_score", app_config.DEFAULTS["min_score"]
         )
     )
-    allow_runtime_readiness = bool(
-        submission_policy.get("allow_runtime_readiness_review", False)
-    )
     allow_runtime_cover = bool(
         submission_policy.get("allow_runtime_cover_letter_discovery", False)
     )
@@ -832,22 +814,17 @@ def authorize_batch(
             )
             raise typer.Exit(code=2)
         job = dict(rows[0])
-        job_decision = decision.evaluate(
+        job_decision = evaluate_submission_admission(
             job,
+            profile,
             minimum_fit_score=minimum_fit_score,
-            allow_runtime_readiness=allow_runtime_readiness,
-            allow_runtime_cover_letter=allow_runtime_cover,
+            preview_only=False,
         )
-        decision_value = (
-            job_decision.get("decision")
-            if isinstance(job_decision, dict)
-            else getattr(job_decision, "decision", job_decision)
-        )
-        decision_value = getattr(decision_value, "value", decision_value)
-        if str(decision_value).casefold() != "ready_to_apply":
+        if not job_decision.get("admitted"):
+            decision_value = job_decision.get("decision")
             console.print(
                 f"[red]Job decision is not ready_to_apply:[/red] {requested_url} "
-                f"({decision_value})"
+                f"({decision_value}: {job_decision.get('reason')})"
             )
             raise typer.Exit(code=2)
         if job.get("tailor_status") != "machine_validated" or not job.get(

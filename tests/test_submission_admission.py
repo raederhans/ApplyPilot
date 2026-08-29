@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from applypilot.apply.submission_admission import (
+    evaluate_submission_admission,
+    summarize_worker_allocation,
+)
+from applypilot.apply.submission_surfaces import classify_submission_surface
+from applypilot.database import init_db
+
+
+def _job(**overrides: object) -> dict[str, object]:
+    job: dict[str, object] = {
+        "url": "https://careers.example.test/jobs/data",
+        "application_url": "https://jobs.lever.co/example/1001",
+        "source_site": "official_careers",
+        "site": "official_careers",
+        "title": "Data Analyst Intern",
+        "company_name": "Example Data",
+        "full_description": "Use SQL and Python to build dashboards.",
+        "fit_score": 8,
+        "eligibility_status": "eligible",
+        "tailored_resume_path": "resume.pdf",
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+        "apply_attempts": 0,
+        "apply_status": None,
+        "apply_retry_blocked": 0,
+    }
+    job.update(overrides)
+    return job
+
+
+def _profile(**policy: object) -> dict[str, object]:
+    return {
+        "submission_policy": {
+            "allowed_submission_surfaces": ["official_ats", "official_company_careers"],
+            **policy,
+        }
+    }
+
+
+def test_surface_classifier_keeps_linkedin_source_separate_from_target_surface() -> None:
+    assert classify_submission_surface(
+        _job(
+            source_site="linkedin",
+            site="linkedin",
+            url="https://www.linkedin.com/jobs/view/1001",
+            application_url="https://www.linkedin.com/jobs/view/1001",
+        )
+    ) == "linkedin_native_easy_apply"
+    assert classify_submission_surface(
+        _job(source_site="linkedin", site="linkedin")
+    ) == "linkedin_to_official_ats"
+
+
+def test_surface_classifier_covers_official_and_direct_email_routes() -> None:
+    assert classify_submission_surface(_job()) == "official_ats"
+    assert classify_submission_surface(
+        _job(
+            source_site="official_careers",
+            application_url="https://careers.example.test/jobs/data",
+        )
+    ) == "official_company_careers"
+    assert classify_submission_surface(
+        _job(email_application={"route": "direct_email"})
+    ) == "official_direct_email"
+
+
+def test_restricted_and_manual_surfaces_are_explicit() -> None:
+    assert classify_submission_surface(
+        _job(
+            source_site="InternSG",
+            site="InternSG",
+            url="https://www.internsg.com/job-apply/123",
+            application_url="https://www.internsg.com/job-apply/123",
+        )
+    ) == "restricted_portal_review"
+    assert classify_submission_surface(
+        _job(
+            source_site="TCS",
+            site="TCS",
+            application_url="https://ibegin.tcsapps.com/candidate/jobs/123",
+        )
+    ) == "manual_ats"
+
+
+def test_missing_surface_policy_preserves_normal_channels() -> None:
+    job = _job(
+        source_site="linkedin",
+        site="linkedin",
+        url="https://www.linkedin.com/jobs/view/1001",
+        application_url="https://www.linkedin.com/jobs/view/1001",
+    )
+    result = evaluate_submission_admission(job, {}, minimum_fit_score=6)
+    assert result["admitted"] is True
+    assert result["surface"] == "linkedin_native_easy_apply"
+
+
+def test_explicit_surface_policy_and_email_authorization_are_enforced() -> None:
+    linkedin = _job(
+        source_site="linkedin",
+        site="linkedin",
+        url="https://www.linkedin.com/jobs/view/1001",
+        application_url="https://www.linkedin.com/jobs/view/1001",
+    )
+    blocked = evaluate_submission_admission(
+        linkedin, _profile(), minimum_fit_score=6
+    )
+    assert blocked["admitted"] is False
+    assert blocked["reason"] == "submission_surface_not_allowed:linkedin_native_easy_apply"
+
+    email = _job(email_application={"route": "direct_email"})
+    email_blocked = evaluate_submission_admission(
+        email,
+        _profile(allowed_submission_surfaces=["official_direct_email"]),
+        minimum_fit_score=6,
+    )
+    assert email_blocked["admitted"] is False
+    assert email_blocked["reason"] == "direct_email_requires_independent_authorization"
+    email_allowed = evaluate_submission_admission(
+        email,
+        _profile(
+            allowed_submission_surfaces=["official_direct_email"],
+            direct_email_application_authorized=True,
+        ),
+        minimum_fit_score=6,
+    )
+    assert email_allowed["admitted"] is True
+
+
+def test_admission_rejects_exhausted_attempts() -> None:
+    result = evaluate_submission_admission(
+        _job(apply_attempts=3), _profile(), minimum_fit_score=6
+    )
+    assert result["admitted"] is False
+    assert result["reason"] == "maximum application attempts reached"
+
+
+def test_worker_summary_counts_manifest_bound_and_executable_jobs(tmp_path: Path) -> None:
+    connection = init_db(tmp_path / "jobs.db")
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-test")
+    job = _job(tailored_resume_path=str(resume))
+    connection.execute(
+        "INSERT INTO jobs (url, application_url, source_site, site, title, company_name, "
+        "full_description, fit_score, eligibility_status, tailored_resume_path, tailor_status, "
+        "cover_letter_status, apply_attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job["url"], job["application_url"], job["source_site"], job["site"],
+            job["title"], job["company_name"], job["full_description"], job["fit_score"],
+            job["eligibility_status"], str(resume), job["tailor_status"],
+            job["cover_letter_status"], 0,
+        ),
+    )
+    connection.commit()
+    from applypilot.apply.authorization import build_bound_manifest
+
+    manifest = build_bound_manifest([job])
+    summary = summarize_worker_allocation(
+        connection,
+        _profile(maximum_workers=2),
+        manifest,
+        requested_workers=2,
+        minimum_fit_score=6,
+    )
+    assert summary == {
+        "requested_workers": 2,
+        "bound_candidates": 1,
+        "executable_candidates": 1,
+        "blocked_candidates": 0,
+        "effective_workers": 1,
+    }

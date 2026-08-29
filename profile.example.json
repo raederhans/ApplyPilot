@@ -57,5 +57,18 @@
     "race_ethnicity": "Decline to self-identify",
     "veteran_status": "I am not a protected veteran",
     "disability_status": "I do not wish to answer"
+  },
+  "submission_policy": {
+    "mode": "auto_submit_when_preflight_passes",
+    "allowed_submission_surfaces": [
+      "linkedin_native_easy_apply",
+      "linkedin_to_official_ats",
+      "official_company_careers",
+      "official_ats",
+      "official_direct_email"
+    ],
+    "direct_email_application_authorized": false,
+    "maximum_workers": 1,
+    "maximum_apply_attempts": 3
   }
 }

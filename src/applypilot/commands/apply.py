@@ -74,6 +74,7 @@ def run_apply(
 
     _bootstrap()
 
+    from applypilot.apply.submission_admission import summarize_worker_allocation
     from applypilot.config import PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
     from applypilot.services.application import (
@@ -332,9 +333,35 @@ def run_apply(
             f"{authorization_manifest['max_submissions']} submissions.[/green]"
         )
 
+    worker_allocation = {
+        "requested_workers": workers,
+        "bound_candidates": 0,
+        "executable_candidates": 0,
+        "blocked_candidates": 0,
+        "effective_workers": workers,
+    }
+    if not dry_run:
+        worker_allocation = summarize_worker_allocation(
+            get_connection(),
+            profile,
+            authorization_manifest,
+            requested_workers=workers,
+            minimum_fit_score=min_score,
+        )
+        if worker_allocation["effective_workers"] < 1:
+            console.print(
+                "[red]No executable authorized candidates remain; refusing to start browser workers.[/red]"
+            )
+            raise typer.Exit(code=2)
+        workers = worker_allocation["effective_workers"]
+
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Success target: {'unlimited' if continuous else effective_limit}")
-    console.print(f"  Workers:  {workers}")
+    console.print(f"  Workers requested:  {worker_allocation['requested_workers']}")
+    console.print(f"  Bound candidates:   {worker_allocation['bound_candidates']}")
+    console.print(f"  Executable:         {worker_allocation['executable_candidates']}")
+    console.print(f"  Blocked:            {worker_allocation['blocked_candidates']}")
+    console.print(f"  Workers effective:  {workers}")
     console.print(f"  Backend:  {backend}")
     console.print(f"  Control:  {effective_interaction_mode}")
     console.print(f"  Model:    {effective_model}")

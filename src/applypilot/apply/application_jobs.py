@@ -135,10 +135,6 @@ def acquire_job(
         allow_runtime_cover = bool(
             submission_policy.get("allow_runtime_cover_letter_discovery", False)
         )
-        allow_runtime_readiness = bool(
-            submission_policy.get("allow_runtime_readiness_review", False)
-        )
-
         if target_url:
             material_clause = """
                   AND tailored_resume_path IS NOT NULL
@@ -153,13 +149,19 @@ def acquire_job(
                 """
             target_match = "(url = ? OR application_url = ?)"
             minimum_fit_score = max(1, min(int(min_score), 10))
-            target_params = (target_url, target_url, minimum_fit_score)
+            target_params = (
+                target_url,
+                target_url,
+                config.DEFAULTS["max_apply_attempts"],
+                minimum_fit_score,
+            )
             rows = conn.execute(f"""
                 SELECT *
                 FROM jobs
                 WHERE {target_match}
                   {material_clause}
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
+                  AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   AND {ELIGIBLE_SQL}
             """, target_params).fetchall()
@@ -200,7 +202,7 @@ def acquire_job(
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
 
         row = None
-        from applypilot.apply.decision import evaluate
+        from applypilot.apply.submission_admission import evaluate_submission_admission
 
         minimum_fit_score = max(1, min(int(min_score), 10))
         if authorization_manifest is not None:
@@ -220,13 +222,28 @@ def acquire_job(
             candidate_job["application_url"] = (
                 candidate_job.get("application_url") or candidate_job.get("url")
             )
-            candidate_decision = evaluate(
+            candidate_admission = evaluate_submission_admission(
                 candidate_job,
+                profile,
                 minimum_fit_score=minimum_fit_score,
-                allow_runtime_readiness=allow_runtime_readiness,
-                allow_runtime_cover_letter=allow_runtime_cover or preview_only,
+                preview_only=preview_only,
             )
-            if candidate_decision.get("decision") != "ready_to_apply":
+            if not candidate_admission.get("admitted"):
+                portal_reason = config.portal_application_gate(
+                    candidate_job["application_url"],
+                    source_site=candidate_job.get("source_site"),
+                    site=candidate_job.get("site"),
+                    preview_only=preview_only,
+                )
+                if portal_reason and candidate_admission.get("reason") == portal_reason:
+                    conn.execute(
+                        "UPDATE jobs SET apply_status = 'manual', apply_error = ? WHERE url = ?",
+                        (portal_reason, candidate_job["url"]),
+                    )
+                    conn.commit()
+                    logger.info("Portal policy paused browser application: %s", candidate_job["url"][:80])
+                    if target_url:
+                        return None
                 continue
             if authorization_manifest is not None:
                 try:
