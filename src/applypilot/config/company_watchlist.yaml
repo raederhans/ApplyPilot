@@ -41,8 +41,11 @@ companies:
 
   - id: grab
     name: Grab
-    provider: rss
-    feed_url: https://www.grab.careers/en/jobs/xml/?rss=true
+    provider: smartrecruiters
+    company_id: Grab
+    country: sg
+    limit: 100
+    detail_concurrency: 4
     career_url: https://www.grab.careers/en/locations/singapore/
     cadence: daily
     track_tags: [product_consulting, data_bi_decision, ai_implementation]
@@ -176,3 +179,120 @@ companies:
     track_tags: [spatial, product_consulting, pre_sales]
     active: false
     activation_note: Verify public detail-page structured data before enabling.
+
+  - id: temus
+    name: Temus
+    provider: greenhouse
+    board: temus
+    career_url: https://www.temus.com/careers
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision, ai_implementation]
+    active: true
+
+  - id: straitsx
+    name: StraitsX
+    provider: greenhouse
+    board: straitsx
+    career_url: https://straitsx.com/careers
+    cadence: daily
+    track_tags: [data_bi_decision, ai_implementation, product_consulting]
+    active: true
+
+  - id: workato
+    name: Workato
+    provider: greenhouse
+    board: workato
+    career_url: https://www.workato.com/careers
+    cadence: daily
+    track_tags: [ai_implementation, product_consulting, data_bi_decision, pre_sales]
+    active: true
+
+  - id: simplifynext
+    name: SimplifyNext
+    provider: greenhouse
+    board: simplifynext
+    career_url: https://simplifynext.com/careers
+    cadence: daily
+    track_tags: [ai_implementation, product_consulting, data_bi_decision]
+    active: true
+
+  - id: geotab
+    name: Geotab
+    provider: greenhouse
+    board: geotab
+    career_url: https://www.geotab.com/careers/
+    cadence: daily
+    track_tags: [spatial, data_bi_decision, product_consulting, ai_implementation]
+    active: true
+
+  - id: shift_technology
+    name: Shift Technology
+    provider: greenhouse
+    board: shifttechnology
+    career_url: https://www.shift-technology.com/careers
+    cadence: daily
+    track_tags: [data_bi_decision, ai_implementation, product_consulting]
+    active: true
+
+  - id: shopback
+    name: ShopBack
+    provider: lever
+    site: shopback-2
+    career_url: https://careers.shopback.com/
+    cadence: daily
+    track_tags: [data_bi_decision, product_consulting, ai_implementation]
+    active: true
+
+  - id: portcast
+    name: Portcast
+    provider: lever
+    site: portcast
+    career_url: https://www.portcast.io/careers
+    cadence: daily
+    track_tags: [data_bi_decision, ai_implementation, product_consulting]
+    active: true
+
+  - id: goto_group
+    name: GoTo Group
+    provider: lever
+    site: GoToGroup
+    career_url: https://www.gotocompany.com/careers
+    cadence: daily
+    track_tags: [data_bi_decision, ai_implementation, product_consulting]
+    active: true
+
+  - id: venti_technologies
+    name: Venti Technologies
+    provider: ashby
+    board: GoVenti
+    career_url: https://www.venti.ai/careers
+    cadence: daily
+    track_tags: [spatial, ai_implementation, data_bi_decision, product_consulting]
+    active: true
+
+  - id: simular
+    name: Simular
+    provider: ashby
+    board: simular
+    career_url: https://www.simular.com/careers
+    cadence: daily
+    track_tags: [data_bi_decision, product_consulting, ai_implementation]
+    active: true
+
+  - id: k_id
+    name: k-ID
+    provider: ashby
+    board: k-ID
+    career_url: https://www.k-id.com/careers
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision]
+    active: true
+
+  - id: porsche_asia_pacific
+    name: Porsche Asia Pacific
+    provider: workable
+    subdomain: porsche-asia-pacific
+    career_url: https://apply.workable.com/porsche-asia-pacific/
+    cadence: daily
+    track_tags: [product_consulting, data_bi_decision]
+    active: true

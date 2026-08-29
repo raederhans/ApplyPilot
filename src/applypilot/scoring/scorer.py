@@ -28,7 +28,7 @@ RESUME_PATH = _config.RESUME_PATH
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+_SCORE_PROMPT_TEMPLATE = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
 
 SCORING CRITERIA:
 - 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
@@ -42,11 +42,54 @@ IMPORTANT FACTORS:
 - Consider transferable experience (automation, scripting, API work)
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+- Treat ordinary seniority, years, degree, skill, citizenship, and work-authorization requirements as scoring evidence, not automatic rejection instructions
+- Never upgrade or infer candidate experience, degrees, skills, citizenship, or work authorization beyond the resume
+
+QUALIFICATION PENALTIES:
+{qualification_penalties}
+- Apply each gap once; do not double-count a senior title and an overlapping years requirement
+- A qualification gap lowers the fit score, but does not by itself force a 1-2 score
+- In REASONING, name every applied penalty and the resume/job evidence for it. If evidence is insufficient, say so rather than inventing a fact
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
 REASONING: [2-3 sentences explaining the score]"""
+
+_DEFAULT_QUALIFICATION_PENALTIES = (
+    "- Senior title without matching resume evidence: subtract at most 1 point(s).\n"
+    "- Explicit years gap: subtract one point per 2 missing year(s), capped at 3 point(s)."
+)
+# Public compatibility value remains a complete, directly usable prompt.
+SCORE_PROMPT = _SCORE_PROMPT_TEMPLATE.format(
+    qualification_penalties=_DEFAULT_QUALIFICATION_PENALTIES
+)
+
+
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _score_prompt() -> str:
+    senior_penalty = _bounded_env_int(
+        "APPLYPILOT_SCORE_SENIOR_TITLE_PENALTY", 1, minimum=0, maximum=3
+    )
+    years_per_point = _bounded_env_int(
+        "APPLYPILOT_SCORE_YEARS_GAP_PER_POINT", 2, minimum=1, maximum=5
+    )
+    years_cap = _bounded_env_int(
+        "APPLYPILOT_SCORE_YEARS_GAP_MAX_PENALTY", 3, minimum=0, maximum=5
+    )
+    penalties = (
+        f"- Senior title without matching resume evidence: subtract at most {senior_penalty} point(s).\n"
+        "- Explicit years gap: subtract one point per "
+        f"{years_per_point} missing year(s), capped at {years_cap} point(s)."
+    )
+    return _SCORE_PROMPT_TEMPLATE.format(qualification_penalties=penalties)
 
 
 def _parse_score_response(response: str) -> dict:
@@ -123,7 +166,7 @@ def score_job(resume_text: str, job: dict) -> dict:
     )
 
     messages = [
-        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "system", "content": _score_prompt()},
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 

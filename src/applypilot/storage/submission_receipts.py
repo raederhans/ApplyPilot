@@ -90,6 +90,93 @@ def record_submission_observation(
     return observed_status
 
 
+def admit_direct_email_sent_receipt(
+    conn: sqlite3.Connection,
+    job_url: str,
+    evidence: dict,
+) -> dict[str, object]:
+    """Uniquely bind one provider Sent message to one exact application."""
+    job_url = str(job_url or "").strip()
+    provider_message_id = str(evidence.get("provider_message_id") or "").strip()[:180]
+    recipient = str(evidence.get("recipient") or "").strip().casefold()
+    subject = " ".join(str(evidence.get("subject") or "").split())
+    body_sha256 = str(evidence.get("body_sha256") or "").strip().casefold()
+    attachment_names = evidence.get("attachment_names")
+    if (
+        not job_url
+        or str(evidence.get("folder") or "").strip().casefold() != "sent"
+        or not provider_message_id
+        or not recipient
+        or not subject
+        or not re.fullmatch(r"[a-f0-9]{64}", body_sha256)
+        or not isinstance(attachment_names, list)
+        or not attachment_names
+        or any(not isinstance(name, str) or not name.strip() for name in attachment_names)
+    ):
+        return {"status": "rejected", "reason": "invalid_direct_email_receipt"}
+
+    cleaned = {
+        "folder": "sent",
+        "recipient": recipient,
+        "subject": subject,
+        "attachment_names": [str(name).strip()[:180] for name in attachment_names[:8]],
+        "body_sha256": body_sha256,
+        "provider_message_id": provider_message_id,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            cleaned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    application_ledger.ensure_schema(conn)
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM jobs WHERE url=?", (job_url,)).fetchone() is None:
+            if owns_transaction:
+                conn.rollback()
+            return {"status": "not_found", "job_url": job_url}
+        existing = conn.execute(
+            "SELECT job_url, receipt_digest FROM application_receipts "
+            "WHERE receipt_source='direct_email_sent' AND receipt_id=?",
+            (provider_message_id,),
+        ).fetchone()
+        if existing is not None:
+            existing_url = existing["job_url"] if isinstance(existing, sqlite3.Row) else existing[0]
+            existing_digest = (
+                existing["receipt_digest"] if isinstance(existing, sqlite3.Row) else existing[1]
+            )
+            if existing_url != job_url or existing_digest != digest:
+                if owns_transaction:
+                    conn.rollback()
+                return {
+                    "status": "rejected",
+                    "reason": "receipt_replay_conflict",
+                    "job_url": job_url,
+                }
+            if owns_transaction:
+                conn.commit()
+            return {"status": "already_admitted", "job_url": job_url}
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            "INSERT INTO application_receipts "
+            "(receipt_source, receipt_id, job_url, observed_at, admitted_at, receipt_digest) "
+            "VALUES ('direct_email_sent', ?, ?, ?, ?, ?)",
+            (provider_message_id, job_url, now, now, digest),
+        )
+        if owns_transaction:
+            conn.commit()
+        return {"status": "admitted", "job_url": job_url}
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+
+
 _STRONG_SUBMISSION_RECEIPT = re.compile(
     r"application (?:was |has been )?(?:successfully )?(?:submitted|received)|"
     r"we(?:'ve| have) received your resume|"

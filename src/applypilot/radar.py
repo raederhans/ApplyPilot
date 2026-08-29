@@ -92,6 +92,7 @@ class LeadStatus(StrEnum):
 LINKEDIN_WINDOWS = frozenset({"past-24h", "past-week", "past-month"})
 OFFICIAL_SOURCE_KINDS = frozenset({"official_careers", "official_ats", "official_rss", "official_email"})
 SOCIAL_SOURCE_KINDS = frozenset({"linkedin_post", "forum", "community", "aggregator"})
+COMPANY_SEED_SOURCE_KINDS = frozenset({"company_seed"})
 _TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 
 
@@ -581,6 +582,17 @@ def _display_job(observation: JobObservation) -> str:
     return f"- {title} | {company}{location}{tags} | {url}{lineage}"
 
 
+def _display_lead(observation: JobObservation) -> str:
+    """Render the candidate URL without losing the portal evidence URL."""
+    provenance = f" | lead source: {observation.source_id}"
+    if (
+        observation.official_job_url
+        and observation.source_url != observation.official_job_url
+    ):
+        provenance += f" ({observation.source_url})"
+    return _display_job(observation) + provenance
+
+
 def _merge_source_lineage(group: Sequence[JobObservation]) -> JobObservation:
     """Keep every exact-source lineage label when rendering one deduped job."""
     source_ids = tuple(
@@ -594,6 +606,7 @@ def render_daily_report(
     source_runs: Sequence[SourceRun | Mapping[str, object]],
     observations: Sequence[JobObservation | Mapping[str, object]] = (),
     leads: Sequence[OpportunityLead | Mapping[str, object]] = (),
+    company_seeds: Sequence[Mapping[str, object]] = (),
     applied_exclusions: Sequence[Mapping[str, object]] = (),
     applied_snapshot: Mapping[str, object] | None = None,
     report_date: str | None = None,
@@ -607,6 +620,7 @@ def render_daily_report(
     normalized_runs = [_coerce_source_run(run) for run in source_runs]
     normalized_observations = [_coerce_observation(item) for item in observations]
     normalized_leads = [_coerce_lead(item) for item in leads]
+    normalized_seeds = [_as_mapping(item) for item in company_seeds]
     official_runs = [
         run
         for run in normalized_runs
@@ -614,7 +628,14 @@ def render_daily_report(
         or run.source_id.startswith("official-")
         or run.source_id.startswith("ats-")
     ]
-    lead_runs = [run for run in normalized_runs if run not in official_runs]
+    seed_runs = [
+        run for run in normalized_runs if run.source_kind in COMPANY_SEED_SOURCE_KINDS
+    ]
+    lead_runs = [
+        run
+        for run in normalized_runs
+        if run not in official_runs and run not in seed_runs
+    ]
     official_complete = bool(official_runs) and all(run.is_complete for run in official_runs)
     lead_complete = bool(lead_runs) and all(run.is_complete for run in lead_runs)
     promoted_candidates = [
@@ -747,7 +768,7 @@ def render_daily_report(
     if non_promoted:
         for lead in non_promoted:
             reason = f"; {lead.reason}" if lead.reason else ""
-            lines.append(f"{_display_job(lead.observation)} [{lead.status.value}{reason}]")
+            lines.append(f"{_display_lead(lead.observation)} [{lead.status.value}{reason}]")
         if unavailable_leads:
             lines.append("- Coverage: lead discovery is non-exhaustive or unavailable for some sources.")
     elif lead_complete:
@@ -755,4 +776,45 @@ def render_daily_report(
     else:
         names = ", ".join(run.source_id for run in unavailable_leads) or "no lead source run"
         lines.append(f"- unavailable: lead zero cannot be claimed ({names})")
+
+    lines.extend(["", "## Company seeds awaiting official careers verification", ""])
+    if normalized_seeds:
+        for seed in sorted(
+            normalized_seeds,
+            key=lambda item: normalize_text(item.get("company_name")).casefold(),
+        ):
+            company_name = normalize_text(seed.get("company_name")) or "Unknown company"
+            location = normalize_text(seed.get("location"))
+            sectors = ", ".join(
+                normalize_text(item)
+                for item in seed.get("sectors", [])
+                if normalize_text(item)
+            )
+            target_url = normalize_text(
+                seed.get("careers_url") or seed.get("official_url")
+            )
+            source_ids = [
+                normalize_text(item)
+                for item in seed.get("source_ids", [])
+                if normalize_text(item)
+            ]
+            details = [item for item in (location, sectors, target_url) if item]
+            lineage = (
+                f"; {len(source_ids)} sources: {', '.join(source_ids)}"
+                if source_ids
+                else ""
+            )
+            lines.append(
+                f"- {company_name} | {' | '.join(details) or 'no official careers URL yet'} "
+                f"[{normalize_text(seed.get('status')) or 'awaiting_official_careers'}{lineage}]"
+            )
+        if any(not run.is_complete for run in seed_runs):
+            lines.append(
+                "- Coverage: company directories are non-exhaustive; this is a seed queue, not a company total."
+            )
+    elif seed_runs and all(run.is_complete for run in seed_runs):
+        lines.append("- 0 company seeds (all configured seed source runs complete)")
+    else:
+        names = ", ".join(run.source_id for run in seed_runs) or "no company-seed source run"
+        lines.append(f"- unavailable: company-seed zero cannot be claimed ({names})")
     return "\n".join(lines) + "\n"

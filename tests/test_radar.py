@@ -162,6 +162,103 @@ def test_official_title_classifier_fails_closed_for_unrelated_role() -> None:
     assert classify_job_subtracks("Senior Software Engineer", query_config) == ()
 
 
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("AI/Data Intern", {"data_analytics", "ai_solutions"}),
+        ("Intern, Product Management", {"product_management"}),
+        ("Consulting Intern (Jan - May 2027)", {"implementation_consulting"}),
+        ("Data Scientist Intern", {"data_analytics"}),
+        ("Data Science Internship", {"data_analytics"}),
+        ("Analytics Engineer", {"data_analytics"}),
+        ("Map Simulation and Annotation Intern", {"geospatial"}),
+        ("Mapping/Localization Intern", {"geospatial"}),
+        (
+            "Autonomous Driving Data Analysis Intern",
+            {"data_analytics", "geospatial"},
+        ),
+        ("Intern, OmniCommerce", {"product_ops"}),
+        (
+            "Intern, Commercial Enablement, Sales Enablement",
+            {"pre_sales_solution_consulting"},
+        ),
+        ("Intern, Fleet Systems Analyst", {"workflow_automation"}),
+        (
+            "Intern Corporate Development and Strategy",
+            {"strategy_ops"},
+        ),
+        ("Product Internship Program 2026", {"product_management"}),
+        (
+            "Machine Learning Engineer / Data Scientist (OCR/CV)",
+            {"data_analytics", "ai_solutions"},
+        ),
+        ("Internship Programme - AI Product Engineering", {"ai_solutions"}),
+        ("Intern, Data Engineering", {"data_analytics"}),
+        ("AI/ML Ops and Software Engineering Intern", {"ai_solutions"}),
+        ("Robotics AI Software Engineer Intern", {"ai_solutions"}),
+    ],
+)
+def test_official_title_classifier_covers_high_precision_internship_phrases(
+    title, expected
+) -> None:
+    config_path = Path(__file__).parents[1] / "src" / "applypilot" / "config" / "linkedin_searches.yaml"
+    query_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert set(classify_job_subtracks(title, query_config)) >= expected
+
+
+@pytest.mark.parametrize("title", ["Operations Intern", "Software Localization Intern"])
+def test_official_title_classifier_rejects_ambiguous_internship_phrases(title) -> None:
+    config_path = Path(__file__).parents[1] / "src" / "applypilot" / "config" / "linkedin_searches.yaml"
+    query_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert classify_job_subtracks(title, query_config) == ()
+
+
+def test_shipped_watchlist_registers_verified_p0_boards() -> None:
+    config_path = Path(__file__).parents[1] / "src" / "applypilot" / "config" / "company_watchlist.yaml"
+    companies = yaml.safe_load(config_path.read_text(encoding="utf-8"))["companies"]
+    by_id = {company["id"]: company for company in companies}
+    expected = {
+        "temus": ("greenhouse", "board", "temus"),
+        "straitsx": ("greenhouse", "board", "straitsx"),
+        "workato": ("greenhouse", "board", "workato"),
+        "simplifynext": ("greenhouse", "board", "simplifynext"),
+        "geotab": ("greenhouse", "board", "geotab"),
+        "shift_technology": ("greenhouse", "board", "shifttechnology"),
+        "shopback": ("lever", "site", "shopback-2"),
+        "portcast": ("lever", "site", "portcast"),
+        "goto_group": ("lever", "site", "GoToGroup"),
+        "venti_technologies": ("ashby", "board", "GoVenti"),
+        "simular": ("ashby", "board", "simular"),
+        "k_id": ("ashby", "board", "k-ID"),
+    }
+    for company_id, (provider, key, value) in expected.items():
+        assert by_id[company_id]["active"] is True
+        assert by_id[company_id]["provider"] == provider
+        assert by_id[company_id][key] == value
+        # Active sources participate in every daily completeness gate.  Until
+        # the report has due-source scheduling semantics, a weekly active
+        # source would make otherwise healthy daily reports look incomplete.
+        assert by_id[company_id]["cadence"] == "daily"
+        assert by_id[company_id]["track_tags"]
+
+
+def test_shipped_watchlist_registers_p1_provider_canaries() -> None:
+    config_path = Path(__file__).parents[1] / "src" / "applypilot" / "config" / "company_watchlist.yaml"
+    companies = yaml.safe_load(config_path.read_text(encoding="utf-8"))["companies"]
+    by_id = {company["id"]: company for company in companies}
+
+    assert by_id["grab"]["provider"] == "smartrecruiters"
+    assert by_id["grab"]["company_id"] == "Grab"
+    assert by_id["grab"]["country"] == "sg"
+    assert by_id["grab"]["active"] is True
+    assert by_id["grab"]["cadence"] == "daily"
+
+    assert by_id["porsche_asia_pacific"]["provider"] == "workable"
+    assert by_id["porsche_asia_pacific"]["subdomain"] == "porsche-asia-pacific"
+    assert by_id["porsche_asia_pacific"]["active"] is True
+    assert by_id["porsche_asia_pacific"]["cadence"] == "daily"
+
+
 def test_official_ats_listing_promotes_to_verified_job() -> None:
     decision = promote_observation(_official_job())
     assert decision.status is LeadStatus.PROMOTED
@@ -282,6 +379,64 @@ def test_daily_report_separates_verified_jobs_from_leads() -> None:
     assert "## Leads awaiting official verification" in report
     assert "Solutions Consultant | Databricks" in report
     assert "verify company careers page" in report
+
+
+def test_daily_report_retains_portal_provenance_for_candidate_official_url() -> None:
+    report = render_daily_report(
+        source_runs=[
+            SourceRun(
+                "careeraxis",
+                SourceStatus.PARTIAL,
+                source_kind="ecosystem_lead",
+            )
+        ],
+        leads=[
+            {
+                "source": "careeraxis",
+                "kind": "ecosystem_lead",
+                "url": "https://careeraxis.ntu.edu.sg/students/jobs/861866",
+                "official_job_url": "https://jobs.edp.com/job-invite/180475/",
+                "company": "EDP APAC",
+                "title": "Intern, Data Engineering",
+                "location": "Singapore",
+                "status": "awaiting_official",
+            }
+        ],
+    )
+
+    assert "https://jobs.edp.com/job-invite/180475" in report
+    assert "lead source: careeraxis" in report
+    assert "https://careeraxis.ntu.edu.sg/students/jobs/861866" in report
+
+
+def test_daily_report_separates_company_seeds_from_job_leads() -> None:
+    report = render_daily_report(
+        source_runs=[
+            {
+                "source": "startup-sg-directory",
+                "kind": "company_seed",
+                "status": "partial",
+                "count": 1,
+                "pages": 1,
+            }
+        ],
+        company_seeds=[
+            {
+                "company_name": "Example AI",
+                "location": "Singapore",
+                "official_url": "https://example.ai/",
+                "sectors": ["AI", "urban technology"],
+                "status": "awaiting_official_careers",
+                "source_ids": ["startup-sg-directory"],
+            }
+        ],
+    )
+
+    assert "## Company seeds awaiting official careers verification" in report
+    assert "Example AI | Singapore | AI, urban technology | https://example.ai/" in report
+    assert "awaiting_official_careers; 1 sources: startup-sg-directory" in report
+    assert "unavailable: lead zero cannot be claimed (no lead source run)" in report
+    assert "Coverage: company directories are non-exhaustive" in report
 
 
 def test_daily_report_accepts_serialisable_dicts_from_cli_or_db_layer() -> None:

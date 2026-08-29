@@ -1,0 +1,70 @@
+[
+  {
+    "id": "resume-upload",
+    "observation": {
+      "page_kind": "resume_upload",
+      "step_index": 1,
+      "step_count": 4,
+      "visible_controls": ["file_upload"],
+      "required_count": 1,
+      "has_next": true
+    },
+    "state": "upload"
+  },
+  {
+    "id": "my-information",
+    "observation": {
+      "page_kind": "my_information",
+      "step_index": 2,
+      "step_count": 4,
+      "visible_controls": ["text", "email", "phone", "select"],
+      "required_count": 4,
+      "has_next": true
+    },
+    "state": "form"
+  },
+  {
+    "id": "review",
+    "observation": {
+      "page_kind": "review",
+      "step_index": 4,
+      "step_count": 4,
+      "visible_controls": ["checkbox"],
+      "required_count": 1,
+      "has_submit": true
+    },
+    "state": "review"
+  },
+  {
+    "id": "repairable-validation",
+    "observation": {
+      "page_kind": "validation_error",
+      "step_index": 4,
+      "step_count": 4,
+      "visible_controls": ["text", "checkbox"],
+      "required_count": 2,
+      "invalid_count": 1,
+      "has_submit": true,
+      "repairable_validation": true
+    },
+    "state": "form"
+  },
+  {
+    "id": "manual-gate",
+    "observation": {
+      "page_kind": "manual_gate",
+      "visible_controls": [],
+      "has_manual_gate": true
+    },
+    "state": "manual_review"
+  },
+  {
+    "id": "confirmation",
+    "observation": {
+      "page_kind": "confirmation",
+      "visible_controls": [],
+      "has_confirmation": true
+    },
+    "state": "applied"
+  }
+]

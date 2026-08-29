@@ -3,34 +3,25 @@
 from __future__ import annotations
 
 import json
-import re
 
 from applypilot.apply.authorization import compute_job_fingerprint
+from applypilot.apply.failure_taxonomy import classify_failure
 
-_BLOCKING_STATUS_TOKENS = {
-    "submission_uncertain",
-    "captcha",
-    "assessment",
-    "login",
-    "manual",
-    "blocked",
-    "in_progress",
-}
 _PERMANENT_IGNORE_TOKENS = {"expired", "duplicate", "already_applied"}
-_SENIOR_TITLE = re.compile(
-    r"(?i)\b(?:senior|sr\.?|staff|principal|lead|director|head|vice president|vp|chief)\b"
-)
-_EXPERIENCE_REQUIREMENT = re.compile(
-    r"(?i)\b(?:at least|minimum(?:\s+of)?|min\.?)?\s*(\d{1,2})\s*\+?\s*years?"
-)
+_DO_NOT_APPLY_READINESS = {
+    "contradiction",
+    "do-not-apply",
+    "do_not_apply",
+    "explicit_contradiction",
+    "ineligible",
+}
 
 
 def _has_unanswered_questions(value: object) -> bool:
     if isinstance(value, dict):
-        # Browser previews also report optional fields that were deliberately
-        # left blank.  Only unresolved required/unknown questions should block
-        # a submission decision.
-        return value.get("required") is not False
+        # Ordinary unknowns are resolved in the live form. Only an explicitly
+        # required, direct-impact question remains a pre-acquisition blocker.
+        return value.get("required") is True and value.get("direct_impact") is True
     if isinstance(value, (list, tuple, set)):
         return any(_has_unanswered_questions(item) for item in value)
     if value is None:
@@ -41,21 +32,10 @@ def _has_unanswered_questions(value: object) -> bool:
     try:
         parsed = json.loads(text)
     except (TypeError, json.JSONDecodeError):
-        return True
+        # Legacy free-form records lack impact metadata. Revisit them in the
+        # live resolver instead of treating every historical unknown as fatal.
+        return False
     return _has_unanswered_questions(parsed)
-
-
-def _status_text(job: dict) -> str:
-    return " ".join(
-        str(job.get(field) or "").strip().casefold()
-        for field in (
-            "apply_status",
-            "apply_error",
-            "apply_retry_reason",
-            "detail_error",
-            "dedupe_status",
-        )
-    )
 
 
 def evaluate(
@@ -73,11 +53,11 @@ def evaluate(
     if job.get("applied_at") or str(job.get("apply_status") or "").casefold() == "applied":
         return {"decision": "ignore", "reason": "Job is already recorded as applied."}
 
-    status_text = _status_text(job)
+    apply_status = str(job.get("apply_status") or "").strip().casefold()
     if str(job.get("eligibility_status") or "").casefold() == "ineligible":
         reason = str(job.get("eligibility_reason") or "explicit eligibility failure").strip()
         return {"decision": "ignore", "reason": f"Job is ineligible: {reason}"}
-    if any(token in status_text for token in _PERMANENT_IGNORE_TOKENS):
+    if apply_status in _PERMANENT_IGNORE_TOKENS:
         return {"decision": "ignore", "reason": "Job is expired or an explicit duplicate."}
     if job.get("possible_repost_of") and str(job.get("dedupe_status") or "").casefold() in {
         "duplicate",
@@ -100,42 +80,25 @@ def evaluate(
             ),
         }
 
+    readiness_conditions: list[str] = []
     readiness_status = str(job.get("application_readiness_status") or "").strip().casefold()
+    if readiness_status in _DO_NOT_APPLY_READINESS:
+        reason = str(job.get("application_readiness_reason") or "explicit contradiction").strip()
+        return {"decision": "ignore", "reason": f"Application readiness failed: {reason}"}
     if readiness_status not in {"", "confirmed"}:
-        return {
-            "decision": "needs_review",
-            "reason": (
-                "Application readiness is not confirmed from evidence for work authorization, "
-                "availability, location, and other hard requirements."
-            ),
-        }
-    if not readiness_status and not allow_runtime_readiness:
-        return {
-            "decision": "needs_review",
-            "reason": (
-                "Application readiness is not confirmed from evidence for work authorization, "
-                "availability, location, and other hard requirements."
-            ),
-        }
+        readiness_conditions.append("application readiness requires runtime confirmation")
+    elif not readiness_status:
+        readiness_conditions.append("application readiness will be determined in the form")
     if readiness_status == "confirmed":
         readiness_reason = str(job.get("application_readiness_reason") or "").strip()
         readiness_reviewed_at = str(job.get("application_readiness_reviewed_at") or "").strip()
         if not readiness_reason or not readiness_reviewed_at:
-            return {
-                "decision": "needs_review",
-                "reason": "Confirmed application readiness requires a reason and review timestamp.",
-            }
+            readiness_conditions.append("readiness evidence is incomplete")
         readiness_fingerprint = str(job.get("application_readiness_fingerprint") or "").strip()
         if not readiness_fingerprint:
-            return {
-                "decision": "needs_review",
-                "reason": "Application readiness is not bound to the reviewed job version.",
-            }
-        if readiness_fingerprint != compute_job_fingerprint(job):
-            return {
-                "decision": "needs_review",
-                "reason": "Job details changed after the application-readiness review.",
-            }
+            readiness_conditions.append("readiness is not bound to the current job version")
+        elif readiness_fingerprint != compute_job_fingerprint(job):
+            readiness_conditions.append("job details changed after readiness review")
 
     description = str(job.get("full_description") or "").strip()
     if not description:
@@ -143,25 +106,28 @@ def evaluate(
 
     eligibility = str(job.get("eligibility_status") or "").strip().casefold()
     if eligibility not in {"eligible", "pass", "passed"}:
-        return {"decision": "needs_review", "reason": "Eligibility is unknown or not confirmed."}
+        readiness_conditions.append("eligibility will be confirmed during the application")
 
     if _has_unanswered_questions(job.get("unanswered_questions_json")) or _has_unanswered_questions(
         job.get("unanswered_questions")
     ):
         return {"decision": "needs_review", "reason": "Required application questions remain unanswered."}
 
-    if job.get("apply_retry_blocked") or any(token in status_text for token in _BLOCKING_STATUS_TOKENS):
-        return {"decision": "needs_review", "reason": "Application is blocked or requires manual review."}
-
-    title = str(job.get("title") or "")
-    if _SENIOR_TITLE.search(title):
-        return {"decision": "needs_review", "reason": "Title indicates a clearly senior role."}
-    experience_years = [int(match.group(1)) for match in _EXPERIENCE_REQUIREMENT.finditer(description)]
-    if experience_years and max(experience_years) >= 4:
-        return {
-            "decision": "needs_review",
-            "reason": f"Job description includes a {max(experience_years)}+ year experience threshold.",
-        }
+    if apply_status in {"submission_uncertain", "in_progress"}:
+        return {"decision": "needs_review", "reason": "Application has a structured active or uncertain state."}
+    if job.get("apply_retry_blocked"):
+        retry_reason = str(job.get("apply_retry_reason") or job.get("apply_error") or "")
+        failure = classify_failure(retry_reason)
+        if failure.recoverability in {
+            "do_not_retry",
+            "requires_human_boundary",
+            "requires_material",
+            "submission_uncertain",
+        }:
+            return {
+                "decision": "needs_review",
+                "reason": f"Application retry requires action: {failure.next_action}.",
+            }
 
     if not str(job.get("application_url") or job.get("url") or "").strip():
         return {"decision": "needs_review", "reason": "Application URL is missing."}
@@ -175,4 +141,9 @@ def evaluate(
     ):
         return {"decision": "needs_review", "reason": "Cover-letter requirement is not resolved."}
 
+    if readiness_conditions:
+        return {
+            "decision": "ready_to_apply",
+            "reason": "Apply with conditions: " + "; ".join(dict.fromkeys(readiness_conditions)) + ".",
+        }
     return {"decision": "ready_to_apply", "reason": "Eligibility, materials, and application state are clear."}

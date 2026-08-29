@@ -36,6 +36,24 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             ON application_batch_consumptions(batch_id, status)
     """)
     connection.execute("""
+        CREATE TABLE IF NOT EXISTS application_submission_gates (
+            gate_id            TEXT PRIMARY KEY,
+            attempt_id         TEXT NOT NULL UNIQUE,
+            batch_id           TEXT NOT NULL,
+            job_url            TEXT NOT NULL,
+            claimed_at         TEXT NOT NULL,
+            state              TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            audit_fingerprint  TEXT,
+            idempotency_key    TEXT NOT NULL UNIQUE,
+            evidence_json      TEXT
+        )
+    """)
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_application_submission_gates_rate
+            ON application_submission_gates(claimed_at, state)
+    """)
+    connection.execute("""
         CREATE TABLE IF NOT EXISTS application_attempts (
             attempt_id       TEXT PRIMARY KEY,
             job_url          TEXT NOT NULL,
@@ -412,6 +430,269 @@ def reserve_batch_submission(
         if owns_transaction:
             connection.rollback()
         raise
+
+
+def claim_submission_gate(
+    connection: sqlite3.Connection,
+    batch_id: str,
+    job_url: str,
+    max_submissions: int,
+    attempt_id: str,
+    *,
+    hourly_maximum: int = 15,
+    minimum_gap_seconds: float = 20,
+    audit_fingerprint: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Atomically reserve batch, attempt owner, and global submission capacity.
+
+    The gate serializes only the final authority claim. Browser preparation and
+    read-only checks remain parallel. A replay for the same attempt is
+    idempotent; a different attempt can never reuse the claim.
+    """
+    batch_id = str(batch_id or "").strip()
+    job_url = str(job_url or "").strip()
+    attempt_id = str(attempt_id or "").strip()
+    if not batch_id or not job_url or not attempt_id:
+        raise ValueError("batch_id, job_url, and attempt_id are required")
+    if (
+        isinstance(max_submissions, bool)
+        or not isinstance(max_submissions, int)
+        or max_submissions <= 0
+    ):
+        raise ValueError("max_submissions must be a positive integer")
+    if isinstance(hourly_maximum, bool) or not isinstance(hourly_maximum, int):
+        raise TypeError("hourly_maximum must be an integer")
+    if hourly_maximum < 0 or minimum_gap_seconds < 0:
+        raise ValueError("submission rate limits cannot be negative")
+
+    ensure_schema(connection)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    current_text = current.isoformat()
+    gate_uuid = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{batch_id}|{attempt_id}|{job_url}",
+    )
+    gate_id = f"submit:{gate_uuid}"
+    idempotency_key = gate_id.removeprefix("submit:")
+    owns_transaction = not connection.in_transaction
+    try:
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+
+        replay = connection.execute(
+            "SELECT gate_id, batch_id, job_url, state, audit_fingerprint, "
+            "idempotency_key FROM application_submission_gates WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if replay is not None:
+            same_claim = (
+                str(replay[1]) == batch_id
+                and str(replay[2]) == job_url
+                and str(replay[4] or "") == str(audit_fingerprint or "")
+            )
+            if owns_transaction:
+                connection.commit() if same_claim else connection.rollback()
+            if not same_claim:
+                return {"claimed": False, "reason": "submission_gate_claim_conflict"}
+            return {
+                "claimed": True,
+                "reason": "submission_gate_replay",
+                "gate_id": str(replay[0]),
+                "idempotency_key": str(replay[5]),
+                "state": str(replay[3]),
+                "replay": True,
+            }
+
+        attempt = connection.execute(
+            "SELECT job_url, phase, submit_started, status, lease_expires_at "
+            "FROM application_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            if owns_transaction:
+                connection.rollback()
+            return {"claimed": False, "reason": "submission_gate_attempt_missing"}
+        if str(attempt[0]) != job_url:
+            if owns_transaction:
+                connection.rollback()
+            return {"claimed": False, "reason": "submission_gate_job_mismatch"}
+        if (
+            str(attempt[1]) != "reservation"
+            or int(attempt[2]) != 0
+            or str(attempt[3]) != "in_progress"
+        ):
+            if owns_transaction:
+                connection.rollback()
+            return {"claimed": False, "reason": "submission_gate_attempt_not_ready"}
+        try:
+            lease_expires_at = datetime.fromisoformat(str(attempt[4]))
+            if lease_expires_at.tzinfo is None:
+                lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            lease_expires_at = current - timedelta(seconds=1)
+        if lease_expires_at <= current:
+            if owns_transaction:
+                connection.rollback()
+            return {"claimed": False, "reason": "submission_gate_attempt_lease_expired"}
+
+        cutoff = (current - timedelta(hours=1)).isoformat()
+        recent_gate_rows = connection.execute(
+            "SELECT claimed_at FROM application_submission_gates "
+            "WHERE claimed_at>=? AND state!='cancelled_before_action' ORDER BY claimed_at",
+            (cutoff,),
+        ).fetchall()
+        represented_urls = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT job_url FROM application_submission_gates "
+                "WHERE claimed_at>=? AND state!='cancelled_before_action'",
+                (cutoff,),
+            ).fetchall()
+        }
+        historical_rows = connection.execute(
+            "SELECT url, applied_at FROM jobs WHERE applied_at IS NOT NULL AND applied_at>=?",
+            (cutoff,),
+        ).fetchall()
+        unrepresented_applied = [
+            row for row in historical_rows if str(row[0]) not in represented_urls
+        ]
+        recent_count = len(recent_gate_rows) + len(unrepresented_applied)
+        if hourly_maximum > 0 and recent_count >= hourly_maximum:
+            timestamps = [str(row[0]) for row in recent_gate_rows] + [
+                str(row[1]) for row in unrepresented_applied
+            ]
+            retry_after = 0.0
+            parsed = []
+            for value in timestamps:
+                try:
+                    parsed_value = datetime.fromisoformat(value)
+                    if parsed_value.tzinfo is None:
+                        parsed_value = parsed_value.replace(tzinfo=UTC)
+                    parsed.append(parsed_value)
+                except ValueError:
+                    continue
+            if parsed:
+                retry_after = max(
+                    0.0,
+                    (min(parsed) + timedelta(hours=1) - current).total_seconds(),
+                )
+            if owns_transaction:
+                connection.rollback()
+            return {
+                "claimed": False,
+                "reason": "rolling_hour_submission_cap",
+                "retry_after_seconds": retry_after,
+            }
+
+        latest_candidates: list[datetime] = []
+        for value in [
+            *(str(row[0]) for row in recent_gate_rows),
+            *(str(row[1]) for row in unrepresented_applied),
+        ]:
+            try:
+                parsed_value = datetime.fromisoformat(value)
+                if parsed_value.tzinfo is None:
+                    parsed_value = parsed_value.replace(tzinfo=UTC)
+                latest_candidates.append(parsed_value)
+            except ValueError:
+                continue
+        if latest_candidates and minimum_gap_seconds > 0:
+            remaining = minimum_gap_seconds - (
+                current - max(latest_candidates)
+            ).total_seconds()
+            if remaining > 0:
+                if owns_transaction:
+                    connection.rollback()
+                return {
+                    "claimed": False,
+                    "reason": "minimum_submission_gap",
+                    "retry_after_seconds": remaining,
+                }
+
+        existing = connection.execute(
+            "SELECT 1 FROM application_batch_consumptions WHERE batch_id=? AND job_url=?",
+            (batch_id, job_url),
+        ).fetchone()
+        used = connection.execute(
+            "SELECT COUNT(*) FROM application_batch_consumptions WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()[0]
+        if existing is not None or used >= max_submissions:
+            if owns_transaction:
+                connection.rollback()
+            return {"claimed": False, "reason": "authorization_batch_reservation_denied"}
+
+        connection.execute(
+            "INSERT INTO application_batch_consumptions "
+            "(batch_id, job_url, reserved_at, status, updated_at, evidence_json) "
+            "VALUES (?, ?, ?, 'reserved', ?, NULL)",
+            (batch_id, job_url, current_text, current_text),
+        )
+        connection.execute(
+            "INSERT INTO application_submission_gates "
+            "(gate_id, attempt_id, batch_id, job_url, claimed_at, state, updated_at, "
+            "audit_fingerprint, idempotency_key, evidence_json) "
+            "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, NULL)",
+            (
+                gate_id,
+                attempt_id,
+                batch_id,
+                job_url,
+                current_text,
+                current_text,
+                str(audit_fingerprint or "") or None,
+                idempotency_key,
+            ),
+        )
+        if owns_transaction:
+            connection.commit()
+        return {
+            "claimed": True,
+            "reason": "submission_gate_claimed",
+            "gate_id": gate_id,
+            "idempotency_key": idempotency_key,
+            "state": "claimed",
+            "replay": False,
+        }
+    except sqlite3.IntegrityError:
+        if owns_transaction:
+            connection.rollback()
+        return {"claimed": False, "reason": "submission_gate_claim_conflict"}
+    except Exception:
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def update_submission_gate_state(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    state: str,
+    evidence: object | None = None,
+) -> bool:
+    """Record a bounded terminal state without releasing the consumed claim."""
+    attempt_id = str(attempt_id or "").strip()
+    state = str(state or "").strip()
+    if not attempt_id or not state:
+        raise ValueError("attempt_id and state are required")
+    ensure_schema(connection)
+    owns_transaction = not connection.in_transaction
+    cursor = connection.execute(
+        "UPDATE application_submission_gates SET state=?, updated_at=?, evidence_json=? "
+        "WHERE attempt_id=?",
+        (
+            state,
+            datetime.now(UTC).isoformat(),
+            None if evidence is None else _json_text(evidence),
+            attempt_id,
+        ),
+    )
+    if owns_transaction:
+        connection.commit()
+    return cursor.rowcount == 1
 
 
 def update_batch_submission_status(

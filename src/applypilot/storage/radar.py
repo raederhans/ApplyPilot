@@ -15,9 +15,49 @@ canonicalize_job_url = job_identity.canonicalize_job_url
 _normalized_identity_text = job_identity._normalized_identity_text
 _usable_requisition_id = job_identity._usable_requisition_id
 
+_LEGACY_REQUISITION_ID_PROVIDERS = (
+    "ashby",
+    "greenhouse",
+    "jobposting-jsonld",
+    "jobposting_jsonld",
+    "lever",
+    "rss",
+    "smartrecruiters",
+    "workable",
+)
+
 
 def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _existing_requisition_platform_id(
+    conn: sqlite3.Connection,
+    company_identity: str,
+    requisition_id: str,
+) -> str:
+    """Return an existing identity when an official source provider changes."""
+    if not company_identity or not requisition_id:
+        return ""
+    normalized_requisition = _normalized_identity_text(requisition_id)
+    canonical_id = f"radar:{company_identity}:req:{normalized_requisition}"
+    aliases = [canonical_id]
+    for provider in _LEGACY_REQUISITION_ID_PROVIDERS:
+        aliases.append(f"{provider}:{company_identity}:{requisition_id}")
+        aliases.append(f"{provider}:{company_identity}:{normalized_requisition}")
+    folded_aliases = list(dict.fromkeys(alias.casefold() for alias in aliases))
+    placeholders = ", ".join("?" for _ in folded_aliases)
+    row = conn.execute(
+        f"""
+        SELECT platform_job_id
+        FROM jobs
+        WHERE lower(platform_job_id) IN ({placeholders})
+        ORDER BY CASE WHEN lower(platform_job_id) = ? THEN 0 ELSE 1 END, rowid
+        LIMIT 1
+        """,
+        (*folded_aliases, canonical_id.casefold()),
+    ).fetchone()
+    return str(row["platform_job_id"] or "") if row is not None else ""
 
 
 def ensure_radar_schema(conn: sqlite3.Connection) -> None:
@@ -46,6 +86,7 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS radar_fetch_runs (
             run_id               TEXT PRIMARY KEY,
             source_id            TEXT NOT NULL,
+            source_type          TEXT,
             started_at           TEXT NOT NULL,
             finished_at          TEXT,
             status               TEXT NOT NULL,
@@ -64,6 +105,7 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS radar_source_observations (
             observation_key     TEXT PRIMARY KEY,
             source_id           TEXT NOT NULL,
+            source_type         TEXT,
             company_id          TEXT,
             external_id         TEXT,
             source_url          TEXT,
@@ -100,6 +142,32 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
             last_seen_at         TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS radar_company_seeds (
+            company_key          TEXT PRIMARY KEY,
+            company_name         TEXT NOT NULL,
+            official_domain      TEXT,
+            official_url         TEXT,
+            careers_url          TEXT,
+            location             TEXT,
+            sectors_json         TEXT,
+            track_tags_json      TEXT,
+            status               TEXT NOT NULL,
+            verification_status  TEXT NOT NULL,
+            first_seen_at        TEXT NOT NULL,
+            last_seen_at         TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS radar_company_seed_sources (
+            company_key      TEXT NOT NULL,
+            source_id        TEXT NOT NULL,
+            source_url       TEXT NOT NULL,
+            last_run_id      TEXT NOT NULL,
+            payload_json     TEXT,
+            first_seen_at    TEXT NOT NULL,
+            last_seen_at     TEXT NOT NULL,
+            PRIMARY KEY (company_key, source_id, source_url)
+        );
+
         CREATE TABLE IF NOT EXISTS radar_job_sources (
             job_url          TEXT NOT NULL,
             observation_key  TEXT NOT NULL,
@@ -132,11 +200,31 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
             ON radar_source_observations(source_id, external_id);
         CREATE INDEX IF NOT EXISTS idx_radar_leads_status
             ON radar_leads(status, last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_radar_company_seeds_status
+            ON radar_company_seeds(status, last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_radar_company_seed_sources_source
+            ON radar_company_seed_sources(source_id, last_seen_at DESC);
         CREATE INDEX IF NOT EXISTS idx_radar_job_sources_source
             ON radar_job_sources(source_id, job_url);
         CREATE INDEX IF NOT EXISTS idx_radar_exclusion_snapshots_imported
             ON radar_exclusion_snapshots(source, imported_at DESC);
     """)
+    additive_columns = (
+        ("radar_fetch_runs", "source_type"),
+        ("radar_source_observations", "source_type"),
+    )
+    for table_name, column_name in additive_columns:
+        existing_columns = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")
+        }
+        if column_name not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_radar_runs_source_type_started "
+        "ON radar_fetch_runs(source_id, source_type, started_at DESC)"
+    )
     conn.commit()
 
 
@@ -195,11 +283,12 @@ def start_radar_fetch_run(
     run_id = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO radar_fetch_runs "
-        "(run_id, source_id, started_at, status, parser_version, metadata_json) "
-        "VALUES (?, ?, ?, 'running', ?, ?)",
+        "(run_id, source_id, source_type, started_at, status, parser_version, "
+        "metadata_json) VALUES (?, ?, ?, ?, 'running', ?, ?)",
         (
             run_id,
             source["source_id"],
+            source.get("source_type"),
             datetime.now(UTC).isoformat(),
             parser_version,
             _json_text(metadata or {}),
@@ -279,13 +368,17 @@ def record_radar_observation(
     conn.execute(
         """
         INSERT INTO radar_source_observations (
-            observation_key, source_id, company_id, external_id, source_url,
-            canonical_url, title, company_name, location, published_at,
-            first_seen_at, last_seen_at, last_run_id, publisher_name,
-            publisher_type, verification_status, content_fingerprint,
-            payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            observation_key, source_id, source_type, company_id, external_id,
+            source_url, canonical_url, title, company_name, location,
+            published_at, first_seen_at, last_seen_at, last_run_id,
+            publisher_name, publisher_type, verification_status,
+            content_fingerprint, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(observation_key) DO UPDATE SET
+            source_type = COALESCE(
+                excluded.source_type,
+                radar_source_observations.source_type
+            ),
             source_url = excluded.source_url,
             canonical_url = excluded.canonical_url,
             title = COALESCE(excluded.title, radar_source_observations.title),
@@ -303,6 +396,7 @@ def record_radar_observation(
         (
             observation_key,
             source_id,
+            observation.get("source_type"),
             observation.get("company_id"),
             external_id or None,
             source_url or None,
@@ -342,16 +436,28 @@ def upsert_radar_lead(
             last_seen_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(observation_key) DO UPDATE SET
-            status = excluded.status,
+            status = CASE
+                WHEN radar_leads.status IN ('promoted', 'rejected', 'expired')
+                    THEN radar_leads.status
+                ELSE excluded.status
+            END,
             company_id = COALESCE(excluded.company_id, radar_leads.company_id),
             title = COALESCE(excluded.title, radar_leads.title),
             location = COALESCE(excluded.location, radar_leads.location),
             source_url = COALESCE(excluded.source_url, radar_leads.source_url),
             official_job_url = COALESCE(excluded.official_job_url, radar_leads.official_job_url),
-            promoted_job_url = COALESCE(excluded.promoted_job_url, radar_leads.promoted_job_url),
+            promoted_job_url = COALESCE(radar_leads.promoted_job_url, excluded.promoted_job_url),
             publisher_type = COALESCE(excluded.publisher_type, radar_leads.publisher_type),
-            verification_status = excluded.verification_status,
-            reason = excluded.reason,
+            verification_status = CASE
+                WHEN radar_leads.status IN ('promoted', 'rejected', 'expired')
+                    THEN radar_leads.verification_status
+                ELSE excluded.verification_status
+            END,
+            reason = CASE
+                WHEN radar_leads.status IN ('promoted', 'rejected', 'expired')
+                    THEN radar_leads.reason
+                ELSE excluded.reason
+            END,
             track_tags_json = excluded.track_tags_json,
             last_seen_at = excluded.last_seen_at
         """,
@@ -368,7 +474,7 @@ def upsert_radar_lead(
             lead.get("publisher_type"),
             lead.get("verification_status", "unverified"),
             lead.get("reason"),
-            _json_text(lead.get("track_tags", [])),
+            _json_text(lead.get("track_tags") or lead.get("subtracks", [])),
             now,
             now,
         ),
@@ -441,8 +547,16 @@ def ingest_radar_official_jobs(
                 company_id or job.get("company_id") or job.get("company_name")
             ).replace(" ", "-")
             if requisition_id:
-                job["platform_job_id"] = (
+                canonical_platform_id = (
                     f"radar:{company_identity}:req:{_normalized_identity_text(requisition_id)}"
+                )
+                job["platform_job_id"] = (
+                    _existing_requisition_platform_id(
+                        conn,
+                        company_identity,
+                        requisition_id,
+                    )
+                    or canonical_platform_id
                 )
             else:
                 job["platform_job_id"] = f"{provider}:{company_identity}:{external_id}"
@@ -482,6 +596,7 @@ def ingest_radar_official_jobs(
         observation = {
             **job,
             "source_id": source_id,
+            "source_type": source.get("source_type"),
             "company_id": company_id or job.get("company_id"),
             "source_url": job.get("url") or job.get("source_url"),
             "canonical_url": canonical_url,
@@ -523,6 +638,7 @@ def ingest_radar_leads(
         observation = {
             **lead,
             "source_id": source_id,
+            "source_type": source.get("source_type"),
             "source_url": lead.get("source_url") or lead.get("url"),
             "publisher_type": lead.get("publisher_type", "unknown"),
             "verification_status": lead.get("verification_status", "unverified"),
@@ -532,6 +648,127 @@ def ingest_radar_leads(
         upsert_radar_lead(conn, observation_key, lead)
         inserted += 1
     return {"leads": inserted}
+
+
+def _company_seed_key(seed: dict) -> str:
+    supplied = str(seed.get("company_key") or "").strip()
+    if supplied:
+        return supplied
+    official_domain = str(seed.get("official_domain") or "").strip().casefold()
+    if official_domain:
+        return f"domain:{official_domain}"
+    company_name = _normalized_identity_text(seed.get("company_name")).replace(" ", "-")
+    if not company_name:
+        raise ValueError("company seed requires company_name")
+    return f"name:{company_name}"
+
+
+def ingest_radar_company_seeds(
+    conn: sqlite3.Connection,
+    run_id: str,
+    source: dict,
+    seeds: list[dict],
+) -> dict:
+    """Persist ecosystem company candidates without creating jobs or leads."""
+    source_id = str(source.get("source_id") or "").strip()
+    if not source_id:
+        raise ValueError("company seed ingest requires source_id")
+    now = datetime.now(UTC).isoformat()
+    new_count = 0
+    existing_count = 0
+    for raw_seed in seeds:
+        seed = dict(raw_seed)
+        company_name = str(seed.get("company_name") or "").strip()
+        source_url = str(seed.get("source_url") or "").strip()
+        if not company_name or not source_url:
+            raise ValueError("company seed requires company_name and source_url")
+        company_key = _company_seed_key(seed)
+        exists = conn.execute(
+            "SELECT 1 FROM radar_company_seeds WHERE company_key = ?",
+            (company_key,),
+        ).fetchone()
+        if exists is None:
+            new_count += 1
+        else:
+            existing_count += 1
+        conn.execute(
+            """
+            INSERT INTO radar_company_seeds (
+                company_key, company_name, official_domain, official_url,
+                careers_url, location, sectors_json, track_tags_json, status,
+                verification_status, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company_key) DO UPDATE SET
+                company_name = excluded.company_name,
+                official_domain = COALESCE(
+                    excluded.official_domain,
+                    radar_company_seeds.official_domain
+                ),
+                official_url = COALESCE(
+                    excluded.official_url,
+                    radar_company_seeds.official_url
+                ),
+                careers_url = COALESCE(
+                    excluded.careers_url,
+                    radar_company_seeds.careers_url
+                ),
+                location = COALESCE(excluded.location, radar_company_seeds.location),
+                sectors_json = excluded.sectors_json,
+                track_tags_json = excluded.track_tags_json,
+                status = CASE
+                    WHEN radar_company_seeds.status IN ('rejected', 'source_configured')
+                        THEN radar_company_seeds.status
+                    ELSE excluded.status
+                END,
+                verification_status = CASE
+                    WHEN radar_company_seeds.status IN ('rejected', 'source_configured')
+                        THEN radar_company_seeds.verification_status
+                    ELSE excluded.verification_status
+                END,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                company_key,
+                company_name,
+                seed.get("official_domain"),
+                seed.get("official_url"),
+                seed.get("careers_url"),
+                seed.get("location"),
+                _json_text(seed.get("sectors", [])),
+                _json_text(seed.get("track_tags", [])),
+                seed.get("status", "awaiting_official_careers"),
+                seed.get("verification_status", "company_seed_unverified"),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO radar_company_seed_sources (
+                company_key, source_id, source_url, last_run_id, payload_json,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company_key, source_id, source_url) DO UPDATE SET
+                last_run_id = excluded.last_run_id,
+                payload_json = excluded.payload_json,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                company_key,
+                source_id,
+                source_url,
+                run_id,
+                _json_text(raw_seed),
+                now,
+                now,
+            ),
+        )
+    conn.commit()
+    return {
+        "seeds": len(seeds),
+        "new": new_count,
+        "existing": existing_count,
+    }
 
 
 def reconcile_radar_leads(
@@ -788,7 +1025,7 @@ def get_radar_daily_snapshot(
     run_params = (since,) if since else ()
     run_rows = conn.execute(
         f"""
-        SELECT r.*, s.source_type
+        SELECT r.*, COALESCE(r.source_type, s.source_type) AS resolved_source_type
         FROM radar_fetch_runs r
         LEFT JOIN radar_sources s ON s.source_id = r.source_id
         {run_where}
@@ -797,12 +1034,17 @@ def get_radar_daily_snapshot(
         run_params,
     ).fetchall()
     runs = []
-    seen_sources: set[str] = set()
+    seen_run_keys: set[tuple[str, str]] = set()
+    seen_source_ids: set[str] = set()
     latest_observation_run_ids: list[str] = []
     for row in run_rows:
-        if row["source_id"] in seen_sources:
+        source_id = str(row["source_id"])
+        source_type = str(row["resolved_source_type"] or "")
+        run_key = (source_id, source_type)
+        if run_key in seen_run_keys:
             continue
-        seen_sources.add(row["source_id"])
+        seen_run_keys.add(run_key)
+        seen_source_ids.add(source_id)
         if row["finished_at"] and row["status"] in {"complete", "partial"}:
             latest_observation_run_ids.append(row["run_id"])
         try:
@@ -820,9 +1062,9 @@ def get_radar_daily_snapshot(
             error = error or "pagination incomplete"
         runs.append(
             {
-                "source": row["source_id"],
-                "kind": row["source_type"]
-                or ("official_careers" if row["source_id"].startswith("official:") else "social_lead"),
+                "source": source_id,
+                "kind": source_type
+                or ("official_careers" if source_id.startswith("official:") else "social_lead"),
                 "status": status,
                 "count": metadata.get("accepted_count", row["normalized_count"]),
                 "raw_count": row["raw_count"],
@@ -838,7 +1080,7 @@ def get_radar_daily_snapshot(
         )
     for source in expected_sources or []:
         source_id = str(source.get("source_id") or "").strip()
-        if not source_id or source_id in seen_sources:
+        if not source_id or source_id in seen_source_ids:
             continue
         runs.append(
             {
@@ -933,9 +1175,11 @@ def get_radar_daily_snapshot(
     lead_params = (since,) if since else ()
     lead_rows = conn.execute(
         f"""
-        SELECT l.*, o.source_id, o.payload_json
+        SELECT l.*, o.source_id, o.payload_json,
+               COALESCE(o.source_type, s.source_type) AS resolved_source_type
         FROM radar_leads l
         JOIN radar_source_observations o ON o.observation_key = l.observation_key
+        LEFT JOIN radar_sources s ON s.source_id = o.source_id
         {lead_where.replace('last_seen_at', 'l.last_seen_at')}
         ORDER BY l.last_seen_at DESC
         """,
@@ -950,7 +1194,12 @@ def get_radar_daily_snapshot(
         leads.append(
             {
                 "source": row["source_id"],
-                "kind": "linkedin_post" if "linkedin.com" in (row["source_url"] or "") else "forum",
+                "kind": row["resolved_source_type"]
+                or (
+                    "linkedin_post"
+                    if "linkedin.com" in (row["source_url"] or "")
+                    else "forum"
+                ),
                 "url": row["source_url"],
                 "company": row["company_id"],
                 "title": row["title"],
@@ -963,10 +1212,58 @@ def get_radar_daily_snapshot(
                 "subtracks": payload.get("subtracks") or payload.get("track_tags", []),
             }
         )
+    seed_where = "WHERE last_seen_at >= ?" if since else ""
+    seed_params = (since,) if since else ()
+    seed_rows = conn.execute(
+        f"""
+        SELECT *
+        FROM radar_company_seeds
+        {seed_where}
+        ORDER BY last_seen_at DESC, company_name
+        """,
+        seed_params,
+    ).fetchall()
+    company_seeds = []
+    for row in seed_rows:
+        lineage = conn.execute(
+            """
+            SELECT source_id, source_url
+            FROM radar_company_seed_sources
+            WHERE company_key = ?
+            ORDER BY source_id, source_url
+            """,
+            (row["company_key"],),
+        ).fetchall()
+        try:
+            sectors = json.loads(row["sectors_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            sectors = []
+        try:
+            track_tags = json.loads(row["track_tags_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            track_tags = []
+        company_seeds.append(
+            {
+                "company_key": row["company_key"],
+                "company_name": row["company_name"],
+                "official_domain": row["official_domain"],
+                "official_url": row["official_url"],
+                "careers_url": row["careers_url"],
+                "location": row["location"],
+                "sectors": sectors,
+                "track_tags": track_tags,
+                "status": row["status"],
+                "verification_status": row["verification_status"],
+                "source_count": len(lineage),
+                "source_ids": [item["source_id"] for item in lineage],
+                "source_urls": [item["source_url"] for item in lineage],
+            }
+        )
     return {
         "source_runs": runs,
         "observations": observations,
         "leads": leads,
+        "company_seeds": company_seeds,
         "applied_exclusions": applied_exclusions,
         "applied_snapshot": applied_snapshot,
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from applypilot.commands.apply import _select_runnable_browser_backend
 from applypilot.runtime_settings import load_runtime_settings
 
 
@@ -38,3 +39,36 @@ def test_runtime_settings_keep_backend_and_browser_validation_contracts() -> Non
     assert settings.resolve_apply_backend(fallback_invalid=True) == "codex"
     with pytest.raises(ValueError, match="browser backend must be edge, cloak, or auto"):
         settings.resolve_browser_backend()
+
+
+def test_auto_browser_backend_uses_edge_when_optional_cloak_is_unavailable() -> None:
+    def resolve(backend: str) -> str:
+        if backend == "cloak":
+            raise RuntimeError("cloak not installed")
+        return "msedge.exe"
+
+    selected, unavailable = _select_runnable_browser_backend("auto", resolve)
+
+    assert selected == "edge"
+    assert unavailable == {"cloak": "cloak not installed"}
+
+
+def test_auto_browser_backend_uses_cloak_when_edge_is_unavailable() -> None:
+    def resolve(backend: str) -> str:
+        if backend == "edge":
+            raise FileNotFoundError("edge not installed")
+        return "cloakbrowser.exe"
+
+    selected, unavailable = _select_runnable_browser_backend("auto", resolve)
+
+    assert selected == "cloak"
+    assert unavailable == {"edge": "edge not installed"}
+
+
+def test_auto_browser_backend_preserves_fallback_when_both_are_available() -> None:
+    selected, unavailable = _select_runnable_browser_backend(
+        "auto", lambda backend: f"{backend}.exe"
+    )
+
+    assert selected == "auto"
+    assert unavailable == {}

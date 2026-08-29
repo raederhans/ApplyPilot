@@ -1,0 +1,221 @@
+{
+  "schema_version": "1",
+  "label": "replay_conformance_only_not_a_real_provider_benchmark",
+  "scenarios": [
+    {
+      "scenario_id": "prepare-form",
+      "dry_run": false,
+      "request": {
+        "run_id": "run-prepare",
+        "attempt_id": "attempt-prepare",
+        "agent_role": "form-preparer",
+        "phase": "prepare",
+        "objective": "Prepare an application without submitting it",
+        "available_tools": ["browser_snapshot", "browser_fill_form"],
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "prepare",
+          "reason_code": "primary_playwright"
+        },
+        "interaction_mode": "auto"
+      },
+      "expected": {
+        "status": "ready_to_submit",
+        "receipt": false,
+        "conflict": false,
+        "tools": ["browser_snapshot", "browser_fill_form"],
+        "side_effects": ["read", "write"],
+        "max_latency_ms": 500
+      }
+    },
+    {
+      "scenario_id": "submit-with-receipt",
+      "dry_run": false,
+      "request": {
+        "run_id": "run-receipt",
+        "attempt_id": "attempt-receipt",
+        "agent_role": "submit-owner",
+        "phase": "submit",
+        "objective": "Classify a recorded submission turn",
+        "available_tools": ["browser_click", "browser_snapshot"],
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "primary_playwright"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "applied",
+        "receipt": true,
+        "conflict": false,
+        "tools": ["browser_click", "browser_snapshot"],
+        "side_effects": ["write", "read"],
+        "max_latency_ms": 500
+      }
+    },
+    {
+      "scenario_id": "submit-conflict-fails-closed",
+      "dry_run": false,
+      "request": {
+        "run_id": "run-conflict",
+        "attempt_id": "attempt-conflict",
+        "agent_role": "submit-owner",
+        "phase": "submit",
+        "objective": "Fail closed when recorded outputs disagree",
+        "available_tools": ["browser_click"],
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "primary_playwright"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "submission_uncertain",
+        "receipt": false,
+        "conflict": true,
+        "tools": ["browser_click"],
+        "side_effects": ["write"],
+        "max_latency_ms": 500
+      }
+    }
+  ],
+  "runtimes": {
+    "provider-a-replay": {
+      "run-prepare": {
+        "latency_ms": 120,
+        "legacy_output": "RESULT:READY_TO_SUBMIT",
+        "result": {
+          "run_id": "run-prepare",
+          "status": "ready_to_submit",
+          "summary": "Recorded form preparation completed",
+          "observations": {
+            "tool_calls": [
+              {"name": "browser_snapshot", "side_effect": "read"},
+              {"name": "browser_fill_form", "side_effect": "write"}
+            ]
+          },
+          "proposals": [
+            {
+              "proposal_id": "review-copy",
+              "kind": "review",
+              "summary": "Review prepared copy",
+              "concurrency_mode": "parallel",
+              "concurrency_key": "copy"
+            },
+            {
+              "proposal_id": "review-files",
+              "kind": "review",
+              "summary": "Review file references",
+              "concurrency_mode": "parallel",
+              "concurrency_key": "files"
+            }
+          ]
+        }
+      },
+      "run-receipt": {
+        "latency_ms": 180,
+        "legacy_output": "RESULT:APPLIED\nSUBMISSION_EVIDENCE: {\"receipt_visible\": true, \"applied_badge_visible\": false, \"confirmation_text\": \"Application received\", \"confirmation_url\": \"https://example.test/confirmation\"}",
+        "result": {
+          "run_id": "run-receipt",
+          "status": "applied",
+          "summary": "Recorded receipt was visible",
+          "observations": {
+            "submission_evidence": {
+              "receipt_visible": true,
+              "applied_badge_visible": false,
+              "confirmation_text": "Application received",
+              "confirmation_url": "https://example.test/confirmation"
+            },
+            "tool_calls": [
+              {"name": "browser_click", "side_effect": "write"},
+              {"name": "browser_snapshot", "side_effect": "read"}
+            ]
+          }
+        }
+      },
+      "run-conflict": {
+        "latency_ms": 95,
+        "legacy_output": "RESULT:SUBMISSION_UNCERTAIN",
+        "result": {
+          "run_id": "run-conflict",
+          "status": "applied",
+          "summary": "Structured replay claimed a receipt",
+          "observations": {
+            "submission_evidence": {
+              "receipt_visible": true,
+              "applied_badge_visible": false,
+              "confirmation_text": "Application received",
+              "confirmation_url": "https://example.test/confirmation"
+            },
+            "tool_calls": [
+              {"name": "browser_click", "side_effect": "write"}
+            ]
+          }
+        }
+      }
+    },
+    "provider-b-replay": {
+      "run-prepare": {
+        "latency_ms": 145,
+        "legacy_output": "RESULT:READY_TO_SUBMIT",
+        "result": {
+          "run_id": "run-prepare",
+          "status": "ready_to_submit",
+          "summary": "Alternative recorded runtime prepared the form",
+          "observations": {
+            "tool_calls": [
+              {"name": "browser_snapshot", "side_effect": "read"},
+              {"name": "browser_fill_form", "side_effect": "write"}
+            ]
+          }
+        }
+      },
+      "run-receipt": {
+        "latency_ms": 210,
+        "legacy_output": "RESULT:APPLIED\nSUBMISSION_EVIDENCE: {\"receipt_visible\": true, \"applied_badge_visible\": false, \"confirmation_text\": \"Application received\", \"confirmation_url\": \"https://example.test/confirmation\"}",
+        "result": {
+          "run_id": "run-receipt",
+          "status": "applied",
+          "summary": "Alternative replay observed the same receipt contract",
+          "observations": {
+            "submission_evidence": {
+              "receipt_visible": true,
+              "applied_badge_visible": false,
+              "confirmation_text": "Application received",
+              "confirmation_url": "https://example.test/confirmation"
+            },
+            "tool_calls": [
+              {"name": "browser_click", "side_effect": "write"},
+              {"name": "browser_snapshot", "side_effect": "read"}
+            ]
+          }
+        }
+      },
+      "run-conflict": {
+        "latency_ms": 110,
+        "legacy_output": "RESULT:SUBMISSION_UNCERTAIN",
+        "result": {
+          "run_id": "run-conflict",
+          "status": "applied",
+          "summary": "Alternative structured replay disagreed with legacy output",
+          "observations": {
+            "submission_evidence": {
+              "receipt_visible": true,
+              "applied_badge_visible": false,
+              "confirmation_text": "Application received",
+              "confirmation_url": "https://example.test/confirmation"
+            },
+            "tool_calls": [
+              {"name": "browser_click", "side_effect": "write"}
+            ]
+          }
+        }
+      }
+    }
+  }
+}

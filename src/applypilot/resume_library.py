@@ -26,7 +26,7 @@ from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
 from applypilot.scoring.cover_letter import read_resume_source
 
-TAXONOMY_VERSION = "resume-library-v4"
+TAXONOMY_VERSION = "resume-library-v5"
 POLICY_VERSION = "reuse-policy-v2"
 
 REUSE_REQUIRED_COVERAGE = 0.90
@@ -119,6 +119,11 @@ _DELIVERABLE_TERMS = {
 # validated material for adjacent technical work already present in the local
 # application history.  Rules are ordered from specific to general.
 _RESUME_SUBTYPE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "ai_solutions",
+        "ai_implementation",
+        ("machine learning engineer", "artificial intelligence engineer", "ai engineer"),
+    ),
     (
         "workflow_automation",
         "ai_implementation",
@@ -365,6 +370,12 @@ def extract_job_profile(
                 if score:
                     term_scores[str(subtype)] = score
 
+    # The discovery classifier already proved these phrases against the title
+    # with punctuation-normalized matching.  Give them title weight so a weak
+    # description-only term cannot displace the title's subtype.
+    for title_match in title_matches:
+        term_scores[title_match] = max(term_scores.get(title_match, 0), 5)
+
     ordered = sorted(term_scores, key=lambda item: (-term_scores[item], item))
     subtype = ordered[0] if ordered else (title_matches[0] if title_matches else None)
     raw_track = SUBTRACK_TO_TRACK.get(subtype) if subtype else None
@@ -378,25 +389,27 @@ def extract_job_profile(
         if second_score == top_score and second_score:
             confidence = min(confidence, 0.60)
 
-    if not subtype:
-        title_text = _normalise_text(title)
+    title_text = _normalise_text(title)
+    matched_rule: tuple[str, str, bool] | None = None
+    for rule_subtype, rule_track, phrases in _RESUME_SUBTYPE_RULES:
+        if any(_contains_phrase(title_text, phrase) for phrase in phrases):
+            matched_rule = (rule_subtype, rule_track, True)
+            break
+    if matched_rule is None and not subtype:
         description_text = _normalise_text(description)
-        matched_rule: tuple[str, str, bool] | None = None
         for rule_subtype, rule_track, phrases in _RESUME_SUBTYPE_RULES:
-            if any(_contains_phrase(title_text, phrase) for phrase in phrases):
-                matched_rule = (rule_subtype, rule_track, True)
+            if any(_contains_phrase(description_text, phrase) for phrase in phrases):
+                matched_rule = (rule_subtype, rule_track, False)
                 break
-        if matched_rule is None:
-            for rule_subtype, rule_track, phrases in _RESUME_SUBTYPE_RULES:
-                if any(_contains_phrase(description_text, phrase) for phrase in phrases):
-                    matched_rule = (rule_subtype, rule_track, False)
-                    break
-        if matched_rule is not None:
-                rule_subtype, rule_track, title_hit = matched_rule
-                subtype = rule_subtype
-                track = rule_track
-                confidence = 0.85 if title_hit else 0.60
-                term_scores[subtype] = 5 if title_hit else 1
+    if matched_rule is not None:
+        rule_subtype, rule_track, title_hit = matched_rule
+        # Fine-grained title rules intentionally refine the broader discovery
+        # taxonomy.  Description-only rules remain a no-subtype fallback above.
+        if title_hit or not subtype:
+            subtype = rule_subtype
+            track = rule_track
+            confidence = 0.85 if title_hit else 0.60
+            term_scores[subtype] = max(term_scores.get(subtype, 0), 5 if title_hit else 1)
 
     lowered_title = title.casefold()
     if re.search(r"\b(?:intern|internship|trainee|co-op|graduate programme)\b", lowered_title):
@@ -738,8 +751,9 @@ def _add_coverage_cell(
     tracks = [
         str(row["track"])
         for row in conn.execute(
-            "SELECT DISTINCT track FROM resume_coverage_cells WHERE artifact_id=? ORDER BY track",
-            (artifact_id,),
+            "SELECT DISTINCT track FROM resume_coverage_cells "
+            "WHERE artifact_id=? AND taxonomy_version=? ORDER BY track",
+            (artifact_id, TAXONOMY_VERSION),
         ).fetchall()
     ]
     if tracks:
@@ -913,12 +927,14 @@ def _write_reuse_route_report(
     route_root = (artifact_path.parent.parent / "routes").resolve()
     route_root.mkdir(parents=True, exist_ok=True)
     artifact_token = str(artifact["artifact_id"]).replace(":", "-")
+    decision = str(result.get("decision") or "reuse_exact")
+    decision_suffix = "-manual-selection" if decision == "manual_selection" else ""
     report_path = route_root / (
-        f"{job_profile['job_fingerprint']}-{artifact_token}.json"
+        f"{job_profile['job_fingerprint']}-{artifact_token}{decision_suffix}.json"
     )
     payload = {
         "status": "machine_validated",
-        "decision": "reuse_exact",
+        "decision": decision,
         "policy_version": POLICY_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
         "assignment_id": assignment_id,
@@ -994,27 +1010,30 @@ def route_resume_for_job(
     conn: sqlite3.Connection,
     job: Mapping[str, object],
     profile: Mapping[str, object],
+    *,
+    artifact_id: str | None = None,
 ) -> dict:
     """Choose reuse/create/review/ignore for one exact job, without LLM calls."""
     ensure_resume_library_schema(conn)
     job_profile = extract_job_profile(job, profile)
     persist_job_profile(conn, job_profile)
 
+    requested_artifact_id = str(artifact_id or "").strip() or None
     decision = "manual_review"
     artifact_id: str | None = None
     required_coverage: float | None = None
     overall_score: float | None = None
     margin: float | None = None
     hard_gaps: list[str] = []
-    components: dict[str, object] = {"job_profile": job_profile}
+    manual_selection_allowed = False
+    candidates: list[dict] = []
+    components: dict[str, object] = {"job_profile": job_profile, "candidates": []}
 
     if str(job.get("eligibility_status") or "").casefold() == "ineligible":
         decision = "ignore"
         reason = f"Job is ineligible: {job.get('eligibility_reason') or 'explicit eligibility failure'}"
     elif not str(job.get("full_description") or "").strip():
         reason = "Full job description is missing; subtype and hard requirements cannot be verified."
-    elif job_profile["seniority"] == "senior_or_high_experience":
-        reason = "The role is senior or includes a 4+ year threshold and requires review."
     elif not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55:
         reason = "No sufficiently confident fine-grained role subtype was found."
     else:
@@ -1031,7 +1050,6 @@ def route_resume_for_job(
             """,
             (TAXONOMY_VERSION, job_profile["subtype"]),
         ).fetchall()
-        candidates: list[dict] = []
         for row in rows:
             artifact = dict(row)
             if _artifact_is_current(artifact):
@@ -1138,6 +1156,7 @@ def route_resume_for_job(
             elif not top["exact_job_validation"] and margin < REUSE_MIN_MARGIN:
                 decision = "manual_review"
                 reason = "Two validated artifacts are too close to choose automatically."
+                manual_selection_allowed = True
             elif not top["exact_job_validation"]:
                 decision = "reuse_exact"
                 if route_preference_resolved_tie:
@@ -1150,6 +1169,63 @@ def route_resume_for_job(
                         "A current validated artifact covers the same subtype and clears all "
                         "reuse gates."
                     )
+
+    if requested_artifact_id:
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate["artifact_id"] == requested_artifact_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(
+                "The requested resume artifact is not a current candidate for this exact job"
+            )
+        if decision != "manual_review" or not manual_selection_allowed:
+            raise ValueError(
+                "Manual selection cannot resolve this route decision; review remains required"
+            )
+        selected_required_coverage = float(selected["required_coverage"])
+        selected_overall_score = float(selected["overall_score"])
+        if (
+            selected_required_coverage < REUSE_REQUIRED_COVERAGE
+            or selected_overall_score < REUSE_OVERALL_SCORE
+        ):
+            raise ValueError("The requested candidate does not clear the existing reuse gates")
+        selected_hard_gaps = list(selected["missing_required"])
+        all_source_text = "\n".join(
+            _normalise_text(read_resume_source(Path(str(row["text_path"]))))
+            for row in conn.execute(
+                "SELECT text_path FROM resume_artifacts WHERE active=1 AND kind='base'"
+            ).fetchall()
+            if Path(str(row["text_path"])).is_file()
+        )
+        unsupported = [
+            gap
+            for gap in selected_hard_gaps
+            if not _contains_phrase(all_source_text, gap)
+        ]
+        if unsupported:
+            raise ValueError(
+                "Manual selection cannot resolve unsupported required skill review"
+            )
+        artifact_id = requested_artifact_id
+        required_coverage = selected_required_coverage
+        overall_score = selected_overall_score
+        hard_gaps = selected_hard_gaps
+        original_reason = reason
+        decision = "manual_selection"
+        reason = (
+            "An explicit operator or agent selected one current qualified candidate "
+            "from an otherwise unresolved tie."
+        )
+        components["manual_selection"] = {
+            "artifact_id": artifact_id,
+            "original_decision": "manual_review",
+            "original_reason": original_reason,
+        }
 
     assignment_id = _record_assignment(
         conn,
@@ -1173,8 +1249,9 @@ def route_resume_for_job(
         "runner_up_margin": margin,
         "hard_gaps": hard_gaps,
         "job_profile": job_profile,
+        "candidates": components["candidates"],
     }
-    if decision == "reuse_exact" and artifact_id:
+    if decision in {"reuse_exact", "manual_selection"} and artifact_id:
         artifact = dict(
             conn.execute(
                 "SELECT * FROM resume_artifacts WHERE artifact_id=?", (artifact_id,)
@@ -1184,11 +1261,16 @@ def route_resume_for_job(
         _record_validation(
             conn,
             artifact_id=artifact_id,
-            validation_kind="reuse_route_binding",
+            validation_kind=(
+                "manual_selection_route_binding"
+                if decision == "manual_selection"
+                else "reuse_route_binding"
+            ),
             status="machine_validated",
             job_profile=job_profile,
             evidence={
                 "assignment_id": assignment_id,
+                "decision": decision,
                 "pdf_sha256": artifact.get("pdf_sha256"),
                 "pdf_size": artifact.get("pdf_size"),
                 "policy_version": POLICY_VERSION,
@@ -1206,9 +1288,11 @@ def project_reuse_to_job(
     job: Mapping[str, object],
     route: Mapping[str, object],
 ) -> dict:
-    """Project a reuse decision into the legacy material fields atomically."""
-    if route.get("decision") != "reuse_exact" or not route.get("artifact"):
-        raise ValueError("Only a reuse_exact route can be projected")
+    """Project a validated automatic or explicit reuse route atomically."""
+    if route.get("decision") not in {"reuse_exact", "manual_selection"} or not route.get(
+        "artifact"
+    ):
+        raise ValueError("Only a validated reuse route can be projected")
     artifact = route["artifact"]
     if not _artifact_is_current(artifact):
         raise ValueError("Resume artifact bytes changed before compatibility projection")
@@ -1266,7 +1350,9 @@ def library_status(conn: sqlite3.Connection) -> dict:
     counts["covered_subtypes"] = [
         row["subtype"]
         for row in conn.execute(
-            "SELECT DISTINCT subtype FROM resume_coverage_cells ORDER BY subtype"
+            "SELECT DISTINCT subtype FROM resume_coverage_cells "
+            "WHERE taxonomy_version=? ORDER BY subtype",
+            (TAXONOMY_VERSION,),
         ).fetchall()
     ]
     counts["taxonomy_version"] = TAXONOMY_VERSION

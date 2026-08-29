@@ -127,7 +127,7 @@ def _build_standing_authorization_manifest(
             SELECT * FROM jobs
             WHERE (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
               AND COALESCE(apply_retry_blocked, 0) = 0
-              AND eligibility_status != 'ineligible'
+              AND COALESCE(eligibility_status, 'eligible') != 'ineligible'
               AND COALESCE(fit_score, -1) >= ?
             ORDER BY fit_score DESC, url
             LIMIT ?
@@ -655,6 +655,21 @@ def radar_import_leads(
 ) -> None:
     """Import a candidate-reviewed JSON/CSV lead file without creating jobs."""
     return radar_command_mod.run_radar_import_leads(
+        sys.modules[__name__],
+        {
+            "file": file,
+            "source_id": source_id,
+        },
+    )
+
+
+@radar_app.command("import-company-seeds")
+def radar_import_company_seeds(
+    file: Path = typer.Option(..., "--file", exists=True, dir_okay=False),
+    source_id: str = typer.Option(..., "--source-id"),
+) -> None:
+    """Import reviewed ecosystem companies without creating jobs or leads."""
+    return radar_command_mod.run_radar_import_company_seeds(
         sys.modules[__name__],
         {
             "file": file,
@@ -1350,10 +1365,15 @@ def resume_library_status_command() -> None:
 @app.command("resume-route")
 def resume_route_command(
     url: str = typer.Option(..., "--url", help="Exact job or application URL."),
+    artifact_id: str | None = typer.Option(
+        None,
+        "--artifact-id",
+        help="Explicitly select one current qualified candidate when automatic routing ties.",
+    ),
     project_reuse: bool = typer.Option(
         False,
         "--project-reuse",
-        help="If the decision is reuse_exact, project it into the legacy jobs material fields.",
+        help="Project a validated automatic or explicit reuse route into legacy material fields.",
     ),
 ) -> None:
     """Fingerprint one job and select reuse/create/review/ignore deterministically."""
@@ -1376,11 +1396,11 @@ def resume_route_command(
     profile = load_profile()
     sync_resume_library(conn, profile)
     job = dict(rows[0])
-    result = route_resume_for_job(conn, job, profile)
+    result = route_resume_for_job(conn, job, profile, artifact_id=artifact_id)
     if project_reuse:
-        if result["decision"] != "reuse_exact":
+        if result["decision"] not in {"reuse_exact", "manual_selection"}:
             console.print_json(data=result)
-            console.print("[red]Only reuse_exact can be projected.[/red]")
+            console.print("[red]Only a validated reuse route can be projected.[/red]")
             raise typer.Exit(code=2)
         result["legacy_projection"] = project_reuse_to_job(conn, job, result)
     console.print_json(data=result)

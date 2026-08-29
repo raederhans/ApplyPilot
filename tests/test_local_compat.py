@@ -18,6 +18,7 @@ from applypilot.apply import (
     credential_relay,
     credential_relay_mcp,
     launcher,
+    page_observation,
     prompt,
     worker_orchestration,
 )
@@ -199,6 +200,11 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
         credential_relay_authorized=True,
     )
     rendered = " ".join(command)
+    overrides = {
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    }
 
     assert command[:2] == [str(native), "exec"]
     assert "--ignore-user-config" in command
@@ -209,8 +215,40 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
     assert "browser_file_upload" in rendered
     assert "mcp_servers.credential_relay.command" in rendered
     assert "applypilot.apply.credential_relay_mcp" in rendered
+    assert "mcp_servers.credential_relay.env_vars" in rendered
+    for name in (
+        "APPLYPILOT_ATS_CREDENTIAL_FILE",
+        "APPLYPILOT_CDP_PORT",
+        "APPLYPILOT_CREDENTIAL_ALLOWED_HOSTS",
+        "APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS",
+        "APPLYPILOT_CREDENTIAL_ALLOW_KNOWN_ATS_REDIRECT",
+        "APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS",
+        "APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED",
+    ):
+        assert name in rendered
+    assert (
+        'mcp_servers.applypilot_ats.env_vars=["APPLYPILOT_ATS_CONTEXT_PATH"]'
+        in overrides
+    )
+    assert (
+        "mcp_servers.applypilot_control.env_vars="
+        '["APPLYPILOT_AGENT_REPORT_PATH", "APPLYPILOT_AGENT_RUN_ID"]'
+        in overrides
+    )
+    ats_env = next(
+        value for value in overrides
+        if value.startswith("mcp_servers.applypilot_ats.env_vars=")
+    )
+    control_env = next(
+        value for value in overrides
+        if value.startswith("mcp_servers.applypilot_control.env_vars=")
+    )
+    assert "CREDENTIAL" not in ats_env
+    assert "CREDENTIAL" not in control_env
     assert "browser_evaluate" not in rendered
-    assert "gmail" not in rendered.casefold()
+    assert "mcp_servers.mailbox.required=false" in rendered
+    assert 'mcp_servers.mailbox.enabled_tools=["search_emails", "read_email"]' in rendered
+    assert "send_email" not in rendered
     assert "--sandbox read-only" in rendered
     assert "features.shell_tool=false" in rendered
     assert 'web_search="disabled"' in rendered
@@ -409,6 +447,107 @@ def test_unknown_browser_profile_mode_is_rejected(monkeypatch, tmp_path: Path) -
         chrome.setup_worker_profile(0)
 
 
+def test_cdp_readiness_accepts_edge_zero_exit_relaunch(monkeypatch) -> None:
+    class Process:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(chrome, "urlopen", lambda *_args, **_kwargs: Response())
+
+    chrome._wait_for_cdp_ready(Process(), 9432, timeout_seconds=0.1)
+
+
+def test_cdp_readiness_rejects_nonzero_browser_exit() -> None:
+    class Process:
+        returncode = 12
+
+        @staticmethod
+        def poll():
+            return 12
+
+    with pytest.raises(RuntimeError, match=r"exit=12"):
+        chrome._wait_for_cdp_ready(Process(), 9432, timeout_seconds=0.1)
+
+
+def test_cleanup_closes_edge_child_after_zero_exit_relaunch(monkeypatch) -> None:
+    class Process:
+        pid = 456
+
+        @staticmethod
+        def poll():
+            return 0
+
+    closed_ports: list[int] = []
+    killed_pids: list[int] = []
+    monkeypatch.setattr(chrome, "_close_browser_via_cdp", closed_ports.append)
+    monkeypatch.setattr(chrome, "_kill_process_tree", killed_pids.append)
+    chrome._chrome_procs[37] = Process()
+    chrome._chrome_ports[37] = 9432
+
+    chrome.cleanup_worker(37, chrome._chrome_procs[37])
+
+    assert closed_ports == [9432]
+    assert killed_pids == []
+    assert 37 not in chrome._chrome_procs
+    assert 37 not in chrome._chrome_ports
+
+
+def test_close_browser_via_cdp_sends_browser_close(monkeypatch) -> None:
+    from playwright import sync_api
+
+    sent: list[str] = []
+    endpoints: list[str] = []
+
+    class Session:
+        def send(self, method):
+            sent.append(method)
+
+    class Browser:
+        @staticmethod
+        def new_browser_cdp_session():
+            return Session()
+
+    class Chromium:
+        @staticmethod
+        def connect_over_cdp(endpoint):
+            endpoints.append(endpoint)
+            return Browser()
+
+    class Playwright:
+        chromium = Chromium()
+
+    class Context:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: Context())
+
+    chrome._close_browser_via_cdp(9432)
+
+    assert endpoints == ["http://127.0.0.1:9432"]
+    assert sent == ["Browser.close"]
+
+
+def test_agent_log_slug_removes_windows_invalid_source_characters() -> None:
+    assert launcher._safe_log_slug("official:grab:rss") == "official_grab_rss"
+    assert launcher._safe_log_slug(" ") == "unknown"
+
+
 def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) -> None:
     captured = {}
 
@@ -533,6 +672,21 @@ def test_agent_watchdog_kills_process_at_wall_clock_deadline(monkeypatch) -> Non
     assert timed_out.wait(1)
     timer.join(timeout=1)
     assert killed == [321]
+
+
+def test_runtime_timeout_status_distinguishes_budget_exhaustion_from_submission_uncertainty() -> None:
+    assert (
+        launcher._runtime_timeout_status(submission_phase="prepare", dry_run=False)
+        == "failed:agent_runtime_timeout"
+    )
+    assert (
+        launcher._runtime_timeout_status(submission_phase="submit", dry_run=False)
+        == "submission_uncertain"
+    )
+    assert (
+        launcher._runtime_timeout_status(submission_phase="submit", dry_run=True)
+        == "failed:agent_runtime_timeout"
+    )
 
 
 def test_preview_audit_requires_non_submission_and_verified_resume() -> None:
@@ -775,13 +929,28 @@ def test_preferred_display_name_is_not_duplicated() -> None:
     assert "Ryan Yu Yu" not in hard_rules
 
 
+def test_hard_rules_allow_audited_same_level_education_taxonomy() -> None:
+    profile = _application_profile()
+    profile["education"] = [{
+        "institution": "Nanyang Technological University",
+        "degree": "Master of Computing in Applied Artificial Intelligence",
+    }]
+
+    hard_rules = prompt._build_hard_rules(profile)
+
+    assert "closest option at the same degree level" in hard_rules
+    assert "Never select a different degree level" in hard_rules
+    assert "Master of Computing in Applied Artificial Intelligence" in hard_rules
+
+
 def test_salary_guidance_is_singapore_and_quality_first() -> None:
     salary = prompt._build_salary_section(_application_profile())
 
     assert "no salary-based rejection" in salary
     assert "SGD 1750 per month" in salary
     assert "enter 4500" in salary
-    assert "RESULT:FAILED:manual_salary_review" in salary
+    assert "SGD 67500 per year" in salary
+    assert "containing that value" in salary
     assert "$110K" not in salary
     assert "Divide your annual answer by 2080" not in salary
 
@@ -834,17 +1003,23 @@ def test_phone_and_linkedin_uploaded_resume_routing_are_contextual() -> None:
 
 
 def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -> None:
-    steps = prompt._build_login_steps(_application_profile())
+    steps = prompt._build_login_steps(
+        _application_profile(),
+        available_tools=("mailbox_search", "mailbox_get_message"),
+    )
 
     assert "Continue with Google" in steps
     assert "already signed-in account" in steps
     assert "candidate@example.com" in steps
     assert "mcp__credential_relay__fill_ats_credentials" in steps
-    assert "no authorized mailbox capability" in steps
+    assert "read-only mailbox tools" in steps
+    assert "within the last 10 minutes" in steps
     assert "credential_relay_required" in steps
 
     claude_steps = prompt._build_login_steps(
-        _application_profile(), agent_backend="claude"
+        _application_profile(),
+        agent_backend="claude",
+        available_tools=("mailbox_search", "mailbox_get_message"),
     )
     assert ".\\fill-ats-credentials.ps1" in claude_steps
     assert "never repeat the code" in claude_steps
@@ -958,6 +1133,29 @@ def test_credential_relay_both_mode_rejects_partial_forms() -> None:
     assert credential_relay._requested_fields_present("email", True, False) is True
 
 
+def test_credential_relay_fills_password_and_confirmation_without_exposing_value() -> None:
+    class Field:
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def fill(self, value: str) -> None:
+            self.values.append(value)
+
+    password = Field()
+    confirmation = Field()
+
+    assert credential_relay._fill_password_fields(
+        [password, confirmation], "test-only-secret"
+    ) == 2
+    assert password.values == ["test-only-secret"]
+    assert confirmation.values == ["test-only-secret"]
+
+    with pytest.raises(credential_relay.CredentialRelayError, match="more than two"):
+        credential_relay._fill_password_fields(
+            [password, confirmation, Field()], "test-only-secret"
+        )
+
+
 def test_apply_backend_defaults_to_codex(monkeypatch) -> None:
     monkeypatch.delenv("APPLYPILOT_APPLY_BACKEND", raising=False)
 
@@ -1067,7 +1265,7 @@ def test_resume_layout_validator_rejects_title_line_and_tiny_summary_sentence() 
     assert any("undersized sentence" in error for error in result["errors"])
 
 
-def test_hard_singapore_citizen_requirement_is_ineligible() -> None:
+def test_singapore_citizen_requirement_is_scored_not_hard_excluded() -> None:
     status, reason = evaluate_job_eligibility(
         {
             "title": "AI Apprentice",
@@ -1075,8 +1273,8 @@ def test_hard_singapore_citizen_requirement_is_ineligible() -> None:
         }
     )
 
-    assert status == "ineligible"
-    assert "Singapore citizen/PR" in reason
+    assert status == "eligible"
+    assert reason is None
 
 
 def test_soft_citizen_encouragement_is_not_excluded() -> None:
@@ -1091,7 +1289,7 @@ def test_soft_citizen_encouragement_is_not_excluded() -> None:
     assert reason is None
 
 
-def test_hard_singapore_pr_requirement_is_ineligible() -> None:
+def test_singapore_pr_requirement_is_scored_not_hard_excluded() -> None:
     status, reason = evaluate_job_eligibility(
         {
             "title": "Data Intern",
@@ -1099,17 +1297,54 @@ def test_hard_singapore_pr_requirement_is_ineligible() -> None:
         }
     )
 
-    assert status == "ineligible"
-    assert "Singapore citizen/PR" in reason
+    assert status == "eligible"
+    assert reason is None
 
 
-def test_ineligible_jobs_are_hidden_from_stages_and_stats(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("citizen", "permanent_resident", "expected_status"),
+    [
+        (False, True, "eligible"),
+        (True, False, "eligible"),
+        (False, False, "ineligible"),
+    ],
+)
+def test_explicit_citizen_or_pr_exclusion_respects_either_eligible_status(
+    citizen: bool, permanent_resident: bool, expected_status: str
+) -> None:
+    status, _reason = evaluate_job_eligibility(
+        {
+            "title": "Data Intern",
+            "full_description": (
+                "If you are not a Singapore citizen or permanent resident, "
+                "do not apply."
+            ),
+        },
+        profile={
+            "personal": {"nationality": "Malaysia"},
+            "work_authorization": {
+                "singapore_citizen": citizen,
+                "singapore_permanent_resident": permanent_resident,
+            },
+        },
+    )
+
+    assert status == expected_status
+
+
+def test_ineligible_jobs_are_hidden_from_stages_and_stats(
+    tmp_path: Path, monkeypatch
+) -> None:
     conn = init_db(tmp_path / "jobs.db")
+    monkeypatch.setattr(
+        "applypilot.config.load_profile",
+        lambda: {"personal": {"nationality": "China"}},
+    )
     jobs = [
         (
             "https://example.com/citizen-only",
             "AI Apprentice",
-            "**Eligibility**\n* Singapore Citizen",
+            "If you are not a Singapore citizen, please do not apply.",
         ),
         (
             "https://example.com/open",
@@ -1125,7 +1360,9 @@ def test_ineligible_jobs_are_hidden_from_stages_and_stats(tmp_path: Path) -> Non
         )
     conn.commit()
 
-    eligibility = refresh_job_eligibility(conn)
+    eligibility = refresh_job_eligibility(
+        conn, profile={"personal": {"nationality": "China"}}
+    )
     pending = get_jobs_by_stage(conn=conn, stage="pending_score", limit=0)
     stats = get_stats(conn)
 
@@ -1895,6 +2132,7 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
         "tailor_status": "machine_validated",
         "cover_letter_path": str(letter_txt),
         "cover_letter_status": "human_approved",
+        "_agent_reporting_enabled": True,
         "_control_contract": {
             "contract_version": 1,
             "interaction_driver": "playwright",
@@ -1930,15 +2168,19 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "A filename or remove/replace control under Cover letter" in built
     assert "FAILURE_CONTEXT" in built
     assert "LinkedIn/SmartRecruiters city autocomplete" in built
-    assert "Typed text alone is not a valid selection" in built
-    assert "Greenhouse/React Select location controls" in built
-    assert "visible value chip/container" in built
-    assert "manual_review_required:location_validation" in built
+    assert "SmartRecruiters dual upload controls" not in built
+    assert "Greenhouse/React Select location controls" not in built
+    assert "manual_review_required:location_validation" not in built
     assert "one-character inputs is a CAPTCHA/identity-verification gate" in built
     assert "an enabled Submit button or non-empty boxes alone is not a receipt" in built
     assert "Video/audio upload contradiction" in built
     assert "RESULT:FAILED:unsafe_verification" in built
-    assert "conditional questions can appear dynamically" in built
+    assert "conditional questions can appear dynamically" not in built
+    assert "Standard applicant truthfulness certifications" in built
+    assert "are not a separate human-review boundary" in built
+    assert "cover_not_required or cover_letter_required" in built
+    assert "observations.resume_upload" in built
+    assert "visible_filename" in built
     assert "Same page signature after one corrective attempt" in built
     assert "A field labelled optional becomes conditionally required" in built
     assert "RESULT:APPLIED with a note that this was a dry run" not in built
@@ -1967,6 +2209,8 @@ def test_apply_prompt_scopes_one_time_validation_repair() -> None:
     assert "no receipt was observed" in section
     assert "click the final control at most once" in section
     assert "camera, microphone" in section
+    assert "required direct-impact" in section
+    assert "unsupported-answer gates" not in section
 
 
 def test_apply_prompt_resumes_manual_verification_without_exposing_codes() -> None:
@@ -2041,9 +2285,10 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "mcp__credential_relay__fill_ats_credentials" in built
     assert "FULL-TIME salaried positions only" not in built
     assert "internships or full-time employment" in built
-    assert 'aria-label is exactly or starts with "Easy Apply to this job"' in built
-    assert "Do not click an \"Easy Apply\" job-type chip" in built
-    assert "openSDUIApplyFlow=true" in built
+    assert 'aria-label is exactly or starts with "Easy Apply to this job"' not in built
+    assert "Lever: select native comboboxes" in built
+    assert "Do not click an \"Easy Apply\" job-type chip" not in built
+    assert "openSDUIApplyFlow=true" not in built
     assert "goal is always the same: submit" not in built
     assert "send_email with subject" not in built
     assert "After submit:" not in built
@@ -2106,7 +2351,7 @@ def test_submission_prompt_blocks_uncertain_or_missing_resume_state(
     assert "hard submission pause" in built
     assert "Prior local application state: submission_uncertain" in built
     assert "must never trigger another submit click" in built
-    assert "use browser_select_option directly" in built
+    assert "call browser_select_option with the selected visible option text" in built
     assert "Lever ordinary application form" in built
     assert "declare progress without visible state change" in built
 
@@ -2198,6 +2443,33 @@ def test_pre_submit_snapshot_enforces_identity_resume_and_hard_answers() -> None
     assert "hard_answer_mismatch:starting_september" in issues
 
 
+def test_pre_submit_snapshot_ignores_optional_blank_answers_and_accepts_location_aliases() -> None:
+    profile = _application_profile()
+    job = {"url": "https://jobs.example.test/intern/apply"}
+    snapshot = {
+        "url": job["url"],
+        "current_location_fields": [
+            {"text": "Current location", "value": "", "required": False},
+            {"text": "Current city", "value": "SG", "required": True},
+        ],
+        "radio_questions": [{
+            "text": "Are you available for a full-time internship starting September?",
+            "selected": "",
+            "required": False,
+        }],
+        "select_fields": [{
+            "text": "Where are you currently based, and do you have the legal right to work?",
+            "selected": "Singapore, Singapore",
+            "required": True,
+        }],
+        "submit_control_count": 1,
+    }
+
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+    mappings = page_observation._collect_lossy_answer_mappings(snapshot, profile, job)
+    assert any(item["field_semantic"] == "current_location" for item in mappings)
+
+
 def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limit() -> None:
     profile = _application_profile()
     profile["application_facts"].extend(
@@ -2268,6 +2540,277 @@ def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limi
     assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
 
 
+def test_pre_submit_snapshot_accepts_closest_non_contradictory_visa_category() -> None:
+    profile = _application_profile()
+    job = {
+        "url": "https://jobs.example.test/intern",
+        "title": "Data Analyst Intern",
+        "company_name": "Example",
+        "full_description": "Credit-bearing full-time internship in Singapore.",
+        "application_readiness_reason": "Confirmed programme-credit-bearing internship.",
+    }
+    snapshot = {
+        "url": job["url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "select_fields": [{
+            "text": "Citizenship/Visa Status",
+            "selected": "Possess relevant work visa",
+        }],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert issues == []
+
+    profile["application_facts"].append({
+        "key": "citizenship_visa_status_option",
+        "value": "Possess relevant work visa",
+    })
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+
+def test_pre_submit_snapshot_accepts_same_level_degree_taxonomy_but_not_another_level() -> None:
+    profile = _application_profile()
+    profile["education"] = [{
+        "institution": "Nanyang Technological University",
+        "degree": "Master of Computing in Applied Artificial Intelligence",
+    }]
+    job = {
+        "url": "https://example.wd3.myworkdayjobs.com/job/intern/apply",
+        "title": "AI Intern",
+        "company_name": "Example",
+    }
+    snapshot = {
+        "url": job["url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "select_fields": [],
+        "radio_questions": [],
+        "education_entries": [{
+            "institution": "Nanyang Technological University",
+            "degree": "Masters of Science",
+        }],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+    snapshot["education_entries"][0]["degree"] = "Bachelor of Science"
+    assert "education_degree_mismatch" in launcher._validate_pre_submit_snapshot(
+        snapshot, profile, job
+    )
+
+    snapshot["education_entries"][0]["degree"] = "Master's Degree"
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+    snapshot["education_entries"][0]["degree"] = "Masters of Science"
+    profile["application_facts"].append({
+        "key": "education_degree_option",
+        "context": "Nanyang Technological University",
+        "value": "Masters of Science",
+    })
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+
+def test_pre_submit_snapshot_blocks_unverifiable_or_partial_education_state() -> None:
+    profile = _application_profile()
+    profile["education"] = [
+        {
+            "institution": "Nanyang Technological University",
+            "degree": "Master of Computing in Applied Artificial Intelligence",
+        },
+        {
+            "institution": "University of Example",
+            "degree": "Bachelor of Engineering",
+        },
+    ]
+    job = {
+        "url": "https://example.wd3.myworkdayjobs.com/job/intern/apply",
+        "title": "AI Intern",
+        "company_name": "Example",
+    }
+    snapshot = {
+        "url": job["url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "select_fields": [],
+        "radio_questions": [],
+        "education_field_present": True,
+        "education_record_count": 1,
+        "education_entries": [],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    assert "education_state_unconfirmed" in launcher._validate_pre_submit_snapshot(
+        snapshot, profile, job
+    )
+
+    snapshot["education_record_count"] = 2
+    snapshot["education_entries"] = [{
+        "institution": "Nanyang Technological University",
+        "degree": "Master's Degree",
+    }]
+    assert "education_state_unconfirmed" in launcher._validate_pre_submit_snapshot(
+        snapshot, profile, job
+    )
+
+    snapshot["education_record_count"] = 1
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+
+def test_pre_submit_snapshot_validates_generic_highest_education_level() -> None:
+    profile = _application_profile()
+    profile["education"] = [
+        {
+            "institution": "Nanyang Technological University",
+            "degree": "Master of Computing in Applied Artificial Intelligence",
+        },
+        {
+            "institution": "University of Example",
+            "degree": "Bachelor of Engineering",
+        },
+    ]
+    job = {
+        "url": "https://jobs.example.test/intern/apply",
+        "title": "AI Intern",
+        "company_name": "Example",
+    }
+    snapshot = {
+        "url": job["url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "select_fields": [{
+            "text": "Highest Education Level",
+            "selected": "Master's Degree",
+        }],
+        "radio_questions": [],
+        "education_field_present": False,
+        "education_record_count": 0,
+        "education_entries": [],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+    snapshot["select_fields"][0]["selected"] = "Bachelor's Degree"
+    assert "education_level_mismatch" in launcher._validate_pre_submit_snapshot(
+        snapshot, profile, job
+    )
+
+    snapshot["select_fields"][0]["selected"] = "Master of Science"
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+    mappings = page_observation._collect_lossy_answer_mappings(snapshot, profile, job)
+    assert any(item["field_semantic"] == "highest_education_level" for item in mappings)
+
+    profile["education"][0]["status"] = "Currently enrolled"
+    profile["education"][1]["graduation"] = "May 2024"
+    snapshot["select_fields"][0]["selected"] = "Bachelor's Degree"
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+    profile["application_facts"].append({
+        "key": "highest_education_level_option",
+        "value": "Postgraduate Degree",
+    })
+    snapshot["select_fields"][0]["selected"] = "Postgraduate Degree"
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+    snapshot["select_fields"][0]["selected"] = "Bachelor's Degree"
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+
+def test_built_prompt_does_not_reintroduce_location_or_unsupported_answer_stops(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    job = {
+        "url": "https://jobs.example.test/intern/apply",
+        "title": "AI Intern",
+        "company_name": "Example",
+        "source_site": "generic",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+    }
+
+    built = prompt.build_prompt(job, "Verified resume", dry_run=True)
+
+    assert "If not eligible, output RESULT and stop" not in built
+    assert "unsupported-answer gates" not in built
+    assert "Only an explicit do_not_apply" in built
+
+
+def test_email_route_prompt_requires_bound_prepare_and_sent_evidence() -> None:
+    prepare = prompt._build_email_route_section(
+        {
+            "_available_tools": [
+                "mailbox_search",
+                "mailbox_get_message",
+            ]
+        },
+        dry_run=False,
+        submission_phase="prepare",
+    )
+    submit = prompt._build_email_route_section(
+        {
+            "_available_tools": [
+                "mailbox_search",
+                "mailbox_get_message",
+                "direct_email_send",
+            ],
+            "_browser_observation": {
+                "email_application": {"route": "direct_email"}
+            },
+        },
+        dry_run=False,
+        submission_phase="submit",
+    )
+
+    assert "recipient_source=official_listing" in prepare
+    assert "email_route_capability_missing" not in prepare
+    assert "direct_email_send" not in prepare
+    assert "non-empty listing_evidence" in prepare
+    assert "body_sha256" in prepare
+    assert "duplicate_check={folder:'sent',completed:true,duplicate_found:false,provider_query_id:<nonempty>}" in prepare
+    assert "Do not report attachment paths or digests" in prepare
+    assert "only in submit phase after launcher reservation" in submit
+    assert "folder=sent" in submit
+    assert "provider_message_id" in submit
+    assert "body_sha256" in submit
+
+
+def test_email_route_submit_keeps_send_capability_gate() -> None:
+    submit = prompt._build_email_route_section(
+        {
+            "_available_tools": ["mailbox_search", "mailbox_get_message"],
+            "_browser_observation": {
+                "email_application": {"route": "direct_email"}
+            },
+        },
+        dry_run=False,
+        submission_phase="submit",
+    )
+
+    assert "RESULT:FAILED:email_route_capability_missing" in submit
+    assert "missing_capability=direct_email_send" in submit
+    assert "Call the authorized direct-email send tool exactly once" not in submit
+
 @pytest.mark.parametrize(
     ("changes", "expected_signal"),
     [
@@ -2300,6 +2843,223 @@ def test_browser_snapshot_states_are_reported_as_agent_attention_signals(
     issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
 
     assert expected_signal in issues
+
+
+def test_workday_review_url_is_bound_by_tenant_and_review_state() -> None:
+    profile = _application_profile()
+    job = {
+        "url": (
+            "https://tenant.wd103.myworkdayjobs.com/en-US/careers/job/"
+            "Singapore/AI-Intern_JR123"
+        )
+    }
+    snapshot = {
+        "url": "https://tenant.wd103.myworkdayjobs.com/en-US/careers/application/review",
+        "job_reference_urls": [job["url"]],
+        "required_unfilled": [],
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "captcha_visible": False,
+        "workday_observation": {
+            "page_kind": "review",
+            "has_submit": True,
+            "has_manual_gate": False,
+        },
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert "unexpected_application_url" not in issues
+
+
+def test_workday_review_url_rejects_another_job_on_the_same_tenant() -> None:
+    profile = _application_profile()
+    job = {
+        "url": (
+            "https://tenant.wd103.myworkdayjobs.com/en-US/careers/job/"
+            "Singapore/AI-Intern_JR123"
+        )
+    }
+    snapshot = {
+        "url": "https://tenant.wd103.myworkdayjobs.com/en-US/careers/application/review",
+        "job_reference_urls": [
+            (
+                "https://tenant.wd103.myworkdayjobs.com/en-US/careers/job/"
+                "Singapore/Other-Intern_JR999"
+            )
+        ],
+        "required_unfilled": [],
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "captcha_visible": False,
+        "workday_observation": {
+            "page_kind": "review",
+            "has_submit": True,
+            "has_manual_gate": False,
+        },
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert "unexpected_application_url" in issues
+
+
+def test_bound_job_path_normalizes_percent_encoded_punctuation() -> None:
+    profile = _application_profile()
+    job = {
+        "url": (
+            "https://tenant.wd103.myworkdayjobs.com/en-US/careers/job/"
+            "Singapore-Singapore/AI-Intern_JR123"
+        )
+    }
+    snapshot = {
+        "url": (
+            "https://tenant.wd103.myworkdayjobs.com/en-US/careers/job/"
+            "Singapore%2C-Singapore/AI-Intern_JR123/apply"
+        ),
+        "required_unfilled": [],
+        "resume_field_present": False,
+        "resume_uploaded": False,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "captcha_visible": False,
+        "workday_observation": {
+            "page_kind": "form",
+            "has_submit": True,
+            "has_manual_gate": False,
+        },
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert "unexpected_application_url" not in issues
+
+
+@pytest.mark.parametrize(
+    ("actual_url", "expected_issue"),
+    [
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
+                "4df5dd16-4fc7-48b4-a943-492fbc508b62?dcr_ci=Grab"
+            ),
+            False,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/Other/publication/"
+                "4df5dd16-4fc7-48b4-a943-492fbc508b62?dcr_ci=Other"
+            ),
+            True,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?dcr_ci=Grab"
+            ),
+            True,
+        ),
+    ],
+)
+def test_smartrecruiters_oneclick_url_is_bound_to_same_tenant_and_ready_form(
+    actual_url: str,
+    expected_issue: bool,
+) -> None:
+    profile = _application_profile()
+    job = {
+        "url": (
+            "https://jobs.smartrecruiters.com/Grab/"
+            "744000145885499-intern-strategy-insights"
+        ),
+        "_ats_application_binding": {
+            "provider": "smartrecruiters",
+            "tenant": "Grab",
+            "posting_id": "744000145885499",
+            "publication_id": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+            "resolved": True,
+        },
+    }
+    snapshot = {
+        "url": actual_url,
+        "required_unfilled": [],
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "captcha_visible": False,
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert ("unexpected_application_url" in issues) is expected_issue
+
+
+def test_smartrecruiters_same_tenant_route_without_final_control_is_not_bound() -> None:
+    assert not page_observation._same_bound_application_flow(
+        "https://jobs.smartrecruiters.com/Grab/744000145885499-role",
+        (
+            "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
+            "4df5dd16-4fc7-48b4-a943-492fbc508b62/screening?dcr_ci=Grab"
+        ),
+        {"submit_control_count": 0, "captcha_visible": False},
+    )
+
+
+def test_smartrecruiters_final_page_uses_same_turn_resume_upload_proof() -> None:
+    profile = _application_profile()
+    job = {
+        "url": "https://jobs.smartrecruiters.com/Grab/744000145885499-role",
+        "_ats_application_binding": {
+            "provider": "smartrecruiters",
+            "tenant": "Grab",
+            "posting_id": "744000145885499",
+            "publication_id": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+            "resolved": True,
+        },
+        "_agent_observations": {
+            "resume_upload": {
+                "verified": True,
+                "field_label": "Resume *",
+                "visible_filename": "candidate-resume.pdf",
+            }
+        },
+    }
+    snapshot = {
+        "url": (
+            "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
+            "4df5dd16-4fc7-48b4-a943-492fbc508b62/screening?dcr_ci=Grab"
+        ),
+        "required_unfilled": [],
+        "resume_field_present": False,
+        "resume_uploaded": False,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "captcha_visible": False,
+    }
+
+    issues = launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+
+    assert "unexpected_application_url" not in issues
+    assert "resume_state_unconfirmed" not in issues
 
 
 def test_manual_captcha_response_token_overrides_stale_visible_iframe() -> None:
@@ -2426,13 +3186,11 @@ def test_worker_treats_browser_observation_as_hard_submission_gate(monkeypatch) 
 
     assert result == (0, 1)
     assert [kwargs["submission_phase"] for _, kwargs in calls] == ["prepare"]
-    assert marked == [
-        (
-            job["url"],
-            "failed",
-            "manual_review_required:pre_submit_audit:resume_not_uploaded",
-        )
-    ]
+    assert marked[0][:2] == (job["url"], "failed")
+    assert marked[0][2].startswith(
+        "manual_review_required:pre_submit_audit:resume_not_uploaded; "
+        "category=resume_upload_failed; recoverability=retry_same_application"
+    )
 
 
 def test_exact_submission_acquisition_accepts_verified_no_cover(
@@ -2441,10 +3199,10 @@ def test_exact_submission_acquisition_accepts_verified_no_cover(
     conn = init_db(tmp_path / "jobs.db")
     url = "https://example.com/no-cover"
     conn.execute(
-        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
-        "tailored_resume_path, tailor_status, cover_letter_status, eligibility_status) "
-        "VALUES (?, 'Data Intern', 'Example', 'lever', 'lever', ?, 'resume.txt', "
-        "'machine_validated', 'not_required', 'eligible')",
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, full_description, "
+        "tailored_resume_path, tailor_status, cover_letter_status, eligibility_status, fit_score) "
+        "VALUES (?, 'Data Intern', 'Example', 'lever', 'lever', ?, 'Verified JD', 'resume.txt', "
+        "'machine_validated', 'not_required', 'eligible', 8)",
         (url, url),
     )
     conn.commit()
@@ -2507,6 +3265,27 @@ def test_automatic_exact_submission_enforces_policy_minimum(
     assert acquired["fit_score"] == 8
 
 
+def test_exact_acquisition_enforces_cli_floor_and_stricter_legacy_auto_floor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    conn = init_db(tmp_path / "jobs.db")
+    url = "https://example.com/exact-score-floor"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
+        "full_description, tailored_resume_path, tailor_status, cover_letter_status, "
+        "eligibility_status, fit_score) VALUES (?, 'AI Intern', 'Example', 'lever', 'lever', "
+        "?, 'Verified JD', 'resume.txt', 'machine_validated', 'not_required', 'eligible', 8)",
+        (url, url),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    assert launcher.acquire_job(target_url=url, min_score=9, preview_only=True) is None
+    monkeypatch.setenv("APPLYPILOT_AUTO_SUBMIT", "1")
+    monkeypatch.setenv("APPLYPILOT_AUTO_SUBMIT_MIN_SCORE", "7")
+    assert launcher.acquire_job(target_url=url, min_score=9, preview_only=False) is None
+
+
 def test_ready_stage_accepts_previewed_linkedin_job_with_verified_no_cover(
     tmp_path: Path,
 ) -> None:
@@ -2533,11 +3312,11 @@ def test_exact_url_acquisition_requires_human_approval_and_accepts_null_status(
     conn = init_db(tmp_path / "jobs.db")
     url = "https://example.com/approved"
     conn.execute(
-        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, full_description, "
         "tailored_resume_path, tailor_status, cover_letter_path, cover_letter_status, "
-        "eligibility_status) "
-        "VALUES (?, 'AI Intern', 'Example', 'linkedin', 'linkedin', ?, 'resume.txt', "
-        "'machine_validated', 'letter.txt', 'human_approved', 'eligible')",
+        "eligibility_status, fit_score) "
+        "VALUES (?, 'AI Intern', 'Example', 'linkedin', 'linkedin', ?, 'Verified JD', 'resume.txt', "
+        "'machine_validated', 'letter.txt', 'human_approved', 'eligible', 8)",
         (url, url),
     )
     conn.commit()
@@ -2574,10 +3353,10 @@ def test_preview_acquisition_accepts_validated_resume_without_cover(
     conn = init_db(tmp_path / "jobs.db")
     url = "https://example.com/preview"
     conn.execute(
-        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
-        "tailored_resume_path, tailor_status, eligibility_status) "
-        "VALUES (?, 'Data Analyst Intern', 'Example', 'lever', 'lever', ?, "
-        "'resume.txt', 'machine_validated', 'eligible')",
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, full_description, "
+        "tailored_resume_path, tailor_status, eligibility_status, fit_score) "
+        "VALUES (?, 'Data Analyst Intern', 'Example', 'lever', 'lever', ?, 'Verified JD', "
+        "'resume.txt', 'machine_validated', 'eligible', 8)",
         (url, url),
     )
     conn.commit()
@@ -3136,6 +3915,30 @@ def test_tailoring_validator_rejects_new_skill_and_numeric_claim() -> None:
     assert validation["passed"] is False
     assert any("Skills section adds tokens" in error for error in validation["errors"])
     assert any("numeric claims" in error for error in validation["errors"])
+
+
+def test_tailoring_validator_preserves_role_before_compact_month_range() -> None:
+    source, job, data = _grounded_tailor_payload()
+    company = "Jiangxi Province Architecture Design Research Institution"
+    source = source.replace(
+        "Example Company\nData Analyst\n",
+        f"{company}\nPlanning Analyst\tJun–Dec 2021 (Intern); May–Aug 2022 (Full-time)\n",
+    )
+    data["experience"][0]["header"] = company
+    data["experience"][0]["subtitle"] = "Planning Analyst"
+
+    validation = validate_json_fields(
+        data,
+        {"resume_facts": {"preserved_companies": [company]}},
+        mode="strict",
+        original_text=source,
+        job_description=job["full_description"],
+        job_title=job["title"],
+        target_company=job["company_name"],
+    )
+
+    assert validation["passed"] is True
+    assert not any("source role exactly" in error for error in validation["errors"])
 
 
 def test_tailoring_validator_rejects_invented_seniority_and_target_history() -> None:

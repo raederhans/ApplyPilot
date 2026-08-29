@@ -10,10 +10,10 @@ def _store_ready_job(
     conn, *, url: str, source_site: str, application_url: str | None = None
 ) -> None:
     conn.execute(
-        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
-        "tailored_resume_path, tailor_status, cover_letter_status, eligibility_status) "
-        "VALUES (?, 'Data Analyst Intern', 'Example', ?, ?, ?, 'resume.txt', "
-        "'machine_validated', 'not_required', 'eligible')",
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, full_description, "
+        "tailored_resume_path, tailor_status, cover_letter_status, eligibility_status, fit_score) "
+        "VALUES (?, 'Data Analyst Intern', 'Example', ?, ?, ?, 'Use SQL to build dashboards.', 'resume.txt', "
+        "'machine_validated', 'not_required', 'eligible', 8)",
         (url, source_site, source_site, application_url or url),
     )
     conn.commit()
@@ -32,6 +32,7 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     )
     assert external_jobstreet is not None
     assert external_jobstreet["name"] == "JobStreet Singapore"
+    assert external_jobstreet["external_application_mode"] == "continue_when_authorized"
 
     internsg = config.get_portal_policy("https://www.internsg.com/job-apply/123/")
     assert internsg is not None
@@ -46,9 +47,11 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     assert "bounded visible agent browsing" in config.portal_discovery_gate(
         "https://careeraxis.ntu.edu.sg/students/jobs/882308"
     )
-    assert config.get_portal_policy(
+    external_career_axis = config.get_portal_policy(
         "https://careers.example.com/apply/123", source_site="Career Axis"
-    ) == career_axis
+    )
+    assert external_career_axis["external_application_mode"] == "continue_when_authorized"
+    assert external_career_axis["source_portal_handoff"] is True
     assert config.portal_application_gate(
         "https://careers.example.com/apply/123", source_site="Career Axis", preview_only=False
     ) is None
@@ -58,24 +61,25 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     assert "must submit manually" in config.portal_application_gate(
         "https://www.internsg.com/job-apply/123/", preview_only=False
     )
-    assert "handed off to an external ATS" in config.portal_application_gate(
+    assert config.portal_application_gate(
         "https://careers.example.com/apply/123",
         source_site="InternSG",
         preview_only=True,
-    )
+    ) is None
     assert "authorised export" in config.portal_discovery_gate(
         "https://sg.jobstreet.com/data-analyst-jobs"
     )
-    assert "external ATS" in prompt._build_portal_handoff_rule(
+    assert prompt._build_portal_handoff_rule(
         {
             "url": "https://www.internsg.com/job-apply/123/",
+            "application_url": "https://careers.example.com/apply/123",
             "source_site": "InternSG",
             "site": "InternSG",
         }
-    )
+    ) == ""
 
 
-def test_portal_policy_blocks_jobstreet_and_submission_but_allows_internsg_preview(
+def test_portal_policy_allows_bound_external_ats_but_keeps_portal_boundaries(
     monkeypatch, tmp_path: Path
 ) -> None:
     conn = init_db(tmp_path / "jobs.db")
@@ -88,14 +92,10 @@ def test_portal_policy_blocks_jobstreet_and_submission_but_allows_internsg_previ
         source_site="JobStreet Singapore",
         application_url="https://careers.example.com/apply/123",
     )
-    assert launcher.acquire_job(target_url=jobstreet_url, preview_only=True) is None
-    jobstreet_row = conn.execute(
-        "SELECT apply_status, apply_error FROM jobs WHERE url=?", (jobstreet_url,)
-    ).fetchone()
-    assert tuple(jobstreet_row) == (
-        "manual",
-        "JobStreet Singapore requires a candidate-operated manual application.",
-    )
+    acquired_external = launcher.acquire_job(target_url=jobstreet_url, preview_only=True)
+    assert acquired_external is not None
+    assert acquired_external["application_url"] == "https://careers.example.com/apply/123"
+    launcher.restore_preview_state(acquired_external)
 
     internsg_url = "https://www.internsg.com/job-apply/456/"
     _store_ready_job(conn, url=internsg_url, source_site="InternSG")
@@ -113,6 +113,20 @@ def test_portal_policy_blocks_jobstreet_and_submission_but_allows_internsg_previ
     acquired = launcher.acquire_job(target_url=internsg_url, preview_only=True)
     assert acquired is not None
     assert acquired["url"] == internsg_url
+
+
+def test_manual_ats_is_a_runtime_capability_hint_not_an_acquisition_block(
+    monkeypatch, tmp_path: Path
+) -> None:
+    conn = init_db(tmp_path / "jobs.db")
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    url = "https://ibegin.tcsapps.com/candidate/jobs/123"
+    _store_ready_job(conn, url=url, source_site="TCS")
+
+    acquired = launcher.acquire_job(target_url=url, preview_only=True)
+
+    assert acquired is not None
+    assert acquired["_ats_capability_hint"] == "manual_boundary_likely"
 
 
 def test_authorised_portal_listing_csv_is_local_intake(monkeypatch, tmp_path: Path) -> None:

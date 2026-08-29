@@ -2,8 +2,43 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
+
+
+def _select_runnable_browser_backend(
+    requested: str,
+    resolve_executable: Callable[[str], str],
+) -> tuple[str, dict[str, str]]:
+    """Select an installed runtime without making ``auto`` require both.
+
+    ``auto`` keeps the Edge-to-Cloak fallback only when both runtimes are
+    available.  When exactly one optional runtime is unavailable, execution
+    continues on the installed runtime and returns the unavailable detail for
+    an explicit operator warning.
+    """
+    candidates = ("edge", "cloak") if requested == "auto" else (requested,)
+    available: list[str] = []
+    unavailable: dict[str, str] = {}
+    for backend in candidates:
+        try:
+            resolve_executable(backend)
+        except (FileNotFoundError, RuntimeError) as exc:
+            unavailable[backend] = str(exc)
+        else:
+            available.append(backend)
+
+    if not available:
+        details = "; ".join(
+            f"{backend}: {reason}" for backend, reason in unavailable.items()
+        )
+        raise RuntimeError(details or f"{requested} browser is unavailable")
+    if requested == "auto":
+        if len(available) == len(candidates):
+            return "auto", {}
+        return available[0], unavailable
+    return requested, {}
 
 
 def run_apply(
@@ -176,13 +211,16 @@ def run_apply(
 
     backend_binary = shutil.which("codex.exe") or shutil.which("codex") if backend == "codex" else shutil.which("claude")
     try:
-        if effective_browser_backend in {"edge", "auto"}:
-            get_browser_executable("edge")
-        if effective_browser_backend in {"cloak", "auto"}:
-            get_browser_executable("cloak")
+        effective_browser_backend, unavailable_browsers = (
+            _select_runnable_browser_backend(
+                effective_browser_backend,
+                get_browser_executable,
+            )
+        )
         has_browser = True
         browser_error = ""
-    except (FileNotFoundError, RuntimeError) as exc:
+    except RuntimeError as exc:
+        unavailable_browsers = {}
         has_browser = False
         browser_error = str(exc)
     if not backend_binary or not has_browser:
@@ -193,6 +231,15 @@ def run_apply(
             missing.append(browser_error or effective_browser_backend)
         console.print(f"[red]Browser apply is missing: {', '.join(missing)}.[/red]")
         raise typer.Exit(code=1)
+    if unavailable_browsers:
+        unavailable = "; ".join(
+            f"{backend}: {reason}"
+            for backend, reason in unavailable_browsers.items()
+        )
+        console.print(
+            "[yellow]Automatic browser fallback is unavailable for "
+            f"{unavailable}; continuing with {effective_browser_backend}.[/yellow]"
+        )
 
     # Check 2: Profile exists
     if not _profile_path.exists():

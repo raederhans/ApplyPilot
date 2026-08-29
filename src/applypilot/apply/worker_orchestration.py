@@ -7,15 +7,37 @@ while removing the orchestration state machine from the launcher facade.
 
 from __future__ import annotations
 
+import threading
 from types import ModuleType
+
+from applypilot.apply.email_routing import (
+    normalize_prepared_email_application,
+    normalize_sent_receipt,
+    reserve_direct_email_send,
+)
+from applypilot.apply.failure_taxonomy import classify_failure
+
+
+def _prepared_email_application(job: dict) -> dict | None:
+    """Return a bounded, verified prepare plan reported by the application agent."""
+    observations = job.get("_agent_observations")
+    if not isinstance(observations, dict):
+        return None
+    return normalize_prepared_email_application(
+        observations.get("email_application"),
+        job,
+    )
 
 WORKER_RUNTIME_PORTS = (
     "POLL_INTERVAL", "_acquire_cloak_lane", "_archive_worker_evidence",
+    "_snapshot_worker_evidence",
     "_attach_control_contract", "_audit_live_pre_submit_page",
     "_classify_post_submit_observation", "_cloak_lane", "_format_failure_error",
     "_is_permanent_failure", "_mark_runtime_cover_not_required",
     "_observe_post_submit_page", "_open_bound_application_target",
+    "_resolve_ats_application_binding", "_run_read_only_preflight",
     "_prepare_runtime_cover_letter", "_reserve_manifest_submission",
+    "_admit_direct_email_receipt",
     "_route_for_phase", "_stop_event", "_submission_evidence_consistent",
     "_submission_rate_status", "_update_submission_ledger",
     "_wait_for_manual_captcha", "acquire_job", "add_event", "allocate_cdp_port",
@@ -50,6 +72,7 @@ def _worker_loop_with_port(
     interaction_mode: str = "auto",
     authorization_manifest: dict | None = None,
     attempted_urls: set[str] | None = None,
+    attempted_urls_lock: threading.Lock | None = None,
 ) -> tuple[int, int]:
     """Run jobs until the confirmed-success target is reached or the queue is empty.
 
@@ -68,6 +91,7 @@ def _worker_loop_with_port(
     POLL_INTERVAL = runtime.POLL_INTERVAL
     _acquire_cloak_lane = runtime._acquire_cloak_lane
     _archive_worker_evidence = runtime._archive_worker_evidence
+    _snapshot_worker_evidence = runtime._snapshot_worker_evidence
     _attach_control_contract = runtime._attach_control_contract
     _audit_live_pre_submit_page = runtime._audit_live_pre_submit_page
     _classify_post_submit_observation = runtime._classify_post_submit_observation
@@ -77,7 +101,10 @@ def _worker_loop_with_port(
     _mark_runtime_cover_not_required = runtime._mark_runtime_cover_not_required
     _observe_post_submit_page = runtime._observe_post_submit_page
     _open_bound_application_target = runtime._open_bound_application_target
+    _resolve_ats_application_binding = runtime._resolve_ats_application_binding
+    _run_read_only_preflight = runtime._run_read_only_preflight
     _prepare_runtime_cover_letter = runtime._prepare_runtime_cover_letter
+    _admit_direct_email_receipt = runtime._admit_direct_email_receipt
     _reserve_manifest_submission = runtime._reserve_manifest_submission
     _route_for_phase = runtime._route_for_phase
     _stop_event = runtime._stop_event
@@ -139,13 +166,18 @@ def _worker_loop_with_port(
                 if _stop_event.wait(timeout=cooldown):
                     break
 
+        if attempted_urls_lock is None:
+            excluded_urls = set(run_attempted_urls)
+        else:
+            with attempted_urls_lock:
+                excluded_urls = set(run_attempted_urls)
         job = acquire_job(
             target_url=target_url,
             min_score=min_score,
             worker_id=worker_id,
             preview_only=dry_run,
             authorization_manifest=authorization_manifest,
-            exclude_urls=run_attempted_urls,
+            exclude_urls=excluded_urls,
             application_lease_minutes=application_lease_minutes,
         )
         if not job:
@@ -164,17 +196,61 @@ def _worker_loop_with_port(
             continue
 
         empty_polls = 0
-        run_attempted_urls.add(str(job["url"]))
+        job["_evidence_baseline"] = _snapshot_worker_evidence(worker_id)
+        if attempted_urls_lock is None:
+            run_attempted_urls.add(str(job["url"]))
+        else:
+            with attempted_urls_lock:
+                run_attempted_urls.add(str(job["url"]))
 
         chrome_proc = None
         submission_started = False
         verification_relay_used = False
         cover_material_resolved = False
+        pre_submit_repair_used = False
         ledger_reserved = False
         submission_evidence: dict | None = None
         cloak_lane_held = False
         cloak_fallback_used = False
         route_history: list[dict[str, object]] = []
+        try:
+            read_only_preflight = _run_read_only_preflight(job)
+        except Exception as exc:  # noqa: BLE001 - final atomic gate remains authoritative
+            logger.warning(
+                "Read-only preflight failed for %s: %s",
+                job.get("url"),
+                exc,
+            )
+            read_only_preflight = {
+                "task_statuses": {},
+                "error_type": type(exc).__name__,
+            }
+        job["_read_only_preflight"] = read_only_preflight
+        duplicate_snapshot = read_only_preflight.get("duplicate")
+        if (
+            isinstance(duplicate_snapshot, dict)
+            and duplicate_snapshot.get("clear") is False
+        ):
+            reason = str(
+                duplicate_snapshot.get("reason") or "duplicate_submission_identity"
+            )
+            mark_result(
+                job["url"],
+                "skipped",
+                reason,
+                permanent=True,
+                task_id=job.get("_attempt_id"),
+                evidence={"duplicate_snapshot": duplicate_snapshot},
+            )
+            jobs_done += 1
+            add_event(f"[W{worker_id}] Exact duplicate skipped before browser launch")
+            update_state(
+                worker_id,
+                status="skipped",
+                last_action="exact duplicate receipt/status",
+                jobs_done=jobs_done,
+            )
+            continue
         try:
             active_route = initial_route(requested_browser_backend, phase="prepare")
             active_browser_backend = active_route.browser_runtime
@@ -193,6 +269,14 @@ def _worker_loop_with_port(
             })
             add_event(f"[W{worker_id}] Launching {active_browser_backend} browser...")
             start_url = str(job.get("application_url") or job["url"])
+            ats_binding = read_only_preflight.get("ats_binding")
+            if (
+                read_only_preflight.get("provider") == "smartrecruiters"
+                and "ats_binding" not in read_only_preflight
+            ):
+                ats_binding = _resolve_ats_application_binding(job)
+            if ats_binding is not None:
+                job["_ats_application_binding"] = ats_binding
             chrome_proc = launch_chrome(
                 worker_id,
                 port=port,
@@ -421,9 +505,26 @@ def _worker_loop_with_port(
                     break
 
                 if result == "ready_to_submit" and not dry_run:
-                    audit_signal, audit_report = _audit_live_pre_submit_page(
-                        port, worker_id, job
-                    )
+                    email_application = _prepared_email_application(job)
+                    if email_application is not None:
+                        audit_signal = None
+                        audit_report = {
+                            "status": "clear",
+                            "disposition": "clear",
+                            "page_url": str(job.get("application_url") or job.get("url") or ""),
+                            "issues": [],
+                            "blocking_issues": [],
+                            "repairable_issues": [],
+                            "advisory_issues": [],
+                            "lossy_answer_mappings": [],
+                            "advisory_only": False,
+                            "submission_gate": True,
+                            "email_application": email_application,
+                        }
+                    else:
+                        audit_signal, audit_report = _audit_live_pre_submit_page(
+                            port, worker_id, job
+                        )
                     observation_label = audit_signal or "clear"
                     add_event(
                         f"[W{worker_id}] Browser observation: {observation_label[:45]}"
@@ -433,6 +534,47 @@ def _worker_loop_with_port(
                         status="observed",
                         last_action=f"browser signal: {observation_label[:25]}",
                     )
+                    if audit_report.get("disposition") == "retry_prepare":
+                        repairable = [
+                            str(issue)
+                            for issue in audit_report.get("repairable_issues", [])
+                        ]
+                        if pre_submit_repair_used:
+                            reason = repairable[0] if repairable else "pre_submit_state"
+                            result = f"failed:pre_submit_not_ready:{reason}"
+                            break
+                        pre_submit_repair_used = True
+                        repair_job = dict(job)
+                        repair_job["_browser_observation"] = {
+                            **audit_report,
+                            "signal": audit_signal,
+                            "repair_prepare": True,
+                            "advisory_only": False,
+                            "submission_gate": False,
+                        }
+                        _attach_control_contract(
+                            repair_job,
+                            active_route,
+                            interaction_mode=requested_interaction_mode,
+                            resume_existing_page=True,
+                        )
+                        add_event(
+                            f"[W{worker_id}] One prepare repair: "
+                            f"{','.join(repairable[:2])[:45]}"
+                        )
+                        result, repair_duration = run_job(
+                            repair_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase="prepare",
+                        )
+                        duration_ms += repair_duration
+                        continue
                     if audit_signal:
                         result = f"failed:manual_review_required:{audit_signal}"
                         break
@@ -443,26 +585,93 @@ def _worker_loop_with_port(
                         attempt_id,
                         phase="reservation",
                         submit_started=False,
-                        evidence={"pre_submit_audit": "clear"},
+                        evidence={
+                            "pre_submit_audit": audit_report.get("disposition", "clear"),
+                            "lossy_answer_mapping_count": len(
+                                audit_report.get("lossy_answer_mappings", [])
+                            ),
+                        },
                         lease_minutes=application_lease_minutes,
                     )
                     if not lease_held:
                         result = "failed:stale_application_attempt"
                         break
                     reserved, reservation_reason = _reserve_manifest_submission(
-                        authorization_manifest, job
+                        authorization_manifest,
+                        job,
+                        audit_report,
                     )
+                    if (
+                        not reserved
+                        and reservation_reason == "minimum_submission_gap"
+                    ):
+                        gate_state = job.get("_submission_gate", {})
+                        retry_after = (
+                            float(gate_state.get("retry_after_seconds") or 0)
+                            if isinstance(gate_state, dict)
+                            else 0.0
+                        )
+                        retry_after = max(0.0, min(retry_after, 120.0))
+                        add_event(
+                            f"[W{worker_id}] Atomic submit gate wait: "
+                            f"{retry_after:.1f}s"
+                        )
+                        update_state(
+                            worker_id,
+                            status="idle",
+                            last_action="atomic submission gap",
+                        )
+                        if _stop_event.wait(timeout=retry_after):
+                            result = "deferred:operator_stop_before_submission_gate"
+                            break
+                        if email_application is None:
+                            audit_signal, audit_report = _audit_live_pre_submit_page(
+                                port,
+                                worker_id,
+                                job,
+                            )
+                            if audit_signal or audit_report.get("disposition") != "clear":
+                                result = (
+                                    "failed:manual_review_required:"
+                                    f"{audit_signal or 'page_changed_during_submission_gap'}"
+                                )
+                                break
+                        lease_held = not attempt_id or update_application_attempt(
+                            attempt_id,
+                            phase="reservation",
+                            submit_started=False,
+                            evidence={"submission_gate_wait_seconds": retry_after},
+                            lease_minutes=application_lease_minutes,
+                        )
+                        if not lease_held:
+                            result = "failed:stale_application_attempt"
+                            break
+                        reserved, reservation_reason = _reserve_manifest_submission(
+                            authorization_manifest,
+                            job,
+                            audit_report,
+                        )
                     if not reserved:
-                        result = f"failed:manual_review_required:{reservation_reason}"
+                        if reservation_reason in {
+                            "minimum_submission_gap",
+                            "rolling_hour_submission_cap",
+                        }:
+                            result = f"deferred:{reservation_reason}"
+                        else:
+                            result = f"failed:manual_review_required:{reservation_reason}"
                         break
                     ledger_reserved = authorization_manifest is not None
                     observed_job = dict(job)
                     observed_job["_browser_observation"] = {
                         **audit_report,
                         "signal": audit_signal,
-                        "advisory_only": False,
+                        "advisory_only": bool(audit_report.get("advisory_only")),
                         "submission_gate": True,
                     }
+                    if email_application is not None:
+                        observed_job["_direct_email_send_reservation"] = (
+                            reserve_direct_email_send(job, email_application)
+                        )
                     submission_phase = "submit"
                     lease_held = not attempt_id or update_application_attempt(
                         attempt_id,
@@ -482,7 +691,17 @@ def _worker_loop_with_port(
                     active_route = _route_for_phase(
                         active_route,
                         "submit",
-                        "pre_submit_audit_clear",
+                        (
+                            "email_plan_verified"
+                            if email_application is not None
+                            else "pre_submit_audit_clear"
+                        ),
+                        interaction_driver=(
+                            "mailbox" if email_application is not None else None
+                        ),
+                        submit_owner=(
+                            "mailbox" if email_application is not None else None
+                        ),
                     )
                     _attach_control_contract(
                         observed_job,
@@ -509,10 +728,84 @@ def _worker_loop_with_port(
                     )
                     duration_ms += submit_duration
                     agent_evidence = observed_job.get("_agent_submission_evidence")
-                    observer_evidence = _observe_post_submit_page(
-                        port, worker_id, job, attempt=1
-                    )
-                    disposition = _classify_post_submit_observation(observer_evidence)
+                    if email_application is not None:
+                        runtime_mailbox = observed_job.get(
+                            "_mailbox_runtime_evidence", {}
+                        )
+                        if not isinstance(runtime_mailbox, dict):
+                            runtime_mailbox = {}
+                        sent_receipt = normalize_sent_receipt(
+                            runtime_mailbox.get("sent_receipt"),
+                            email_application,
+                        )
+                        observer_evidence = {
+                            "channel": "direct_email",
+                            "confirmed": bool(
+                                sent_receipt is not None
+                                and runtime_mailbox.get("send_request_bound") is True
+                                and runtime_mailbox.get("send_call_completed") is True
+                                and runtime_mailbox.get("post_send_search_completed") is True
+                                and runtime_mailbox.get("post_send_read_completed") is True
+                            ),
+                            "send_call_completed": bool(
+                                runtime_mailbox.get("send_call_completed")
+                            ),
+                            "send_request_bound": bool(
+                                runtime_mailbox.get("send_request_bound")
+                            ),
+                            "post_send_search_completed": bool(
+                                runtime_mailbox.get("post_send_search_completed")
+                            ),
+                            "post_send_read_completed": bool(
+                                runtime_mailbox.get("post_send_read_completed")
+                            ),
+                            "recipient": email_application.get("recipient"),
+                            "subject": email_application.get("subject"),
+                            "attachment_names": email_application.get(
+                                "attachment_names", []
+                            ),
+                            "confirmation_text": "mailbox send and Sent-copy verification tools completed",
+                            "sent_receipt": sent_receipt,
+                        }
+                        disposition = (
+                            "confirmed"
+                            if observer_evidence["confirmed"]
+                            else "inconclusive"
+                        )
+                    else:
+                        observer_evidence = _observe_post_submit_page(
+                            port, worker_id, job, attempt=1
+                        )
+                        disposition = _classify_post_submit_observation(
+                            observer_evidence
+                        )
+                        observer_reason = str(observer_evidence.get("reason") or "")
+                        if (
+                            disposition == "uncertain"
+                            and observer_reason.startswith(
+                                (
+                                    "post_submit_observer_error:",
+                                    "post_submit_no_bound_application_page",
+                                )
+                            )
+                            and not _stop_event.wait(timeout=0.75)
+                        ):
+                            add_event(
+                                f"[W{worker_id}] Reconnecting observer once; "
+                                "never repeating Submit"
+                            )
+                            retry_observation = _observe_post_submit_page(
+                                port,
+                                worker_id,
+                                job,
+                                attempt=1,
+                            )
+                            retry_observation["observer_reconnect_attempts"] = 1
+                            retry_observation["initial_observer_reason"] = observer_reason
+                            observer_evidence = retry_observation
+                            disposition = _classify_post_submit_observation(
+                                observer_evidence
+                            )
                     attempts = [{
                         "agent": agent_evidence,
                         "observer": observer_evidence,
@@ -522,7 +815,10 @@ def _worker_loop_with_port(
                     # One repair turn is allowed only when visible validation
                     # errors prove the first click was rejected. An absent
                     # receipt alone can never authorize another click.
-                    if disposition == "validation_blocked_repairable":
+                    if (
+                        email_application is None
+                        and disposition == "validation_blocked_repairable"
+                    ):
                         repair_job = dict(observed_job)
                         repair_job.pop("_agent_submission_evidence", None)
                         repair_job["_browser_observation"] = {
@@ -564,6 +860,8 @@ def _worker_loop_with_port(
                             "disposition": disposition,
                         })
                     elif (
+                        email_application is None
+                        and
                         disposition == "verification_required"
                         and manual_captcha_relay
                         and not verification_relay_used
@@ -626,11 +924,31 @@ def _worker_loop_with_port(
                         "observer": observer_evidence,
                         "attempts": attempts,
                     }
-                    archived = _archive_worker_evidence(
-                        config.APPLY_WORKER_DIR / f"worker-{worker_id}",
-                        job,
-                        worker_id,
-                        datetime.now().astimezone().strftime("%Y%m%d_%H%M%S"),
+                    if disposition == "provider_submission_error":
+                        submission_evidence["technical_failure"] = classify_failure(
+                            "failed:provider_submission_error"
+                        ).as_dict()
+                    elif (
+                        disposition == "uncertain"
+                        and str(observer_evidence.get("reason") or "").startswith(
+                            (
+                                "post_submit_observer_error:",
+                                "post_submit_no_bound_application_page",
+                            )
+                        )
+                    ):
+                        submission_evidence["technical_failure"] = classify_failure(
+                            "failed:post_submit_observer_unavailable"
+                        ).as_dict()
+                    archived = (
+                        []
+                        if email_application is not None
+                        else _archive_worker_evidence(
+                            config.APPLY_WORKER_DIR / f"worker-{worker_id}",
+                            job,
+                            worker_id,
+                            datetime.now().astimezone().strftime("%Y%m%d_%H%M%S"),
+                        )
                     )
                     archived_by_name = {path.name: path for path in archived}
                     for index, attempt_evidence in enumerate(attempts, start=1):
@@ -653,16 +971,43 @@ def _worker_loop_with_port(
                         observer_evidence["screenshot_path"] = str(final_archive)
 
                     if disposition == "confirmed":
-                        if result != "applied" or not _submission_evidence_consistent(
-                            agent_evidence, observer_evidence
+                        sent_receipt = observer_evidence.get("sent_receipt")
+                        direct_receipt_agrees = bool(
+                            email_application is None
+                            or (
+                                isinstance(agent_evidence, dict)
+                                and isinstance(sent_receipt, dict)
+                                and str(agent_evidence.get("provider_message_id") or "")
+                                == str(sent_receipt.get("provider_message_id") or "")
+                            )
+                        )
+                        if (
+                            result != "applied"
+                            or not direct_receipt_agrees
+                            or not _submission_evidence_consistent(
+                                agent_evidence, observer_evidence
+                            )
                         ):
                             result = "submission_uncertain"
+                        elif email_application is not None:
+                            admission = _admit_direct_email_receipt(
+                                job,
+                                observer_evidence.get("sent_receipt"),
+                            )
+                            if admission.get("status") not in {
+                                "admitted",
+                                "already_admitted",
+                            }:
+                                observer_evidence["receipt_admission"] = admission
+                                result = "submission_uncertain"
                     elif disposition == "verification_required":
                         result = "captcha"
                     elif disposition == "validation_blocked_manual":
                         result = "failed:manual_review_required:submission_validation"
                     elif disposition == "validation_blocked_repairable":
                         result = "failed:submission_validation_blocked_after_repair"
+                    elif disposition == "provider_submission_error":
+                        result = "submission_uncertain"
                     else:
                         result = "submission_uncertain"
                     break
@@ -770,6 +1115,15 @@ def _worker_loop_with_port(
                     task_id=job.get("_attempt_id"),
                 )
                 update_state(worker_id, jobs_done=applied + failed + 1)
+            elif result.startswith("deferred:"):
+                release_lock(job["url"], job.get("_attempt_id"))
+                reason = result.split(":", 1)[1]
+                add_event(f"[W{worker_id}] Deferred without failure: {reason[:45]}")
+                update_state(
+                    worker_id,
+                    status="idle",
+                    last_action=f"deferred: {reason[:25]}",
+                )
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 reason = _format_failure_error(reason, job.pop("_failure_context", None))
@@ -877,6 +1231,7 @@ def worker_loop(
     interaction_mode: str = "auto",
     authorization_manifest: dict | None = None,
     attempted_urls: set[str] | None = None,
+    attempted_urls_lock: threading.Lock | None = None,
 ) -> tuple[int, int]:
     """Validate injected ports and own the CDP claim for the full worker run."""
     _validate_runtime_ports(runtime)
@@ -898,6 +1253,7 @@ def worker_loop(
             interaction_mode=interaction_mode,
             authorization_manifest=authorization_manifest,
             attempted_urls=attempted_urls,
+            attempted_urls_lock=attempted_urls_lock,
         )
     finally:
         runtime.release_cdp_port(worker_id)

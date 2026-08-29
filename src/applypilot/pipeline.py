@@ -244,6 +244,9 @@ _PENDING_SQL: dict[str, str] = {
 
 # How long to sleep between polling loops in streaming mode (seconds)
 _STREAM_POLL_INTERVAL = 10
+_STREAM_FAILURE_BUDGET = 3
+_STREAM_BACKOFF_INITIAL = 1.0
+_STREAM_BACKOFF_MAX = 30.0
 
 
 def _count_pending(stage: str, min_score: int = 7) -> int:
@@ -255,6 +258,17 @@ def _count_pending(stage: str, min_score: int = 7) -> int:
     if "?" in sql:
         return conn.execute(sql, (min_score,)).fetchone()[0]
     return conn.execute(sql).fetchone()[0]
+
+
+def _stream_failure(result: object) -> str | None:
+    """Return a structured stage error without changing runner contracts."""
+    if not isinstance(result, dict):
+        return None
+    status = str(result.get("status") or "").strip()
+    if not status.casefold().startswith("error"):
+        return None
+    _, _, detail = status.partition(":")
+    return detail.strip() or status
 
 
 def _run_stage_streaming(
@@ -293,6 +307,8 @@ def _run_stage_streaming(
 
     # For downstream stages: loop until upstream done + no pending work
     passes = 0
+    consecutive_failures = 0
+    last_error: str | None = None
     while not stop_event.is_set():
         # Wait for upstream to start producing work (first pass only)
         if passes == 0 and upstream and not tracker.is_done(upstream):
@@ -302,12 +318,31 @@ def _run_stage_streaming(
         pending = _count_pending(stage, min_score)
 
         if pending > 0:
+            passes += 1
             try:
-                runner(**kwargs)
-                passes += 1
+                result = runner(**kwargs)
+                failure = _stream_failure(result)
+                if failure is not None:
+                    raise RuntimeError(failure)
+                consecutive_failures = 0
+                last_error = None
             except Exception as e:
                 log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
-                passes += 1
+                consecutive_failures += 1
+                last_error = str(e)
+                if consecutive_failures >= _STREAM_FAILURE_BUDGET:
+                    log.error(
+                        "Stage '%s' exhausted its streaming failure budget (%d)",
+                        stage,
+                        _STREAM_FAILURE_BUDGET,
+                    )
+                    break
+                backoff = min(
+                    _STREAM_BACKOFF_MAX,
+                    _STREAM_BACKOFF_INITIAL * (2 ** (consecutive_failures - 1)),
+                )
+                if stop_event.wait(timeout=backoff):
+                    break
         else:
             # No work right now
             upstream_done = upstream is None or tracker.is_done(upstream)
@@ -318,7 +353,20 @@ def _run_stage_streaming(
             if stop_event.wait(timeout=_STREAM_POLL_INTERVAL):
                 break  # Stop requested
 
-    tracker.mark_done(stage, {"status": "ok", "passes": passes})
+    if consecutive_failures >= _STREAM_FAILURE_BUDGET:
+        tracker.mark_done(
+            stage,
+            {
+                "status": f"error: {last_error}",
+                "passes": passes,
+                "consecutive_failures": consecutive_failures,
+            },
+        )
+    else:
+        tracker.mark_done(
+            stage,
+            {"status": "ok", "passes": passes, "consecutive_failures": 0},
+        )
 
 
 # ---------------------------------------------------------------------------

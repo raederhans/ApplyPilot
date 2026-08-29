@@ -47,7 +47,7 @@ def count_submission_ready_jobs(
         return int(conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
             "AND tailor_status = 'machine_validated' AND applied_at IS NULL "
-            "AND eligibility_status != 'ineligible'"
+            "AND COALESCE(eligibility_status, 'eligible') != 'ineligible'"
         ).fetchone()[0])
 
     allow_runtime_cover = bool(

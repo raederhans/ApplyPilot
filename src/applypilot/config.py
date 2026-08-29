@@ -303,9 +303,9 @@ def get_portal_policy(
 ) -> dict | None:
     """Return the configured portal policy for a URL or recorded source.
 
-    The source-site fallback is intentional. A JobStreet listing that opens an
-    employer's ATS is still governed by JobStreet's manual-only policy until a
-    candidate explicitly takes over that external application themselves.
+    The source-site fallback preserves portal provenance. A registered HTTPS
+    employer-ATS target is returned as an authorized external handoff while
+    the portal's own host retains its configured manual/review boundary.
     """
     host = (urlparse(url or "").hostname or "").lower()
     source_names = {
@@ -314,6 +314,7 @@ def get_portal_policy(
         if _normalise_site_name(value)
     }
 
+    scheme = urlparse(url or "").scheme.casefold()
     for policy in load_portal_policies():
         domains = policy.get("domains", [])
         if isinstance(domains, str):
@@ -334,6 +335,22 @@ def get_portal_policy(
             if isinstance(value, str) and _normalise_site_name(value)
         }
         if source_names.intersection(names):
+            external_https_target = bool(
+                host
+                and scheme == "https"
+                and domains
+                and not any(
+                    _host_matches(host, domain)
+                    for domain in domains
+                    if isinstance(domain, str)
+                )
+            )
+            if external_https_target:
+                return {
+                    **policy,
+                    "external_application_mode": "continue_when_authorized",
+                    "source_portal_handoff": True,
+                }
             return policy
     return None
 
@@ -357,6 +374,8 @@ def portal_application_gate(
 
     name = str(policy.get("name") or "configured portal")
     mode = str(policy.get("application_mode") or "").casefold()
+    if policy.get("external_application_mode") == "continue_when_authorized":
+        return None
     if mode == "manual_only":
         return f"{name} requires a candidate-operated manual application."
 

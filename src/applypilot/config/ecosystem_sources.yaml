@@ -1,0 +1,100 @@
+sources:
+  - id: linkedin-content-manual
+    name: LinkedIn Content Search
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: social_content
+    access_mode: candidate_visible_login
+    collection_modes: {job_lead: manual_url_import}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [linkedin.com]
+    discovery_url: https://www.linkedin.com/search/results/content/
+    login_requirement: required
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: careeraxis
+    name: NTU CareerAxis
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: authenticated_campus_portal
+    access_mode: candidate_visible_login
+    collection_modes: {job_lead: manual_url_import}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [careeraxis.ntu.edu.sg]
+    discovery_url: https://careeraxis.ntu.edu.sg/
+    login_requirement: required
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: mycareersfuture
+    name: MyCareersFuture
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: government_job_portal
+    access_mode: singpass_login
+    collection_modes: {job_lead: manual_url_import}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [mycareersfuture.gov.sg]
+    discovery_url: https://www.mycareersfuture.gov.sg/search
+    login_requirement: required_for_application
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: careers-gov-early-careers
+    name: Careers@Gov Early Careers
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: government_job_portal
+    access_mode: public_manual_review
+    collection_modes: {job_lead: manual_url_import}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [careers.gov.sg]
+    discovery_url: https://www.careers.gov.sg/join-us/early-careers/
+    login_requirement: not_required_for_discovery
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: sfa-job-portal
+    name: SFA Job Portal
+    enabled: false
+    record_kinds: [job_lead]
+    publisher_type: industry_job_portal
+    access_mode: public_manual_review
+    collection_modes: {job_lead: manual_url_import}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [jobs.singaporefintech.org]
+    discovery_url: https://jobs.singaporefintech.org/jobs/
+    login_requirement: not_required_for_discovery
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: Public endpoint unreachable on 2026-08-28; recheck page and terms before enabling.
+
+  - id: sginnovate-dtc
+    name: SGInnovate Deep Tech Central
+    enabled: true
+    record_kinds: [job_lead, company_seed]
+    publisher_type: ecosystem_program
+    access_mode: public_directory
+    collection_modes:
+      job_lead: manual_url_import
+      company_seed: public_company_seed
+    coverage_mode: non_exhaustive
+    allowed_hosts: [sginnovate.com]
+    discovery_url: https://www.sginnovate.com/dtc
+    login_requirement: account_required_for_application
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: startup-sg-directory
+    name: Startup SG Directory
+    enabled: true
+    record_kinds: [company_seed]
+    publisher_type: ecosystem_directory
+    access_mode: public_directory
+    collection_modes: {company_seed: public_company_seed}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [startupsg.gov.sg]
+    discovery_url: https://www.startupsg.gov.sg/directory/startups/
+    login_requirement: not_required_for_discovery
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null

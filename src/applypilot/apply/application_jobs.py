@@ -18,6 +18,80 @@ from applypilot import config
 logger = logging.getLogger(__name__)
 
 
+def revalidate_duplicate_before_submit(
+    connection: sqlite3.Connection,
+    job_url: str,
+) -> dict[str, object]:
+    """Recheck durable duplicate identities inside the submit claim transaction.
+
+    Read-only duplicate analysis may run in parallel against a frozen job
+    snapshot.  This final check intentionally requires an existing SQLite
+    transaction so callers can keep it atomic with the submission-gate claim
+    and avoid a time-of-check/time-of-use gap.
+    """
+    if not connection.in_transaction:
+        raise RuntimeError(
+            "duplicate revalidation must run inside the submission claim transaction"
+        )
+    job_url = str(job_url or "").strip()
+    if not job_url:
+        raise ValueError("job_url is required")
+    current = connection.execute(
+        "SELECT url, canonical_job_url, platform_job_id, apply_status "
+        "FROM jobs WHERE url=?",
+        (job_url,),
+    ).fetchone()
+    if current is None:
+        return {"clear": False, "reason": "job_not_found"}
+    current = dict(current)
+    if str(current.get("apply_status") or "").casefold() in {
+        "applied",
+        "submission_uncertain",
+    }:
+        return {"clear": False, "reason": "current_job_already_submitted_or_uncertain"}
+
+    receipt = connection.execute(
+        "SELECT receipt_source, receipt_id FROM application_receipts "
+        "WHERE job_url=? ORDER BY admitted_at DESC LIMIT 1",
+        (job_url,),
+    ).fetchone()
+    if receipt is not None:
+        return {
+            "clear": False,
+            "reason": "current_job_receipt_exists",
+            "receipt_source": str(receipt[0]),
+        }
+
+    canonical = str(current.get("canonical_job_url") or "").strip()
+    platform_id = str(current.get("platform_job_id") or "").strip()
+    if not canonical and not platform_id:
+        return {"clear": True, "reason": "no_duplicate_identity"}
+    duplicate = connection.execute(
+        """
+        SELECT j.url, j.apply_status,
+               EXISTS(SELECT 1 FROM application_receipts AS r WHERE r.job_url=j.url) AS has_receipt
+        FROM jobs AS j
+        WHERE j.url != ?
+          AND ((? != '' AND j.canonical_job_url = ?)
+               OR (? != '' AND j.platform_job_id = ?))
+          AND (j.apply_status IN ('applied', 'submission_uncertain')
+               OR EXISTS(SELECT 1 FROM application_receipts AS r WHERE r.job_url=j.url))
+        ORDER BY CASE WHEN j.apply_status='applied' THEN 0 ELSE 1 END, j.url
+        LIMIT 1
+        """,
+        (job_url, canonical, canonical, platform_id, platform_id),
+    ).fetchone()
+    if duplicate is None:
+        return {"clear": True, "reason": "no_duplicate_submission"}
+    return {
+        "clear": False,
+        "reason": "duplicate_submission_identity",
+        "matched_job_url": str(duplicate[0]),
+        "matched_status": str(duplicate[1] or "receipt"),
+        "has_receipt": bool(duplicate[2]),
+    }
+
+
 def acquire_job(
     connection: sqlite3.Connection,
     target_url: str | None = None,
@@ -49,14 +123,15 @@ def acquire_job(
     )
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
     recover_stale_application_attempts(conn)
-    refresh_job_eligibility(conn)
+    try:
+        profile = config.load_profile()
+    except FileNotFoundError:
+        profile = {}
+    refresh_job_eligibility(conn, profile=profile)
     try:
         conn.execute("BEGIN IMMEDIATE")
 
-        try:
-            submission_policy = config.load_profile().get("submission_policy", {})
-        except FileNotFoundError:
-            submission_policy = {}
+        submission_policy = profile.get("submission_policy", {})
         allow_runtime_cover = bool(
             submission_policy.get("allow_runtime_cover_letter_discovery", False)
         )
@@ -77,15 +152,16 @@ def acquire_job(
                   )
                 """
             target_match = "(url = ? OR application_url = ?)"
-            target_params = (target_url, target_url)
+            minimum_fit_score = max(1, min(int(min_score), 10))
+            target_params = (target_url, target_url, minimum_fit_score)
             rows = conn.execute(f"""
                 SELECT *
                 FROM jobs
                 WHERE {target_match}
                   {material_clause}
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
-                  AND COALESCE(apply_retry_blocked, 0) = 0
-                  AND eligibility_status != 'ineligible'
+                  AND fit_score >= ?
+                  AND {ELIGIBLE_SQL}
             """, target_params).fetchall()
             if excluded:
                 rows = [candidate for candidate in rows if candidate["url"] not in excluded]
@@ -115,7 +191,6 @@ def acquire_job(
                   {"" if allow_runtime_cover else "AND ((cover_letter_path IS NOT NULL AND cover_letter_status IN ('human_approved', 'agent_validated')) OR cover_letter_status = 'not_required')"}
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed'))
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND COALESCE(apply_retry_blocked, 0) = 0
                   AND fit_score >= ?
                   AND {ELIGIBLE_SQL}
                   {excluded_clause}
@@ -125,13 +200,11 @@ def acquire_job(
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
 
         row = None
-        if authorization_manifest is None:
-            row = rows[0] if rows else None
-        else:
-            from applypilot.apply.authorization import authorize_job
-            from applypilot.apply.decision import evaluate
+        from applypilot.apply.decision import evaluate
 
-            minimum_fit_score = max(1, min(int(min_score), 10))
+        minimum_fit_score = max(1, min(int(min_score), 10))
+        if authorization_manifest is not None:
+            from applypilot.apply.authorization import authorize_job
 
             try:
                 expires_at = datetime.fromisoformat(
@@ -142,26 +215,28 @@ def acquire_job(
             if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at:
                 rows = []
 
-            for candidate in rows:
-                candidate_job = dict(candidate)
-                candidate_job["application_url"] = (
-                    candidate_job.get("application_url") or candidate_job.get("url")
-                )
-                candidate_decision = evaluate(
-                    candidate_job,
-                    minimum_fit_score=minimum_fit_score,
-                    allow_runtime_readiness=allow_runtime_readiness,
-                    allow_runtime_cover_letter=allow_runtime_cover,
-                )
-                if candidate_decision.get("decision") != "ready_to_apply":
-                    continue
+        for candidate in rows:
+            candidate_job = dict(candidate)
+            candidate_job["application_url"] = (
+                candidate_job.get("application_url") or candidate_job.get("url")
+            )
+            candidate_decision = evaluate(
+                candidate_job,
+                minimum_fit_score=minimum_fit_score,
+                allow_runtime_readiness=allow_runtime_readiness,
+                allow_runtime_cover_letter=allow_runtime_cover or preview_only,
+            )
+            if candidate_decision.get("decision") != "ready_to_apply":
+                continue
+            if authorization_manifest is not None:
                 try:
                     authorized = authorize_job(authorization_manifest, candidate_job)
                 except (KeyError, PermissionError, RuntimeError, ValueError):
                     continue
-                if authorized is not None:
-                    row = candidate
-                    break
+                if authorized is None:
+                    continue
+            row = candidate
+            break
 
         if not row:
             conn.rollback()
@@ -188,8 +263,9 @@ def acquire_job(
             and not preview_only
             and os.environ.get("APPLYPILOT_AUTO_SUBMIT") == "1"
         ):
-            policy_min_score = int(
-                os.environ.get("APPLYPILOT_AUTO_SUBMIT_MIN_SCORE", "8")
+            policy_min_score = max(
+                minimum_fit_score,
+                int(os.environ.get("APPLYPILOT_AUTO_SUBMIT_MIN_SCORE", "8")),
             )
             auto_issue = None
             if not str(row["company_name"] or "").strip():
@@ -206,16 +282,10 @@ def acquire_job(
                 logger.warning("Automatic submission paused for %s: %s", row["url"], auto_issue)
                 return None
 
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
+        # A historically difficult ATS is a runtime hint. The visible agent may
+        # still complete ordinary preparation before the actual human boundary.
         from applypilot.config import is_manual_ats
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
-            conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
+        ats_capability_hint = "manual_boundary_likely" if is_manual_ats(apply_url) else None
 
         now = datetime.now(UTC).isoformat()
         attempt_id = start_application_attempt(
@@ -236,6 +306,8 @@ def acquire_job(
 
         acquired = dict(row)
         acquired["_attempt_id"] = attempt_id
+        if ats_capability_hint:
+            acquired["_ats_capability_hint"] = ats_capability_hint
         return acquired
     except Exception:
         conn.rollback()
@@ -266,12 +338,21 @@ def mark_result(
         )
         where_params += (task_id, task_id, now)
     if status == "applied":
+        agent_evidence = (
+            evidence.get("agent", {}) if isinstance(evidence, dict) else {}
+        )
+        verification_confidence = (
+            "direct_email_sent_verified"
+            if isinstance(agent_evidence, dict)
+            and agent_evidence.get("channel") == "direct_email"
+            else "visible_confirmation"
+        )
         cursor = conn.execute(f"""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_retry_blocked = 0, apply_retry_reason = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
-                           verification_confidence = 'visible_confirmation',
+                           verification_confidence = ?,
                            application_evidence = ?, application_recorded_at = ?,
                            submission_observation_json = ?, submission_observed_at = ?
             {where}
@@ -279,6 +360,7 @@ def mark_result(
             now,
             duration_ms,
             task_id,
+            verification_confidence,
             json.dumps(evidence or {}, ensure_ascii=False),
             now,
             json.dumps(evidence or {}, ensure_ascii=False),

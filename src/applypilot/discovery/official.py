@@ -18,9 +18,11 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as element_tree
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from html import unescape
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import yaml
 from bs4 import BeautifulSoup
@@ -30,6 +32,15 @@ from applypilot.config import CONFIG_DIR
 Transport = Callable[..., Any]
 _BLOCKED_HTTP_CODES = {401, 403, 407, 429}
 _USER_AGENT = "ApplyPilotOfficialRadar/0.1 (+read-only-job-discovery)"
+_ACTIVE_PROVIDER_KEYS = {
+    "greenhouse": "board",
+    "lever": "site",
+    "ashby": "board",
+    "smartrecruiters": "company_id",
+    "workable": "subdomain",
+    "rss": "feed_url",
+    "jobposting_jsonld": "career_url",
+}
 
 
 def load_company_watchlist(path: str | None = None) -> list[dict[str, Any]]:
@@ -40,7 +51,32 @@ def load_company_watchlist(path: str | None = None) -> list[dict[str, Any]]:
     companies = payload.get("companies", [])
     if not isinstance(companies, list):
         raise TypeError("company_watchlist.yaml must contain a companies list")
-    return [company for company in companies if isinstance(company, dict)]
+    normalized = [company for company in companies if isinstance(company, dict)]
+    seen_ids: set[str] = set()
+    for company in normalized:
+        company_id = str(company.get("id") or "").strip()
+        if not company_id:
+            raise ValueError("company_watchlist company is missing id")
+        if company_id.casefold() in seen_ids:
+            raise ValueError(f"company_watchlist contains duplicate id: {company_id}")
+        seen_ids.add(company_id.casefold())
+        if not company.get("active", False):
+            continue
+        provider = str(company.get("provider") or "").casefold()
+        required_key = _ACTIVE_PROVIDER_KEYS.get(provider)
+        if required_key is None:
+            raise ValueError(
+                f"active company {company_id} has unsupported provider: {provider or 'missing'}"
+            )
+        if not str(company.get(required_key) or "").strip():
+            raise ValueError(
+                f"active {provider} company {company_id} requires canonical key {required_key}"
+            )
+        if company.get("cadence") != "daily":
+            raise ValueError(
+                f"active company {company_id} must use daily cadence until due-source scheduling exists"
+            )
+    return normalized
 
 
 def _default_transport(url: str, headers: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -104,6 +140,14 @@ def _empty_run(company: Mapping[str, Any]) -> dict[str, Any]:
             "career_url": company.get("career_url", ""),
             "cadence": company.get("cadence", ""),
             "coverage_mode": company.get("coverage_mode", "full"),
+            "provider_identifier": (
+                company.get("company_id")
+                or company.get("subdomain")
+                or company.get("identifier")
+                or company.get("site")
+                or company.get("board")
+                or ""
+            ),
             "read_only": True,
         },
         "started_at": now,
@@ -129,6 +173,7 @@ def _plain_text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         value = str(value)
+    value = unescape(value)
     if "<" not in value or ">" not in value:
         return " ".join(value.split())
     return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
@@ -244,6 +289,7 @@ def normalise_job(raw: Mapping[str, Any], company: Mapping[str, Any], provider: 
         "canonical_url": _canonical_url(url),
         "job_id": str(identifier or ""),
         "external_id": str(identifier or ""),
+        "provider_application_id": _plain_text(raw.get("provider_application_id")),
         "requisition_id": _plain_text(raw.get("requisitionId") or raw.get("requisition_id")),
         "description": description,
         "full_description": description,
@@ -350,6 +396,365 @@ def ashby_url(company: Mapping[str, Any]) -> str:
         f"https://api.ashbyhq.com/posting-api/job-board/{company['board']}"
         "?includeCompensation=true"
     )
+
+
+def _company_key(company: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str(company.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def smartrecruiters_url(company: Mapping[str, Any], *, offset: int = 0) -> str:
+    identifier = _company_key(company, "company_id", "identifier", "site", "board")
+    limit = min(max(int(company.get("limit", 100)), 1), 100)
+    parameters: list[tuple[str, str | int]] = [("limit", limit), ("offset", offset)]
+    country = str(company.get("country") or "").strip()
+    if country:
+        parameters.append(("country", country))
+    return (
+        f"https://api.smartrecruiters.com/v1/companies/{quote(identifier, safe='')}/postings"
+        f"?{urlencode(parameters)}"
+    )
+
+
+def workable_url(company: Mapping[str, Any]) -> str:
+    account = _company_key(company, "subdomain", "account", "site")
+    return f"https://www.workable.com/api/accounts/{quote(account, safe='')}?details=true"
+
+
+def _joined_location(*values: Any) -> str:
+    parts: list[str] = []
+    for value in values:
+        for part in str(value or "").split(","):
+            cleaned = part.strip()
+            if cleaned and cleaned.casefold() not in {item.casefold() for item in parts}:
+                parts.append(cleaned)
+    return ", ".join(parts)
+
+
+def _smartrecruiters_record(summary: Mapping[str, Any], detail: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    merged = dict(summary)
+    merged.update(detail or {})
+    sections = _nested_mapping(_nested_mapping(merged.get("jobAd")).get("sections"))
+    description_parts = []
+    for key in ("companyDescription", "jobDescription", "qualifications", "additionalInformation"):
+        section = _nested_mapping(sections.get(key))
+        text = _plain_text(section.get("text"))
+        if text:
+            description_parts.append(text)
+    location = _nested_mapping(merged.get("location"))
+    full_location = _joined_location(location.get("fullLocation")) or _joined_location(
+        location.get("city"), location.get("region"), location.get("country")
+    )
+    employment_type = _nested_mapping(merged.get("typeOfEmployment"))
+    function = _nested_mapping(merged.get("function"))
+    public_url = merged.get("postingUrl") or merged.get("applyUrl")
+    return {
+        "id": merged.get("id") or merged.get("uuid"),
+        "title": merged.get("name") or merged.get("title"),
+        "url": public_url,
+        "application_url": merged.get("applyUrl") or public_url,
+        "location": full_location,
+        "description": "\n\n".join(description_parts),
+        "datePosted": merged.get("releasedDate"),
+        "employmentType": employment_type.get("label") or merged.get("typeOfEmployment"),
+        "requisition_id": merged.get("refNumber"),
+        "provider_application_id": merged.get("uuid"),
+        "function": function.get("label") or merged.get("function"),
+    }
+
+
+def collect_smartrecruiters(
+    company: Mapping[str, Any], transport: Transport = _default_transport
+) -> dict[str, Any]:
+    """Read every SmartRecruiters posting page and enrich it from its official detail ref."""
+    run = _empty_run(company)
+    identifier = _company_key(company, "company_id", "identifier", "site", "board")
+    if not identifier:
+        run["status"] = "partial"
+        run["errors"].append("SmartRecruiters company is missing company_id/identifier/site")
+        return _finish_run(run)
+
+    max_pages = min(max(int(company.get("max_pages", 50)), 1), 100)
+    offset = 0
+    expected_total: int | None = None
+    seen_offsets: set[int] = set()
+    seen_page_signatures: set[tuple[str, ...]] = set()
+    seen_posting_ids: set[str] = set()
+    summaries_seen = 0
+    detail_concurrency = min(
+        max(int(company.get("detail_concurrency", 1)), 1),
+        8,
+    )
+    run["metadata"]["detail_concurrency"] = detail_concurrency
+
+    while expected_total is None or summaries_seen < expected_total:
+        if run["pages_scanned"] >= max_pages:
+            run["status"] = "partial"
+            run["errors"].append(f"pagination stopped at configured limit ({max_pages} pages)")
+            break
+        if offset in seen_offsets:
+            run["status"] = "partial"
+            run["errors"].append("pagination loop detected")
+            break
+        seen_offsets.add(offset)
+        page_url = smartrecruiters_url(company, offset=offset)
+        try:
+            status_code, body, _headers = _call_transport(transport, page_url)
+        except Exception as error:  # noqa: BLE001 - transports are an integration boundary
+            run["status"] = "partial"
+            run["errors"].append(str(error))
+            break
+        if status_code >= 400:
+            run["status"] = _error_status(status_code) if run["pages_scanned"] == 0 else "partial"
+            run["errors"].append(f"HTTP {status_code} for {page_url}")
+            break
+        try:
+            payload = _parse_json(body)
+        except (TypeError, ValueError) as error:
+            run["status"] = "partial"
+            run["errors"].append(f"invalid JSON: {error}")
+            break
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("content"), list):
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters response is missing content list")
+            break
+        try:
+            page_total = int(payload["totalFound"])
+        except (KeyError, TypeError, ValueError):
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters response is missing valid totalFound")
+            break
+        if page_total < 0:
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters totalFound must not be negative")
+            break
+        if expected_total is None:
+            expected_total = page_total
+        elif page_total != expected_total:
+            run["status"] = "partial"
+            run["errors"].append(
+                f"SmartRecruiters totalFound changed during pagination ({expected_total} to {page_total})"
+            )
+            break
+
+        try:
+            response_offset = int(payload.get("offset", offset))
+        except (TypeError, ValueError):
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters response has invalid offset")
+            break
+        if response_offset != offset:
+            run["status"] = "partial"
+            run["errors"].append(
+                f"SmartRecruiters offset mismatch (requested {offset}, received {response_offset})"
+            )
+            break
+
+        raw_content = payload["content"]
+        run["pages_scanned"] += 1
+        run["raw_count"] += len(raw_content)
+        if not raw_content and summaries_seen < expected_total:
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters pagination returned an empty page before totalFound")
+            break
+        page_signature = tuple(
+            str(item.get("ref") or item.get("id") or item.get("uuid") or "")
+            if isinstance(item, Mapping)
+            else ""
+            for item in raw_content
+        )
+        if page_signature and page_signature in seen_page_signatures:
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters pagination repeated a page")
+            break
+        seen_page_signatures.add(page_signature)
+
+        detail_entries: list[tuple[Mapping[str, Any], str, str]] = []
+        for summary in raw_content:
+            summaries_seen += 1
+            if not isinstance(summary, Mapping):
+                run["status"] = "partial"
+                run["errors"].append("skipped non-object SmartRecruiters record")
+                continue
+            posting_identity = str(summary.get("ref") or summary.get("id") or summary.get("uuid") or "").strip()
+            if posting_identity and posting_identity in seen_posting_ids:
+                run["status"] = "partial"
+                run["errors"].append(f"SmartRecruiters pagination repeated posting {posting_identity}")
+                continue
+            if posting_identity:
+                seen_posting_ids.add(posting_identity)
+            detail_ref = str(summary.get("ref") or "").strip()
+            detail_url = _safe_pagination_url(page_url, page_url, detail_ref) if detail_ref else None
+            if detail_url is None:
+                run["status"] = "partial"
+                run["errors"].append("skipped SmartRecruiters record without a safe same-origin detail ref")
+                continue
+            detail_entries.append((summary, detail_ref, detail_url))
+
+        def fetch_detail(
+            entry: tuple[Mapping[str, Any], str, str],
+        ) -> tuple[Mapping[str, Any] | None, list[str]]:
+            _summary, detail_ref, detail_url = entry
+            errors: list[str] = []
+            try:
+                detail_status, detail_body, _detail_headers = _call_transport(transport, detail_url)
+                if detail_status >= 400:
+                    errors.append(
+                        f"HTTP {detail_status} for SmartRecruiters detail {detail_url}"
+                    )
+                    return None, errors
+                parsed_detail = _parse_json(detail_body)
+                if isinstance(parsed_detail, Mapping):
+                    return parsed_detail, errors
+                errors.append(f"invalid SmartRecruiters detail object for {detail_url}")
+            except Exception as error:  # noqa: BLE001 - one detail must not discard other records
+                errors.append(f"SmartRecruiters detail failed for {detail_ref}: {error}")
+            return None, errors
+
+        if detail_concurrency > 1 and len(detail_entries) > 1:
+            with ThreadPoolExecutor(max_workers=detail_concurrency) as executor:
+                detail_results = list(executor.map(fetch_detail, detail_entries))
+        else:
+            detail_results = [fetch_detail(entry) for entry in detail_entries]
+
+        for (summary, _detail_ref, detail_url), (detail, detail_errors) in zip(
+            detail_entries,
+            detail_results,
+            strict=True,
+        ):
+            if detail_errors:
+                run["status"] = "partial"
+                run["errors"].extend(detail_errors)
+            job = normalise_job(
+                _smartrecruiters_record(summary, detail),
+                company,
+                "smartrecruiters",
+                source_url=detail_url,
+            )
+            if job is None:
+                run["status"] = "partial"
+                run["errors"].append("skipped SmartRecruiters record without title or public URL")
+            else:
+                run["jobs"].append(job)
+
+        if summaries_seen > expected_total:
+            run["status"] = "partial"
+            run["errors"].append(
+                f"SmartRecruiters returned more records ({summaries_seen}) than totalFound ({expected_total})"
+            )
+            break
+
+        if summaries_seen >= expected_total:
+            break
+        next_offset = offset + len(raw_content)
+        if next_offset <= offset:
+            run["status"] = "partial"
+            run["errors"].append("SmartRecruiters pagination did not advance")
+            break
+        offset = next_offset
+
+    if expected_total is not None and len(seen_posting_ids) != expected_total:
+        run["status"] = "partial"
+        run["errors"].append(
+            f"SmartRecruiters unique posting count ({len(seen_posting_ids)}) did not match totalFound ({expected_total})"
+        )
+
+    return _finish_run(run)
+
+
+def _looks_like_application_url(value: Any) -> bool:
+    path = urlsplit(str(value or "")).path.casefold().rstrip("/")
+    return path.endswith("/apply") or "/candidates/new" in path
+
+
+def _workable_urls(raw: Mapping[str, Any]) -> tuple[str, str]:
+    """Resolve Workable's conflicting documented and live URL field shapes."""
+    direct_url = _plain_text(raw.get("url"))
+    application_url = _plain_text(raw.get("application_url"))
+    shortlink = _plain_text(raw.get("shortlink"))
+    job_url = next(
+        (
+            value
+            for value in (direct_url, application_url, shortlink)
+            if value and not _looks_like_application_url(value)
+        ),
+        direct_url or application_url or shortlink,
+    )
+    apply_url = next(
+        (
+            value
+            for value in (application_url, direct_url, shortlink)
+            if value and _looks_like_application_url(value)
+        ),
+        application_url or direct_url or job_url,
+    )
+    return job_url, apply_url
+
+
+def _workable_record(raw: Mapping[str, Any]) -> dict[str, Any]:
+    location = _joined_location(raw.get("city"), raw.get("state"), raw.get("country"))
+    job_url, apply_url = _workable_urls(raw)
+    return {
+        "id": raw.get("shortcode") or raw.get("code"),
+        "title": raw.get("title"),
+        "url": job_url,
+        "application_url": apply_url,
+        "location": location,
+        "description": raw.get("description"),
+        "datePosted": raw.get("published_on") or raw.get("created_at"),
+        "employment_type": raw.get("employment_type"),
+    }
+
+
+def collect_workable(company: Mapping[str, Any], transport: Transport = _default_transport) -> dict[str, Any]:
+    """Read Workable's anonymous public account collection, which is not paginated."""
+    run = _empty_run(company)
+    account = _company_key(company, "subdomain", "account", "site")
+    if not account:
+        run["status"] = "partial"
+        run["errors"].append("Workable company is missing subdomain/account/site")
+        return _finish_run(run)
+    url = workable_url(company)
+    try:
+        status_code, body, _headers = _call_transport(transport, url)
+    except Exception as error:  # noqa: BLE001 - transports are an integration boundary
+        run["status"] = "partial"
+        run["errors"].append(str(error))
+        return _finish_run(run)
+    if status_code >= 400:
+        run["status"] = _error_status(status_code)
+        run["errors"].append(f"HTTP {status_code} for {url}")
+        return _finish_run(run)
+    try:
+        payload = _parse_json(body)
+    except (TypeError, ValueError) as error:
+        run["status"] = "partial"
+        run["errors"].append(f"invalid JSON: {error}")
+        return _finish_run(run)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("jobs"), list):
+        run["status"] = "partial"
+        run["errors"].append("Workable response is missing jobs list")
+        return _finish_run(run)
+    if payload.get("next") or payload.get("paging"):
+        run["status"] = "partial"
+        run["errors"].append("Workable public response unexpectedly indicated pagination")
+    run["pages_scanned"] = 1
+    run["raw_count"] = len(payload["jobs"])
+    for raw in payload["jobs"]:
+        if not isinstance(raw, Mapping):
+            run["status"] = "partial"
+            run["errors"].append("skipped non-object Workable record")
+            continue
+        job = normalise_job(_workable_record(raw), company, "workable", source_url=url)
+        if job is None:
+            run["status"] = "partial"
+            run["errors"].append("skipped Workable record without title or public URL")
+        else:
+            run["jobs"].append(job)
+    return _finish_run(run)
 
 
 def collect_greenhouse(company: Mapping[str, Any], transport: Transport = _default_transport) -> dict[str, Any]:
@@ -504,6 +909,8 @@ _COLLECTORS: dict[str, Callable[[Mapping[str, Any], Transport], dict[str, Any]]]
     "greenhouse": collect_greenhouse,
     "lever": collect_lever,
     "ashby": collect_ashby,
+    "smartrecruiters": collect_smartrecruiters,
+    "workable": collect_workable,
     "rss": collect_rss,
     "jobposting_jsonld": collect_jobposting_jsonld,
 }

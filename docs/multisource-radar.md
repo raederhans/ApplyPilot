@@ -1,10 +1,11 @@
 # ApplyPilot 多来源求职雷达
 
-这套雷达把“发现职位”从原有固定求职网站扩展为三层信息面：
+这套雷达把“发现职位”从原有固定求职网站扩展为四层信息面：
 
 1. 公司官网和官方 ATS/RSS：可核验的正式职位，经过新加坡地域、标题和赛道过滤后进入 `jobs`。
 2. LinkedIn Content Search：生成候选人可见的定向查询 URL；ApplyPilot 不自动抓取 LinkedIn。
-3. LinkedIn 帖子、论坛和社区：只进入 `radar_leads`；导入时不依据历史职位自动升级，只有下一次新鲜官网采集仍看到相同正式链接后才升级。
+3. 新加坡校园、政府和行业门户：由候选人在场复核后只进入 `radar_leads`；导入时不依据门户声明或历史职位自动升级。
+4. SGInnovate/Startup SG 公司目录：只进入 `radar_company_seeds`，用于后续发现和核验公司官网招聘入口，不虚构职位。
 
 ```text
 official careers / ATS / RSS ──> source run ──> observation ──> verified job
@@ -13,7 +14,21 @@ LinkedIn / forum / community ──> source run ──> observation ──> lead
                                       official-open verification
                                                         ▼
                                                    verified job
+ecosystem company directory ──> source run ──> company seed
+                                                        │
+                                      official-careers verification
+                                                        ▼
+                                              watchlist candidate
 ```
+
+## P2 新加坡生态来源
+
+- CareerAxis、MyCareersFuture、Careers@Gov Early Careers：仅支持有人在场的 URL 导入，覆盖状态固定为 `non_exhaustive`。
+- SGInnovate Deep Tech Central：公开公司目录可导入 company seed；具体岗位仍须人工确认后以 lead 导入。
+- Startup SG Directory：仅支持 company seed，不接受职位记录。
+- Singapore FinTech Association Job Portal：截至 2026-08-28 公共入口不可用，注册为 disabled；恢复前不会接受导入，也不会把不可达折算为零结果。
+
+所有 portal lead 均强制写成 `awaiting_official + unverified`。即便导入文件自行声称 `promoted`、`verified_official` 或“官方发布者”，也不会绕过核验；只有本轮新鲜官方来源精确观察到相同雇主 ATS URL 后才可升级。
 
 ## 赛道结构
 
@@ -28,11 +43,14 @@ LinkedIn / forum / community ──> source run ──> observation ──> lead
 
 ## 当前官网覆盖
 
-默认每日启用：Databricks、Cloudflare、Stripe、Grab、OpenAI、Anthropic、MongoDB、Datadog、ST Engineering。
+默认每日启用 22 个官方来源：
 
-- Greenhouse：Databricks、Cloudflare、Stripe、Anthropic、MongoDB、Datadog。
-- Ashby：OpenAI。
-- 官方 XML/RSS：Grab、ST Engineering。
+- Greenhouse：Databricks、Cloudflare、Stripe、Anthropic、MongoDB、Datadog、Temus、StraitsX、Workato、SimplifyNext、Geotab、Shift Technology。
+- Ashby：OpenAI、Venti Technologies、Simular、k-ID。
+- Lever：ShopBack、Portcast、GoTo Group。
+- SmartRecruiters：Grab（列表分页后读取同源官方详情；总数、offset 和岗位 ID 不守恒时记为 `partial`）。
+- Workable：Porsche Asia Pacific（读取公开 account jobs 集合，并按 URL 路径区分职位页和申请页）。
+- 官方 XML/RSS：ST Engineering。
 - ST Engineering 仅公开最新条目，固定记录为 `partial`，不能用空结果宣称“官网零职位”。
 - Palantir、Wise 等已验证但当前无新加坡岗位的来源保留为 inactive，可在 dry-run 中检查，不能直接 live 采集。
 
@@ -44,6 +62,7 @@ LinkedIn / forum / community ──> source run ──> observation ──> lead
 .\run-radar.ps1 sync-linkedin-applied --file .\data\radar-imports\linkedin-applied-YYYY-MM-DD.json
 .\run-radar.ps1 radar collect
 .\run-radar.ps1 radar collect --company openai --company grab
+.\run-radar.ps1 radar collect --company shopback --company venti_technologies --company porsche_asia_pacific
 .\run-radar.ps1 radar collect --dry-run --include-inactive
 
 .\run-radar.ps1 radar queries --track ai_implementation --window past-24h
@@ -51,10 +70,13 @@ LinkedIn / forum / community ──> source run ──> observation ──> lead
 .\run-radar.ps1 radar queries --subtrack transport_planning --window past-month
 
 .\run-radar.ps1 -AttendedReview radar import-leads --file .\data\radar-imports\linkedin-leads-YYYY-MM-DD.json
+.\run-radar.ps1 -AttendedReview radar import-leads --source-id careeraxis --file .\data\radar-imports\careeraxis-leads-YYYY-MM-DD.json
+.\run-radar.ps1 -AttendedReview radar import-leads --source-id mycareersfuture --file .\data\radar-imports\mcf-leads-YYYY-MM-DD.json
+.\run-radar.ps1 -AttendedReview radar import-company-seeds --source-id startup-sg-directory --file .\data\radar-imports\startup-sg-companies-YYYY-MM-DD.json
 .\run-radar.ps1 radar report --hours 24 --require-applied-snapshot <sync 返回的 snapshot_id> --output .\data\reports\daily-radar-YYYY-MM-DD.md
 ```
 
-`run-radar.ps1` 是运行时能力白名单：只放行 Applied 同步和四个 radar 子命令，限制导入/报告路径和扩展，并在启动 Python 前拒绝 apply、pipeline、tailor、cover 等入口。日报必须绑定同一次同步返回的完整 Applied snapshot；快照观察时间超过 6 小时、计数不守恒、存在 skipped 或 ID 不匹配时，不会创建日报。
+`run-radar.ps1` 是运行时能力白名单：只放行 Applied 同步和五个 radar 子命令，限制导入/报告路径和扩展，并在启动 Python 前拒绝 apply、pipeline、tailor、cover 等入口。两类导入都要求 `-AttendedReview`；source ID 必须出现在各自 allowlist，disabled 来源会在 Python registry 再次拒绝。日报必须绑定同一次同步返回的完整 Applied snapshot；快照观察时间超过 6 小时、计数不守恒、存在 skipped 或 ID 不匹配时，不会创建日报。
 
 LinkedIn 默认 prompt 采用实测更能压低全球泛帖噪声的本地招聘标签格式：
 

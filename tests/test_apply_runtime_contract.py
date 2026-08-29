@@ -7,8 +7,155 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from applypilot import config
-from applypilot.apply import launcher, router
+from applypilot.apply import agent_runtime, launcher, prompt, router
+from applypilot.apply.email_routing import MailboxMcpSpec, mailbox_prepare_duplicate_receipt
 from applypilot.database import init_db
+
+
+def test_prepare_guidance_fragments_are_selected_from_job_context() -> None:
+    fragments = prompt._select_prompt_fragments(
+        {
+            "title": "Data Intern",
+            "full_description": "Expected compensation and background check details.",
+            "source_site": "generic",
+        },
+        dry_run=False,
+    )
+
+    assert "core" in fragments
+    assert "compensation" in fragments
+    assert "screening" in fragments
+    assert "linkedin" not in fragments
+    assert "direct_email" not in fragments
+    assert "agent_orchestration" not in fragments
+    assert "agent_orchestration" in prompt._select_prompt_fragments(
+        {
+            "title": "Data Intern",
+            "source_site": "generic",
+            "_agent_orchestration_available": True,
+        },
+        dry_run=False,
+    )
+
+
+def test_reduced_specialist_results_are_bounded_context_for_the_next_turn() -> None:
+    section = prompt._build_specialist_context_section(
+        {
+            "_agent_specialist_context": [
+                {
+                    "proposal_id": "duplicate-check",
+                    "kind": "read-only-check",
+                    "status": "completed",
+                    "summary": "No exact duplicate receipt was found.",
+                }
+            ]
+        }
+    )
+
+    assert "CONSUMED SPECIALIST CONTEXT" in section
+    assert "No exact duplicate receipt was found" in section
+    assert "never treat them as submission authority" in section
+
+
+def test_resume_upload_tool_state_requires_visible_repairable_resume_error() -> None:
+    assert launcher._repair_requires_resume_upload(
+        {
+            "repair_mode": True,
+            "validation_errors": [
+                {
+                    "label": "Resume / CV",
+                    "message": "Please upload a file",
+                    "field_type": "file",
+                    "repairable": True,
+                }
+            ],
+        }
+    ) is True
+    assert launcher._repair_requires_resume_upload(
+        {
+            "repair_mode": True,
+            "validation_errors": [
+                {
+                    "label": "Optional video introduction",
+                    "message": "Please upload a recording",
+                    "field_type": "file",
+                    "repairable": False,
+                }
+            ],
+        }
+    ) is False
+    assert launcher._repair_requires_resume_upload(
+        {
+            "repair_mode": True,
+            "validation_errors": [
+                {
+                    "label": "Portfolio URL",
+                    "message": "This field is required",
+                    "field_type": "url",
+                    "repairable": True,
+                }
+            ],
+        }
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("job", "expected_fragment"),
+    [
+        ({"url": "https://tenant.myworkdayjobs.com/job/1"}, "ats_workday"),
+        ({"url": "https://jobs.smartrecruiters.com/Example/1-role"}, "ats_smartrecruiters"),
+        ({"source_site": "greenhouse"}, "ats_greenhouse"),
+        ({"source_site": "lever"}, "ats_lever"),
+    ],
+)
+def test_provider_guidance_is_exposed_only_for_the_matching_route(
+    job: dict, expected_fragment: str
+) -> None:
+    fragments = prompt._select_prompt_fragments(job, dry_run=False)
+
+    assert expected_fragment in fragments
+    assert len(
+        {
+            "ats_workday",
+            "ats_smartrecruiters",
+            "ats_greenhouse",
+            "ats_lever",
+        }
+        & set(fragments)
+    ) == 1
+
+
+def test_submit_prompt_is_a_compact_phase_delta_without_resume_body() -> None:
+    built = prompt._build_compact_submit_prompt(
+        job={"url": "https://jobs.example/1", "title": "Intern", "company_name": "Example"},
+        control_contract_json='{"single_writer": true, "submit_owner": "playwright"}',
+        profile_summary="Legal Name: Taylor Chen\nWork Auth: confirmed",
+        hard_rules="HARD RULES",
+        browser_observation_section="FROZEN AUDIT: ready",
+        specialist_context_section="",
+        email_route_section="",
+        ats_adapter_section="",
+        pdf_path="C:/worker/Taylor_Resume.pdf",
+        cl_upload_path="",
+        opening_steps="Do not navigate or reload.",
+        mission_instruction="Review and submit exactly once.",
+        mission_body="The form is already populated.",
+        field_review_steps="Review required fields.",
+        final_steps="Click once, then observe.",
+        result_codes="RESULT:APPLIED\nRESULT:SUBMISSION_UNCERTAIN",
+        structured_reporting_section="Report one compact turn.",
+        captcha_section="Visible CAPTCHA is a hard pause.",
+        phone_digits="90000000",
+    )
+
+    assert len(built) < 7000
+    assert "FROZEN AUDIT: ready" in built
+    assert "single_writer" in built
+    assert "Click the authorized final control exactly once" in built
+    assert "receipt never authorizes a second click" in built
+    assert "IDENTITY AND ELIGIBILITY MATERIALS" in built
+    assert "RESUME TEXT" not in built
+    assert "COVER LETTER TEXT" not in built
 
 
 @pytest.mark.parametrize(
@@ -24,6 +171,15 @@ from applypilot.database import init_db
 )
 def test_result_marker_is_one_standalone_line(output: str, expected: object) -> None:
     assert launcher._parse_result_line(output) == expected
+
+
+def test_agent_log_text_is_always_redacted() -> None:
+    secret = "OTP 123456 and full email body"
+
+    rendered = launcher._redacted_agent_log_line(secret)
+
+    assert rendered == "  >> agent_text_redacted\n"
+    assert secret not in rendered
 
 
 def test_control_router_separates_driver_runtime_and_handoff_policy() -> None:
@@ -108,6 +264,179 @@ def test_auto_keeps_edge_workers_parallel_while_explicit_cloak_is_bounded() -> N
     assert (cloak_workers, cloak_reduced) == (1, True)
 
 
+def test_worker_count_uses_configured_profile_cap_without_hidden_global_limit() -> None:
+    workers, reduced = launcher._resolve_worker_count(
+        8,
+        6,
+        "auto",
+        cloak_concurrency_allowed=False,
+    )
+
+    assert workers == 6
+    assert reduced is False
+
+
+def test_finite_target_never_creates_zero_allocation_continuous_workers() -> None:
+    assert launcher._workers_for_target(6, 2) == 2
+    assert launcher._workers_for_target(6, 0) == 6
+
+
+def test_codex_receives_non_required_read_only_mailbox_mcp(tmp_path) -> None:
+    mailbox = MailboxMcpSpec(
+        package=None,
+        command="portable-mail-mcp",
+        search_tool="find_messages",
+        read_tool="get_message",
+        send_tool="send_message",
+    )
+
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        resolve_codex=lambda: ["codex"],
+        mailbox_mcp=mailbox,
+    )
+    rendered = " ".join(command)
+    overrides = {
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    }
+
+    assert "mcp_servers.mailbox.required=false" in rendered
+    assert 'mcp_servers.mailbox.enabled_tools=["find_messages", "get_message"]' in overrides
+    assert not any(
+        "mcp_servers.mailbox.enabled_tools=" in value and "send_message" in value
+        for value in overrides
+    )
+
+
+def test_mailbox_send_tool_requires_explicit_standing_authorization(tmp_path) -> None:
+    mailbox = MailboxMcpSpec(package=None, command="portable-mail-mcp")
+    config = agent_runtime.make_mcp_config(
+        9432,
+        mailbox_mcp=mailbox,
+        direct_email_send_authorized=True,
+    )
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        resolve_codex=lambda: ["codex"],
+        mailbox_mcp=mailbox,
+        direct_email_send_authorized=True,
+    )
+    overrides = {
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    }
+
+    assert "mailbox" in config["mcpServers"]
+    assert (
+        'mcp_servers.mailbox.enabled_tools=["search_emails", "read_email", "send_email"]'
+        in overrides
+    )
+
+
+def test_prepare_phase_never_exposes_mailbox_send_even_when_profile_allows_it(
+    monkeypatch, tmp_path
+) -> None:
+    profile = {
+        "authentication": {
+            "mailbox_read_authorized": True,
+            "mailbox": "candidate@example.test",
+        },
+        "submission_policy": {"direct_email_application_authorized": True},
+    }
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+
+    command, _ = launcher.run_job.__globals__["_build_agent_command"](
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        mailbox_mcp=MailboxMcpSpec(package=None, command="portable-mail-mcp"),
+        direct_email_send_authorized=False,
+    )
+    enabled = next(
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c" and command[index + 1].startswith("mcp_servers.mailbox.enabled_tools=")
+    )
+
+    assert "send_email" not in enabled
+
+
+def test_claude_mailbox_surface_is_read_only_without_send_authorization(tmp_path) -> None:
+    mailbox = MailboxMcpSpec(package=None, command="portable-mail-mcp")
+    config = agent_runtime.make_mcp_config(9432, mailbox_mcp=mailbox)
+    command, _ = agent_runtime.build_agent_command(
+        "claude",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "mcp.json",
+        resolve_claude=lambda: ["claude"],
+        mailbox_mcp=mailbox,
+    )
+    allowed = command[command.index("--allowedTools") + 1]
+    disallowed = command[command.index("--disallowedTools") + 1]
+
+    assert config["mcpServers"]["mailbox"]["command"] == "portable-mail-mcp"
+    assert "mcp__mailbox__search_emails" in allowed
+    assert "mcp__mailbox__read_email" in allowed
+    assert "mcp__mailbox__send_email" not in allowed
+    assert "mcp__mailbox__send_email" in disallowed
+    assert "mcp__mailbox__delete_email" in disallowed
+
+
+def test_claude_mailbox_send_is_exposed_only_when_authorized(tmp_path) -> None:
+    mailbox = MailboxMcpSpec(package=None, command="portable-mail-mcp")
+    command, _ = agent_runtime.build_agent_command(
+        "claude",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "mcp.json",
+        resolve_claude=lambda: ["claude"],
+        mailbox_mcp=mailbox,
+        direct_email_send_authorized=True,
+    )
+    allowed = command[command.index("--allowedTools") + 1]
+    disallowed = command[command.index("--disallowedTools") + 1]
+
+    assert "mcp__mailbox__send_email" in allowed
+    assert "mcp__mailbox__send_email" not in disallowed
+
+
+def test_mailbox_environment_values_stay_out_of_codex_command(tmp_path) -> None:
+    mailbox = MailboxMcpSpec(
+        package=None,
+        command="portable-mail-mcp",
+        env={"MAILBOX_PRIVATE_TOKEN": "secret-value"},
+    )
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        resolve_codex=lambda: ["codex"],
+        mailbox_mcp=mailbox,
+    )
+    rendered = " ".join(command)
+
+    assert "MAILBOX_PRIVATE_TOKEN" in rendered
+    assert "secret-value" not in rendered
+
+
 @pytest.mark.parametrize(
     ("phase", "output", "expected"),
     [
@@ -150,8 +479,13 @@ def test_upload_failure_context_becomes_actionable_without_file_paths() -> None:
         "visible_state": "optional attachment accepted but required resume stayed empty",
         "attempts": 2,
     }
-    assert error == (
-        "resume_upload; field=Resume/CV; "
+    assert error.startswith(
+        "resume_upload; category=resume_upload; "
+        "recoverability=retry_same_application; "
+        "missing_capability=browser_file_upload_or_site_adapter; "
+        "next_action=repair_bound_resume_upload_once; field=Resume/CV; "
+    )
+    assert error.endswith(
         "state=optional attachment accepted but required resume stayed empty; attempts=2"
     )
     assert "private" not in error
@@ -201,7 +535,10 @@ def test_pre_submit_snapshot_hard_pauses_new_uncertain_states() -> None:
     assert "assessment_present" in issues
     assert "resume_not_uploaded" in issues
     assert any(item.startswith("required_field_empty:") for item in issues)
-    assert any(item.startswith("sensitive_required_unknown:") for item in issues)
+    assert any(
+        item.startswith("required_field_empty:confirmed_identity_fact:")
+        for item in issues
+    )
 
 
 def test_visible_captcha_remains_a_hard_pause_even_if_a_token_exists() -> None:
@@ -283,6 +620,85 @@ def test_application_page_selection_prefers_review_tab_over_last_detail_tab() ->
     assert launcher._select_application_page([review, detail]) is review
 
 
+def test_application_page_selection_prefers_populated_form_over_empty_shell() -> None:
+    class Page:
+        def __init__(self, signals: dict) -> None:
+            self.signals = signals
+
+        def evaluate(self, _script: str) -> dict:
+            return self.signals
+
+    empty_shell = Page(
+        {
+            "receipt": False,
+            "final_submit": False,
+            "review": False,
+            "dialog": False,
+            "form_controls": 0,
+            "text_length": 20,
+        }
+    )
+    populated_form = Page(
+        {
+            "receipt": False,
+            "final_submit": False,
+            "review": False,
+            "dialog": False,
+            "form_controls": 12,
+            "text_length": 1200,
+        }
+    )
+
+    assert launcher._select_application_page([empty_shell, populated_form]) is populated_form
+
+
+def test_application_page_selection_scores_each_surface_once() -> None:
+    class Page:
+        def __init__(self, score: int) -> None:
+            self.frames = [self]
+            self.score = score
+            self.evaluate_calls = 0
+
+        def evaluate(self, _script: str) -> dict:
+            self.evaluate_calls += 1
+            return {
+                "receipt": False,
+                "final_submit": self.score > 0,
+                "review": False,
+                "dialog": False,
+                "form_controls": self.score,
+                "text_length": 100,
+            }
+
+    first = Page(0)
+    second = Page(4)
+
+    assert launcher._select_application_page([first, second]) is second
+    assert [first.evaluate_calls, second.evaluate_calls] == [1, 1]
+
+
+def test_application_frame_selection_prefers_populated_child_frame() -> None:
+    class Surface:
+        def __init__(self, signals: dict) -> None:
+            self.signals = signals
+
+        def evaluate(self, _script: str) -> dict:
+            return self.signals
+
+    outer = Surface(
+        {"receipt": False, "final_submit": False, "form_controls": 0, "text_length": 10}
+    )
+    application_frame = Surface(
+        {"receipt": False, "final_submit": True, "form_controls": 9, "text_length": 900}
+    )
+
+    class Page:
+        def __init__(self) -> None:
+            self.frames = [outer, application_frame]
+
+    assert launcher._select_application_frame(Page()) is application_frame
+
+
 def test_hidden_captcha_iframe_is_not_a_visible_verification_gate() -> None:
     class Iframe:
         def __init__(self, visible: bool) -> None:
@@ -340,6 +756,15 @@ def test_model_and_observer_evidence_must_strongly_agree() -> None:
         {**observer, "confirmation_text": "Success Your application has been submitted"},
     ) is True
     assert launcher._submission_evidence_consistent(
+        {
+            **model,
+            "confirmation_text": (
+                "Congratulations! Your application has been submitted successfully."
+            ),
+        },
+        {**observer, "confirmation_text": "Application Submitted"},
+    ) is True
+    assert launcher._submission_evidence_consistent(
         model, {**observer, "current_url": "https://evil.example/confirmation"}
     ) is False
     assert launcher._submission_evidence_consistent(
@@ -353,6 +778,15 @@ def test_model_and_observer_evidence_must_strongly_agree() -> None:
         ({"confirmed": True}, "confirmed"),
         ({"verification_visible": True}, "verification_required"),
         ({"captcha_visible": True}, "verification_required"),
+        (
+            {
+                "provider_submission_error_visible": True,
+                "provider_submission_error_text": (
+                    "There was an error verifying your application. Please try again."
+                ),
+            },
+            "provider_submission_error",
+        ),
         (
             {
                 "validation_error_count": 1,
@@ -448,13 +882,19 @@ def _run_worker_contract(
     verification_calls: list[dict] | None = None,
     use_target_url: bool = True,
     limit: int = 1,
+    audit_results: list[tuple[str | None, dict]] | None = None,
+    email_application: dict | None = None,
+    staged_attachment: str | None = None,
 ):
     job = {
         "url": "https://jobs.example.test/role",
         "application_url": "https://jobs.example.test/role/apply",
         "title": "Data Analyst",
         "company_name": "Example",
+        "description": "Apply by email to jobs@example.test for this role.",
     }
+    if staged_attachment:
+        job["_staged_resume_path"] = staged_attachment
     run_phases: list[str] = []
     ledger: list[tuple[str, dict | None]] = []
     marked: list[tuple[tuple, dict]] = []
@@ -464,11 +904,32 @@ def _run_worker_contract(
     def fake_run(current_job, *args, **kwargs):
         nonlocal prepare_index, submit_index
         assert current_job.get("_browser_backend") in {"edge", "cloak"}
-        assert current_job["_control_contract"]["interaction_driver"] == "playwright"
-        assert current_job["_control_contract"]["browser_runtime"] == current_job["_browser_backend"]
         phase = kwargs["submission_phase"]
+        expected_driver = (
+            "mailbox"
+            if phase == "submit" and email_application is not None
+            else "playwright"
+        )
+        assert current_job["_control_contract"]["interaction_driver"] == expected_driver
+        assert current_job["_control_contract"]["browser_runtime"] == current_job["_browser_backend"]
         run_phases.append(phase)
         if phase == "prepare":
+            if email_application is not None:
+                current_job["_agent_observations"] = {
+                    "email_application": dict(email_application)
+                }
+                current_job["_mailbox_prepare_duplicate_receipt"] = (
+                    mailbox_prepare_duplicate_receipt(
+                        {
+                            "query": (
+                                f'in:sent to:{email_application["recipient"]} '
+                                f'subject:"{email_application["subject"]}"'
+                            )
+                        },
+                        {"messages": []},
+                        email_application,
+                    )
+                )
             selected_prepare = (
                 prepare_results[min(prepare_index, len(prepare_results) - 1)]
                 if prepare_results
@@ -478,12 +939,38 @@ def _run_worker_contract(
             return selected_prepare, 10
         if submit_raises:
             raise RuntimeError("agent disconnected")
-        current_job["_agent_submission_evidence"] = {
-            "receipt_visible": True,
-            "applied_badge_visible": False,
-            "confirmation_text": "Your application has been submitted",
-            "confirmation_url": "https://jobs.example.test/confirmation",
-        }
+        if email_application is not None:
+            current_job["_agent_submission_evidence"] = {
+                "channel": "direct_email",
+                "send_accepted": True,
+                "sent_copy_verified": True,
+                "recipient": email_application["recipient"],
+                "subject": email_application["subject"],
+                "attachment_names": email_application["attachment_names"],
+                "confirmation_text": "Sent copy verified",
+                "provider_message_id": "message-1",
+            }
+            current_job["_mailbox_runtime_evidence"] = {
+                "send_call_completed": True,
+                "send_request_bound": True,
+                "post_send_search_completed": True,
+                "post_send_read_completed": True,
+                "sent_receipt": {
+                    "folder": "sent",
+                    "recipient": email_application["recipient"],
+                    "subject": email_application["subject"],
+                    "attachment_names": email_application["attachment_names"],
+                    "body_sha256": email_application["body_sha256"],
+                    "provider_message_id": "message-1",
+                },
+            }
+        else:
+            current_job["_agent_submission_evidence"] = {
+                "receipt_visible": True,
+                "applied_badge_visible": False,
+                "confirmation_text": "Your application has been submitted",
+                "confirmation_url": "https://jobs.example.test/confirmation",
+            }
         selected_result = (
             submit_results[min(submit_index, len(submit_results) - 1)]
             if submit_results
@@ -541,7 +1028,14 @@ def _run_worker_contract(
         lambda *args, **kwargs: 1,
     )
     monkeypatch.setattr(launcher, "run_job", fake_run)
-    monkeypatch.setattr(launcher, "_audit_live_pre_submit_page", lambda *args: (None, {"status": "clear"}))
+    audits = list(audit_results or [])
+
+    def fake_audit(*args):
+        if audits:
+            return audits.pop(0)
+        return None, {"status": "clear", "disposition": "clear"}
+
+    monkeypatch.setattr(launcher, "_audit_live_pre_submit_page", fake_audit)
     monkeypatch.setattr(launcher, "_reserve_manifest_submission", lambda *args: (True, "reserved"))
     monkeypatch.setattr(
         launcher,
@@ -581,6 +1075,11 @@ def _run_worker_contract(
     )
     monkeypatch.setattr(
         launcher,
+        "_admit_direct_email_receipt",
+        lambda *args, **kwargs: {"status": "admitted"},
+    )
+    monkeypatch.setattr(
+        launcher,
         "mark_result",
         lambda *args, **kwargs: marked.append((args, kwargs)),
     )
@@ -597,6 +1096,149 @@ def _run_worker_contract(
         authorization_manifest={"batch_id": "batch-1", "max_submissions": 1},
     )
     return result, run_phases, ledger, marked
+
+
+def test_worker_reenters_prepare_once_for_repairable_audit_state(monkeypatch) -> None:
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "issues": ["required_field_empty:Application source"],
+        "blocking_issues": [],
+        "repairable_issues": ["required_field_empty:Application source"],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+    }
+    clear_report = {
+        "status": "clear",
+        "disposition": "clear",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+    }
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            ("pre_submit_repair:required_field_empty:Application source", repair_report),
+            (None, clear_report),
+        ],
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+
+
+def test_worker_uses_reserved_mailbox_submit_route_for_email_application(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    attachment = tmp_path / "Candidate_Resume.pdf"
+    attachment.write_bytes(b"resume-pdf")
+    email_plan = {
+        "route": "direct_email",
+        "recipient": "jobs@example.test",
+        "recipient_domain": "example.test",
+        "recipient_source": "official_listing",
+        "subject": "Application - Data Analyst",
+        "attachment_names": ["Candidate_Resume.pdf"],
+        "attachments_verified": True,
+        "duplicate_found": False,
+        "body_sha256": "a" * 64,
+        "duplicate_check": {
+            "folder": "sent",
+            "completed": True,
+            "duplicate_found": False,
+            "provider_query_id": "query-1",
+        },
+        "listing_evidence": "Official listing says apply to jobs@example.test",
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        email_application=email_plan,
+        staged_attachment=str(attachment),
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "applied"
+    assert ledger[0][1]["agent"]["channel"] == "direct_email"
+    assert ledger[0][1]["observer"]["confirmed"] is True
+    assert marked[0][0][1] == "applied"
+
+
+def test_direct_email_submission_evidence_requires_send_and_sent_copy() -> None:
+    valid = (
+        "RESULT:APPLIED\n"
+        'SUBMISSION_EVIDENCE: {"channel":"direct_email","send_accepted":true,'
+        '"sent_copy_verified":true,"recipient":"jobs@example.test",'
+        '"subject":"Application - Analyst","attachment_names":["Resume.pdf"],'
+        '"confirmation_text":"Sent copy verified","provider_message_id":"m-1"}'
+    )
+    incomplete = valid.replace('"sent_copy_verified":true', '"sent_copy_verified":false')
+
+    evidence = launcher._validate_submission_evidence(valid)
+    assert evidence is not None
+    assert evidence["channel"] == "direct_email"
+    assert launcher._validate_submission_evidence(incomplete) is None
+
+
+def test_lossy_degree_and_work_status_mappings_are_audited_without_blocking() -> None:
+    profile = {
+        "education": [
+            {
+                "institution": "Example University",
+                "degree": "Master of Computing in Applied AI",
+            }
+        ],
+        "work_authorization": {
+            "form_answer_policy": {
+                "programme_credit_bearing_internship": {
+                    "legally_authorized": True,
+                    "requires_sponsorship": False,
+                }
+            }
+        },
+    }
+    job = {
+        "url": "https://jobs.example.test/intern",
+        "title": "AI Intern",
+        "full_description": "Credit-bearing internship",
+    }
+    snapshot = {
+        "url": job["url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "education_entries": [
+            {
+                "institution": "Example University",
+                "degree": "Master of Science",
+            }
+        ],
+        "select_fields": [
+            {
+                "text": "Citizenship / Visa Status",
+                "selected": "Possess relevant work visa",
+            }
+        ],
+        "radio_questions": [],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+    mappings = launcher.page_observation_mod._collect_lossy_answer_mappings(
+        snapshot, profile, job
+    )
+
+    assert {mapping["field_semantic"] for mapping in mappings} == {
+        "education_degree",
+        "citizenship_visa_status",
+    }
 
 
 def test_worker_uses_one_adaptive_lease_for_acquire_and_phase_renewals(
@@ -697,10 +1339,12 @@ def test_auto_browser_backend_does_not_misclassify_generic_stall_as_bot_block(
     assert result == (0, 1)
     assert phases == ["prepare"]
     assert [call[1]["browser_backend"] for call in launches] == ["edge"]
-    assert marked[0][0][:3] == (
+    assert marked[0][0][:2] == (
         "https://jobs.example.test/role",
         "failed",
-        "stuck",
+    )
+    assert marked[0][0][2].startswith(
+        "stuck; category=page_or_progress_failure; recoverability=retry_new_session"
     )
 
 
@@ -786,7 +1430,10 @@ def test_real_batch_replaces_pre_submit_failure_until_success_target(monkeypatch
 
     assert result == (1, 1)
     assert phases == ["prepare", "prepare", "submit"]
-    assert marked[0][0][:3] == (first["url"], "failed", "expired")
+    assert marked[0][0][:2] == (first["url"], "failed")
+    assert marked[0][0][2].startswith(
+        "expired; category=expired; recoverability=do_not_retry"
+    )
     assert marked[-1][0][:2] == (second["url"], "applied")
 
 
@@ -806,6 +1453,34 @@ def test_worker_bootstraps_browser_at_the_authorized_application_url(monkeypatch
     _run_worker_contract(monkeypatch, launch_calls=launches)
 
     assert launches[0][1]["start_url"] is None
+
+
+def test_exact_duplicate_preflight_skips_before_browser_launch(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        launcher,
+        "_run_read_only_preflight",
+        lambda _job: {
+            "provider": "smartrecruiters",
+            "duplicate": {
+                "clear": False,
+                "reason": "duplicate_submission_identity",
+                "matched_job_url": "https://jobs.example.test/older",
+            },
+            "task_statuses": {},
+        },
+    )
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        launch_calls=launches,
+    )
+
+    assert result == (0, 0)
+    assert phases == []
+    assert launches == []
+    assert marked[0][0][1] == "skipped"
+    assert marked[0][1]["permanent"] is True
 
 
 @pytest.mark.parametrize("discovery_result", ["cover_not_required", "cover_letter_required"])
@@ -923,6 +1598,101 @@ def test_worker_never_repairs_media_or_identity_validation(monkeypatch) -> None:
     assert ledger[0][0] == "failed"
     assert marked[0][0][1] == "failed"
     assert marked[0][1]["permanent"] is True
+
+
+def test_worker_records_explicit_provider_submission_error_as_retry_blocked_uncertainty(
+    monkeypatch,
+) -> None:
+    provider_rejection = {
+        "confirmed": False,
+        "provider_submission_error_visible": True,
+        "provider_submission_error_text": (
+            "There was an error verifying your application. Please try again."
+        ),
+        "validation_error_count": 0,
+        "current_url": "https://jobs.example.test/role/apply",
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="submission_uncertain",
+        observer_results=[provider_rejection],
+    )
+
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "submission_uncertain"
+    assert marked[0][0][1] == "submission_uncertain"
+    failure = marked[0][1]["evidence"]["technical_failure"]
+    assert failure["category"] == "provider_submission_failure"
+    assert failure["recoverability"] == "submission_uncertain"
+
+
+def test_post_submit_observer_reconnects_read_only_without_repeating_submit(
+    monkeypatch,
+) -> None:
+    initial_disconnect = {
+        "confirmed": False,
+        "reason": "post_submit_observer_error:ConnectionError",
+    }
+    confirmed = {
+        "confirmed": True,
+        "receipt_visible": True,
+        "applied_badge_visible": False,
+        "confirmation_text": "Your application has been submitted",
+        "current_url": "https://jobs.example.test/confirmation",
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        observer_results=[initial_disconnect, confirmed],
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "applied"
+    assert marked[0][0][1] == "applied"
+    observer = marked[0][1]["evidence"]["observer"]
+    assert observer["observer_reconnect_attempts"] == 1
+    assert observer["initial_observer_reason"].startswith(
+        "post_submit_observer_error:"
+    )
+
+
+def test_smartrecruiters_binding_resolves_public_posting_to_publication_uuid() -> None:
+    requested: list[str] = []
+
+    def transport(url: str) -> dict:
+        requested.append(url)
+        return {
+            "status_code": 200,
+            "json": {
+                "id": "744000145885499",
+                "uuid": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+                "company": {"identifier": "Grab"},
+            },
+        }
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "application_url": (
+                "https://jobs.smartrecruiters.com/Grab/"
+                "744000145885499-intern-strategy-insights?oga=true"
+            )
+        },
+        transport=transport,
+    )
+
+    assert requested == [
+        "https://api.smartrecruiters.com/v1/companies/Grab/postings/744000145885499"
+    ]
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "Grab",
+        "posting_id": "744000145885499",
+        "publication_id": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+        "resolved": True,
+    }
 
 
 def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> None:

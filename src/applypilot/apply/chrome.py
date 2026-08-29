@@ -19,6 +19,12 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from applypilot import config
+from applypilot.apply.retention import (
+    mark_owned_directory,
+    profile_clone_ignore,
+    prune_owned_profile,
+    read_ownership_marker,
+)
 from applypilot.runtime_settings import load_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -28,11 +34,12 @@ BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
+_chrome_ports: dict[int, int] = {}
+_profile_maintenance_checked: set[Path] = set()
 _chrome_lock = threading.Lock()
 _cdp_port_claims: dict[int, tuple[int, Path]] = {}
 
 SUPPORTED_BROWSER_BACKENDS = {"edge", "cloak", "auto"}
-DEFAULT_CLOAK_BROWSER_VERSION = "146.0.7680.177.5"
 
 
 def _lock_owner_is_running(lock_path: Path) -> bool | None:
@@ -160,20 +167,19 @@ def get_browser_executable(browser_backend: str) -> str:
             "CloakBrowser backend is not installed; install applypilot-local[stealth]"
         ) from exc
 
-    # ApplyPilot owns update admission. CloakBrowser must not silently replace
-    # the tested browser binary between application runs.
-    os.environ["CLOAKBROWSER_AUTO_UPDATE"] = "false"
-    requested_version = (
-        os.environ.get("APPLYPILOT_CLOAK_VERSION")
-        or DEFAULT_CLOAK_BROWSER_VERSION
-    )
+    # A version pin is an optional deployment choice, not an ApplyPilot code
+    # dependency. Without one, the installed CloakBrowser package owns its
+    # stable-channel resolution and cache policy.
+    requested_version = os.environ.get("APPLYPILOT_CLOAK_VERSION") or None
+    if requested_version:
+        os.environ["CLOAKBROWSER_AUTO_UPDATE"] = "false"
     if os.environ.get("CLOAKBROWSER_LICENSE_KEY"):
         from cloakbrowser.license import resolve_license_key, validate_license
 
         license_info = validate_license(resolve_license_key(None))
         if not license_info or not license_info.valid:
             raise RuntimeError("CloakBrowser license could not be validated for pinned execution")
-        if str(license_info.plan).casefold() == "free":
+        if requested_version and str(license_info.plan).casefold() == "free":
             raise RuntimeError(
                 "CloakBrowser free licenses force an unpinned latest binary; "
                 "unset the key or use a pin-capable license"
@@ -241,6 +247,14 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     )
     profile_dir = worker_root / f"worker-{worker_id}"
 
+    def mark_owned() -> None:
+        mark_owned_directory(
+            profile_dir,
+            root=worker_root,
+            kind="browser_profile",
+            owner_id=f"{backend}:worker-{worker_id}",
+        )
+
     mode = os.environ.get("APPLYPILOT_BROWSER_PROFILE_MODE", "clone").lower()
 
     # A patched Chromium profile is a separate browser identity. Copying the
@@ -266,6 +280,7 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
         if resolved_profile.exists():
             shutil.rmtree(resolved_profile)
         profile_dir.mkdir(parents=True, exist_ok=True)
+        mark_owned()
         logger.info("[worker-%d] Using a fresh isolated browser profile", worker_id)
         return profile_dir
 
@@ -274,6 +289,7 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     # application runs without copying the user's daily Edge/Chrome profile.
     if mode == "persistent":
         profile_dir.mkdir(parents=True, exist_ok=True)
+        mark_owned()
         logger.info("[worker-%d] Using the persistent ApplyPilot browser profile", worker_id)
         return profile_dir
 
@@ -283,6 +299,7 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
         )
 
     if (profile_dir / "Default").exists():
+        mark_owned()
         return profile_dir  # Already initialized
 
     # Find a source: prefer existing worker (has session cookies), else user profile
@@ -298,6 +315,7 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
         source = config.get_chrome_user_data()
     if not source.exists():
         profile_dir.mkdir(parents=True, exist_ok=True)
+        mark_owned()
         logger.warning(
             "[worker-%d] Browser profile source not found at %s; using a fresh profile",
             worker_id,
@@ -308,27 +326,17 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                 worker_id, source.name)
     profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
+    mark_owned()
 
     for item in source.iterdir():
-        if item.name in skip:
+        if item.name in profile_clone_ignore(str(source), [item.name]):
             continue
         dst = profile_dir / item.name
         try:
             if item.is_dir():
                 shutil.copytree(
                     str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
+                    ignore=profile_clone_ignore,
                 )
             else:
                 shutil.copy2(str(item), str(dst))
@@ -397,11 +405,18 @@ def _wait_for_cdp_ready(
     """Wait until the browser exposes its local DevTools endpoint."""
     deadline = time.monotonic() + timeout_seconds
     last_error: Exception | None = None
+    clean_bootstrap_exit = False
     while time.monotonic() < deadline:
-        if process.poll() is not None:
+        exit_code = process.poll()
+        if exit_code not in (None, 0):
             raise RuntimeError(
-                f"Browser exited before CDP became ready (exit={process.returncode})"
+                f"Browser exited before CDP became ready (exit={exit_code})"
             )
+        # Current Edge builds can relaunch through a compatibility bootstrap:
+        # the Popen handle exits successfully while the child browser continues
+        # starting on the requested CDP port. A zero exit is therefore not a
+        # failure until the bounded readiness window also expires.
+        clean_bootstrap_exit = clean_bootstrap_exit or exit_code == 0
         try:
             with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.5) as response:
                 if response.status == 200:
@@ -409,7 +424,56 @@ def _wait_for_cdp_ready(
         except Exception as exc:  # noqa: BLE001 - readiness preserves the last transport error
             last_error = exc
         time.sleep(0.2)
+    if clean_bootstrap_exit:
+        raise RuntimeError(
+            "Browser bootstrap exited successfully, but the relaunched browser "
+            f"did not expose CDP port {port}: {last_error}"
+        )
     raise TimeoutError(f"Browser CDP port {port} was not ready: {last_error}")
+
+
+def _close_browser_via_cdp(port: int) -> None:
+    """Close the real browser even when Edge's bootstrap Popen has exited."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        browser.new_browser_cdp_session().send("Browser.close")
+
+
+def _cdp_endpoint_reachable(port: int) -> bool:
+    """Return whether the worker's browser endpoint is still serving CDP."""
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_browser_stopped(
+    port: int | None,
+    process: subprocess.Popen | None,
+    *,
+    timeout_seconds: float = 2.0,
+) -> bool:
+    """Confirm both the owned process and its CDP endpoint have stopped.
+
+    Edge can return a bootstrap ``Popen`` that exits while a child browser keeps
+    serving the profile.  Profile maintenance is therefore allowed only when a
+    process handle exists, that handle is stopped, and the known CDP endpoint is
+    no longer reachable.
+    """
+    if process is None:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        process_stopped = process.poll() is not None
+        endpoint_stopped = port is None or not _cdp_endpoint_reachable(port)
+        if process_stopped and endpoint_stopped:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _scoped_cookie_urls(allowed_urls: list[str] | tuple[str, ...]) -> list[str]:
@@ -530,6 +594,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
+        _chrome_ports[worker_id] = port
 
     logger.info("[worker-%d] %s browser started on port %d (pid %d)",
                 worker_id, backend, port, proc.pid)
@@ -543,10 +608,69 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         worker_id: Numeric worker identifier.
         process: The Popen handle returned by launch_chrome.
     """
-    if process and process.poll() is None:
-        _kill_process_tree(process.pid)
     with _chrome_lock:
-        _chrome_procs.pop(worker_id, None)
+        tracked_process = _chrome_procs.pop(worker_id, None)
+        port = _chrome_ports.pop(worker_id, None)
+    if port is not None:
+        try:
+            _close_browser_via_cdp(port)
+        except Exception:
+            logger.debug(
+                "[worker-%d] Unable to close browser via CDP port %d",
+                worker_id,
+                port,
+                exc_info=True,
+            )
+    owned_process = tracked_process or process
+    if owned_process and owned_process.poll() is None:
+        _kill_process_tree(owned_process.pid)
+    browser_is_stopped = _wait_for_browser_stopped(port, owned_process)
+    if not browser_is_stopped:
+        logger.warning(
+            "[worker-%d] Browser stop could not be confirmed; skipping profile pruning",
+            worker_id,
+        )
+    for profile_root in (config.CHROME_WORKER_DIR, config.CLOAK_WORKER_DIR):
+        profile_dir = profile_root / f"worker-{worker_id}"
+        resolved_profile = profile_dir.resolve()
+        if not browser_is_stopped:
+            continue
+        with _chrome_lock:
+            if resolved_profile in _profile_maintenance_checked:
+                continue
+            _profile_maintenance_checked.add(resolved_profile)
+        marker = read_ownership_marker(profile_dir)
+        if not marker or marker.get("kind") != "browser_profile":
+            continue
+        try:
+            retention_days = max(
+                1.0,
+                float(os.environ.get("APPLYPILOT_PROFILE_CACHE_RETENTION_DAYS", "7")),
+            )
+        except ValueError:
+            retention_days = 7.0
+        try:
+            maintenance = prune_owned_profile(
+                profile_dir,
+                profile_root=profile_root,
+                minimum_age_seconds=retention_days * 24 * 60 * 60,
+                execute=True,
+                browser_is_stopped=browser_is_stopped,
+            )
+            if maintenance["removed_files"]:
+                logger.info(
+                    "[worker-%d] Reclaimed %d old regenerable profile files (%d bytes)",
+                    worker_id,
+                    maintenance["removed_files"],
+                    maintenance["removed_bytes"],
+                )
+        except (OSError, PermissionError, RuntimeError, ValueError):
+            logger.debug(
+                "[worker-%d] Browser profile maintenance skipped for %s",
+                worker_id,
+                profile_dir,
+                exc_info=True,
+            )
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
 
 
@@ -557,9 +681,22 @@ def kill_all_chrome() -> None:
     """
     with _chrome_lock:
         procs = dict(_chrome_procs)
+        ports = dict(_chrome_ports)
         _chrome_procs.clear()
+        _chrome_ports.clear()
 
     for wid, proc in procs.items():
+        port = ports.get(wid)
+        if port is not None:
+            try:
+                _close_browser_via_cdp(port)
+            except Exception:
+                logger.debug(
+                    "[worker-%d] Unable to close browser via CDP port %d",
+                    wid,
+                    port,
+                    exc_info=True,
+                )
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
         release_cdp_port(wid)
@@ -596,9 +733,22 @@ def cleanup_on_exit() -> None:
     """
     with _chrome_lock:
         procs = dict(_chrome_procs)
+        ports = dict(_chrome_ports)
         _chrome_procs.clear()
+        _chrome_ports.clear()
 
     for wid, proc in procs.items():
+        port = ports.get(wid)
+        if port is not None:
+            try:
+                _close_browser_via_cdp(port)
+            except Exception:
+                logger.debug(
+                    "[worker-%d] Unable to close browser via CDP port %d",
+                    wid,
+                    port,
+                    exc_info=True,
+                )
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
         release_cdp_port(wid)

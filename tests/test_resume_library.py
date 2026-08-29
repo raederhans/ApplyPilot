@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from typer.testing import CliRunner
+
 from applypilot import single_job
+from applypilot.cli import app
 from applypilot.database import init_db
 from applypilot.resume_library import (
     TAXONOMY_VERSION,
@@ -18,7 +22,15 @@ from applypilot.scoring import tailor
 
 
 def test_resume_taxonomy_version_tracks_routing_term_changes() -> None:
-    assert TAXONOMY_VERSION == "resume-library-v4"
+    assert TAXONOMY_VERSION == "resume-library-v5"
+
+
+def test_resume_route_cli_exposes_explicit_candidate_selection() -> None:
+    result = CliRunner().invoke(app, ["resume-route", "--help"])
+
+    assert result.exit_code == 0
+    assert "--artifact-id" in result.output
+    assert "--project-reuse" in result.output
 
 
 def _profile(base_resume: Path) -> dict:
@@ -52,10 +64,18 @@ def _insert_job(conn, *, url: str, title: str, description: str, **fields: objec
     conn.commit()
 
 
-def _validated_history(tmp_path: Path, conn, base_resume: Path, *, suffix: str = "one") -> str:
+def _validated_history(
+    tmp_path: Path,
+    conn,
+    base_resume: Path,
+    *,
+    suffix: str = "one",
+    content: str | None = None,
+) -> str:
     text_path = tmp_path / f"validated-{suffix}.txt"
     text_path.write_text(
-        "DATA ANALYST\nSQL, Python, data analysis\nBuilt a dashboard and reporting workflow.",
+        content
+        or "DATA ANALYST\nSQL, Python, data analysis\nBuilt a dashboard and reporting workflow.",
         encoding="utf-8",
     )
     text_path.with_suffix(".pdf").write_bytes(b"synthetic-pdf-binding-" + suffix.encode())
@@ -137,6 +157,33 @@ def test_schema_and_job_profile_use_fine_grained_subtype(tmp_path: Path) -> None
     assert profile["required_skills"] == ["sql"]
 
 
+def test_senior_or_high_experience_role_is_routed_after_fit_scoring(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python dashboard delivery.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": "https://careers.example.test/senior-data",
+            "title": "Senior Data Analyst",
+            "full_description": (
+                "Requires at least five years of experience. Required: SQL. "
+                "Build dashboards and reporting for business decisions."
+            ),
+            "eligibility_status": "eligible",
+            "fit_score": 8,
+        },
+        profile,
+    )
+
+    assert result["job_profile"]["seniority"] == "senior_or_high_experience"
+    assert result["decision"] == "reuse_exact"
+
+
 def test_resume_taxonomy_extends_discovery_for_real_work_natures() -> None:
     cases = {
         "Operations Automation Engineer Intern": ("ai_implementation", "workflow_automation"),
@@ -199,6 +246,40 @@ def test_resume_taxonomy_routes_ai_platform_before_generic_platform_terms() -> N
     assert result["confidence"] >= 0.79
 
 
+def test_resume_taxonomy_prefers_title_match_over_description_only_term() -> None:
+    result = extract_job_profile(
+        {
+            "url": "https://example.test/omnicommerce",
+            "title": "Intern, OmniCommerce",
+            "full_description": (
+                "Support merchant operations and commercial analytics with data analysis."
+            ),
+        }
+    )
+
+    assert (result["track"], result["subtype"]) == (
+        "general_product_consulting",
+        "product_ops",
+    )
+    assert result["confidence"] >= 0.79
+
+
+def test_resume_taxonomy_uses_specific_ml_engineer_rule_to_break_title_tie() -> None:
+    result = extract_job_profile(
+        {
+            "url": "https://example.test/ml-ocr",
+            "title": "Machine Learning Engineer / Data Scientist (OCR/CV)",
+            "full_description": "Build and deploy OCR models for enterprise workflows.",
+        }
+    )
+
+    assert (result["track"], result["subtype"]) == (
+        "ai_implementation",
+        "ai_solutions",
+    )
+    assert result["confidence"] >= 0.85
+
+
 def test_sync_collapses_duplicate_content_and_keeps_coverage_evidence(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "library.db")
     base = tmp_path / "base.txt"
@@ -231,6 +312,57 @@ def test_sync_collapses_duplicate_content_and_keeps_coverage_evidence(tmp_path: 
     assert status["artifacts"] == 2  # one base plus one deduplicated tailored content
     assert status["active_validated_artifacts"] == 1
     assert conn.execute("SELECT COUNT(*) FROM resume_coverage_cells").fetchone()[0] == 2
+
+
+def test_taxonomy_v5_ignores_v4_coverage_until_sync_rebuilds_it(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    history_url = _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    conn.execute(
+        "UPDATE resume_coverage_cells SET taxonomy_version='resume-library-v4', "
+        "track='spatial', subtype='geospatial'"
+    )
+    conn.execute(
+        "UPDATE job_resume_profiles SET taxonomy_version='resume-library-v4', "
+        "track='spatial', subtype='geospatial' WHERE job_url=?",
+        (history_url,),
+    )
+    conn.execute("UPDATE resume_artifacts SET track='spatial' WHERE kind='tailored'")
+    conn.commit()
+
+    new_job = {
+        "url": "https://careers.example.test/new-data-v5",
+        "application_url": "https://ats.example.test/new-data-v5",
+        "title": "Data Analyst",
+        "company_name": "New Data",
+        "location": "Singapore",
+        "eligibility_status": "eligible",
+        "full_description": "Required: SQL. Build dashboards for business decisions.",
+    }
+    before_rebuild = route_resume_for_job(conn, new_job, profile)
+    assert before_rebuild["decision"] == "create_variant"
+
+    rebuilt = sync_resume_library(conn, profile, tmp_path)
+    assert rebuilt["coverage_cells"] == 1
+    versions = {
+        row["taxonomy_version"]
+        for row in conn.execute(
+            "SELECT taxonomy_version FROM resume_coverage_cells"
+        ).fetchall()
+    }
+    assert versions == {"resume-library-v4", "resume-library-v5"}
+    artifact = conn.execute(
+        "SELECT track FROM resume_artifacts WHERE kind='tailored'"
+    ).fetchone()
+    assert artifact["track"] == "data_bi_decision"
+    assert library_status(conn)["covered_subtypes"] == ["data_analytics"]
+
+    after_rebuild = route_resume_for_job(conn, new_job, profile)
+    assert after_rebuild["decision"] == "reuse_exact"
 
 
 def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
@@ -389,6 +521,101 @@ def test_new_subtype_creates_variant_and_unsupported_hard_skill_needs_review(
     assert product["decision"] == "create_variant"
     assert unsupported["decision"] == "manual_review"
     assert unsupported["hard_gaps"] == ["aws"]
+
+
+def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base, suffix="one")
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        suffix="two",
+        content=(
+            "DATA ANALYST\nSQL, Python, data analysis\n"
+            "Built a dashboard and reporting workflow.\nAdditional verified detail."
+        ),
+    )
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    job = {
+        "url": "https://careers.example.test/tied-data",
+        "title": "Data Analyst",
+        "full_description": (
+            "Required: SQL. Build dashboards and reporting for business decisions."
+        ),
+        "eligibility_status": "eligible",
+    }
+    _insert_job(
+        conn,
+        url=str(job["url"]),
+        title=str(job["title"]),
+        description=str(job["full_description"]),
+    )
+
+    unresolved = route_resume_for_job(conn, job, profile)
+
+    assert unresolved["decision"] == "manual_review"
+    assert len(unresolved["candidates"]) == 2
+    selected_artifact_id = unresolved["candidates"][1]["artifact_id"]
+
+    selected = route_resume_for_job(
+        conn,
+        job,
+        profile,
+        artifact_id=selected_artifact_id,
+    )
+
+    assert selected["decision"] == "manual_selection"
+    assert selected["artifact_id"] == selected_artifact_id
+    assert Path(selected["reuse_report_path"]).is_file()
+    assert project_reuse_to_job(conn, job, selected)["artifact_id"] == selected_artifact_id
+    validation = conn.execute(
+        """
+        SELECT validation_kind, status FROM resume_validation_runs
+        WHERE artifact_id=? ORDER BY recorded_at DESC LIMIT 1
+        """,
+        (selected_artifact_id,),
+    ).fetchone()
+    assert dict(validation) == {
+        "validation_kind": "manual_selection_route_binding",
+        "status": "machine_validated",
+    }
+
+    unsupported_job = {
+        **job,
+        "url": "https://careers.example.test/tied-unsupported",
+        "full_description": "Required: AWS. Build dashboards.",
+    }
+    with pytest.raises(ValueError, match="cannot resolve"):
+        route_resume_for_job(
+            conn,
+            unsupported_job,
+            profile,
+            artifact_id=selected_artifact_id,
+        )
+
+    with pytest.raises(ValueError, match="candidate"):
+        route_resume_for_job(
+            conn,
+            job,
+            profile,
+            artifact_id="resume:not-a-candidate",
+        )
+
+    selected_pdf = Path(selected["artifact"]["pdf_path"])
+    selected_pdf.write_bytes(b"changed-after-selection")
+    with pytest.raises(ValueError, match="candidate"):
+        route_resume_for_job(
+            conn,
+            job,
+            profile,
+            artifact_id=selected_artifact_id,
+        )
 
 
 def test_changed_pdf_binding_is_not_reused(tmp_path: Path) -> None:

@@ -211,17 +211,34 @@ try {
     return completed.stdout
 
 
+def _visible_locators(frame: Frame, selectors: tuple[str, ...]) -> list[Locator]:
+    locator = frame.locator(", ".join(selectors))
+    visible: list[Locator] = []
+    for index in range(min(locator.count(), 10)):
+        candidate = locator.nth(index)
+        try:
+            if candidate.is_visible() and candidate.is_editable():
+                visible.append(candidate)
+        except Exception:  # noqa: BLE001, S112 - detached frames are expected during navigation
+            continue
+    return visible
+
+
 def _visible_locator(frame: Frame, selectors: tuple[str, ...]) -> Locator | None:
-    for selector in selectors:
-        locator = frame.locator(selector)
-        for index in range(min(locator.count(), 10)):
-            candidate = locator.nth(index)
-            try:
-                if candidate.is_visible() and candidate.is_editable():
-                    return candidate
-            except Exception:  # noqa: BLE001, S112 - detached frames are expected during navigation
-                continue
-    return None
+    visible = _visible_locators(frame, selectors)
+    return visible[0] if visible else None
+
+
+def _fill_password_fields(password_fields: list[Locator], password: str) -> int:
+    """Fill an ordinary ATS password plus its optional confirmation field."""
+    if len(password_fields) > 2:
+        raise CredentialRelayError(
+            "Credential relay found more than two password fields and refused a "
+            "possible password-change or recovery form."
+        )
+    for field in password_fields:
+        field.fill(password)
+    return len(password_fields)
 
 
 def _requested_fields_present(field: str, email_present: bool, password_present: bool) -> bool:
@@ -336,15 +353,17 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                     if field in {"email", "both"}
                     else None
                 )
-                password_locator = (
-                    _visible_locator(frame, PASSWORD_SELECTORS)
+                password_locators = (
+                    _visible_locators(frame, PASSWORD_SELECTORS)
                     if field in {"password", "both"}
-                    else None
+                    else []
                 )
+                if len(password_locators) > 2:
+                    continue
                 if not _requested_fields_present(
                     field,
                     email_locator is not None,
-                    password_locator is not None,
+                    bool(password_locators),
                 ):
                     continue
                 candidates.append(
@@ -356,29 +375,29 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                         "frame_url": frame.url,
                         "host": target_host,
                         "match": match,
-                        "field_count": int(email_locator is not None) + int(password_locator is not None),
+                        "field_count": int(email_locator is not None) + len(password_locators),
                         "email_locator": email_locator,
-                        "password_locator": password_locator,
+                        "password_locators": password_locators,
                     }
                 )
 
         selected = _select_candidate(candidates)
         email_locator = selected["email_locator"]
-        password_locator = selected["password_locator"]
+        password_locators = list(selected["password_locators"])
         email_filled = False
-        password_filled = False
+        password_fields_filled = 0
         if email_locator is not None:
             email_locator.fill(email)
             email_filled = True
-        if password_locator is not None:
-            password_locator.fill(password)
-            password_filled = True
+        if password_locators:
+            password_fields_filled = _fill_password_fields(password_locators, password)
         return {
             "status": "filled",
             "host": selected["host"],
             "selection": selected["match"],
             "email_filled": email_filled,
-            "password_filled": password_filled,
+            "password_filled": password_fields_filled > 0,
+            "password_fields_filled": password_fields_filled,
             "submitted": False,
         }
 

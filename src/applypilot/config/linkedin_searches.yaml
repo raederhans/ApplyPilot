@@ -18,13 +18,19 @@ tracks:
       - product manager
       - product analyst
       - product owner
+      - product management intern
+      - product management internship
+      - intern product management
+      - product internship program
     product_ops:
       - product operations
       - product ops
+      - intern omnicommerce
     strategy_ops:
       - strategy operations
       - business operations
       - strategy and operations
+      - corporate development and strategy
     pre_sales_solution_consulting:
       - solutions consultant
       - solution engineer
@@ -33,11 +39,14 @@ tracks:
       - pre-sales
       - presales
       - sales engineer
+      - commercial enablement
     implementation_consulting:
       - implementation consultant
       - implementation specialist
       - implementation manager
       - technical consultant
+      - consulting intern
+      - consulting internship
 
   data_bi_decision:
     data_analytics:
@@ -46,6 +55,15 @@ tracks:
       - data analytics
       - analytics & projects
       - analytics and projects
+      - data scientist
+      - data engineer
+      - data engineering
+      - data science intern
+      - data science internship
+      - analytics engineer
+      - AI data intern
+      - data AI intern
+      - autonomous driving data analysis
     business_intelligence:
       - business intelligence
       - BI analyst
@@ -70,15 +88,22 @@ tracks:
       - AI solutions consultant
       - AI platform
       - AI engineer
+      - AI software engineer
+      - AI product engineering
+      - AI/ML ops
       - artificial intelligence engineer
+      - machine learning engineer
       - generative AI
       - GenAI
+      - AI data intern
+      - data AI intern
     forward_deployed_ai:
       - forward deployed engineer
       - forward deployed AI
     workflow_automation:
       - workflow automation
       - automation analyst
+      - fleet systems analyst
     ai_product_ops:
       - AI product operations
       - AI product ops
@@ -100,6 +125,12 @@ tracks:
       - geospatial
       - GIS analyst
       - GIS consultant
+      - map simulation
+      - map annotation
+      - mapping annotation
+      - mapping localization
+      - mapping and localization
+      - autonomous driving data analysis
     location_intelligence:
       - location intelligence
     digital_twin:

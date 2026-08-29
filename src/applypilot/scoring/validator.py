@@ -148,8 +148,9 @@ def _source_role_for_company(original_text: str, company: str) -> str:
         if company.casefold() not in line.casefold():
             continue
         role_line = lines[index + 1]
+        month = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*"
         date_match = re.search(
-            r"(?=(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})",
+            rf"(?={month}(?:\s+\d{{4}}|\s*[-–—]\s*{month}\s+\d{{4}}))",
             role_line,
             flags=re.IGNORECASE,
         )

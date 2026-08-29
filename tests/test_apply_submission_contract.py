@@ -13,6 +13,7 @@ from applypilot import database as database_mod
 from applypilot.apply import authorization, launcher
 from applypilot.cli import _build_standing_authorization_manifest, app
 from applypilot.database import (
+    admit_direct_email_sent_receipt,
     finalize_application_attempt,
     init_db,
     prune_application_runtime_history,
@@ -585,6 +586,36 @@ def test_confirmation_email_reconciles_manual_submission_from_resume_receipt(
     assert stored["apply_status"] == "applied"
     assert stored["application_evidence"] == "confirmation_email:gmail-example-resume-received"
     assert stored["verification_confidence"] == "durable_receipt_reconciled"
+
+
+def test_direct_email_provider_message_id_is_unique_across_jobs(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "direct-email-receipts.db")
+    first_url = "https://careers.example.test/jobs/data"
+    second_url = "https://careers.example.test/jobs/data-copy"
+    conn.executemany(
+        "INSERT INTO jobs (url, title, company_name) VALUES (?, ?, ?)",
+        [
+            (first_url, "Data Analyst Intern", "Example"),
+            (second_url, "Data Analyst Intern", "Example"),
+        ],
+    )
+    conn.commit()
+    receipt = {
+        "folder": "sent",
+        "recipient": "jobs@example.test",
+        "subject": "Application - Data Analyst Intern",
+        "attachment_names": ["Candidate_Resume.pdf"],
+        "body_sha256": "a" * 64,
+        "provider_message_id": "provider-message-1",
+    }
+
+    first = admit_direct_email_sent_receipt(first_url, receipt, conn)
+    replay = admit_direct_email_sent_receipt(first_url, receipt, conn)
+    conflict = admit_direct_email_sent_receipt(second_url, receipt, conn)
+
+    assert first["status"] == "admitted"
+    assert replay["status"] == "already_admitted"
+    assert conflict["reason"] == "receipt_replay_conflict"
 
 
 def test_browser_receipt_overrides_prior_cli_upload_failure(tmp_path: Path) -> None:

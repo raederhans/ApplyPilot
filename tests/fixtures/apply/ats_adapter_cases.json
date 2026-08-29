@@ -1,0 +1,13 @@
+[
+  {"url": "https://boards.greenhouse.io/acme/jobs/123", "adapter": "greenhouse"},
+  {"url": "https://job-boards.greenhouse.io/acme/jobs/123", "adapter": "greenhouse"},
+  {"url": "https://jobs.lever.co/acme/123", "adapter": "lever"},
+  {"url": "https://jobs.eu.lever.co/acme/123", "adapter": "lever"},
+  {"url": "https://jobs.ashbyhq.com/acme/123", "adapter": "ashby"},
+  {"url": "https://jobs.smartrecruiters.com/acme/123", "adapter": "smartrecruiters"},
+  {"url": "https://boards.greenhouse.io.evil.example/acme/jobs/123", "adapter": "generic"},
+  {"url": "https://notjobs.lever.co/acme/123", "adapter": "generic"},
+  {"url": "https://ashbyhq.com.example/acme/123", "adapter": "generic"},
+  {"url": "https://jobs.smartrecruiters.com.evil.example/acme/123", "adapter": "generic"},
+  {"url": "https://careers.example.com/jobs/123", "adapter": "generic"}
+]

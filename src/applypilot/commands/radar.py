@@ -12,7 +12,7 @@ def run_radar_main(runtime: ModuleType, values: dict[str, object]) -> None:
 
     _assert_discovery_only_command(
         ctx.invoked_subcommand,
-        {"collect", "queries", "import-leads", "report"},
+        {"collect", "queries", "import-leads", "import-company-seeds", "report"},
     )
 
 
@@ -206,29 +206,25 @@ def run_radar_import_leads(runtime: ModuleType, values: dict[str, object]) -> No
 
     from applypilot.config import CONFIG_DIR, RADAR_IMPORT_DIR
 
-    if (
-        os.environ.get("APPLYPILOT_DISCOVERY_ONLY") == "1"
-        and source_id != "linkedin-content-manual"
-    ):
-        console.print(
-            "[red]Discovery-only lead imports require source-id "
-            "linkedin-content-manual.[/red]"
-        )
-        raise typer.Exit(code=2)
     if os.environ.get("APPLYPILOT_ATTENDED_REVIEW") != "1":
         console.print(
             "[red]Lead import requires an explicit attended-review session.[/red]"
         )
         raise typer.Exit(code=2)
     _assert_discovery_storage_path(file, RADAR_IMPORT_DIR, "Lead import")
-    _radar_bootstrap()
-    from applypilot.database import (
-        finish_radar_fetch_run,
-        get_connection,
-        ingest_radar_leads,
-        start_radar_fetch_run,
+    from applypilot.discovery.ecosystem import (
+        get_ecosystem_source,
+        normalize_job_lead,
+        radar_source_descriptor,
     )
     from applypilot.radar import classify_job_subtracks
+
+    try:
+        source_config = get_ecosystem_source(str(source_id))
+        source = radar_source_descriptor(source_config, "job_lead")
+    except (KeyError, TypeError, ValueError) as error:
+        console.print(f"[red]Lead source is not enabled for P2 import: {error}[/red]")
+        raise typer.Exit(code=2) from error
 
     if file.suffix.casefold() == ".json":
         payload = json.loads(file.read_text(encoding="utf-8"))
@@ -243,34 +239,38 @@ def run_radar_import_leads(runtime: ModuleType, values: dict[str, object]) -> No
         console.print("[red]Lead file must contain a list.[/red]")
         raise typer.Exit(code=1)
 
-    source = {
-        "source_id": source_id,
-        "source_type": "social_lead",
-        "provider": "candidate_reviewed_import",
-        "access_mode": "authorised_local_import",
-        "active": True,
-    }
-    conn = get_connection()
     query_config = yaml.safe_load(
         (CONFIG_DIR / "linkedin_searches.yaml").read_text(encoding="utf-8")
     ) or {}
-    run_id = start_radar_fetch_run(conn, source, parser_version="lead-import-v1")
     normalized = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
-            continue
-        source_url = row.get("source_url") or row.get("url")
-        if not str(source_url or "").strip():
-            continue
-        normalized.append({
-            **row,
-            "source_url": source_url,
-            "subtracks": row.get("subtracks")
-            or list(classify_job_subtracks(row.get("title"), query_config)),
-            "status": "awaiting_official",
-            "verification_status": "unverified",
-            "reason": row.get("reason") or "requires official careers verification",
-        })
+            console.print(f"[red]Lead row {index} must be an object.[/red]")
+            raise typer.Exit(code=1)
+        candidate = dict(row)
+        if not candidate.get("source_url") and candidate.get("url"):
+            candidate["source_url"] = candidate["url"]
+        try:
+            lead = normalize_job_lead(candidate, source_config)
+        except (TypeError, ValueError) as error:
+            console.print(f"[red]Lead row {index} is invalid: {error}[/red]")
+            raise typer.Exit(code=1) from error
+        lead["subtracks"] = lead.get("subtracks") or list(
+            classify_job_subtracks(lead.get("title"), query_config)
+        )
+        lead["reason"] = "requires fresh exact employer-official verification"
+        normalized.append(lead)
+
+    _radar_bootstrap()
+    from applypilot.database import (
+        finish_radar_fetch_run,
+        get_connection,
+        ingest_radar_leads,
+        start_radar_fetch_run,
+    )
+
+    conn = get_connection()
+    run_id = start_radar_fetch_run(conn, source, parser_version="ecosystem-lead-import-v2")
     counts = ingest_radar_leads(conn, run_id, source, normalized)
     finish_radar_fetch_run(
         conn,
@@ -288,6 +288,100 @@ def run_radar_import_leads(runtime: ModuleType, values: dict[str, object]) -> No
         "promoted": 0,
         "promotion_note": "awaiting a fresh official-source refresh",
     })
+
+
+def run_radar_import_company_seeds(runtime: ModuleType, values: dict[str, object]) -> None:
+    """Import candidate-reviewed ecosystem companies without creating jobs."""
+    file = values["file"]
+    source_id = values["source_id"]
+    _assert_discovery_storage_path = runtime._assert_discovery_storage_path
+    _radar_bootstrap = runtime._radar_bootstrap
+    console = runtime.console
+    os = runtime.os
+    typer = runtime.typer
+
+    import csv
+    import json
+
+    from applypilot.config import RADAR_IMPORT_DIR
+    from applypilot.discovery.ecosystem import (
+        get_ecosystem_source,
+        normalize_company_seed,
+        radar_source_descriptor,
+    )
+
+    if os.environ.get("APPLYPILOT_ATTENDED_REVIEW") != "1":
+        console.print(
+            "[red]Company-seed import requires an explicit attended-review session.[/red]"
+        )
+        raise typer.Exit(code=2)
+    _assert_discovery_storage_path(file, RADAR_IMPORT_DIR, "Company-seed import")
+    try:
+        source_config = get_ecosystem_source(str(source_id))
+        source = radar_source_descriptor(source_config, "company_seed")
+    except (KeyError, TypeError, ValueError) as error:
+        console.print(f"[red]Company-seed source is not enabled for P2 import: {error}[/red]")
+        raise typer.Exit(code=2) from error
+
+    if file.suffix.casefold() == ".json":
+        payload = json.loads(file.read_text(encoding="utf-8"))
+        rows = payload if isinstance(payload, list) else payload.get("companies", [])
+    elif file.suffix.casefold() == ".csv":
+        with file.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    else:
+        console.print("[red]Company-seed import supports JSON or CSV.[/red]")
+        raise typer.Exit(code=1)
+    if not isinstance(rows, list):
+        console.print("[red]Company-seed file must contain a list.[/red]")
+        raise typer.Exit(code=1)
+
+    normalized = []
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            console.print(f"[red]Company-seed row {index} must be an object.[/red]")
+            raise typer.Exit(code=1)
+        try:
+            normalized.append(normalize_company_seed(row, source_config))
+        except (TypeError, ValueError) as error:
+            console.print(f"[red]Company-seed row {index} is invalid: {error}[/red]")
+            raise typer.Exit(code=1) from error
+
+    _radar_bootstrap()
+    from applypilot.database import (
+        finish_radar_fetch_run,
+        get_connection,
+        ingest_radar_company_seeds,
+        start_radar_fetch_run,
+    )
+
+    conn = get_connection()
+    run_id = start_radar_fetch_run(
+        conn,
+        source,
+        parser_version="company-seed-import-v1",
+    )
+    counts = ingest_radar_company_seeds(conn, run_id, source, normalized)
+    finish_radar_fetch_run(
+        conn,
+        run_id,
+        status="partial",
+        pagination_complete=False,
+        raw_count=len(rows),
+        normalized_count=len(normalized),
+        new_count=counts["new"],
+        existing_count=counts["existing"],
+        metadata={"coverage_note": "company directories are non-exhaustive seed sources"},
+    )
+    console.print_json(
+        data={
+            "read_only": True,
+            **counts,
+            "jobs": 0,
+            "leads": 0,
+            "promotion_note": "company seeds require independent official-careers verification",
+        }
+    )
 
 
 def run_radar_report(runtime: ModuleType, values: dict[str, object]) -> None:
@@ -355,4 +449,4 @@ def run_radar_report(runtime: ModuleType, values: dict[str, object]) -> None:
         output.write_text(report, encoding="utf-8")
         console.print(f"[green]Wrote radar report:[/green] {output}")
     else:
-        console.print(report)
+        console.print(report, markup=False)

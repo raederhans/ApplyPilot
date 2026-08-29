@@ -52,8 +52,20 @@ def _ready_job(**changes: object) -> dict:
     ("changes", "expected"),
     [
         ({}, "ready_to_apply"),
-        ({"eligibility_status": "needs_review"}, "needs_review"),
-        ({"unanswered_questions": [{"question": "Work authorisation?"}]}, "needs_review"),
+        ({"eligibility_status": "needs_review"}, "ready_to_apply"),
+        (
+            {
+                "unanswered_questions": [
+                    {
+                        "question": "Work authorisation?",
+                        "required": True,
+                        "direct_impact": True,
+                    }
+                ]
+            },
+            "needs_review",
+        ),
+        ({"unanswered_questions": [{"question": "Application source?"}]}, "ready_to_apply"),
         ({"tailored_resume_path": None}, "needs_review"),
         ({"eligibility_status": "ineligible"}, "ignore"),
         ({"fit_score": 3}, "ignore"),
@@ -86,6 +98,35 @@ def test_decision_does_not_block_on_explicitly_optional_unanswered_fields() -> N
     )
 
     assert decision.evaluate(job)["decision"] == "ready_to_apply"
+
+
+def test_retryable_historical_errors_do_not_block_a_fresh_application() -> None:
+    job = _ready_job(
+        apply_status="failed",
+        apply_error="captcha encountered in an old session",
+        detail_error="login page encountered during an old enrichment attempt",
+        apply_retry_blocked=False,
+    )
+
+    assert decision.evaluate(job)["decision"] == "ready_to_apply"
+
+
+def test_structured_retry_block_uses_failure_recoverability() -> None:
+    retryable = _ready_job(
+        apply_status="failed",
+        apply_error="stuck",
+        apply_retry_reason="stuck",
+        apply_retry_blocked=True,
+    )
+    boundary = _ready_job(
+        apply_status="failed",
+        apply_error="assessment_required",
+        apply_retry_reason="assessment_required",
+        apply_retry_blocked=True,
+    )
+
+    assert decision.evaluate(retryable)["decision"] == "ready_to_apply"
+    assert decision.evaluate(boundary)["decision"] == "needs_review"
 
 
 def test_fixture_matrix_covers_multiple_companies_and_role_families() -> None:
@@ -196,7 +237,8 @@ def test_decision_invalidates_readiness_when_job_details_change() -> None:
 
     result = decision.evaluate(job, minimum_fit_score=8)
 
-    assert result["decision"] == "needs_review"
+    assert result["decision"] == "ready_to_apply"
+    assert "apply with conditions" in result["reason"].casefold()
     assert "changed" in result["reason"].casefold()
 
 
@@ -209,11 +251,11 @@ def test_decision_invalidates_readiness_when_job_details_change() -> None:
         {"application_readiness_reviewed_at": ""},
     ],
 )
-def test_decision_requires_complete_confirmed_application_readiness(changes: dict) -> None:
+def test_decision_defers_unconfirmed_application_readiness_to_runtime(changes: dict) -> None:
     result = decision.evaluate(_ready_job(**changes))
 
-    assert result["decision"] == "needs_review"
-    assert "readiness" in result["reason"].casefold()
+    assert result["decision"] == "ready_to_apply"
+    assert "apply with conditions" in result["reason"].casefold()
 
 
 def test_standing_policy_can_defer_unset_readiness_and_cover_to_runtime() -> None:
@@ -234,14 +276,45 @@ def test_standing_policy_can_defer_unset_readiness_and_cover_to_runtime() -> Non
     assert result["decision"] == "ready_to_apply"
 
 
-def test_runtime_readiness_never_overrides_explicit_needs_review() -> None:
+def test_explicit_needs_review_enters_application_with_conditions() -> None:
     result = decision.evaluate(
         _ready_job(application_readiness_status="needs_review"),
         allow_runtime_readiness=True,
         allow_runtime_cover_letter=True,
     )
 
-    assert result["decision"] == "needs_review"
+    assert result["decision"] == "ready_to_apply"
+    assert "apply with conditions" in result["reason"].casefold()
+
+
+@pytest.mark.parametrize(
+    ("title", "description"),
+    [
+        ("Senior Data Analyst", "Use SQL and Python to build decision dashboards."),
+        ("Data Analyst", "Requires at least 5 years of analytics experience."),
+    ],
+)
+def test_seniority_and_experience_do_not_override_a_passing_fit_score(
+    title: str, description: str
+) -> None:
+    job = _ready_job(title=title, full_description=description)
+    job["application_readiness_fingerprint"] = compute_job_fingerprint(job)
+
+    assert decision.evaluate(job, minimum_fit_score=8)["decision"] == "ready_to_apply"
+    job["fit_score"] = 7
+    assert decision.evaluate(job, minimum_fit_score=8)["decision"] == "ignore"
+
+
+def test_explicit_readiness_contradiction_is_do_not_apply() -> None:
+    result = decision.evaluate(
+        _ready_job(
+            application_readiness_status="explicit_contradiction",
+            application_readiness_reason="Candidate cannot meet the mandatory location requirement.",
+        )
+    )
+
+    assert result["decision"] == "ignore"
+    assert "location" in result["reason"].casefold()
 
 
 def test_jobs_schema_includes_application_readiness_review_fields(tmp_path: Path) -> None:

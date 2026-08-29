@@ -13,7 +13,9 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from applypilot.apply.contracts import AgentCheckpoint, ApplicationEvent, HumanRequest
 from applypilot.config import DB_PATH
+from applypilot.storage import agent_control as _agent_control
 from applypilot.storage import application_ledger as _application_ledger
 from applypilot.storage import job_identity as _job_identity
 from applypilot.storage import job_stats as _job_stats
@@ -34,6 +36,7 @@ record_radar_observation = _radar.record_radar_observation
 upsert_radar_lead = _radar.upsert_radar_lead
 link_radar_job_source = _radar.link_radar_job_source
 ingest_radar_leads = _radar.ingest_radar_leads
+ingest_radar_company_seeds = _radar.ingest_radar_company_seeds
 reconcile_radar_leads = _radar.reconcile_radar_leads
 _location_scope = _radar._location_scope
 _find_applied_exclusion = _radar._find_applied_exclusion
@@ -62,6 +65,18 @@ def reconcile_submission_receipt(
 ) -> dict[str, object]:
     return _submission_receipts.reconcile_submission_receipt(
         conn or get_connection(),
+        evidence,
+    )
+
+
+def admit_direct_email_sent_receipt(
+    job_url: str,
+    evidence: dict,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, object]:
+    return _submission_receipts.admit_direct_email_sent_receipt(
+        conn or get_connection(),
+        job_url,
         evidence,
     )
 
@@ -451,8 +466,54 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
 
 
 def ensure_application_batch_schema(conn: sqlite3.Connection | None = None) -> None:
-    """Create durable application authorization, attempt, and receipt ledgers."""
-    _application_ledger.ensure_schema(conn or get_connection())
+    """Create durable application and Agent control ledgers."""
+    connection = conn or get_connection()
+    _application_ledger.ensure_schema(connection)
+    _agent_control.ensure_schema(connection)
+
+
+def append_agent_event(
+    event: ApplicationEvent,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Append one advisory control event without changing application state."""
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    try:
+        inserted = _agent_control.append_event(connection, event)
+        if owns_transaction:
+            connection.commit()
+        return inserted
+    except (sqlite3.Error, TypeError, ValueError):
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def record_agent_turn_control(
+    event: ApplicationEvent,
+    checkpoint: AgentCheckpoint,
+    human_request: HumanRequest | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[bool, bool, bool | None]:
+    """Atomically append a completed turn, checkpoint, and optional handoff."""
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    try:
+        event_inserted = _agent_control.append_event(connection, event)
+        checkpoint_inserted = _agent_control.append_checkpoint(connection, checkpoint)
+        request_inserted = (
+            None
+            if human_request is None
+            else _agent_control.create_human_request(connection, human_request)
+        )
+        if owns_transaction:
+            connection.commit()
+        return event_inserted, checkpoint_inserted, request_inserted
+    except (sqlite3.Error, TypeError, ValueError):
+        if owns_transaction:
+            connection.rollback()
+        raise
 
 
 def start_application_attempt(
@@ -652,6 +713,47 @@ def reserve_batch_submission(
         batch_id,
         job_url,
         max_submissions,
+    )
+
+
+def claim_submission_gate(
+    batch_id: str,
+    job_url: str,
+    max_submissions: int,
+    attempt_id: str,
+    *,
+    hourly_maximum: int = 15,
+    minimum_gap_seconds: float = 20,
+    audit_fingerprint: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Atomically claim batch, attempt, and global submission authority."""
+    return _application_ledger.claim_submission_gate(
+        conn or get_connection(),
+        batch_id,
+        job_url,
+        max_submissions,
+        attempt_id,
+        hourly_maximum=hourly_maximum,
+        minimum_gap_seconds=minimum_gap_seconds,
+        audit_fingerprint=audit_fingerprint,
+        now=now,
+    )
+
+
+def update_submission_gate_state(
+    attempt_id: str,
+    state: str,
+    evidence: object | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Record the durable outcome of one claimed submission authority."""
+    return _application_ledger.update_submission_gate_state(
+        conn or get_connection(),
+        attempt_id,
+        state,
+        evidence,
     )
 
 
@@ -1027,6 +1129,23 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     new = 0
     existing = 0
 
+    def refreshed_text(existing_value: object, candidate_value: object) -> str | None:
+        """Prefer richer text, except when a shorter candidate removes encoded HTML."""
+        existing_text = str(existing_value or "").strip()
+        candidate_text = str(candidate_value or "").strip()
+        if not candidate_text:
+            return existing_text or None
+        if not existing_text:
+            return candidate_text
+        encoded_markers = ("&lt;", "&gt;", "&quot;")
+        existing_is_encoded = any(marker in existing_text for marker in encoded_markers)
+        candidate_is_encoded = any(marker in candidate_text for marker in encoded_markers)
+        if existing_is_encoded and not candidate_is_encoded:
+            return candidate_text
+        if len(candidate_text) > len(existing_text):
+            return candidate_text
+        return existing_text
+
     for job in jobs:
         url = job.get("url")
         if not url:
@@ -1039,19 +1158,27 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             job.get("canonical_job_url") or canonicalize_job_url(identity_url) or ""
         )
         duplicate = conn.execute(
-            "SELECT url FROM jobs WHERE url = ? LIMIT 1", (url,)
+            "SELECT url, description, full_description FROM jobs WHERE url = ? LIMIT 1", (url,)
         ).fetchone()
         if not duplicate and platform_job_id:
             duplicate = conn.execute(
-                "SELECT url FROM jobs WHERE platform_job_id = ? LIMIT 1",
+                "SELECT url, description, full_description FROM jobs "
+                "WHERE platform_job_id = ? LIMIT 1",
                 (platform_job_id,),
             ).fetchone()
         if not duplicate and canonical_url:
             duplicate = conn.execute(
-                "SELECT url FROM jobs WHERE canonical_job_url = ? LIMIT 1",
+                "SELECT url, description, full_description FROM jobs "
+                "WHERE canonical_job_url = ? LIMIT 1",
                 (canonical_url,),
             ).fetchone()
         if duplicate:
+            refreshed_description = refreshed_text(
+                duplicate["description"], job.get("description")
+            )
+            refreshed_full_description = refreshed_text(
+                duplicate["full_description"], job.get("full_description")
+            )
             conn.execute(
                 """
                 UPDATE jobs SET
@@ -1060,12 +1187,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                     company_name = COALESCE(NULLIF(company_name, ''), ?),
                     location = COALESCE(NULLIF(location, ''), ?),
                     salary = COALESCE(NULLIF(salary, ''), ?),
-                    description = CASE
-                        WHEN LENGTH(COALESCE(description, '')) < LENGTH(COALESCE(?, ''))
-                        THEN ? ELSE description END,
-                    full_description = CASE
-                        WHEN LENGTH(COALESCE(full_description, '')) < LENGTH(COALESCE(?, ''))
-                        THEN ? ELSE full_description END,
+                    description = ?,
+                    full_description = ?,
                     application_url = CASE
                         WHEN NULLIF(?, '') IS NULL THEN application_url
                         WHEN application_url IS NULL OR application_url = '' OR application_url = url
@@ -1084,10 +1207,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                     job.get("company_name") or job.get("company"),
                     job.get("location"),
                     job.get("salary"),
-                    job.get("description"),
-                    job.get("description"),
-                    job.get("full_description"),
-                    job.get("full_description"),
+                    refreshed_description,
+                    refreshed_full_description,
                     job.get("application_url"),
                     job.get("application_url"),
                     job.get("detail_scraped_at"),
