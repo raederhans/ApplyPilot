@@ -74,6 +74,10 @@
   },
   "submission_policy": {
     "mode": "auto_submit_when_preflight_passes",
+    "authorization_granted": false,
+    "standing_auto_authorize_ready_jobs": false,
+    "batch_authorization_required": false,
+    "batch_final_authorization_required": false,
     "allowed_submission_surfaces": [
       "linkedin_apply_entry",
       "linkedin_native_easy_apply",

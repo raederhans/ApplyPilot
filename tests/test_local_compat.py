@@ -2701,6 +2701,41 @@ def test_prepare_prompt_stops_for_advisory_observation_before_submit(
     assert "RESULT:APPLIED only after" not in built
 
 
+def test_submit_prompt_uses_bound_authorization_without_reconfirmation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    job = {
+        "url": "https://example.com/job",
+        "title": "Data Analyst Intern",
+        "company_name": "Example",
+        "source_site": "lever",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+    }
+
+    built = prompt.build_prompt(
+        job,
+        "Verified resume",
+        dry_run=False,
+        manual_captcha_relay=True,
+        submission_phase="submit",
+    )
+
+    assert "binding authorization to this exact job and submission materials" in built
+    assert "do not ask the user for another confirmation" in built
+    assert "visible CAPTCHA, assessment, missing resume after repair" in built
+    assert "click the final submission control exactly once" in built
+    assert "Otherwise output RESULT:SUBMISSION_UNCERTAIN" in built
+
+
 def test_pre_submit_snapshot_enforces_identity_resume_and_hard_answers() -> None:
     profile = _application_profile()
     job = {

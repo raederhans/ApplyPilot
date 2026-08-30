@@ -11,7 +11,11 @@ from typer.testing import CliRunner
 
 from applypilot import database as database_mod
 from applypilot.apply import authorization, launcher
-from applypilot.cli import _build_standing_authorization_manifest, app
+from applypilot.cli import (
+    _build_standing_authorization_manifest,
+    _standing_auto_authorization_enabled,
+    app,
+)
 from applypilot.database import (
     admit_direct_email_sent_receipt,
     finalize_application_attempt,
@@ -227,6 +231,27 @@ def test_standing_authorization_selects_only_ready_exact_jobs(tmp_path: Path) ->
 
     assert manifest["max_submissions"] == 1
     assert manifest["jobs"][0]["url"] == job["url"]
+
+
+def test_example_profile_declares_but_does_not_grant_standing_submission() -> None:
+    example_profile = Path(__file__).parents[1] / "profile.example.json"
+    profile = json.loads(example_profile.read_text(encoding="utf-8"))
+    policy = profile["submission_policy"]
+
+    assert policy["mode"] == "auto_submit_when_preflight_passes"
+    assert policy["authorization_granted"] is False
+    assert policy["standing_auto_authorize_ready_jobs"] is False
+    assert policy["batch_authorization_required"] is False
+    assert policy["batch_final_authorization_required"] is False
+    assert _standing_auto_authorization_enabled(profile) is False
+
+    explicitly_authorized = dict(profile)
+    explicitly_authorized["submission_policy"] = {
+        **policy,
+        "authorization_granted": True,
+        "standing_auto_authorize_ready_jobs": True,
+    }
+    assert _standing_auto_authorization_enabled(explicitly_authorized) is True
 
 
 def test_standing_authorization_binds_a_bounded_replacement_pool(tmp_path: Path) -> None:

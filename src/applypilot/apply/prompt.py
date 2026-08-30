@@ -1679,7 +1679,11 @@ RESULT:LOGIN_ISSUE -- {login_issue_result}
 RESULT:FAILED:reason -- any other failure (brief reason)"""
 
     if not dry_run and submission_phase == "submit":
-        mission_instruction = "Review the prepared application against hard safety gates, then submit it exactly once only when every gate passes."
+        mission_instruction = (
+            "Review the prepared application against hard safety gates, then submit it exactly once only "
+            "when every gate passes. The launcher enters this phase only after binding authorization to "
+            "this exact job and submission materials; do not ask the user for another confirmation."
+        )
         mission_body = (
             "The visible application form has already been populated. The launcher may provide an advisory "
             "snapshot, but the browser agent remains responsible for interpreting the current page."
