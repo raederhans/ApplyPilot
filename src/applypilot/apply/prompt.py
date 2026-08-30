@@ -15,8 +15,37 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from applypilot import config
+from applypilot.apply.authentication_policy import authentication_capability
 
 logger = logging.getLogger(__name__)
+
+
+_STANDING_SCREENING_FACTS = (
+    (
+        "Government/public-agency employment in the last 5 years",
+        "government_or_public_agency_employment_last_5_years",
+    ),
+    (
+        "Civil servant, cabinet member, or legislator in the last 5 years",
+        "civil_servant_cabinet_or_legislator_last_5_years",
+    ),
+    (
+        "Target-employer conflict-of-interest activities",
+        "conflict_of_interest_activities_at_target_employer",
+    ),
+    (
+        "Family/close relationship employed by a major company in conflict-of-interest scope",
+        "family_or_close_relationship_employed_by_major_company",
+    ),
+    (
+        "Government regulatory/procurement relationship with target employer",
+        "government_body_regulatory_or_procurement_relationship_with_target_employer",
+    ),
+    (
+        "Family/close relationship with government influence over target employer",
+        "family_or_close_relationship_government_influence_over_target_employer",
+    ),
+)
 
 
 def _preferred_display_name(personal: dict) -> str:
@@ -115,6 +144,7 @@ def _build_profile_summary(profile: dict) -> str:
         ("NDA", "willing_to_sign_nda"),
         ("Employment Restrictions", "employment_or_non_compete_restrictions"),
         ("Previously Worked Here", "previously_worked_for_target_employer"),
+        *_STANDING_SCREENING_FACTS,
     )
     for label, key in screening_labels:
         lines.append(f"{label}: {screening.get(key, 'Manual review')}")
@@ -372,6 +402,10 @@ def _build_screening_section(profile: dict) -> str:
         "exact_tool_policy",
         "Do not claim an absent exact tool, duration, certification, license, or regulated qualification.",
     )
+    standing_facts = "\n".join(
+        f"  - {label}: {screening.get(key, 'Manual review')}"
+        for label, key in _STANDING_SCREENING_FACTS
+    )
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
@@ -380,7 +414,11 @@ Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: convictions to disclose = {screening.get('criminal_convictions_to_disclose', 'manual review')}; background check = {screening.get('willing_to_complete_background_check', 'manual review')}
-  - Previous employment, relatives, or referrals at this employer: determine for this exact employer; never use a global default
+  - Previous employment or a named employee referral at this employer: determine for this exact employer; never use a global default. Family/close-relationship conflict questions may use only the exact standing facts below.
+
+Standing screening facts (use only for the exact question scope shown):
+{standing_facts}
+These standing facts do not answer other identity, criminal, work-authorization, prior-employment, or legal questions. A missing value remains Manual review. Target-employer prior employment still requires exact-employer evidence.
 
 Required experience and skills -> use the APPLICANT PROFILE, RESUME TEXT, and configured evidence policy. This candidate is a {target_role} with {years} years total experience. {related_yes_policy} Umbrella categories may be supported by explicit adjacent work: for example, documented LLM, generative-AI, hybrid-RAG, tool-calling, agent, or AI-workflow work can justify YES to a broadly phrased LLM/GenAI/AI-automation experience question. Do not require an exact keyword match when the underlying same-domain work is clear.
 
@@ -683,17 +721,24 @@ def _build_login_steps(
     profile: dict,
     *,
     allow_account_creation: bool = True,
+    allow_credential_relay: bool = True,
     agent_backend: str = "codex",
     available_tools: tuple[str, ...] = (),
     application_url: str = "",
 ) -> str:
     """Build a narrow, auditable authentication policy for the browser agent."""
     authentication = profile.get("authentication", {})
-    google_reuse_authorized = bool(
-        authentication.get("google_sso_existing_session_authorized", False)
+    ordinary_sign_in_authorized = authentication_capability(
+        profile, "ordinary_ats_sign_in_authorized"
     )
-    account_creation_authorized = allow_account_creation and bool(
-        authentication.get("ats_account_creation_authorized", False)
+    credential_relay_authorized = allow_credential_relay and authentication_capability(
+        profile, "credential_relay_authorized"
+    )
+    google_reuse_authorized = authentication_capability(
+        profile, "google_sso_existing_session_authorized"
+    )
+    account_creation_authorized = allow_account_creation and authentication_capability(
+        profile, "ats_account_creation_authorized"
     )
     gmail_verification_authorized = bool(
         authentication.get("gmail_verification_authorized", False)
@@ -711,7 +756,12 @@ def _build_login_steps(
         ".linkedin.com"
     )
 
-    if google_reuse_authorized or account_creation_authorized:
+    if (
+        ordinary_sign_in_authorized
+        or credential_relay_authorized
+        or google_reuse_authorized
+        or account_creation_authorized
+    ):
         session_rule = (
             "then reuse an already authenticated browser session or select an already signed-in Google "
             "account when offered. "
@@ -722,13 +772,18 @@ def _build_login_steps(
             "When a login page appears, actively make one bounded ordinary authentication attempt: "
             "click the ordinary Sign in, Log in, or Continue control, "
             + session_rule
+            + "The trusted profile already authorizes this ordinary login action, so do not request a separate "
+            "confirmation for it. "
             + "Do not return RESULT:LOGIN_ISSUE merely because a login page appears. Do not retry the "
             "authentication flow or switch identities. "
+            if ordinary_sign_in_authorized
+            else "Do not start an ordinary first-party ATS sign-in flow. "
         )
         google_rule = (
             f"You may use Continue with Google only by selecting the already signed-in account {email} and "
-            "granting basic identity/email access. Stop if Google asks for credentials, account recovery, MFA "
-            "enrollment, or broader OAuth scopes."
+            "granting basic identity/email access. The trusted profile authorizes this existing-session selection "
+            "without a separate confirmation. Stop if Google asks for credentials, account recovery, MFA or a "
+            "security code, enrollment, or broader OAuth scopes."
             if google_reuse_authorized
             else "Google SSO reuse is not authorized."
         )
@@ -739,14 +794,21 @@ def _build_login_steps(
             else "run .\\fill-ats-credentials.ps1 -Field email, password, or both from "
             "the worker directory"
         )
+        relay_rule = (
+            f"Credential relay is independently authorized for an already-visible ordinary employer ATS sign-in form: "
+            f"{relay_instruction}. Never type, print, read aloud, copy into the prompt, or expose the password. "
+            "The trusted profile authorizes this relay without a separate confirmation. "
+            "The relay fills credentials directly and must not click Sign in, Continue, Apply, or Submit. If the relay "
+            "is missing, unconfigured, rejects the current host, or fails, stop with RESULT:LOGIN_ISSUE and "
+            "FAILURE_CONTEXT category credential_relay_required."
+            if credential_relay_authorized
+            else "Credential relay is not authorized."
+        )
         signup_rule = (
-            f"For an ordinary employer ATS only, account creation with {email} is authorized. Never type, print, "
-            f"read aloud, copy into the prompt, or expose the password. Use the credential relay for an ordinary sign-in "
-            f"or account creation by {relay_instruction}. The relay fills the browser directly and must not submit the "
-            "form. If the relay is missing, unconfigured, rejects the current host, or fails, stop with "
-            "RESULT:LOGIN_ISSUE and FAILURE_CONTEXT category credential_relay_required."
+            f"For an ordinary employer ATS only, account creation with {email} is authorized; use credential relay "
+            "only when it is independently authorized."
             if account_creation_authorized
-            else "Do not create a new account."
+            else "Do not create a new account. Ordinary sign-in or credential relay authorization does not authorize account creation."
         )
         mailbox_tools_available = {
             "mailbox_search",
@@ -782,13 +844,18 @@ def _build_login_steps(
             + linkedin_rule
             + google_rule
             + " "
+            + relay_rule
+            + " "
             + signup_rule
             + " "
             + verification_rule
             + " Do not use LinkedIn as a third-party ATS OAuth provider; no independent LinkedIn SSO authorization is configured."
             + " After authentication navigation, list tabs and return to the application tab if needed. "
-            "Only after that one bounded attempt fails, or the flow requires MFA, account recovery, "
+            "Only after that one bounded attempt fails, or the flow requires MFA, an identity-provider security "
+            "code/security challenge, account recovery, "
             "unavailable authorized credentials, or broader OAuth scopes, output RESULT:LOGIN_ISSUE. "
+            "That hard stop does not include the exact employer ATS mailbox OTP admitted by the narrow mailbox "
+            "rule above. "
             "Never solve a CAPTCHA, enroll or bypass MFA, use recovery, disclose identity or financial "
             "documents, or grant abnormal permissions."
         )
@@ -802,18 +869,25 @@ def _login_issue_result_description(
     profile: dict,
     *,
     allow_account_creation: bool,
+    allow_credential_relay: bool,
 ) -> str:
     """Describe LOGIN_ISSUE without implying an authorized login may be skipped."""
-    authentication = profile.get("authentication", {})
-    attempt_authorized = bool(
-        authentication.get("google_sso_existing_session_authorized", False)
+    attempt_authorized = (
+        authentication_capability(profile, "ordinary_ats_sign_in_authorized")
+        or authentication_capability(
+            profile, "google_sso_existing_session_authorized"
+        )
+        or (
+            allow_credential_relay
+            and authentication_capability(profile, "credential_relay_authorized")
+        )
     ) or (
         allow_account_creation
-        and bool(authentication.get("ats_account_creation_authorized", False))
+        and authentication_capability(profile, "ats_account_creation_authorized")
     )
     if attempt_authorized:
         return (
-            "one bounded authorized sign-in/account attempt failed, or MFA, recovery, "
+            "one bounded authorized authentication attempt failed, or MFA/identity-provider security challenge, recovery, "
             "unavailable authorized credentials, or abnormal OAuth scope blocked it"
         )
     return "authentication or account creation is required but is not authorized"
@@ -1210,7 +1284,8 @@ def build_prompt(job: dict, tailored_resume: str,
                  worker_dir: Path | None = None,
                  manual_captcha_relay: bool = False,
                  resume_existing_page: bool = False,
-                 submission_phase: str = "submit") -> str:
+                 submission_phase: str = "submit",
+                 credential_relay_authorized: bool | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -1224,6 +1299,7 @@ def build_prompt(job: dict, tailored_resume: str,
         dry_run: If True, tell the agent not to click Submit.
         worker_id: Worker identifier used to isolate upload artifacts.
         worker_dir: Optional already-reset worker directory.
+        credential_relay_authorized: Launcher's runtime-scoped relay decision.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -1395,9 +1471,15 @@ Before the final plain-text RESULT lines, call the attached applypilot_control r
     phone_digits = _national_phone_digits(personal)
 
     allow_account_creation = job.get("_browser_backend") != "cloak"
+    allow_credential_relay = (
+        job.get("_browser_backend") != "cloak"
+        if credential_relay_authorized is None
+        else credential_relay_authorized
+    )
     authorized_login_steps = _build_login_steps(
         profile,
         allow_account_creation=allow_account_creation,
+        allow_credential_relay=allow_credential_relay,
         agent_backend=str(job.get("_agent_backend") or "codex"),
         available_tools=tuple(job.get("_available_tools") or ()),
         application_url=str(job.get("application_url") or job.get("url") or ""),
@@ -1405,6 +1487,7 @@ Before the final plain-text RESULT lines, call the attached applypilot_control r
     login_issue_result = _login_issue_result_description(
         profile,
         allow_account_creation=allow_account_creation,
+        allow_credential_relay=allow_credential_relay,
     )
     application_host = (
         urlsplit(str(job.get("application_url") or job.get("url") or ""))
@@ -1884,8 +1967,8 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
 {multipage_efficiency}
-- Optional fields: leave unsupported optional fields blank. A field labelled optional becomes conditionally required only when the live form later shows a specific blocking validation error; fill it only when it is an ordinary field backed by confirmed facts. Recording/media, camera/microphone, identity-document, financial, assessment, verification-code, and CAPTCHA requirements are never optional automation work even when the label is contradictory.
-- Fill ALL fields in ONE browser_fill_form call. Not one at a time.
+- Optional fields: leave unsupported optional fields blank. A field labelled optional becomes conditionally required only when the live form later shows a specific blocking validation error; fill it only when it is an ordinary field backed by confirmed facts. Recording/media, camera/microphone, identity-document, financial, assessment, identity-provider/MFA/security-challenge code, and CAPTCHA requirements are never optional automation work even when the label is contradictory. This does not prohibit the exact employer ATS mailbox OTP admitted by the Authentication policy.
+- Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite controlled dates; those dates must follow the dedicated Workday date rule below. Do not fill other fields one at a time.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - {captcha_efficiency_instruction}
 
@@ -1895,7 +1978,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 {smartrecruiters_form_trick}
 {greenhouse_form_trick}
-- Email/security-code verification: an 8-character code split across one-character inputs is a CAPTCHA/identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
+- Identity-provider/MFA/security-challenge verification: an 8-character code split across one-character inputs is an identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. This rule does not cover an exact employer ATS mailbox OTP admitted by the narrow Authentication policy; enter that OTP only through its authorized mailbox-tool flow. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
 - Video/audio upload contradiction: if a field is labelled optional but native/site validation blocks submission until a recording or media file is provided, the validation behaviour is authoritative. Stop with RESULT:FAILED:unsafe_verification; never activate camera/microphone or fabricate media to satisfy it.
 - Required document preflight: before uploading anything, identify every visible required file field by its own label. FILES authorizes only the named Resume/CV and cover-letter materials. Never upload the resume into Transcript, Portfolio, Supporting documents, Certificates, or a generic optional attachment field to satisfy another requirement. If a required non-resume document is not supplied, stop before submission with `RESULT:FAILED:manual_review_required:required_document`, emit `UNANSWERED_QUESTIONS` for that exact field, and emit `FAILURE_CONTEXT: {{"category":"required_document","field_label":"<visible label>","blocking_material":"<required material>","visible_state":"required file not supplied","attempts":0}}`.
 - File upload verification: bind upload proof to the same labelled Resume/CV field container that received the upload. A filename or remove/replace control under Cover letter, Certificates, Supporting documents, or another attachment field is not resume proof. After browser_file_upload, wait and snapshot. Continue only when the Resume/CV field itself shows the filename or a remove/replace control. Do not click the upload area again after success. If no proof appears, retry the Resume/CV click-plus-upload sequence once, snapshot again, then output `RESULT:FAILED:resume_upload` and `FAILURE_CONTEXT: {{"category":"resume_upload","field_label":"<visible resume label>","visible_state":"<what remained empty or where attachment proof appeared>","attempts":2}}`.
@@ -1906,6 +1989,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
 - Date fields: {datetime.now().astimezone().strftime('%m/%d/%Y')}
+- Workday segmented/composite dates: never bulk-fill a segmented date or put a complete date into one segment. If an accessible calendar/date picker is available, it is mandatory: select the date only through that control and never use keyboard or per-segment typing. Only when no accessible calendar/date picker exists may you focus and type each segment separately, verifying focus and the visible value before moving to the next segment. If any segment loses focus, changes another segment, clears, or shows an unexpected value, stop immediately for manual review; never retry, patch, guess, refill, or loop over the date.
 - {form_validation_tip}
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.

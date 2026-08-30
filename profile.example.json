@@ -52,6 +52,20 @@
     "preserved_school": "Your University",
     "real_metrics": ["50% improvement", "10x faster"]
   },
+  "authentication": {
+    "ordinary_ats_sign_in_authorized": false,
+    "credential_relay_authorized": false,
+    "ats_account_creation_authorized": false,
+    "google_sso_existing_session_authorized": false
+  },
+  "screening": {
+    "government_or_public_agency_employment_last_5_years": "Manual review",
+    "civil_servant_cabinet_or_legislator_last_5_years": "Manual review",
+    "conflict_of_interest_activities_at_target_employer": "Manual review",
+    "family_or_close_relationship_employed_by_major_company": "Manual review",
+    "government_body_regulatory_or_procurement_relationship_with_target_employer": "Manual review",
+    "family_or_close_relationship_government_influence_over_target_employer": "Manual review"
+  },
   "eeo_voluntary": {
     "gender": "Decline to self-identify",
     "race_ethnicity": "Decline to self-identify",

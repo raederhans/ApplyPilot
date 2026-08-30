@@ -303,11 +303,20 @@ def test_credential_relay_mcp_rejects_direct_calls_without_profile_authorization
 
 
 def test_credential_relay_registration_respects_profile_and_browser_policy() -> None:
-    enabled = {"authentication": {"ats_account_creation_authorized": True}}
-    disabled = {"authentication": {"ats_account_creation_authorized": False}}
+    enabled = {"authentication": {"credential_relay_authorized": True}}
+    disabled = {"authentication": {"credential_relay_authorized": False}}
+    legacy_enabled = {"authentication": {"ats_account_creation_authorized": True}}
+    explicit_override = {
+        "authentication": {
+            "ats_account_creation_authorized": True,
+            "credential_relay_authorized": False,
+        }
+    }
 
     assert launcher._credential_relay_allowed(enabled, {"_browser_backend": "edge"}) is True
     assert launcher._credential_relay_allowed(disabled, {"_browser_backend": "edge"}) is False
+    assert launcher._credential_relay_allowed(legacy_enabled, {"_browser_backend": "edge"}) is True
+    assert launcher._credential_relay_allowed(explicit_override, {"_browser_backend": "edge"}) is False
     assert launcher._credential_relay_allowed(enabled, {"_browser_backend": "cloak"}) is False
 
 
@@ -433,10 +442,61 @@ def test_cloak_login_policy_disables_authorized_ats_account_creation() -> None:
     steps = prompt._build_login_steps(
         _application_profile(),
         allow_account_creation=False,
+        allow_credential_relay=False,
     )
 
     assert "Do not create a new account" in steps
     assert "account creation with" not in steps
+    assert "Credential relay is not authorized" in steps
+    assert "mcp__credential_relay__fill_ats_credentials" not in steps
+
+
+def test_prompt_consumes_launcher_runtime_relay_denial(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    profile["authentication"].update(
+        {
+            "ordinary_ats_sign_in_authorized": False,
+            "credential_relay_authorized": True,
+            "ats_account_creation_authorized": False,
+            "google_sso_existing_session_authorized": False,
+        }
+    )
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    job = {
+        "url": "https://jobs.example.test/apply",
+        "application_url": "https://jobs.example.test/apply",
+        "title": "Data Analyst Intern",
+        "company_name": "Example",
+        "source_site": "generic",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+        "_browser_backend": "cloak",
+    }
+
+    runtime_relay_authorized = launcher._credential_relay_allowed(profile, job)
+    built = prompt.build_prompt(
+        job,
+        "Verified resume",
+        dry_run=True,
+        credential_relay_authorized=runtime_relay_authorized,
+    )
+
+    assert runtime_relay_authorized is False
+    assert "mcp__credential_relay__fill_ats_credentials" not in built
+    assert "do not authenticate or create an account" in built
+    assert (
+        "RESULT:LOGIN_ISSUE -- authentication or account creation is required but is not authorized"
+        in built
+    )
+    assert "one bounded authorized authentication attempt failed" not in built
 
 
 def test_unknown_browser_profile_mode_is_rejected(monkeypatch, tmp_path: Path) -> None:
@@ -868,6 +928,8 @@ def _application_profile() -> dict:
         },
         "eeo_voluntary": {},
         "authentication": {
+            "ordinary_ats_sign_in_authorized": True,
+            "credential_relay_authorized": True,
             "google_sso_existing_session_authorized": True,
             "ats_account_creation_authorized": True,
             "ats_signup_email": "candidate@example.com",
@@ -1014,6 +1076,8 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "mcp__credential_relay__fill_ats_credentials" in steps
     assert "read-only mailbox tools" in steps
     assert "within the last 10 minutes" in steps
+    assert "exact employer ATS mailbox OTP admitted" in steps
+    assert "identity-provider security code/security challenge" in steps
     assert "credential_relay_required" in steps
     assert "actively make one bounded ordinary authentication attempt" in steps
     assert "click the ordinary Sign in, Log in, or Continue control" in steps
@@ -1022,7 +1086,9 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "already signed-in Google or LinkedIn account" not in steps
     assert "Do not use LinkedIn as a third-party ATS OAuth provider" in steps
     assert "Do not return RESULT:LOGIN_ISSUE merely because a login page appears" in steps
-    assert "credential relay for an ordinary sign-in" in steps
+    assert "Credential relay is independently authorized" in steps
+    assert "must not click Sign in, Continue, Apply, or Submit" in steps
+    assert "authorizes this relay without a separate confirmation" in steps
     assert "Only after that one bounded attempt fails" in steps
     assert "account recovery, unavailable authorized credentials, or broader OAuth scopes" in steps
 
@@ -1048,7 +1114,7 @@ def test_linkedin_ordinary_login_policy_defers_apply_to_launcher() -> None:
     assert "launcher exclusively owns" in steps
     assert "Do not click that control in an ordinary Agent turn" in steps
     assert "unexpected login dialog requires RESULT:LOGIN_ISSUE" in steps
-    assert "MFA, account recovery" in steps
+    assert "identity-provider security code/security challenge, account recovery" in steps
 
 
 def test_linkedin_login_only_prompt_forbids_agent_apply_and_navigation(
@@ -1101,8 +1167,59 @@ def test_ats_account_creation_does_not_authorize_google_or_linkedin_sso() -> Non
     )
 
     assert "Google SSO reuse is not authorized" in steps
-    assert "credential relay for an ordinary sign-in or account creation" in steps
+    assert "Credential relay is independently authorized" in steps
     assert "Do not use LinkedIn as a third-party ATS OAuth provider" in steps
+
+
+def test_explicit_login_capabilities_do_not_authorize_account_creation() -> None:
+    profile = _application_profile()
+    profile["authentication"].update(
+        {
+            "ordinary_ats_sign_in_authorized": True,
+            "credential_relay_authorized": True,
+            "ats_account_creation_authorized": False,
+            "google_sso_existing_session_authorized": False,
+        }
+    )
+
+    steps = prompt._build_login_steps(profile)
+
+    assert "trusted profile already authorizes this ordinary login action" in steps
+    assert "Credential relay is independently authorized" in steps
+    assert "Do not create a new account" in steps
+    assert "does not authorize account creation" in steps
+    assert "Google SSO reuse is not authorized" in steps
+    assert "must not click Sign in, Continue, Apply, or Submit" in steps
+
+
+def test_explicit_login_capabilities_override_legacy_account_creation_fallback() -> None:
+    profile = _application_profile()
+    profile["authentication"].update(
+        {
+            "ordinary_ats_sign_in_authorized": False,
+            "credential_relay_authorized": False,
+            "ats_account_creation_authorized": True,
+        }
+    )
+
+    steps = prompt._build_login_steps(profile)
+
+    assert "Do not start an ordinary first-party ATS sign-in flow" in steps
+    assert "Credential relay is not authorized" in steps
+    assert "account creation with candidate@example.com is authorized" in steps
+
+
+def test_legacy_account_creation_policy_still_authorizes_bounded_sign_in_and_relay() -> None:
+    profile = {
+        "personal": {"email": "legacy@example.com"},
+        "authentication": {"ats_account_creation_authorized": True},
+    }
+
+    steps = prompt._build_login_steps(profile)
+
+    assert "trusted profile already authorizes this ordinary login action" in steps
+    assert "Credential relay is independently authorized" in steps
+    assert "account creation with legacy@example.com is authorized" in steps
 
 
 def test_authorized_login_result_code_requires_a_bounded_attempt(
@@ -1129,8 +1246,8 @@ def test_authorized_login_result_code_requires_a_bounded_attempt(
     built = prompt.build_prompt(job, "Verified resume", dry_run=False)
 
     assert (
-        "RESULT:LOGIN_ISSUE -- one bounded authorized sign-in/account attempt failed, "
-        "or MFA, recovery, unavailable authorized credentials, or abnormal OAuth scope blocked it"
+        "RESULT:LOGIN_ISSUE -- one bounded authorized authentication attempt failed, "
+        "or MFA/identity-provider security challenge, recovery, unavailable authorized credentials, or abnormal OAuth scope blocked it"
         in built
     )
 
@@ -1152,6 +1269,56 @@ def test_screening_uses_configured_mobility() -> None:
     assert "willing to relocate to another country: No" in screening
     assert "maximum 25%" in screening
     assert "cannot relocate" not in screening
+
+
+def test_standing_screening_facts_render_only_their_exact_confirmed_scope() -> None:
+    profile = _application_profile()
+    profile["screening"].update({
+        "government_or_public_agency_employment_last_5_years": "No",
+        "civil_servant_cabinet_or_legislator_last_5_years": "No",
+        "conflict_of_interest_activities_at_target_employer": "No",
+        "family_or_close_relationship_employed_by_major_company": "No",
+        "government_body_regulatory_or_procurement_relationship_with_target_employer": "No",
+        "family_or_close_relationship_government_influence_over_target_employer": "No",
+    })
+
+    summary = prompt._build_profile_summary(profile)
+    screening = prompt._build_screening_section(profile)
+
+    expected_facts = (
+        "Government/public-agency employment in the last 5 years: No",
+        "Civil servant, cabinet member, or legislator in the last 5 years: No",
+        "Target-employer conflict-of-interest activities: No",
+        "Family/close relationship employed by a major company in conflict-of-interest scope: No",
+        "Government regulatory/procurement relationship with target employer: No",
+        "Family/close relationship with government influence over target employer: No",
+    )
+    for fact in expected_facts:
+        assert fact in summary
+        assert fact in screening
+    assert "do not answer other identity, criminal, work-authorization" in screening
+    assert "Target-employer prior employment still requires exact-employer evidence" in screening
+
+
+def test_missing_standing_screening_facts_remain_manual_review() -> None:
+    profile = _application_profile()
+
+    summary = prompt._build_profile_summary(profile)
+    screening = prompt._build_screening_section(profile)
+
+    assert "Government/public-agency employment in the last 5 years: Manual review" in summary
+    assert "Civil servant, cabinet member, or legislator in the last 5 years: Manual review" in screening
+    assert "Target-employer conflict-of-interest activities: Manual review" in screening
+    assert (
+        "Family/close relationship employed by a major company in conflict-of-interest scope: "
+        "Manual review" in screening
+    )
+    assert "Government regulatory/procurement relationship with target employer: Manual review" in screening
+    assert (
+        "Family/close relationship with government influence over target employer: Manual review"
+        in screening
+    )
+    assert "Previously Worked Here: Determine per employer; never assume" in summary
 
 
 def test_screening_allows_supported_adjacent_category_but_not_exact_tool_claim() -> None:
@@ -2284,7 +2451,8 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "SmartRecruiters dual upload controls" not in built
     assert "Greenhouse/React Select location controls" not in built
     assert "manual_review_required:location_validation" not in built
-    assert "one-character inputs is a CAPTCHA/identity-verification gate" in built
+    assert "one-character inputs is an identity-verification gate" in built
+    assert "exact employer ATS mailbox OTP admitted" in built
     assert "an enabled Submit button or non-empty boxes alone is not a receipt" in built
     assert "Video/audio upload contradiction" in built
     assert "RESULT:FAILED:unsafe_verification" in built
@@ -2295,6 +2463,18 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "observations.resume_upload" in built
     assert "visible_filename" in built
     assert "Same page signature after one corrective attempt" in built
+    assert (
+        "Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite "
+        "controlled dates" in built
+    )
+    assert "Workday segmented/composite dates" in built
+    assert "never bulk-fill a segmented date or put a complete date into one segment" in built
+    assert "If an accessible calendar/date picker is available, it is mandatory" in built
+    assert "never use keyboard or per-segment typing" in built
+    assert "Only when no accessible calendar/date picker exists" in built
+    assert "verifying focus and the visible value before moving to the next segment" in built
+    assert "stop immediately for manual review" in built
+    assert "never retry, patch, guess, refill, or loop over the date" in built
     assert "A field labelled optional becomes conditionally required" in built
     assert "RESULT:APPLIED with a note that this was a dry run" not in built
     assert "launcher normally opens the exact job URL" in built

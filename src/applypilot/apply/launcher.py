@@ -46,6 +46,7 @@ from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
+from applypilot.apply.authentication_policy import authentication_capability
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
     McpPackageSpec,
@@ -2582,10 +2583,8 @@ def gen_prompt(target_url: str, min_score: int = 6,
 
 
 def _credential_relay_allowed(profile: dict, job: dict) -> bool:
-    authentication = profile.get("authentication", {})
     return bool(
-        isinstance(authentication, dict)
-        and authentication.get("ats_account_creation_authorized", False)
+        authentication_capability(profile, "credential_relay_authorized")
         and job.get("_browser_backend") != "cloak"
     )
 
@@ -2827,6 +2826,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         manual_captcha_relay=manual_captcha_relay,
         resume_existing_page=resume_existing_page,
         submission_phase=submission_phase,
+        credential_relay_authorized=credential_relay_authorized,
     )
     setup_metrics["prompt_build_ms"] = round(
         (time.perf_counter() - prompt_started) * 1000,

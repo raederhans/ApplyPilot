@@ -35,6 +35,7 @@ Action = Literal[
 
 _SPACE_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
+_CJK_LABEL_SEPARATOR = r"(?:\s|[，,。.;；:：/／|｜\-–—()（）\[\]【】])"
 _NUMBER_RE = re.compile(r"(?<!\w)(\d+(?:\.\d+)?)")
 _RANGE_RE = re.compile(
     r"\$?\s*(\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*\$?\s*(\d+(?:\.\d+)?)",
@@ -297,6 +298,11 @@ def _first_option(options: Sequence[str], accepted: frozenset[str]) -> str | Non
 
 
 def _option_polarity(option: object) -> bool | None:
+    visible_label = _text(option)
+    if re.match(rf"^(?:否|不是|不适用|不同意)(?:$|{_CJK_LABEL_SEPARATOR})", visible_label):
+        return False
+    if re.match(rf"^(?:是|同意)(?:$|{_CJK_LABEL_SEPARATOR})", visible_label):
+        return True
     token = _token(option)
     if re.match(r"^(?:yes|true)\b", token):
         return True

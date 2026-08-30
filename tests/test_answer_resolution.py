@@ -211,6 +211,70 @@ def test_verbose_negative_availability_continues() -> None:
     assert result.selected_option == "No, I am not available"
 
 
+@pytest.mark.parametrize(
+    ("options", "fact", "expected"),
+    [
+        (("是", "否"), True, "是"),
+        (("是", "否"), False, "否"),
+        (("Yes", "不是"), False, "不是"),
+        (("是", "不是"), True, "是"),
+        (("是", "不是"), False, "不是"),
+        (("是 / Yes，我符合", "否 / No，我不符合"), True, "是 / Yes，我符合"),
+        (("同意 (I agree)", "不适用 (Not applicable)"), False, "不适用 (Not applicable)"),
+        (("同意", "不同意"), False, "不同意"),
+        (("同意（I agree）", "不同意（I disagree）"), False, "不同意（I disagree）"),
+    ],
+)
+def test_chinese_boolean_labels_preserve_visible_option(
+    options: tuple[str, str], fact: bool, expected: str
+) -> None:
+    result = resolve_answer(
+        AnswerRequest(
+            field_semantic="Confirmed boolean question",
+            options=options,
+            confirmed_fact=fact,
+            required=True,
+            direct_impact=True,
+        )
+    )
+
+    assert result.selected_option == expected
+    assert result.confidence == 1.0
+
+
+@pytest.mark.parametrize("option", ("是否", "同意与否", "不确定", "适用情况未知"))
+def test_ambiguous_chinese_options_are_not_treated_as_boolean(option: str) -> None:
+    result = resolve_answer(
+        AnswerRequest(
+            field_semantic="Material declaration",
+            options=(option,),
+            confirmed_fact=True,
+            required=True,
+            direct_impact=True,
+            declaration=True,
+        )
+    )
+
+    assert result.action == "review"
+    assert result.selected_option is None
+
+
+def test_chinese_legal_declaration_still_requires_confirmed_fact() -> None:
+    result = resolve_answer(
+        AnswerRequest(
+            field_semantic="利益冲突法律声明",
+            options=("是", "否"),
+            required=True,
+            direct_impact=True,
+            declaration=True,
+        )
+    )
+
+    assert result.action == "review"
+    assert result.relation == "contradiction"
+    assert result.selected_option is None
+
+
 def test_other_is_truthful_without_an_explanation_control() -> None:
     result = resolve_answer(
         AnswerRequest(

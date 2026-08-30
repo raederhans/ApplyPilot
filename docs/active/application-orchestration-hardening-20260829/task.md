@@ -2,7 +2,7 @@
 
 ## Current status
 
-Implementation hardening is complete in the isolated worktree and the latest LinkedIn authwall/app-promo findings are independently closed. The complete orchestration, specialist feedback, receipt, LinkedIn route, and bounded performance-observation change set has final full-gate evidence and remains contained on the isolated worktree/branch; it has not been integrated into the dirty parent or pushed. Real connected Edge testing reached the exact HP Workday application login page. No receipt-confirmed live submission has been recorded in this task.
+Implementation hardening is complete in the isolated worktree and the latest LinkedIn authwall/app-promo findings are independently closed. The complete orchestration, specialist feedback, receipt, LinkedIn route, and bounded performance-observation change set has final full-gate evidence and remains contained on the isolated worktree/branch; it has not been integrated into the dirty parent or pushed. Connected Edge testing reused the existing HP Workday account through Edge-saved credentials without password inspection, saved steps 1-4, uploaded the exact machine-validated resume, and reached step 6 of 6 Review. HP's own ATS still showed `UNI4131-1` as an unsubmitted draft despite Simplify claiming an Aug 30 application; no final Submit was clicked and no receipt-confirmed live submission has been recorded.
 
 ## Checklist
 
@@ -20,6 +20,11 @@ Implementation hardening is complete in the isolated worktree and the latest Lin
 - [x] Recognize a same-job LinkedIn authwall before Apply without treating it as an application URL or ATS handoff.
 - [x] Dismiss the exact non-application LinkedIn app promo and revalidate target/root/job immediately before Apply.
 - [x] Add bounded acquisition, submit-lane, Agent, and observer performance metrics with thread-safe run aggregation.
+- [x] Split ordinary ATS sign-in, credential relay, account creation, and existing Google-session reuse into separately auditable authentication capabilities; persist the user's standing login authorization without weakening material-answer or submit gates.
+- [x] Harden Workday segmented-date guidance and localized boolean resolution after the connected-browser form exposed both failures.
+- [x] Record the HP live-run rule that target-ATS state and durable receipts outrank third-party extension status; no extension status is application proof.
+- [x] Record exact-scope user-confirmed `No` answers for the HP government-employment and conflict/government-influence questions, without extrapolating them to other screening questions.
+- [x] Require calendar interaction when a Workday segmented/composite date control exposes a calendar; the typed fallback corrupted a live year value before calendar recovery.
 - [ ] Reconcile uncertain/duplicate outcomes without counting false success.
 - [ ] Prepare safe integration handoff without overwriting the dirty parent.
 
@@ -59,7 +64,12 @@ Implementation hardening is complete in the isolated worktree and the latest Lin
 | Focused performance-observation regression | `344 passed in 24.30s`; touched Ruff `All checks passed`. Empty/acquired attempts have separate counts, and a controlled clock proves two lane-hold segments total exactly once before terminal-attempt metrics are backfilled. |
 | Independent performance-observation re-review | `ACCEPT`; acquired/empty/blocked/error attempts are separately observable, terminal lane metrics retain the complete hold, and telemetry remains advisory to authorization, receipt admission, and single-writer decisions. |
 | Isolated v3/v4 login tests | Both reached the expected login-only surface and stopped at Google identifier with `LOGIN_ISSUE`; neither clicked a second Apply, filled an ATS form, submitted, or created a receipt. |
-| Connected Edge route proof | Signed-in LinkedIn job `4455274411` opened HP Workday requisition `UNI4131-1`; current tab is paused at existing-account login before sending credentials. |
+| Connected Edge route proof | Signed-in LinkedIn job `4455274411` opened exact HP Workday requisition `UNI4131-1`; this proved the company-site path before the later authenticated continuation. |
+| Standing login authorization rule | Private runtime profile enables ordinary ATS sign-in, credential relay, account creation, and existing Google-session reuse. Versioned example defaults all four capabilities to `false`; explicit new keys override the legacy account-creation fallback. Final focused compatibility suite: `179 passed in 16.12s`; touched Ruff and `git diff --check` passed. |
+| Connected Edge HP continuation | Existing Workday credentials were reused without exposing the password. Steps 1 and 2 were saved, exact resume artifact `resume-9a6170ac3be39d3ad0cdc849.pdf` was uploaded, and step 3 retained only evidence-backed answers. No final submit or receipt occurred. |
+| Workday date/localization hardening | Bulk fill now explicitly excludes Workday segmented/composite dates; calendar or verified per-segment entry owns them. Boolean resolution recognizes bounded Chinese labels such as `是`, `否`, `不是`, `同意`, `不同意`, and `不适用` while preserving the visible option and the confirmed-fact gate. Combined focused suites: `212 passed in 14.36s`; touched Ruff and `git diff --check` passed. |
+| HP supervised continuation | Official HP ATS showed `UNI4131-1` as an unsubmitted draft while Simplify claimed an Aug 30 application; the official state governs and no receipt exists. Edge restored the existing login through saved credentials without password inspection. Steps 3-4 used the user's exact-scope government-employment/conflict confirmations, then the browser reached 6/6 Review; no final Submit was clicked. |
+| Workday segmented-date live evidence | Per-segment typed fallback lost focus and corrupted the graduation year to `2031`; calendar navigation restored the intended value. Where the control exposes a calendar, use it exclusively and verify the visible result before continuing. |
 
 ## Open risks and remaining work
 
@@ -67,7 +77,7 @@ Implementation hardening is complete in the isolated worktree and the latest Lin
 - Real providers may expose CAPTCHA, assessment, expired listings, historical duplicates, or rate limits.
 - Parent and isolated worktree integration method remains pending until final diff and parent overlap are inspected.
 - LinkedIn external route persistence is now on the early marker/observer path and remains guarded by the reservation-time gate. The marker is a control-plane transition, not a submission receipt; its no-fill guarantee still depends on the Agent obeying the immediate host-check prompt and the runtime stopping before the next external form action.
-- HP Workday resume-upload visibility needs a focused adapter/runtime check after the early-handoff fix; the first live attempt did not reach a submission gate.
+- HP Workday resume upload now has connected-browser proof, but the live segmented-date corruption shows the calendar-mandatory rule must be enforced in the adapter/runtime before unattended Workday scaling. Localized yes/no labels remain bounded to confirmed facts and exact visible options.
 - Two-worker scaling is currently safe only inside one coordinator with independent preparation pages and a single final submit writer. Multiple launcher processes sharing Edge/Cloak profiles remain unsupported.
 - Four-worker production scaling is not yet accepted: no matched 1/2/4 cohort exists, and isolated browser identities cannot reproduce the connected Edge login state. The next scaling gate requires the new acquisition/lane/phase metrics plus unchanged receipt, uncertainty, CAPTCHA/login, upload, and observer quality rates.
-- Continuing the HP Workday test requires action-time confirmation before transmitting configured login credentials; final Submit requires a second action-time confirmation after form review.
+- Ordinary first-party ATS sign-in, existing authenticated sessions, configured credential relay, and already-signed-in Google basic identity/email SSO no longer require per-login confirmation. CAPTCHA, MFA/security challenges, recovery, abnormal OAuth scopes, identity/financial material, unsupported material answers, and final Submit remain separate stop/gate conditions.
