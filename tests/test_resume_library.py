@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
+from typer.main import get_command
 
 from applypilot import single_job
 from applypilot.cli import app
@@ -26,11 +26,13 @@ def test_resume_taxonomy_version_tracks_routing_term_changes() -> None:
 
 
 def test_resume_route_cli_exposes_explicit_candidate_selection() -> None:
-    result = CliRunner().invoke(app, ["resume-route", "--help"])
+    resume_route = get_command(app).commands["resume-route"]
+    params = {param.name: param for param in resume_route.params}
 
-    assert result.exit_code == 0
-    assert "--artifact-id" in result.output
-    assert "--project-reuse" in result.output
+    assert params["artifact_id"].opts == ["--artifact-id"]
+    assert params["artifact_id"].hidden is False
+    assert params["project_reuse"].opts == ["--project-reuse"]
+    assert params["project_reuse"].hidden is False
 
 
 def _profile(base_resume: Path) -> dict:

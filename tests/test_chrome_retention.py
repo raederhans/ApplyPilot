@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -318,8 +320,8 @@ def test_worker_cleanup_skips_prune_when_browser_endpoint_remains_active(
 def test_cloak_version_pin_is_optional_runtime_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import cloakbrowser
-
+    cloakbrowser = ModuleType("cloakbrowser")
+    monkeypatch.setitem(sys.modules, "cloakbrowser", cloakbrowser)
     calls: list[str | None] = []
     monkeypatch.setattr(chrome, "resolve_browser_backend", lambda *_args, **_kwargs: "cloak")
     monkeypatch.setattr(
@@ -327,6 +329,7 @@ def test_cloak_version_pin_is_optional_runtime_configuration(
         "ensure_binary",
         lambda *, browser_version=None, **_kwargs: calls.append(browser_version)
         or "cloak.exe",
+        raising=False,
     )
     for key in (
         "APPLYPILOT_CLOAK_VERSION",

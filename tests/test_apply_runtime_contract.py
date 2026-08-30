@@ -403,8 +403,9 @@ def test_prepare_phase_never_exposes_mailbox_send_even_when_profile_allows_it(
         "submission_policy": {"direct_email_application_authorized": True},
     }
     monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(launcher, "_resolve_codex_command", lambda: ["codex"])
 
-    command, _ = launcher.run_job.__globals__["_build_agent_command"](
+    command, _ = launcher._build_agent_command(
         "codex",
         "model",
         9432,
