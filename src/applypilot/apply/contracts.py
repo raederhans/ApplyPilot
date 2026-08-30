@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -296,6 +296,142 @@ class AgentTurnResult:
             _required(self.requested_human_input, "requested_human_input")
 
 
+RecoveryActionName = Literal[
+    "retry_same_application",
+    "retry_new_session",
+    "requires_capability",
+    "reconcile_receipt",
+    "park",
+    "human_only",
+    "no_retry",
+]
+HumanInterruptionType = Literal[
+    "captcha",
+    "security_challenge",
+    "assessment",
+    "sensitive_identity_or_financial_material",
+    "unsupported_legal_declaration",
+    "human_boundary",
+]
+DecisionDisposition = Literal["advance", "recover", "checkpoint", "complete"]
+
+_RECOVERY_ACTION_NAMES = frozenset(
+    {
+        "retry_same_application",
+        "retry_new_session",
+        "requires_capability",
+        "reconcile_receipt",
+        "park",
+        "human_only",
+        "no_retry",
+    }
+)
+_HUMAN_INTERRUPTION_TYPES = frozenset(
+    {
+        "captcha",
+        "security_challenge",
+        "assessment",
+        "sensitive_identity_or_financial_material",
+        "unsupported_legal_declaration",
+        "human_boundary",
+    }
+)
+_DECISION_DISPOSITIONS = frozenset({"advance", "recover", "checkpoint", "complete"})
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryAction:
+    """Typed, non-authoritative recovery proposal for an application turn."""
+
+    action: RecoveryActionName
+    failure_category: str
+    next_action: str
+    retry_budget_remaining: int = 0
+    missing_capability: str | None = None
+    missing_material: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in _RECOVERY_ACTION_NAMES:
+            raise ValueError(f"unsupported recovery action: {self.action}")
+        _required(self.failure_category, "failure_category")
+        _required(self.next_action, "next_action")
+        if (
+            isinstance(self.retry_budget_remaining, bool)
+            or not isinstance(self.retry_budget_remaining, int)
+            or self.retry_budget_remaining < 0
+        ):
+            raise ValueError("retry_budget_remaining must be a non-negative integer")
+        if self.missing_capability is not None:
+            _required(self.missing_capability, "missing_capability")
+        if self.missing_material is not None:
+            _required(self.missing_material, "missing_material")
+
+
+@dataclass(frozen=True, slots=True)
+class HumanInterruption:
+    """A typed HUMAN_ONLY boundary; raw answers or secrets never belong here."""
+
+    interruption_type: HumanInterruptionType
+    reason: str
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if self.interruption_type not in _HUMAN_INTERRUPTION_TYPES:
+            raise ValueError(f"unsupported human interruption: {self.interruption_type}")
+        _required(self.reason, "reason")
+        _required(self.next_action, "next_action")
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionEnvelope:
+    """Structured shadow decision consumed by existing control-plane code."""
+
+    run_id: str
+    attempt_id: str
+    phase: str
+    disposition: DecisionDisposition
+    next_phase: str
+    recovery_action: RecoveryAction | None = None
+    human_interruption: HumanInterruption | None = None
+    shadow_only: bool = True
+    schema_version: str = "1"
+
+    def __post_init__(self) -> None:
+        for name in ("run_id", "attempt_id", "phase", "next_phase"):
+            _required(getattr(self, name), name)
+        if self.disposition not in _DECISION_DISPOSITIONS:
+            raise ValueError(f"unsupported decision disposition: {self.disposition}")
+        if self.shadow_only is not True:
+            raise ValueError("DecisionEnvelope must remain shadow-only")
+        if self.schema_version != "1":
+            raise ValueError("unsupported DecisionEnvelope schema_version")
+        if self.disposition == "recover" and self.recovery_action is None:
+            raise ValueError("recover disposition requires a RecoveryAction")
+        if self.recovery_action is not None:
+            expected_control = (
+                ("recover", "recover")
+                if self.recovery_action.action
+                in {"retry_same_application", "retry_new_session"}
+                else ("complete", "complete")
+                if self.recovery_action.action == "no_retry"
+                else ("checkpoint", "checkpoint")
+            )
+            if (self.disposition, self.next_phase) != expected_control:
+                raise ValueError("DecisionEnvelope control flow does not match RecoveryAction")
+        elif self.disposition in {"checkpoint", "complete"} and self.next_phase != self.disposition:
+            raise ValueError("DecisionEnvelope next_phase does not match disposition")
+        if self.human_interruption is not None and (
+            self.recovery_action is None or self.recovery_action.action != "human_only"
+        ):
+            raise ValueError("HumanInterruption requires a human_only RecoveryAction")
+        if (
+            self.recovery_action is not None
+            and self.recovery_action.action == "human_only"
+            and self.human_interruption is None
+        ):
+            raise ValueError("human_only RecoveryAction requires a HumanInterruption")
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationEvent:
     event_id: str
@@ -367,6 +503,75 @@ def contract_json(value: object) -> dict[str, JsonValue]:
     if not isinstance(result, dict):  # pragma: no cover - asdict always returns a dict
         raise TypeError("contract must serialize to an object")
     return result
+
+
+def decision_envelope_from_mapping(value: Mapping[str, object]) -> DecisionEnvelope:
+    """Restore one persisted v1 actor decision without weakening its invariants."""
+
+    def required_text(source: Mapping[str, object], key: str) -> str:
+        item = source.get(key)
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"DecisionEnvelope {key} is required")
+        return item
+
+    def optional_text(source: Mapping[str, object], key: str) -> str | None:
+        item = source.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"DecisionEnvelope {key} must be a non-empty string or null")
+        return item
+
+    if value.get("schema_version") != "1":
+        raise ValueError("unsupported DecisionEnvelope schema_version")
+    if value.get("shadow_only") is not True:
+        raise ValueError("DecisionEnvelope must remain shadow-only")
+
+    raw_recovery = value.get("recovery_action")
+    recovery: RecoveryAction | None = None
+    if raw_recovery is not None:
+        if not isinstance(raw_recovery, Mapping):
+            raise TypeError("DecisionEnvelope recovery_action must be an object or null")
+        raw_budget = raw_recovery.get("retry_budget_remaining", 0)
+        if isinstance(raw_budget, bool) or not isinstance(raw_budget, int):
+            raise TypeError("DecisionEnvelope retry_budget_remaining must be an integer")
+        recovery = RecoveryAction(
+            action=cast(RecoveryActionName, required_text(raw_recovery, "action")),
+            failure_category=required_text(raw_recovery, "failure_category"),
+            next_action=required_text(raw_recovery, "next_action"),
+            retry_budget_remaining=raw_budget,
+            missing_capability=optional_text(raw_recovery, "missing_capability"),
+            missing_material=optional_text(raw_recovery, "missing_material"),
+        )
+
+    raw_interruption = value.get("human_interruption")
+    interruption: HumanInterruption | None = None
+    if raw_interruption is not None:
+        if not isinstance(raw_interruption, Mapping):
+            raise TypeError("DecisionEnvelope human_interruption must be an object or null")
+        interruption = HumanInterruption(
+            interruption_type=cast(
+                HumanInterruptionType,
+                required_text(raw_interruption, "interruption_type"),
+            ),
+            reason=required_text(raw_interruption, "reason"),
+            next_action=required_text(raw_interruption, "next_action"),
+        )
+
+    return DecisionEnvelope(
+        run_id=required_text(value, "run_id"),
+        attempt_id=required_text(value, "attempt_id"),
+        phase=required_text(value, "phase"),
+        disposition=cast(
+            DecisionDisposition,
+            required_text(value, "disposition"),
+        ),
+        next_phase=required_text(value, "next_phase"),
+        recovery_action=recovery,
+        human_interruption=interruption,
+        shadow_only=True,
+        schema_version="1",
+    )
 
 
 def agent_proposal_from_mapping(

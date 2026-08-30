@@ -37,6 +37,7 @@ from rich.live import Live
 from applypilot import config
 from applypilot.apply import agent_output as agent_output_mod
 from applypilot.apply import agent_runtime as agent_runtime_mod
+from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import ats as ats_mod
 from applypilot.apply import orchestration as orchestration_mod
@@ -520,6 +521,12 @@ def _persist_agent_turn_completed(
     """Atomically save the terminal control event and resumable checkpoint."""
     from applypilot.database import record_agent_turn_control
 
+    actor_decision = application_actor_mod.decision_for_turn(
+        request,
+        result,
+        application_status=application_status,
+    )
+    actor_decision_json = contract_json(actor_decision)
     raw_evidence_refs = result.observations.get("evidence_refs", ())
     evidence_ref_count = (
         len(raw_evidence_refs) if isinstance(raw_evidence_refs, (list, tuple)) else 0
@@ -548,6 +555,7 @@ def _persist_agent_turn_completed(
             "proposal_ids": [proposal.proposal_id for proposal in result.proposals],
             "evidence_ref_count": evidence_ref_count,
             "metrics": bounded_metrics,
+            "actor_decision": actor_decision_json,
         },
         evidence_refs=(),
         idempotency_key=f"{request.run_id}:completed",
@@ -563,10 +571,21 @@ def _persist_agent_turn_completed(
             "application_status": application_status,
             "result": _durable_agent_result(result),
             "source": source,
+            "actor_decision": actor_decision_json,
         },
     )
-    human_request = None
-    if result.requested_human_input:
+    human_request = application_actor_mod.human_request_for_decision(actor_decision)
+    if (
+        human_request is None
+        and result.requested_human_input
+        and (
+            actor_decision.recovery_action is None
+            or (
+                actor_decision.recovery_action.action == "park"
+                and actor_decision.recovery_action.missing_material is not None
+            )
+        )
+    ):
         human_request = HumanRequest(
             request_id=f"{request.run_id}:human:1",
             run_id=request.run_id,
@@ -2961,6 +2980,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "browser_backend": str(job.get("_browser_backend") or "unknown"),
             "resume_existing_page": resume_existing_page,
             "dry_run": dry_run,
+            "actor_same_application_retries_remaining": int(
+                job.get("_application_actor_same_application_retries_remaining") or 0
+            ),
+            "actor_new_session_retries_remaining": int(
+                job.get("_application_actor_new_session_retries_remaining") or 0
+            ),
             "ats_adapter": str(ats_context.get("adapter") or "generic"),
             "ats_context_schema_version": str(
                 ats_context.get("schema_version") or ats_mod.ATS_SCHEMA_VERSION

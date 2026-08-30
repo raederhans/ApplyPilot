@@ -531,6 +531,17 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     completed_payload = json.loads(events[-1][1])
     assert completed_payload["metrics"]["browser_tool_call_count"] == 1
     assert completed_payload["metrics"]["browser_tool_success_count"] == 1
+    assert completed_payload["actor_decision"] == {
+        "run_id": completed_payload["actor_decision"]["run_id"],
+        "attempt_id": "attempt-1",
+        "phase": "verify",
+        "disposition": "checkpoint",
+        "next_phase": "checkpoint",
+        "recovery_action": None,
+        "human_interruption": None,
+        "shadow_only": True,
+        "schema_version": "1",
+    }
     assert conn.execute("SELECT COUNT(*) FROM agent_checkpoints").fetchone()[0] == 1
     assert "mcp_servers.applypilot_control.command" in " ".join(captured_command)
     assert "mcp_servers.applypilot_ats.command" in " ".join(captured_command)
@@ -549,6 +560,8 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     checkpoint_json = conn.execute(
         "SELECT state_json FROM agent_checkpoints LIMIT 1"
     ).fetchone()[0]
+    checkpoint = json.loads(checkpoint_json)
+    assert checkpoint["actor_decision"] == completed_payload["actor_decision"]
     assert "Form prepared through structured reporting" not in checkpoint_json
     assert "Review one unfamiliar field" not in checkpoint_json
     assert not (worker_dir / "agent-turn-report.json").exists()

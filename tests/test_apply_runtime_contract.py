@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from applypilot import config
 from applypilot.apply import (
     agent_runtime,
+    application_actor,
     launcher,
     page_observation,
     prompt,
@@ -2094,6 +2096,77 @@ def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypa
     ]
 
 
+@pytest.mark.parametrize(
+    "blocked_result",
+    [
+        "failed:site_blocked",
+        "failed:cloudflare_blocked",
+        "failed:blocked_by_cloudflare",
+        "failed:automation_blocked",
+        "failed:bot_detected",
+        "failed:browser_challenge",
+    ],
+)
+def test_actor_preserves_every_existing_explicit_browser_block_fallback(
+    monkeypatch,
+    blocked_result: str,
+) -> None:
+    decisions = []
+    original = application_actor.decision_for_status
+
+    def observed_decision(state, status):
+        decision = original(state, status)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(application_actor, "decision_for_status", observed_decision)
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=[blocked_result, "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge", "cloak"]
+    assert decisions[0].recovery_action.action == "retry_new_session"
+
+
+def test_worker_consumes_actor_park_decision_before_cloak_route(monkeypatch) -> None:
+    route_calls: list[str] = []
+    original_route = launcher.cloak_fallback_route
+    monkeypatch.setattr(
+        launcher,
+        "cloak_fallback_route",
+        lambda result, **kwargs: route_calls.append(result)
+        or original_route(result, **kwargs),
+    )
+
+    def exhausted_decision(state, status):
+        return application_actor.decision_for_status(
+            replace(state, new_session_retries_remaining=0),
+            status,
+        )
+
+    monkeypatch.setattr(application_actor, "decision_for_status", exhausted_decision)
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["failed:cloudflare_blocked", "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+    assert route_calls == []
+
+
 def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:
     launches: list[tuple[tuple, dict]] = []
 
@@ -2107,6 +2180,54 @@ def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:
     assert result == (0, 1)
     assert phases == ["prepare"]
     assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+
+
+@pytest.mark.parametrize(
+    ("blocked_result", "expected_action"),
+    [
+        ("captcha", "human_only"),
+        ("failed:mfa", "human_only"),
+        ("submission_uncertain", "reconcile_receipt"),
+        ("failed:identity_material_missing:passport", "human_only"),
+        ("failed:assessment_required", "human_only"),
+        ("failed:unsupported_legal_declaration", "human_only"),
+    ],
+)
+def test_actor_hard_boundaries_never_enter_browser_fallback(
+    monkeypatch,
+    blocked_result: str,
+    expected_action: str,
+) -> None:
+    route_calls: list[str] = []
+    original_route = launcher.cloak_fallback_route
+    monkeypatch.setattr(
+        launcher,
+        "cloak_fallback_route",
+        lambda result, **kwargs: route_calls.append(result)
+        or original_route(result, **kwargs),
+    )
+    decisions = []
+    original_decision = application_actor.decision_for_status
+
+    def observed_decision(state, status):
+        decision = original_decision(state, status)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(application_actor, "decision_for_status", observed_decision)
+    launches: list[tuple[tuple, dict]] = []
+
+    _result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=[blocked_result, "ready_to_submit"],
+        launch_calls=launches,
+    )
+
+    assert phases == ["prepare"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+    assert route_calls == []
+    assert decisions[0].recovery_action.action == expected_action
 
 
 def test_auto_browser_backend_does_not_misclassify_generic_stall_as_bot_block(

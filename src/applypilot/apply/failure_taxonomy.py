@@ -62,6 +62,25 @@ def classify_failure(result: str) -> FailureDescriptor:
             "exclude_from_active_queue",
             permanent=True,
         )
+    if any(
+        token in reason
+        for token in (
+            "mfa",
+            "multi_factor",
+            "security_challenge",
+            "identity_provider_security_code",
+            "identity_provider_verification_code",
+            "mfa_code",
+            "security_challenge_code",
+            "account_recovery",
+        )
+    ):
+        return FailureDescriptor(
+            "security_challenge_required",
+            "requires_human_boundary",
+            "complete_security_challenge_manually_then_reobserve",
+            missing_capability="authorized_human_security_handoff",
+        )
     if reason in {"captcha", "login_issue"} or "captcha" in reason:
         return FailureDescriptor(
             "human_verification_required",
@@ -75,6 +94,39 @@ def classify_failure(result: str) -> FailureDescriptor:
             "requires_human_boundary",
             "route_to_assessment_workflow",
             missing_capability="assessment_owner",
+        )
+    if any(
+        token in reason
+        for token in (
+            "biometric",
+            "financial_identity",
+            "financial_material",
+            "financial_document",
+            "bank_statement",
+            "tax_document",
+            "identity_material_authorization_unconfirmed",
+            "identity_material_missing",
+            "protected_identifier_source_required",
+        )
+    ) or reason == "financial":
+        return FailureDescriptor(
+            "sensitive_identity_boundary",
+            "requires_human_boundary",
+            "complete_sensitive_identity_or_financial_material_step_manually",
+        )
+    if any(
+        token in reason
+        for token in (
+            "unsupported_legal_declaration",
+            "legal_declaration_unanswerable",
+            "cannot_answer_truthfully",
+            "no_truthful_legal_option",
+        )
+    ):
+        return FailureDescriptor(
+            "unsupported_legal_declaration",
+            "requires_human_boundary",
+            "resolve_legal_declaration_truthfully_with_human_review",
         )
     if "required_document" in reason:
         return FailureDescriptor(
@@ -132,7 +184,17 @@ def classify_failure(result: str) -> FailureDescriptor:
             "repair_or_attach_playwright_mcp_before_retry",
             missing_capability="playwright_mcp",
         )
-    if any(token in reason for token in ("site_blocked", "cloudflare", "cloak_backend")):
+    if any(
+        token in reason
+        for token in (
+            "site_blocked",
+            "cloudflare",
+            "automation_blocked",
+            "bot_detected",
+            "browser_challenge",
+            "cloak_backend",
+        )
+    ):
         return FailureDescriptor(
             "browser_runtime_blocked",
             "retry_new_session",
@@ -194,32 +256,6 @@ def classify_failure(result: str) -> FailureDescriptor:
             "retry_same_application",
             "answer_truthfully_and_let_employer_decide",
             missing_capability="relaxed_application_policy",
-        )
-    if any(
-        token in reason
-        for token in (
-            "biometric",
-            "financial_identity",
-            "identity_material_authorization_unconfirmed",
-        )
-    ):
-        return FailureDescriptor(
-            "sensitive_identity_boundary",
-            "requires_human_boundary",
-            "obtain_explicit_authorization_or_complete_sensitive_check_manually",
-        )
-    if any(
-        token in reason
-        for token in (
-            "protected_identifier_source_required",
-            "identity_material_missing",
-        )
-    ):
-        return FailureDescriptor(
-            "exact_identity_material_missing",
-            "requires_material",
-            "supply_exact_verified_and_authorized_identity_material",
-            missing_material="requested_identity_material",
         )
     if "unsafe_" in reason or "hard_answer_mismatch" in reason:
         return FailureDescriptor(

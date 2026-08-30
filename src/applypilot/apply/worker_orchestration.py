@@ -13,6 +13,8 @@ import time
 from types import ModuleType
 from urllib.parse import urlparse
 
+from applypilot.apply import application_actor as application_actor_mod
+from applypilot.apply.contracts import contract_json
 from applypilot.apply.email_routing import (
     normalize_prepared_email_application,
     normalize_sent_receipt,
@@ -670,15 +672,49 @@ def _worker_loop_with_port(
                     login_duration,
                 )
 
+            job["_application_actor_new_session_retries_remaining"] = int(
+                requested_browser_backend == "auto"
+                and active_browser_backend == "edge"
+                and not cloak_fallback_used
+            )
             result, duration_ms = execute_entry_turn()
 
-            fallback_route = cloak_fallback_route(
-                result,
-                requested_browser_backend=requested_browser_backend,
-                phase="prepare",
-                current_runtime=active_browser_backend,
-                fallback_already_used=cloak_fallback_used,
+            raw_turn = job.get("_agent_turn_result")
+            run_id = (
+                str(raw_turn.get("run_id") or "")
+                if isinstance(raw_turn, dict)
+                else ""
+            ) or f"worker-{worker_id}:prepare"
+            actor_attempt_id = str(
+                job.get("_attempt_id") or job.get("url") or f"worker-{worker_id}:attempt"
             )
+            actor_state = application_actor_mod.ApplicationActorState(
+                run_id=run_id,
+                attempt_id=actor_attempt_id,
+                application_id=str(job.get("url") or actor_attempt_id),
+                page_id=str(job.get("application_url") or job.get("url") or actor_attempt_id),
+                write_owner=str(getattr(active_route, "submit_owner", "playwright")),
+                phase="verify",
+                submission_uncertain=str(result).casefold() == "submission_uncertain",
+                new_session_retries_remaining=int(
+                    job["_application_actor_new_session_retries_remaining"]
+                ),
+            )
+            actor_decision = application_actor_mod.decision_for_status(actor_state, result)
+            job["_application_actor_decision"] = contract_json(actor_decision)
+            recovery_action = actor_decision.recovery_action
+            fallback_route = None
+            if (
+                recovery_action is not None
+                and recovery_action.action == "retry_new_session"
+            ):
+                fallback_route = cloak_fallback_route(
+                    result,
+                    requested_browser_backend=requested_browser_backend,
+                    phase="prepare",
+                    current_runtime=active_browser_backend,
+                    fallback_already_used=cloak_fallback_used,
+                )
             if fallback_route is not None:
                 edge_block_result = result
                 cloak_fallback_used = True
@@ -739,6 +775,7 @@ def _worker_loop_with_port(
                         "session_cookies_restored": restored_cookies,
                         "submit_started": False,
                     })
+                    job["_application_actor_new_session_retries_remaining"] = 0
                     result, stealth_duration = execute_entry_turn()
                     duration_ms += stealth_duration
                 except Exception as exc:
