@@ -608,18 +608,44 @@ def mark_job(
     url: str,
     status: str,
     reason: str | None = None,
-) -> None:
+) -> str:
     """Manually mark a job's apply status in the database.
 
     Args:
         url: Job URL to mark.
         status: Either 'applied' or 'failed'.
         reason: Failure reason (only for status='failed').
+
+    Returns:
+        The canonical job URL that was updated.
+
+    Raises:
+        LookupError: No job matches the supplied canonical or application URL.
+        ValueError: The status is invalid or an application URL is ambiguous.
     """
+    if status not in {"applied", "failed"}:
+        raise ValueError("status must be 'applied' or 'failed'")
+
     conn = connection
+    row = conn.execute("SELECT url FROM jobs WHERE url = ?", (url,)).fetchone()
+    if row is not None:
+        canonical_url = str(row[0])
+    else:
+        rows = conn.execute(
+            "SELECT url FROM jobs WHERE application_url = ? ORDER BY url LIMIT 2",
+            (url,),
+        ).fetchall()
+        if not rows:
+            raise LookupError(f"No job found for URL: {url}")
+        if len(rows) > 1:
+            raise ValueError(
+                "Application URL matches multiple jobs; use the canonical job URL instead."
+            )
+        canonical_url = str(rows[0][0])
+
     now = datetime.now(UTC).isoformat()
     if status == "applied":
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_retry_blocked = 0, apply_retry_reason = NULL,
@@ -627,15 +653,19 @@ def mark_job(
                            application_evidence = 'manually_marked_applied',
                            application_recorded_at = ?
             WHERE url = ?
-        """, (now, now, url))
+        """, (now, now, canonical_url))
     else:
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
                            apply_retry_blocked = 1, apply_retry_reason = ?,
                            agent_id = NULL
             WHERE url = ?
-        """, (reason or "manual", reason or "manual", url))
+        """, (reason or "manual", reason or "manual", canonical_url))
+    if cursor.rowcount != 1:
+        conn.rollback()
+        raise LookupError(f"Job disappeared before status update: {canonical_url}")
     conn.commit()
+    return canonical_url
 
 
 def reset_failed(connection: sqlite3.Connection) -> int:

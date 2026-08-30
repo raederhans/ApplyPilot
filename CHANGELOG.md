@@ -2,6 +2,14 @@
 
 All notable changes to ApplyPilot will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Manual `apply --mark-applied` and `--mark-failed` updates now accept either
+  the canonical job URL or one uniquely matching application URL, and fail
+  clearly instead of reporting success when no database row was updated.
+
 ## [0.4.0] - 2026-08-26
 
 ### Changed

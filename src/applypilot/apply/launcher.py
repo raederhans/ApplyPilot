@@ -953,8 +953,8 @@ def _mark_runtime_cover_not_required(job: dict) -> dict:
     return application_jobs_mod.mark_runtime_cover_not_required(get_connection(), job)
 
 
-def mark_job(url: str, status: str, reason: str | None = None) -> None:
-    application_jobs_mod.mark_job(get_connection(), url, status, reason)
+def mark_job(url: str, status: str, reason: str | None = None) -> str:
+    return application_jobs_mod.mark_job(get_connection(), url, status, reason)
 
 
 def reset_failed() -> int:
