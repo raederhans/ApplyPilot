@@ -889,9 +889,7 @@ def _application_profile() -> dict:
             "earliest_start_date": "2026-11-10",
             "generic_application_availability_date": "2026-11-10",
             "credit_bearing_internship_start": "2026-11-10",
-            "credit_bearing_internship_hours_per_week": "40+",
-            "non_credit_internship_start": "Immediately",
-            "non_credit_internship_hours_per_week_max": 16,
+            "credit_bearing_internship_hours_per_week": "Full-time",
         },
         "compensation": {
             "salary_expectation": "Negotiable",
@@ -922,9 +920,8 @@ def _application_profile() -> dict:
             "has_transportation": "Yes",
             "willing_to_sign_nda": "Yes",
             "employment_or_non_compete_restrictions": "None",
-            "available_for_full_time_3_6_month_internship_starting_september": False,
             "prior_internship_product_startup_logistics_ecommerce_b2b_saas": False,
-            "previously_worked_for_target_employer": "Determine per employer; never assume",
+            "previously_worked_for_target_employer": "No",
         },
         "eeo_voluntary": {},
         "authentication": {
@@ -958,6 +955,7 @@ def _application_profile() -> dict:
             }
         ],
         "application_source": {
+            "use_actual_discovery_source": True,
             "form_source_default": "Other",
             "form_source_fallback": "Company website",
         },
@@ -1021,7 +1019,7 @@ def test_profile_summary_uses_configured_screening_and_full_address() -> None:
     summary = prompt._build_profile_summary(_application_profile())
 
     assert "19 Jurong West Ave 5, #15/17, Singapore, Singapore, 649491" in summary
-    assert "Previously Worked Here: Determine per employer; never assume" in summary
+    assert "Previously Worked Here: No" in summary
     assert "Salary Strategy (SGD): Negotiable" in summary
     assert "Country/Region of Birth: China" in summary
     assert "Citizenship/Nationality: China" in summary
@@ -1031,8 +1029,48 @@ def test_routine_form_defaults_are_not_escalated_to_manual_review() -> None:
     defaults = prompt._build_routine_form_defaults_section(_application_profile())
 
     assert "Country/Region of Birth -> China" in defaults
-    assert 'Prefer "Other"' in defaults
+    assert "Use the actual discovery source when it is available" in defaults
+    assert 'Otherwise prefer "Other"' in defaults
     assert "Do not stop" in defaults
+
+
+def test_education_country_facts_are_explicit_and_not_inferred_from_nationality() -> None:
+    profile = _application_profile()
+    profile["education"] = [
+        {
+            "institution": "Nanyang Technological University",
+            "country": "Singapore",
+            "degree": "Master of Computing",
+            "expected_graduation": "May 2027",
+        },
+        {
+            "institution": "University of Pennsylvania",
+            "country": "United States",
+            "degree": "Master of City Planning",
+            "graduation": "May 2026",
+            "gpa": "3.46/4.0",
+        },
+        {
+            "institution": "University College London",
+            "country": "United Kingdom",
+            "degree": "BSc Urban Planning",
+            "graduation": "May 2024",
+            "gpa": "3.7/4.0",
+        },
+    ]
+    profile["education_country_answer_policy"] = (
+        "For a generic singular 'Study or Graduated In' field, use Singapore "
+        "for the current NTU programme. Never substitute nationality or country of birth."
+    )
+
+    summary = prompt._build_profile_summary(profile)
+    defaults = prompt._build_routine_form_defaults_section(profile)
+
+    assert "Country of study Singapore" in summary
+    assert "Country of study United States" in summary
+    assert "GPA 3.46/4.0" in summary
+    assert "University College London -> United Kingdom" in defaults
+    assert "Never substitute nationality or country of birth" in defaults
 
 
 def test_contextual_application_facts_and_soft_availability_are_rendered() -> None:
@@ -1297,7 +1335,8 @@ def test_standing_screening_facts_render_only_their_exact_confirmed_scope() -> N
         assert fact in summary
         assert fact in screening
     assert "do not answer other identity, criminal, work-authorization" in screening
-    assert "Target-employer prior employment still requires exact-employer evidence" in screening
+    assert "Previous employment at this employer: No" in screening
+    assert "Use the configured previous-employment fact" in screening
 
 
 def test_missing_standing_screening_facts_remain_manual_review() -> None:
@@ -1318,7 +1357,7 @@ def test_missing_standing_screening_facts_remain_manual_review() -> None:
         "Family/close relationship with government influence over target employer: Manual review"
         in screening
     )
-    assert "Previously Worked Here: Determine per employer; never assume" in summary
+    assert "Previously Worked Here: No" in summary
 
 
 def test_screening_allows_supported_adjacent_category_but_not_exact_tool_claim() -> None:
@@ -2783,7 +2822,6 @@ def test_pre_submit_snapshot_enforces_identity_resume_and_hard_answers() -> None
     assert "resume_not_uploaded" in issues
     assert "legal_name_mismatch" in issues
     assert "current_location_not_singapore" in issues
-    assert "hard_answer_mismatch:starting_september" in issues
 
 
 def test_pre_submit_snapshot_ignores_optional_blank_answers_and_accepts_location_aliases() -> None:
@@ -2813,7 +2851,7 @@ def test_pre_submit_snapshot_ignores_optional_blank_answers_and_accepts_location
     assert any(item["field_semantic"] == "current_location" for item in mappings)
 
 
-def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limit() -> None:
+def test_pre_submit_snapshot_validates_reusable_legal_answers() -> None:
     profile = _application_profile()
     profile["application_facts"].extend(
         [
@@ -2826,8 +2864,8 @@ def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limi
         "application_url": "https://jobs.ashbyhq.com/simular/example/application",
         "title": "Data Analyst Intern",
         "company_name": "Simular",
-        "full_description": "Part-time internship in Singapore.",
-        "application_readiness_reason": "Confirmed non-credit part-time internship.",
+        "full_description": "Full-time internship in Singapore.",
+        "application_readiness_reason": "Confirmed full-time internship.",
     }
     snapshot = {
         "url": job["application_url"],
@@ -2839,7 +2877,7 @@ def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limi
         "email_values": ["applicant@example.com.extra"],
         "current_location_values": ["Singapore"],
         "select_fields": [],
-        "text_fields": [{"text": "How many hours per week?", "value": "40"}],
+        "text_fields": [],
         "radio_questions": [
             {"text": "Are you a U.S. Person?", "selected": "Yes"},
             {"text": "Are you currently in F-1, CPT, or OPT status?", "selected": "Yes"},
@@ -2867,11 +2905,9 @@ def test_pre_submit_snapshot_validates_reusable_legal_answers_and_part_time_limi
         "hard_answer_mismatch:employment_or_non_compete_restrictions",
         "hard_answer_mismatch:criminal_convictions_to_disclose",
         "hard_answer_mismatch:background_check",
-        "non_credit_hours_exceed_confirmed_limit",
     } <= set(issues)
 
     snapshot["email_values"] = [profile["personal"]["email"]]
-    snapshot["text_fields"][0]["value"] = "16"
     for question in snapshot["radio_questions"]:
         question["selected"] = (
             "Yes"
@@ -3353,15 +3389,47 @@ def test_smartrecruiters_oneclick_url_is_bound_to_same_tenant_and_ready_form(
     assert ("unexpected_application_url" in issues) is expected_issue
 
 
-def test_smartrecruiters_same_tenant_route_without_final_control_is_not_bound() -> None:
-    assert not page_observation._same_bound_application_flow(
-        "https://jobs.smartrecruiters.com/Grab/744000145885499-role",
-        (
-            "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
-            "4df5dd16-4fc7-48b4-a943-492fbc508b62/screening?dcr_ci=Grab"
-        ),
-        {"submit_control_count": 0, "captcha_visible": False},
+def test_smartrecruiters_route_identity_is_separate_from_form_readiness() -> None:
+    expected_url = (
+        "https://jobs.smartrecruiters.com/Grab/744000145885499-role"
     )
+    actual_url = (
+        "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/publication/"
+        "4df5dd16-4fc7-48b4-a943-492fbc508b62/screening?dcr_ci=Grab"
+    )
+    binding = {
+        "provider": "smartrecruiters",
+        "tenant": "Grab",
+        "posting_id": "744000145885499",
+        "publication_id": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+        "resolved": True,
+    }
+    snapshot = {
+        "url": actual_url,
+        "required_unfilled": [],
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "full_name_values": ["Taylor Chen"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "radio_questions": [],
+        "submit_control_count": 0,
+        "captcha_visible": False,
+    }
+
+    assert page_observation._same_bound_application_flow(
+        expected_url,
+        actual_url,
+        snapshot,
+        binding,
+    )
+    issues = launcher._validate_pre_submit_snapshot(
+        snapshot,
+        _application_profile(),
+        {"url": expected_url, "_ats_application_binding": binding},
+    )
+    assert "unexpected_application_url" not in issues
+    assert "submit_control_missing" in issues
 
 
 def test_smartrecruiters_final_page_uses_same_turn_resume_upload_proof() -> None:
@@ -3580,6 +3648,52 @@ def test_exact_submission_acquisition_accepts_verified_no_cover(
     assert empty_acquisition["candidate_rows"] == 0
     assert empty_acquisition["admission_rows_scanned"] == 0
     assert empty_acquisition["total_ms"] >= 0
+
+
+def test_application_acquisition_retires_resume_with_stale_profile_gpa(
+    monkeypatch, tmp_path: Path
+) -> None:
+    conn = init_db(tmp_path / "jobs.db")
+    resume = tmp_path / "stale-resume.txt"
+    resume.write_text(
+        "University of Pennsylvania, Master of City Planning, GPA: 3.6",
+        encoding="utf-8",
+    )
+    resume_pdf = resume.with_suffix(".pdf")
+    resume_pdf.write_bytes(b"%PDF-stale-gpa-sidecar-binding")
+    url = "https://example.com/stale-gpa"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
+        "full_description, tailored_resume_path, tailor_status, cover_letter_status, "
+        "eligibility_status, fit_score) VALUES (?, 'Data Intern', 'Example', 'lever', "
+        "'lever', ?, 'Verified JD', ?, 'machine_validated', 'not_required', 'eligible', 8)",
+        (url, url, str(resume_pdf)),
+    )
+    conn.commit()
+    profile = _application_profile()
+    profile["education"] = [
+        {
+            "institution": "University of Pennsylvania",
+            "gpa": "3.46/4.0",
+            "gpa_may_be_disclosed": True,
+        }
+    ]
+    profile["submission_policy"]["trusted_external_application_hosts"] = [
+        "example.com"
+    ]
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+
+    acquired = launcher.acquire_job(target_url=url, preview_only=False)
+
+    assert acquired is None
+    stored = conn.execute(
+        "SELECT tailored_resume_path, tailor_status, tailor_error FROM jobs WHERE url=?",
+        (url,),
+    ).fetchone()
+    assert stored["tailored_resume_path"] is None
+    assert stored["tailor_status"] == "stale_profile_fact"
+    assert "current profile records 3.46" in stored["tailor_error"]
 
 
 def test_submission_uncertain_requires_manual_review_and_is_not_reacquired(
@@ -3875,21 +3989,23 @@ def test_tailoring_prompts_forbid_related_tools_and_minor_stretches() -> None:
     assert "Do not turn a JD responsibility into candidate history" in generation_prompt
 
 
-def test_cover_letter_email_policy_blocks_specific_start_dates(tmp_path: Path) -> None:
+def test_cover_letter_email_policy_uses_confirmed_full_time_dates(tmp_path: Path) -> None:
     profile = {
         "personal": {"full_name": "Taylor Chen"},
         "skills_boundary": {"languages": ["Python"]},
         "resume_facts": {},
         "availability": {
-            "credit_bearing_internship_start": "January 2027",
-            "generic_application_availability_date": "2026-10-15",
+            "credit_bearing_internship_start": "2026-11-10",
+            "generic_application_availability_date": "2026-11-10",
+            "internship_end_date": "2027-06-30",
         },
         "work_authorization": {
             "require_sponsorship": "No for a programme-credit-bearing internship",
         },
         "contact_preferences": {
             "email_application_availability_policy": (
-                "Do not state a specific internship start date in application emails."
+                "When relevant, state full-time availability from 2026-11-10 through "
+                "2027-06-30."
             ),
             "email_application_work_authorization_statement": (
                 "I can undertake the internship on a programme-credit-bearing basis and "
@@ -3903,11 +4019,14 @@ def test_cover_letter_email_policy_blocks_specific_start_dates(tmp_path: Path) -
     evidence = cover_letter.load_evidence_sources(profile, primary_path, "Verified resume")
     profile_evidence = evidence[-1]["text"]
 
-    assert "Do not disclose or infer any exact internship start date" in prompt_text
+    assert "Use the flexible confirmed month range" in prompt_text
     assert "programme-credit-bearing basis" in prompt_text
-    assert "Do not add a sentence offering, proposing, or negotiating a start date" in prompt_text
-    assert "January 2027" not in profile_evidence
-    assert "2026-10-15" not in profile_evidence
+    assert "Never invent an earlier date, a weekly-hours cap" in prompt_text
+    assert "2026-11-10" in prompt_text
+    assert "2027-06-30" in prompt_text
+    assert "2026-11-10" in profile_evidence
+    assert "2027-06-30" in profile_evidence
+    assert "Do not disclose a specific internship start date" not in profile_evidence
     assert "Approved email work-authorization statement" in profile_evidence
 
 

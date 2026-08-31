@@ -13,14 +13,41 @@ import sqlite3
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 from applypilot import config
+from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.scoring.validator import current_profile_resume_fact_errors
 
 logger = logging.getLogger(__name__)
 
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _material_profile_fact_errors(job: dict, profile: dict) -> list[str]:
+    """Return current-profile conflicts in an otherwise validated resume."""
+    path = Path(str(job.get("tailored_resume_path") or ""))
+    if not path.is_file():
+        return []
+    if path.suffix.casefold() == ".pdf":
+        text_sidecar = path.with_suffix(".txt")
+        if text_sidecar.is_file():
+            text = read_resume_source(text_sidecar)
+        else:
+            try:
+                from pypdf import PdfReader
+
+                text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+            except Exception:  # noqa: BLE001 - legacy/synthetic PDFs may not expose text
+                return []
+    else:
+        try:
+            text = read_resume_source(path)
+        except (OSError, ValueError):
+            return []
+    return current_profile_resume_fact_errors(text, profile)
 
 
 def revalidate_duplicate_before_submit(
@@ -246,6 +273,7 @@ def acquire_job(
                 rows = []
 
         admission_rows_scanned = 0
+        retired_stale_materials = 0
         phase_started = time.perf_counter()
         for candidate in rows:
             admission_rows_scanned += 1
@@ -253,6 +281,21 @@ def acquire_job(
             candidate_job["application_url"] = (
                 candidate_job.get("application_url") or candidate_job.get("url")
             )
+            material_fact_errors = _material_profile_fact_errors(candidate_job, profile)
+            if material_fact_errors:
+                material_error = "stale_profile_fact:" + "; ".join(material_fact_errors)
+                conn.execute(
+                    "UPDATE jobs SET tailored_resume_path=NULL, "
+                    "tailor_status='stale_profile_fact', tailor_error=? WHERE url=?",
+                    (material_error, candidate_job["url"]),
+                )
+                retired_stale_materials += 1
+                logger.warning(
+                    "Retiring stale application resume for %s: %s",
+                    candidate_job["url"][:80],
+                    material_error,
+                )
+                continue
             candidate_admission = evaluate_submission_admission(
                 candidate_job,
                 profile,
@@ -289,10 +332,14 @@ def acquire_job(
             break
         acquisition_performance["admission_scan_ms"] = _elapsed_ms(phase_started)
         acquisition_performance["admission_rows_scanned"] = admission_rows_scanned
+        acquisition_performance["stale_materials_retired"] = retired_stale_materials
 
         if not row:
             acquisition_performance["outcome"] = "empty"
-            conn.rollback()
+            if retired_stale_materials:
+                conn.commit()
+            else:
+                conn.rollback()
             return None
 
         apply_url = row["application_url"] or row["url"]
@@ -360,6 +407,9 @@ def acquire_job(
         conn.commit()
 
         acquired = dict(row)
+        acquired["application_url"] = (
+            acquired.get("application_url") or acquired.get("url")
+        )
         acquired["_attempt_id"] = attempt_id
         acquisition_performance["outcome"] = "acquired"
         acquisition_performance["total_ms"] = _elapsed_ms(acquisition_started)

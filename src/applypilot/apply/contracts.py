@@ -8,6 +8,7 @@ new runtimes and workflows can extend them without changing the core package.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -29,6 +30,8 @@ _FORBIDDEN_PERSISTED_KEYS = {
     "cookies",
     "credential",
     "credentials",
+    "fin",
+    "fin_number",
     "otp",
     "body",
     "email_body",
@@ -36,12 +39,22 @@ _FORBIDDEN_PERSISTED_KEYS = {
     "message_body",
     "page_handle",
     "password",
+    "passport_number",
+    "national_id_number",
+    "nric",
+    "nric_number",
+    "identity_number",
     "secret",
     "session_cookie",
     "security_code",
     "token",
     "verification_code",
 }
+
+_PROTECTED_IDENTIFIER_VALUE = re.compile(
+    r"(?<![A-Z0-9])[A-Z][0-9]{7}[A-Z](?![A-Z0-9])",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> datetime:
@@ -51,6 +64,12 @@ def utc_now() -> datetime:
 def _required(value: str, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} is required")
+
+
+def application_actor_id(attempt_id: str) -> str:
+    """Return the stable durable actor identity for one application attempt."""
+    _required(attempt_id, "attempt_id")
+    return f"application:{attempt_id}"
 
 
 def _aware(value: datetime, name: str) -> None:
@@ -102,6 +121,10 @@ def ensure_persistable(value: object, *, path: str = "$") -> JsonValue:
         elif isinstance(item, list):
             for index, child in enumerate(item):
                 visit(child, f"{current}[{index}]")
+        elif isinstance(item, str) and _PROTECTED_IDENTIFIER_VALUE.search(item):
+            raise ValueError(
+                f"{current} contains a protected identity number; store a reference instead"
+            )
 
     visit(copied, path)
     return copied
@@ -260,14 +283,26 @@ class AgentRunRequest:
     objective: str
     context: Mapping[str, object] = field(default_factory=dict)
     available_tools: tuple[str, ...] = ()
+    actor_id: str = ""
+    turn_id: str = ""
     parent_run_id: str | None = None
     proposal_group_id: str | None = None
     concurrency_mode: str = "adaptive"
     created_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        actor_id = self.actor_id or application_actor_id(self.attempt_id)
+        turn_id = self.turn_id or self.run_id
+        object.__setattr__(self, "actor_id", actor_id)
+        object.__setattr__(self, "turn_id", turn_id)
         for name in ("run_id", "attempt_id", "agent_role", "phase", "objective", "concurrency_mode"):
             _required(getattr(self, name), name)
+        _required(self.actor_id, "actor_id")
+        _required(self.turn_id, "turn_id")
+        if self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
         _aware(self.created_at, "created_at")
         ensure_persistable(self.context, path="$.context")
         _strings(self.available_tools, "available_tools")
@@ -314,6 +349,37 @@ HumanInterruptionType = Literal[
     "human_boundary",
 ]
 DecisionDisposition = Literal["advance", "recover", "checkpoint", "complete"]
+RecoveryCommandName = Literal[
+    "retry_same_application",
+    "retry_new_session",
+    "enqueue_receipt_reconciliation",
+    "park_exception",
+    "enqueue_human_handoff",
+    "record_no_retry",
+]
+RecoveryEffectScope = Literal[
+    "same_application",
+    "new_session",
+    "receipt_reconciliation",
+    "exception_queue",
+    "human_handoff",
+    "none",
+]
+RecoveryExecutionStage = Literal["started", "executed", "verified", "failed"]
+RecoveryTerminalStatus = Literal[
+    "completed",
+    "failed",
+    "terminated",
+    "timed_out",
+    "canceled",
+]
+ExceptionQueueKind = Literal[
+    "parked",
+    "capability",
+    "receipt_reconciliation",
+    "human_only",
+    "recovery_execution",
+]
 
 _RECOVERY_ACTION_NAMES = frozenset(
     {
@@ -337,6 +403,35 @@ _HUMAN_INTERRUPTION_TYPES = frozenset(
     }
 )
 _DECISION_DISPOSITIONS = frozenset({"advance", "recover", "checkpoint", "complete"})
+_RECOVERY_COMMAND_EFFECTS: dict[str, str] = {
+    "retry_same_application": "same_application",
+    "retry_new_session": "new_session",
+    "enqueue_receipt_reconciliation": "receipt_reconciliation",
+    "park_exception": "exception_queue",
+    "enqueue_human_handoff": "human_handoff",
+    "record_no_retry": "none",
+}
+_RECOVERY_COMMAND_ACTIONS: dict[str, frozenset[str]] = {
+    "retry_same_application": frozenset({"retry_same_application"}),
+    "retry_new_session": frozenset({"retry_new_session"}),
+    "enqueue_receipt_reconciliation": frozenset({"reconcile_receipt"}),
+    "park_exception": frozenset({"requires_capability", "park"}),
+    "enqueue_human_handoff": frozenset({"human_only"}),
+    "record_no_retry": frozenset({"no_retry"}),
+}
+_RECOVERY_EXECUTION_STAGES = frozenset({"started", "executed", "verified", "failed"})
+_RECOVERY_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "terminated", "timed_out", "canceled"}
+)
+_EXCEPTION_QUEUE_KINDS = frozenset(
+    {
+        "parked",
+        "capability",
+        "receipt_reconciliation",
+        "human_only",
+        "recovery_execution",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +478,159 @@ class HumanInterruption:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryCommand:
+    """Policy-admitted recovery effect with no Submit or ledger authority."""
+
+    command_id: str
+    run_id: str
+    attempt_id: str
+    actor_id: str
+    turn_id: str
+    command: RecoveryCommandName
+    effect_scope: RecoveryEffectScope
+    recovery_action: RecoveryActionName
+    failure_category: str
+    next_action: str
+    retry_budget_remaining: int = 0
+    policy_reason: str = "recovery_policy_v1_admitted"
+    payload: Mapping[str, object] = field(default_factory=dict)
+    submit_authority: bool = False
+    page_write_authority: bool = False
+    ledger_write_authority: bool = False
+    schema_version: str = "1"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "command_id",
+            "run_id",
+            "attempt_id",
+            "actor_id",
+            "turn_id",
+            "failure_category",
+            "next_action",
+            "policy_reason",
+        ):
+            _required(getattr(self, name), name)
+        if self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
+        expected_scope = _RECOVERY_COMMAND_EFFECTS.get(self.command)
+        if expected_scope is None:
+            raise ValueError(f"unsupported recovery command: {self.command}")
+        if self.effect_scope != expected_scope:
+            raise ValueError("recovery command effect_scope does not match command")
+        if self.recovery_action not in _RECOVERY_ACTION_NAMES:
+            raise ValueError(f"unsupported recovery action: {self.recovery_action}")
+        if self.recovery_action not in _RECOVERY_COMMAND_ACTIONS[self.command]:
+            raise ValueError("recovery command does not match the admitted recovery action")
+        if (
+            isinstance(self.retry_budget_remaining, bool)
+            or not isinstance(self.retry_budget_remaining, int)
+            or self.retry_budget_remaining < 0
+        ):
+            raise ValueError("retry_budget_remaining must be a non-negative integer")
+        if self.submit_authority or self.page_write_authority or self.ledger_write_authority:
+            raise ValueError("recovery commands cannot claim Submit, page-write, or ledger authority")
+        if self.schema_version != "1":
+            raise ValueError("unsupported RecoveryCommand schema_version")
+        ensure_persistable(self.payload, path="$.payload")
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryExecutionResult:
+    """One immutable lifecycle result for an allowlisted recovery command."""
+
+    result_id: str
+    command_id: str
+    run_id: str
+    attempt_id: str
+    actor_id: str
+    turn_id: str
+    stage: RecoveryExecutionStage
+    outcome: str
+    terminal_status: RecoveryTerminalStatus | None = None
+    details: Mapping[str, object] = field(default_factory=dict)
+    schema_version: str = "1"
+    occurred_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "result_id",
+            "command_id",
+            "run_id",
+            "attempt_id",
+            "actor_id",
+            "turn_id",
+            "outcome",
+        ):
+            _required(getattr(self, name), name)
+        if self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
+        if self.stage not in _RECOVERY_EXECUTION_STAGES:
+            raise ValueError(f"unsupported recovery execution stage: {self.stage}")
+        if self.stage in {"started", "executed"} and self.terminal_status is not None:
+            raise ValueError("non-terminal recovery stages cannot have terminal_status")
+        if self.stage == "verified" and self.terminal_status != "completed":
+            raise ValueError("verified recovery result must be completed")
+        if self.stage == "failed" and self.terminal_status not in (
+            _RECOVERY_TERMINAL_STATUSES - {"completed"}
+        ):
+            raise ValueError("failed recovery result requires a failure terminal_status")
+        if self.schema_version != "1":
+            raise ValueError("unsupported RecoveryExecutionResult schema_version")
+        _aware(self.occurred_at, "occurred_at")
+        ensure_persistable(self.details, path="$.details")
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationException:
+    """One durable parked application item that never grants execution authority."""
+
+    exception_id: str
+    command_id: str
+    run_id: str
+    attempt_id: str
+    actor_id: str
+    turn_id: str
+    queue_kind: ExceptionQueueKind
+    failure_category: str
+    next_action: str
+    status: str = "open"
+    context: Mapping[str, object] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+    resolved_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "exception_id",
+            "command_id",
+            "run_id",
+            "attempt_id",
+            "actor_id",
+            "turn_id",
+            "failure_category",
+            "next_action",
+            "status",
+        ):
+            _required(getattr(self, name), name)
+        if self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
+        if self.queue_kind not in _EXCEPTION_QUEUE_KINDS:
+            raise ValueError(f"unsupported exception queue kind: {self.queue_kind}")
+        if self.status not in {"open", "resolved"}:
+            raise ValueError(f"unsupported exception status: {self.status}")
+        _aware(self.created_at, "created_at")
+        if self.resolved_at is not None:
+            _aware(self.resolved_at, "resolved_at")
+        ensure_persistable(self.context, path="$.context")
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionEnvelope:
     """Structured shadow decision consumed by existing control-plane code."""
 
@@ -393,18 +641,39 @@ class DecisionEnvelope:
     next_phase: str
     recovery_action: RecoveryAction | None = None
     human_interruption: HumanInterruption | None = None
+    actor_id: str = ""
+    turn_id: str = ""
+    upcast_from_schema_version: str | None = None
+    fresh_turn_resume_authorized: bool = False
     shadow_only: bool = True
-    schema_version: str = "1"
+    schema_version: str = "2"
 
     def __post_init__(self) -> None:
+        actor_id = self.actor_id or application_actor_id(self.attempt_id)
+        turn_id = self.turn_id or self.run_id
+        object.__setattr__(self, "actor_id", actor_id)
+        object.__setattr__(self, "turn_id", turn_id)
         for name in ("run_id", "attempt_id", "phase", "next_phase"):
             _required(getattr(self, name), name)
+        _required(self.actor_id, "actor_id")
+        _required(self.turn_id, "turn_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
         if self.disposition not in _DECISION_DISPOSITIONS:
             raise ValueError(f"unsupported decision disposition: {self.disposition}")
         if self.shadow_only is not True:
             raise ValueError("DecisionEnvelope must remain shadow-only")
-        if self.schema_version != "1":
+        if self.schema_version != "2":
             raise ValueError("unsupported DecisionEnvelope schema_version")
+        if self.upcast_from_schema_version not in {None, "1"}:
+            raise ValueError("unsupported DecisionEnvelope upcast source")
+        if self.upcast_from_schema_version == "1":
+            if not self.actor_id.startswith("legacy:"):
+                raise ValueError("legacy DecisionEnvelope must use an isolated actor identity")
+        elif self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.fresh_turn_resume_authorized is not False:
+            raise ValueError("fresh-turn resume is not authorized by DecisionEnvelope v2")
         if self.disposition == "recover" and self.recovery_action is None:
             raise ValueError("recover disposition requires a RecoveryAction")
         if self.recovery_action is not None:
@@ -443,11 +712,27 @@ class ApplicationEvent:
     payload: Mapping[str, object] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     idempotency_key: str | None = None
+    actor_id: str | None = None
+    turn_id: str | None = None
+    schema_version: str = "1"
     occurred_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
         for name in ("event_id", "attempt_id", "run_id", "phase", "actor", "event_type"):
             _required(getattr(self, name), name)
+        if self.schema_version not in {"1", "2"}:
+            raise ValueError("unsupported ApplicationEvent schema_version")
+        if self.schema_version == "2":
+            if self.actor_id is None or self.turn_id is None:
+                raise ValueError("ApplicationEvent v2 requires actor_id and turn_id")
+            _required(self.actor_id, "actor_id")
+            _required(self.turn_id, "turn_id")
+            if self.actor_id != application_actor_id(self.attempt_id):
+                raise ValueError("actor_id must be the canonical identity for attempt_id")
+            if self.turn_id != self.run_id:
+                raise ValueError("run_id must remain the compatibility alias for turn_id")
+        if self.idempotency_key is not None:
+            _required(self.idempotency_key, "idempotency_key")
         _aware(self.occurred_at, "occurred_at")
         ensure_persistable(self.payload, path="$.payload")
         _strings(self.evidence_refs, "evidence_refs")
@@ -461,6 +746,12 @@ class AgentCheckpoint:
     phase: str
     sequence: int
     state: Mapping[str, object]
+    actor_id: str | None = None
+    turn_id: str | None = None
+    idempotency_key: str | None = None
+    expected_sequence: int | None = None
+    fresh_turn_resume_authorized: bool = False
+    schema_version: str = "1"
     created_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -468,6 +759,28 @@ class AgentCheckpoint:
             _required(getattr(self, name), name)
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence < 0:
             raise ValueError("sequence must be a non-negative integer")
+        if self.schema_version not in {"1", "2"}:
+            raise ValueError("unsupported AgentCheckpoint schema_version")
+        if self.fresh_turn_resume_authorized is not False:
+            raise ValueError("fresh-turn resume is not authorized by this checkpoint contract")
+        if self.schema_version == "2":
+            if self.actor_id is None or self.turn_id is None or self.idempotency_key is None:
+                raise ValueError("AgentCheckpoint v2 requires actor, turn, and idempotency identity")
+            _required(self.actor_id, "actor_id")
+            _required(self.turn_id, "turn_id")
+            _required(self.idempotency_key, "idempotency_key")
+            if self.actor_id != application_actor_id(self.attempt_id):
+                raise ValueError("actor_id must be the canonical identity for attempt_id")
+            if self.turn_id != self.run_id:
+                raise ValueError("run_id must remain the compatibility alias for turn_id")
+            if (
+                isinstance(self.expected_sequence, bool)
+                or not isinstance(self.expected_sequence, int)
+                or self.expected_sequence < 0
+            ):
+                raise ValueError("AgentCheckpoint v2 requires a non-negative expected_sequence")
+            if self.sequence != self.expected_sequence + 1:
+                raise ValueError("checkpoint sequence must equal expected_sequence + 1")
         _aware(self.created_at, "created_at")
         ensure_persistable(self.state, path="$.state")
 
@@ -506,7 +819,7 @@ def contract_json(value: object) -> dict[str, JsonValue]:
 
 
 def decision_envelope_from_mapping(value: Mapping[str, object]) -> DecisionEnvelope:
-    """Restore one persisted v1 actor decision without weakening its invariants."""
+    """Read a v2 decision or upcast a legacy v1 decision as read-only state."""
 
     def required_text(source: Mapping[str, object], key: str) -> str:
         item = source.get(key)
@@ -522,10 +835,26 @@ def decision_envelope_from_mapping(value: Mapping[str, object]) -> DecisionEnvel
             raise ValueError(f"DecisionEnvelope {key} must be a non-empty string or null")
         return item
 
-    if value.get("schema_version") != "1":
+    source_schema_version = value.get("schema_version")
+    if source_schema_version not in {"1", "2"}:
         raise ValueError("unsupported DecisionEnvelope schema_version")
     if value.get("shadow_only") is not True:
         raise ValueError("DecisionEnvelope must remain shadow-only")
+
+    run_id = required_text(value, "run_id")
+    if source_schema_version == "1":
+        actor_id = f"legacy:{run_id}"
+        turn_id = run_id
+        upcast_from_schema_version: str | None = "1"
+    else:
+        actor_id = required_text(value, "actor_id")
+        turn_id = required_text(value, "turn_id")
+        raw_upcast_source = value.get("upcast_from_schema_version")
+        if raw_upcast_source not in {None, "1"}:
+            raise ValueError("unsupported DecisionEnvelope upcast source")
+        upcast_from_schema_version = cast(str | None, raw_upcast_source)
+        if value.get("fresh_turn_resume_authorized") is not False:
+            raise ValueError("fresh-turn resume is not authorized by DecisionEnvelope v2")
 
     raw_recovery = value.get("recovery_action")
     recovery: RecoveryAction | None = None
@@ -559,7 +888,7 @@ def decision_envelope_from_mapping(value: Mapping[str, object]) -> DecisionEnvel
         )
 
     return DecisionEnvelope(
-        run_id=required_text(value, "run_id"),
+        run_id=run_id,
         attempt_id=required_text(value, "attempt_id"),
         phase=required_text(value, "phase"),
         disposition=cast(
@@ -569,8 +898,12 @@ def decision_envelope_from_mapping(value: Mapping[str, object]) -> DecisionEnvel
         next_phase=required_text(value, "next_phase"),
         recovery_action=recovery,
         human_interruption=interruption,
+        actor_id=actor_id,
+        turn_id=turn_id,
+        upcast_from_schema_version=upcast_from_schema_version,
+        fresh_turn_resume_authorized=False,
         shadow_only=True,
-        schema_version="1",
+        schema_version="2",
     )
 
 

@@ -89,6 +89,8 @@ def smoke_release(wheel: Path) -> None:
             child_env.pop(secret_name, None)
 
         _run([str(python), "-m", "pip", "install", str(wheel)], cwd=root, env=child_env)
+        applypilot = environment / ("Scripts/applypilot.exe" if os.name == "nt" else "bin/applypilot")
+        _run([str(applypilot), "resume-route", "--help"], cwd=root, env=child_env)
         base = [str(python), "-m", "applypilot.cli"]
         _run([*base, "--version"], cwd=root, env=child_env)
         _run(
@@ -138,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"Release smoke failed: {exc}", file=sys.stderr)
         return 1
-    print("Release smoke passed: install -> init -> doctor -> dashboard")
+    print("Release smoke passed: install -> resume-route help -> init -> doctor -> dashboard")
     return 0
 
 

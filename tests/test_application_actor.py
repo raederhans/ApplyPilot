@@ -20,6 +20,7 @@ from applypilot.apply.contracts import (
     ApplicationEvent,
     DecisionEnvelope,
     RecoveryAction,
+    application_actor_id,
     contract_json,
     decision_envelope_from_mapping,
 )
@@ -28,6 +29,8 @@ from applypilot.apply.contracts import (
 def actor(**changes: object) -> ApplicationActorState:
     values = {
         "run_id": "run-1",
+        "actor_id": application_actor_id("attempt-1"),
+        "turn_id": "run-1",
         "attempt_id": "attempt-1",
         "application_id": "application-1",
         "page_id": "page-1",
@@ -50,10 +53,13 @@ def event(
         event_id=f"event-{phase}-{event_type}",
         attempt_id="attempt-1",
         run_id="run-1",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-1",
         phase=phase,
         actor=actor_id,
         event_type=event_type,
         payload=payload or {},
+        schema_version="2",
     )
 
 
@@ -214,6 +220,8 @@ def test_technical_recovery_consumes_budget_before_parking() -> None:
 def test_real_turn_contract_yields_typed_human_request_without_free_text() -> None:
     request = AgentRunRequest(
         run_id="run-1",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-1",
         attempt_id="attempt-1",
         agent_role="browser-application-agent",
         phase="prepare",
@@ -232,6 +240,8 @@ def test_real_turn_contract_yields_typed_human_request_without_free_text() -> No
     assert human_request is not None
     assert human_request.request_type == "captcha"
     assert human_request.context["recovery_action"] == "human_only"
+    assert decision.actor_id == request.actor_id
+    assert decision.turn_id == request.turn_id
     assert "Do something vague" not in str(contract_json(human_request))
     with pytest.raises(ValueError, match="run_id does not match"):
         decision_for_turn(
@@ -268,14 +278,35 @@ def test_decision_envelope_cannot_claim_application_authority() -> None:
         decision_for_status(actor(), "ready_to_submit")
 
 
-def test_persisted_decision_envelope_round_trips_only_as_schema_v1() -> None:
+def test_persisted_decision_envelope_round_trips_as_v2_and_upcasts_v1_read_only() -> None:
     decision = decide_recovery(actor(phase="verify"), "failed:mfa")
     encoded = contract_json(decision)
 
+    assert encoded["schema_version"] == "2"
+    assert encoded["upcast_from_schema_version"] is None
+    assert encoded["fresh_turn_resume_authorized"] is False
     assert decision_envelope_from_mapping(encoded) == decision
 
+    legacy = dict(encoded)
+    legacy["schema_version"] = "1"
+    legacy.pop("actor_id")
+    legacy.pop("turn_id")
+    legacy.pop("upcast_from_schema_version")
+    legacy.pop("fresh_turn_resume_authorized")
+    upcast = decision_envelope_from_mapping(legacy)
+
+    assert upcast.schema_version == "2"
+    assert upcast.actor_id == f"legacy:{legacy['run_id']}"
+    assert upcast.turn_id == legacy["run_id"]
+    assert upcast.upcast_from_schema_version == "1"
+    assert upcast.fresh_turn_resume_authorized is False
+    with pytest.raises(ValueError, match="legacy|upcast|resume"):
+        apply_recovery(actor(phase="verify"), upcast)
+    with pytest.raises(ValueError, match="legacy|read-only"):
+        human_request_for_decision(upcast)
+
     unknown_version = dict(encoded)
-    unknown_version["schema_version"] = "2"
+    unknown_version["schema_version"] = "3"
     with pytest.raises(ValueError, match="schema_version"):
         decision_envelope_from_mapping(unknown_version)
 
@@ -298,6 +329,8 @@ def test_launcher_persists_typed_human_interruption_in_existing_control_plane(
     )
     request = AgentRunRequest(
         run_id="run-captcha",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-captcha",
         attempt_id="attempt-1",
         agent_role="browser-application-agent",
         phase="prepare",
@@ -316,9 +349,23 @@ def test_launcher_persists_typed_human_interruption_in_existing_control_plane(
         application_status="captcha",
         duration_ms=10,
         source="synthetic-test",
+        expected_checkpoint_sequence=0,
     )
 
     persisted_event, checkpoint, human_request = captured[0]
+    assert persisted_event.schema_version == "2"
+    assert persisted_event.actor_id == request.actor_id
+    assert persisted_event.turn_id == request.turn_id
+    assert checkpoint.schema_version == "2"
+    assert checkpoint.actor_id == request.actor_id
+    assert checkpoint.turn_id == request.turn_id
+    assert checkpoint.idempotency_key == persisted_event.idempotency_key
+    assert checkpoint.expected_sequence == 0
+    assert checkpoint.fresh_turn_resume_authorized is False
+    assert persisted_event.payload["actor_decision"]["schema_version"] == "1"
+    assert persisted_event.payload["actor_decision_v2"]["schema_version"] == "2"
+    assert persisted_event.payload["actor_decision_v2"]["actor_id"] == request.actor_id
+    assert checkpoint.state["actor_decision_v2"] == persisted_event.payload["actor_decision_v2"]
     assert persisted_event.payload["actor_decision"]["recovery_action"]["action"] == "human_only"
     assert checkpoint.state["actor_decision"] == persisted_event.payload["actor_decision"]
     assert human_request.request_type == "captcha"
@@ -337,6 +384,8 @@ def test_launcher_does_not_turn_recoverable_technical_failure_into_vague_human_r
     )
     request = AgentRunRequest(
         run_id="run-technical",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-technical",
         attempt_id="attempt-1",
         agent_role="browser-application-agent",
         phase="prepare",
@@ -355,13 +404,14 @@ def test_launcher_does_not_turn_recoverable_technical_failure_into_vague_human_r
         application_status=result.status,
         duration_ms=10,
         source="synthetic-test",
+        expected_checkpoint_sequence=0,
     )
 
     persisted_event, _checkpoint, human_request = captured[0]
     assert persisted_event.payload["actor_decision"]["recovery_action"]["action"] == "park"
     assert human_request is None
 
-    material_request = replace(request, run_id="run-material")
+    material_request = replace(request, run_id="run-material", turn_id="run-material")
     material_result = AgentTurnResult(
         run_id=material_request.run_id,
         status="failed:manual_review_required:required_document",
@@ -374,6 +424,7 @@ def test_launcher_does_not_turn_recoverable_technical_failure_into_vague_human_r
         application_status=material_result.status,
         duration_ms=10,
         source="synthetic-test",
+        expected_checkpoint_sequence=0,
     )
 
     material_event, _checkpoint, material_human_request = captured[1]
@@ -393,6 +444,8 @@ def test_submit_turn_cannot_advertise_a_fresh_browser_retry(
     )
     request = AgentRunRequest(
         run_id="run-submit-failure",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-submit-failure",
         attempt_id="attempt-1",
         agent_role="browser-application-agent",
         phase="submit",
@@ -412,6 +465,7 @@ def test_submit_turn_cannot_advertise_a_fresh_browser_retry(
         application_status=result.status,
         duration_ms=10,
         source="synthetic-test",
+        expected_checkpoint_sequence=0,
     )
 
     persisted_event, checkpoint, human_request = captured[0]

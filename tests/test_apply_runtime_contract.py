@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -19,7 +20,11 @@ from applypilot.apply import (
 )
 from applypilot.apply.email_routing import MailboxMcpSpec, mailbox_prepare_duplicate_receipt
 from applypilot.apply.run_progress import RunProgress
-from applypilot.database import init_db
+from applypilot.database import (
+    init_db,
+    list_application_exceptions,
+    list_recovery_execution_results,
+)
 
 
 def test_prepare_guidance_fragments_are_selected_from_job_context() -> None:
@@ -163,6 +168,7 @@ def test_submit_prompt_is_a_compact_phase_delta_without_resume_body() -> None:
     assert "single_writer" in built
     assert "Click the authorized final control exactly once" in built
     assert "receipt never authorizes a second click" in built
+    assert "Never preserve a checkbox by position or its earlier label" in built
     assert "IDENTITY AND ELIGIBILITY MATERIALS" in built
     assert "RESUME TEXT" not in built
     assert "COVER LETTER TEXT" not in built
@@ -979,6 +985,7 @@ def _run_worker_contract(
     performance_clock: list[float] | None = None,
     final_performance_records: list[dict] | None = None,
     acquire_error: Exception | None = None,
+    control_connection: sqlite3.Connection | None = None,
 ):
     job = {
         "url": "https://jobs.example.test/role",
@@ -1099,7 +1106,8 @@ def _run_worker_contract(
     launcher._stop_event.clear()
     monkeypatch.setattr(config, "load_profile", dict)
     monkeypatch.setattr(launcher, "_submission_rate_status", lambda *args: (True, 0, "ready"))
-    monkeypatch.setattr(launcher, "get_connection", lambda: object())
+    recovery_connection = control_connection or sqlite3.connect(":memory:")
+    monkeypatch.setattr(launcher, "get_connection", lambda: recovery_connection)
     queued = iter([job] if queued_jobs is None else queued_jobs)
     def fake_acquire(**kwargs):
         if acquire_calls is not None:
@@ -1726,6 +1734,78 @@ def test_worker_binds_smartrecruiters_identity_before_linkedin_route_resume(
     assert ledger[0][0] == "applied"
 
 
+def test_worker_rejects_unresolved_direct_smartrecruiters_identity_before_browser(
+    monkeypatch,
+) -> None:
+    smartrecruiters_url = (
+        "https://jobs.smartrecruiters.com/Grab/"
+        "744000145934539-intern-commercial-enablement-sales-enablement?oga=true"
+    )
+    launch_calls: list[tuple[tuple, dict]] = []
+    unresolved = {
+        "provider": "smartrecruiters",
+        "tenant": "Grab",
+        "posting_id": "744000145934539",
+        "resolved": False,
+        "reason": "identity_lookup_http_unavailable",
+    }
+    monkeypatch.setattr(
+        launcher,
+        "_run_read_only_preflight",
+        lambda _job: {
+            "provider": "smartrecruiters",
+            "ats_binding": unresolved,
+            "material_enforced_block": False,
+        },
+    )
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        job_overrides={
+            "url": smartrecruiters_url.split("?", 1)[0],
+            "application_url": smartrecruiters_url,
+            "source_site": "official:grab:smartrecruiters",
+        },
+        launch_calls=launch_calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == []
+    assert launch_calls == []
+    assert ledger == []
+    assert marked[0][0][1] == "failed"
+    assert "smartrecruiters_provider_identity_unresolved" in marked[0][0][2]
+    assert marked[0][1]["evidence"]["ats_application_binding"] == unresolved
+
+
+def test_worker_persists_blocking_pre_submit_audit_for_diagnosis(monkeypatch) -> None:
+    audit_report = {
+        "status": "attention",
+        "disposition": "block",
+        "page_url": (
+            "https://jobs.smartrecruiters.com/oneclick-ui/company/Grab/"
+            "publication/d2bb722a-a7b0-4049-85ac-be9c9d7a3d89/screening?dcr_ci=Grab"
+        ),
+        "issues": ["unexpected_application_url"],
+        "blocking_issues": ["unexpected_application_url"],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit"],
+        audit_results=[("pre_submit_audit:unexpected_application_url", audit_report)],
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert ledger == []
+    assert marked[0][0][1] == "failed"
+    assert marked[0][1]["evidence"]["pre_submit_audit"] == audit_report
+
+
 def test_worker_preserves_agent_result_when_linkedin_has_no_external_page(
     monkeypatch,
 ) -> None:
@@ -2165,6 +2245,48 @@ def test_worker_consumes_actor_park_decision_before_cloak_route(monkeypatch) -> 
     assert phases == ["prepare"]
     assert [call[1]["browser_backend"] for call in launches] == ["edge"]
     assert route_calls == []
+
+
+def test_worker_parks_one_attempt_and_continues_batch_to_confirmed_success(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    first = {
+        "url": "https://jobs.example.test/blocked",
+        "application_url": "https://jobs.example.test/blocked/apply",
+        "title": "Blocked role",
+        "company_name": "Example",
+        "description": "Blocked synthetic role",
+    }
+    second = {
+        "url": "https://jobs.example.test/success",
+        "application_url": "https://jobs.example.test/success/apply",
+        "title": "Successful role",
+        "company_name": "Example",
+        "description": "Successful synthetic role",
+    }
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["failed:unknown_new_failure", "ready_to_submit"],
+        queued_jobs=[first, second],
+        use_target_url=False,
+        limit=1,
+        control_connection=connection,
+    )
+
+    queued = list_application_exceptions(conn=connection)
+    lifecycle = list_recovery_execution_results(
+        attempt_id=first["url"],
+        conn=connection,
+    )
+    assert result == (1, 1)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert [entry[0][1] for entry in marked] == ["failed", "applied"]
+    assert len(queued) == 1
+    assert queued[0].attempt_id == first["url"]
+    assert queued[0].queue_kind == "parked"
+    assert [entry.stage for entry in lifecycle] == ["started", "executed", "verified"]
 
 
 def test_auto_browser_backend_does_not_retry_captcha(monkeypatch) -> None:

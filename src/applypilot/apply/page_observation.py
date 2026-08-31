@@ -142,11 +142,6 @@ def _same_bound_application_flow(
             and str(binding.get("posting_id") or "") == expected_posting_id
             and str(binding.get("publication_id") or "").casefold()
             == actual_publication_id.casefold()
-            and not snapshot.get("required_unfilled")
-            and not snapshot.get("sensitive_required_unknown")
-            and not snapshot.get("captcha_visible")
-            and not snapshot.get("assessment_visible")
-            and int(snapshot.get("submit_control_count") or 0) > 0
         )
 
     # Workday changes the URL from the public job route to a tenant-local
@@ -333,9 +328,15 @@ def _work_authorization_answers(profile: dict, job: dict) -> tuple[bool, bool] |
     )
     branch = None
     if "intern" in job_text:
-        if "non-credit" in job_text or "part-time" in job_text:
-            branch = policy.get("non_credit_internship")
-        branch = branch or policy.get("programme_credit_bearing_internship")
+        explicit_non_qualifying_route = re.search(
+            r"\bpart[ -]?time\b|\bnon[ -]?credit\b|"
+            r"\bnot\s+(?:eligible\s+)?for\s+academic\s+credit\b|"
+            r"\bnot\s+credit[ -]?bearing\b|\bno\s+academic\s+credit\b",
+            job_text,
+        )
+        if explicit_non_qualifying_route:
+            return None
+        branch = policy.get("programme_credit_bearing_internship")
     elif any(term in job_text for term in ("full-time", "full time", "permanent")):
         branch = policy.get("post_graduation_full_time")
     if not isinstance(branch, dict):
@@ -345,6 +346,48 @@ def _work_authorization_answers(profile: dict, job: dict) -> tuple[bool, bool] |
     if authorized is None or sponsorship is None:
         return None
     return authorized, sponsorship
+
+
+def _is_prior_target_employer_question(text: str, job: dict) -> bool:
+    """Identify employer-history questions without mistaking skill experience for one."""
+    history_language = bool(
+        (
+            re.search(r"\b(?:ever|previously|formerly|prior|before)\b", text)
+            and re.search(r"\b(?:work(?:ed)?|employ(?:ed|ee|ment)?)\b", text)
+        )
+        or re.search(r"\bformer\s+employee\b", text)
+    )
+    if not history_language:
+        return False
+
+    employer_scope = bool(
+        re.search(
+            r"\b(?:for|with|by|at)\s+(?:us|this company|the company|our company|"
+            r"this organization|the organization|our organization)\b|"
+            r"\bour\s+(?:affiliate|affiliates|subsidiary|subsidiaries)\b|"
+            r"\bhere\s+before\b",
+            text,
+        )
+    )
+    company = re.sub(
+        r"[^a-z0-9]+", " ", str(job.get("company_name") or "").casefold()
+    ).strip()
+    if company:
+        company_aliases = {company}
+        without_suffix = re.sub(
+            r"\s+(?:pte\s+ltd|private\s+limited|limited|ltd|inc|corp|corporation|llc)$",
+            "",
+            company,
+        ).strip()
+        if without_suffix:
+            company_aliases.add(without_suffix)
+        normalized_question = re.sub(r"[^a-z0-9]+", " ", text).strip()
+        employer_scope = employer_scope or any(
+            len(alias) >= 3
+            and re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", normalized_question)
+            for alias in company_aliases
+        )
+    return employer_scope
 
 
 def _expected_screening_answer(
@@ -373,14 +416,16 @@ def _expected_screening_answer(
     ) and work_answers is not None:
         return "legally_authorized_to_work", work_answers[0]
 
-    company = re.sub(r"[^a-z0-9]+", " ", str(job.get("company_name") or "").casefold()).strip()
-    employer_question = re.search(r"\b(previously|ever)\b.*\b(worked|employed)\b", text)
-    if employer_question and (not company or company in re.sub(r"[^a-z0-9]+", " ", text)):
-        preserved = {
-            re.sub(r"[^a-z0-9]+", " ", str(name).casefold()).strip()
-            for name in profile.get("resume_facts", {}).get("preserved_companies", [])
-        }
-        return "previously_worked_for_target_employer", company in preserved
+    if _is_prior_target_employer_question(text, job):
+        value = _application_fact_value(
+            profile, "prior_target_employer_history_policy"
+        ) or profile.get("screening", {}).get("previously_worked_for_target_employer")
+        expected = _yes_no_value(value)
+        return (
+            ("previously_worked_for_target_employer", expected)
+            if expected is not None
+            else None
+        )
 
     if re.search(r"non[ -]?compete|non[ -]?solicitation|contractual .*restrict|legal .*restrict", text):
         value = _application_fact_value(
@@ -841,9 +886,6 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
 
     screening = profile.get("screening", {})
     hard_answers = {
-        "starting_september": screening.get(
-            "available_for_full_time_3_6_month_internship_starting_september"
-        ),
         "startup_internship": screening.get(
             "prior_internship_product_startup_logistics_ecommerce_b2b_saas"
         ),
@@ -858,10 +900,7 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
             issues.append(legal_issue)
         expected: bool | None = None
         key = ""
-        if "starting september" in text and "full-time" in text:
-            key = "starting_september"
-            expected = hard_answers[key]
-        elif (
+        if (
             "prior internship" in text
             and "product-based startup" in text
             and any(term in text for term in ("logistics", "ecommerce", "b2b saas"))
@@ -914,20 +953,6 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
             generic_key, generic_value = generic_expected
             if not _selected_matches_boolean(selected, generic_value):
                 issues.append(f"hard_answer_mismatch:{generic_key}")
-
-    readiness_text = str(job.get("application_readiness_reason") or "").casefold()
-    non_credit_part_time = "non-credit" in readiness_text or "part-time" in readiness_text
-    weekly_limit = profile.get("availability", {}).get(
-        "non_credit_internship_hours_per_week_max"
-    )
-    if non_credit_part_time and isinstance(weekly_limit, (int, float)):
-        for field in snapshot.get("text_fields", []):
-            text = str(field.get("text") or "").casefold()
-            if not re.search(r"hours? (?:per|a) week|weekly hours?", text):
-                continue
-            match = re.search(r"\d+(?:\.\d+)?", str(field.get("value") or ""))
-            if match and float(match.group()) > float(weekly_limit):
-                issues.append("non_credit_hours_exceed_confirmed_limit")
 
     if snapshot.get("submit_control_count", 0) < 1:
         issues.append("submit_control_missing")
@@ -2009,6 +2034,47 @@ def _build_ats_fill_plan_snapshot(
     )
 
 
+_PROTECTED_IDENTIFIER_LABEL_RE = re.compile(
+    r"(?:^|\b)(?:nric\s*(?:/|or)\s*fin|nric|fin)"
+    r"(?:\s+(?:identification\s+)?(?:no\.?|number))?(?:\b|$)|"
+    r"passport\s+(?:no\.?|number)|"
+    r"national\s+id(?:entification)?\s+(?:no\.?|number)",
+    re.IGNORECASE,
+)
+
+
+def _redact_protected_identifier_snapshot(snapshot: dict[str, object]) -> None:
+    """Remove protected identifier values before validation or durable projection."""
+    for collection_name in (
+        "text_fields",
+        "select_fields",
+        "radio_questions",
+        "current_location_fields",
+    ):
+        collection = snapshot.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for raw_field in collection:
+            if not isinstance(raw_field, dict):
+                continue
+            descriptor = " ".join(
+                str(raw_field.get(key) or "")
+                for key in ("text", "label", "name", "id", "placeholder", "aria_label")
+            )
+            explicitly_protected = raw_field.get("protected_identifier") is True
+            if not explicitly_protected and not _PROTECTED_IDENTIFIER_LABEL_RE.search(
+                descriptor
+            ):
+                continue
+            for value_key in ("value", "selected"):
+                if value_key not in raw_field:
+                    continue
+                present = bool(str(raw_field.get(value_key) or "").strip())
+                raw_field[value_key] = "[redacted-present]" if present else ""
+                raw_field["value_present"] = present
+            raw_field["protected_identifier"] = True
+
+
 def _audit_live_pre_submit_page(
     port: int, worker_id: int, job: dict
 ) -> tuple[str | None, dict]:
@@ -2075,6 +2141,17 @@ def _audit_live_pre_submit_page(
                const currentLocationFields = [];
               const selectFields = [];
               const textFields = [];
+              const protectedIdentifier = (el, text) => {
+                if (el.hasAttribute('data-applypilot-protected')) return true;
+                const descriptor = [
+                  text,
+                  el.getAttribute('aria-label'),
+                  el.getAttribute('name'),
+                  el.getAttribute('id'),
+                  el.getAttribute('placeholder')
+                ].filter(Boolean).join(' ');
+                return /(?:^|\b)(?:nric\s*(?:\/|or)\s*fin|nric|fin)(?:\s+(?:identification\s+)?(?:no\.?|number))?(?:\b|$)|passport\s+(?:no\.?|number)|national\s+id(?:entification)?\s+(?:no\.?|number)/i.test(descriptor);
+              };
               for (const el of inputs) {
                 const text = labelText(el);
                 const value = el.tagName === 'SELECT'
@@ -2097,7 +2174,15 @@ def _audit_live_pre_submit_page(
                    currentLocationFields.push({text, value, required: required(el)});
                  }
                  if (el.tagName === 'SELECT') selectFields.push({text, selected: value, required: required(el)});
-                else textFields.push({text, value});
+                else {
+                   const sensitiveValue = protectedIdentifier(el, text);
+                  textFields.push({
+                    text,
+                    value: sensitiveValue ? (value ? '[redacted-present]' : '') : value,
+                    value_present: Boolean(value),
+                    protected_identifier: sensitiveValue
+                  });
+                }
               }
               const nearbyUploadText = (el) => {
                 let node = el;
@@ -2362,6 +2447,7 @@ def _audit_live_pre_submit_page(
             }""",
             expected_education,
         )
+        _redact_protected_identifier_snapshot(snapshot)
         snapshot["document_url"] = snapshot.get("url", "")
         snapshot["url"] = page.url
         issues = _validate_pre_submit_snapshot(snapshot, profile, job)

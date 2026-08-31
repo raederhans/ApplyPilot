@@ -23,6 +23,7 @@ SURFACES = frozenset(
         "official_direct_email",
         "restricted_portal_manual",
         "restricted_portal_review",
+        "restricted_portal_authorized",
         "restricted_portal_authorized_handoff",
         "manual_ats",
         "unknown",
@@ -128,12 +129,17 @@ def _portal_surface(job: Mapping[str, object], application_url: str) -> str | No
     if not policy:
         return None
     mode = _text(policy.get("application_mode"))
-    if policy.get("external_application_mode") == "continue_when_authorized":
+    if (
+        policy.get("source_portal_handoff") is True
+        and policy.get("external_application_mode") == "continue_when_authorized"
+    ):
         return "restricted_portal_authorized_handoff"
     if mode == "manual_only":
         return "restricted_portal_manual"
     if mode == "review_only":
         return "restricted_portal_review"
+    if mode == "standing_authorized":
+        return "restricted_portal_authorized"
     return "unknown"
 
 

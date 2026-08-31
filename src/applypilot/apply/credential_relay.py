@@ -8,12 +8,15 @@ already-running Edge instance over CDP, fills visible fields, and never submits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
 
 from playwright.sync_api import Frame, Locator, Page, sync_playwright
 
@@ -56,6 +59,28 @@ PASSWORD_SELECTORS = (
     'input[autocomplete="new-password"]',
     'input[autocomplete="current-password"]',
 )
+PROTECTED_IDENTIFIER_INPUT_SELECTOR = (
+    'input:not([type]), input[type="text"], input[type="tel"], input[type="number"]'
+)
+FIN_FIELD_RE = re.compile(
+    r"(?:^|\b)(?:nric\s*(?:/|or)\s*fin|nric|fin)"
+    r"(?:\s+(?:identification\s+)?(?:no\.?|number))?(?:\b|$)",
+    re.IGNORECASE,
+)
+VOLATILE_QUERY_KEYS = {
+    "gh_src",
+    "li_fat_id",
+    "referrer",
+    "source",
+    "trackingid",
+    "trk",
+    "utm_campaign",
+    "utm_content",
+    "utm_medium",
+    "utm_source",
+    "utm_term",
+}
+_IDENTITY_DECRYPTED_ATTEMPTS: set[str] = set()
 
 
 class CredentialRelayError(RuntimeError):
@@ -151,6 +176,13 @@ def _credential_path() -> Path:
     return config.APP_DIR / "credentials" / "ats-signup.json"
 
 
+def _identity_credential_path() -> Path:
+    configured = os.environ.get("APPLYPILOT_IDENTITY_CREDENTIAL_FILE")
+    if configured:
+        return Path(configured)
+    return config.APP_DIR / "credentials" / "identity-protected.json"
+
+
 def _read_record(path: Path) -> dict[str, str]:
     if not path.is_file():
         raise CredentialRelayError(
@@ -168,13 +200,35 @@ def _read_record(path: Path) -> dict[str, str]:
     return {"email": email, "password_dpapi": encrypted}
 
 
-def _decrypt_password(path: Path) -> str:
-    """Decrypt the DPAPI value without placing plaintext in argv or output logs."""
+def _read_identity_record(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        raise CredentialRelayError(
+            "Protected-identity relay is not configured. Run "
+            "set-identity-credentials.ps1 locally."
+        )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CredentialRelayError("Protected-identity credential record is unreadable.") from exc
+
+    encrypted = str(record.get("fin_dpapi", "")).strip()
+    if not encrypted:
+        raise CredentialRelayError("Protected-identity credential record is incomplete.")
+    return {"fin_dpapi": encrypted}
+
+
+def _decrypt_dpapi_value(path: Path, property_name: str) -> str:
+    """Decrypt one fixed record property without putting plaintext in argv or logs."""
+    if property_name not in {"password_dpapi", "fin_dpapi"}:
+        raise CredentialRelayError("Unsupported protected credential property.")
     powershell = os.environ.get("COMSPEC_POWERSHELL", "powershell.exe")
     script = r"""
 $ErrorActionPreference = 'Stop'
-$record = Get-Content -LiteralPath $env:APPLYPILOT_ATS_CREDENTIAL_FILE -Raw | ConvertFrom-Json
-$secure = ConvertTo-SecureString -String $record.password_dpapi
+$record = Get-Content -LiteralPath $env:APPLYPILOT_DPAPI_CREDENTIAL_FILE -Raw | ConvertFrom-Json
+$propertyName = $env:APPLYPILOT_DPAPI_PROPERTY
+$encrypted = $record.$propertyName
+if (-not $encrypted) { throw 'Protected credential property is missing.' }
+$secure = ConvertTo-SecureString -String $encrypted
 $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
 try {
   [Console]::Out.Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr))
@@ -183,7 +237,8 @@ try {
 }
 """
     child_env = os.environ.copy()
-    child_env["APPLYPILOT_ATS_CREDENTIAL_FILE"] = str(path)
+    child_env["APPLYPILOT_DPAPI_CREDENTIAL_FILE"] = str(path)
+    child_env["APPLYPILOT_DPAPI_PROPERTY"] = property_name
     # A Python process launched from PowerShell 7 may inherit a PSModulePath
     # that contains only pwsh module roots. Windows PowerShell then cannot
     # autoload Microsoft.PowerShell.Security, which makes DPAPI decryption fail
@@ -209,6 +264,30 @@ try {
             "Windows DPAPI could not decrypt the ATS credential for this user."
         )
     return completed.stdout
+
+
+def _decrypt_password(path: Path) -> str:
+    """Decrypt the ATS password without placing plaintext in argv or output logs."""
+    return _decrypt_dpapi_value(path, "password_dpapi")
+
+
+def _decrypt_fin(path: Path) -> str:
+    """Decrypt once only after the launcher context passes exact binding checks."""
+    binding = _application_context_binding()
+    attempt_id = str(binding["attempt_id"])
+    if attempt_id in _IDENTITY_DECRYPTED_ATTEMPTS:
+        raise CredentialRelayError(
+            "Protected-identity authorization was already consumed for this attempt."
+        )
+    try:
+        cdp_port = int(os.environ.get("APPLYPILOT_CDP_PORT", ""))
+    except ValueError as exc:
+        raise CredentialRelayError(
+            "Protected-identity relay has no valid worker browser port."
+        ) from exc
+    _assert_identity_page_preflight(cdp_port, binding)
+    _IDENTITY_DECRYPTED_ATTEMPTS.add(attempt_id)
+    return _decrypt_dpapi_value(path, "fin_dpapi")
 
 
 def _visible_locators(frame: Frame, selectors: tuple[str, ...]) -> list[Locator]:
@@ -271,6 +350,10 @@ def _relay_is_authorized() -> bool:
     return os.environ.get("APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED", "").strip() == "1"
 
 
+def _identity_relay_is_authorized() -> bool:
+    return os.environ.get("APPLYPILOT_IDENTITY_RELAY_AUTHORIZED", "").strip() == "1"
+
+
 def _password_host_is_allowed(host: str) -> bool:
     return host_is_known_ats(host) or host_is_allowed(host, _password_allowed_hosts())
 
@@ -282,6 +365,156 @@ def _known_ats_redirect_enabled() -> bool:
 def _root_target_ids() -> set[str]:
     raw = os.environ.get("APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS", "")
     return {value.strip() for value in raw.split(",") if value.strip()}
+
+
+def _application_context_binding() -> dict[str, object]:
+    """Load the launcher-authored, digest-bound application identity."""
+    path_value = os.environ.get("APPLYPILOT_ATS_CONTEXT_PATH", "").strip()
+    expected_digest = os.environ.get(
+        "APPLYPILOT_CREDENTIAL_APPLICATION_CONTEXT_SHA256", ""
+    ).strip().casefold()
+    expected_attempt = os.environ.get(
+        "APPLYPILOT_CREDENTIAL_ATTEMPT_ID", ""
+    ).strip()
+    expected_application = os.environ.get(
+        "APPLYPILOT_CREDENTIAL_APPLICATION_ID", ""
+    ).strip()
+    if not path_value or not expected_digest or not expected_attempt or not expected_application:
+        raise CredentialRelayError(
+            "Protected-identity relay is missing its exact application context."
+        )
+    try:
+        raw = Path(path_value).read_bytes()
+    except OSError as exc:
+        raise CredentialRelayError(
+            "Protected-identity application context is unavailable."
+        ) from exc
+    if hashlib.sha256(raw).hexdigest() != expected_digest:
+        raise CredentialRelayError(
+            "Protected-identity application context did not match the launcher digest."
+        )
+    try:
+        context = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CredentialRelayError(
+            "Protected-identity application context is unreadable."
+        ) from exc
+    binding = context.get("credential_binding") if isinstance(context, Mapping) else None
+    if not isinstance(binding, Mapping):
+        raise CredentialRelayError(
+            "Protected-identity application context has no credential binding."
+        )
+    if (
+        binding.get("schema_version") != "1"
+        or str(binding.get("attempt_id") or "") != expected_attempt
+        or str(binding.get("application_id") or "") != expected_application
+    ):
+        raise CredentialRelayError(
+            "Protected-identity application context does not identify this exact attempt."
+        )
+    target_urls = binding.get("target_urls")
+    if not isinstance(target_urls, list) or not all(
+        isinstance(url, str) and url.strip() for url in target_urls
+    ):
+        raise CredentialRelayError(
+            "Protected-identity application context has no exact target route."
+        )
+    return dict(binding)
+
+
+def _same_exact_application_path(expected_url: str, actual_url: str) -> bool:
+    expected = urlparse(expected_url)
+    actual = urlparse(actual_url)
+    if (
+        expected.scheme.casefold() != "https"
+        or actual.scheme.casefold() != "https"
+        or not expected.hostname
+        or expected.hostname.casefold() != (actual.hostname or "").casefold()
+    ):
+        return False
+    expected_path = unquote(expected.path).rstrip("/").removesuffix("/apply")
+    actual_path = unquote(actual.path).rstrip("/").removesuffix("/apply")
+    expected_tokens = tuple(re.findall(r"[a-z0-9]+", expected_path.casefold()))
+    actual_tokens = tuple(re.findall(r"[a-z0-9]+", actual_path.casefold()))
+    if not expected_tokens or expected_tokens != actual_tokens:
+        return False
+    expected_identity_query = tuple(
+        sorted(
+            (key.casefold(), value)
+            for key, value in parse_qsl(expected.query, keep_blank_values=True)
+            if key.casefold() not in VOLATILE_QUERY_KEYS
+        )
+    )
+    actual_identity_query = tuple(
+        sorted(
+            (key.casefold(), value)
+            for key, value in parse_qsl(actual.query, keep_blank_values=True)
+            if key.casefold() not in VOLATILE_QUERY_KEYS
+        )
+    )
+    return expected_identity_query == actual_identity_query
+
+
+def _smartrecruiters_application_is_bound(
+    expected_url: str,
+    actual_url: str,
+    provider_binding: Mapping[str, object],
+) -> bool:
+    """Bind the public posting to one resolved one-click tenant/publication."""
+    expected = urlparse(expected_url)
+    actual = urlparse(actual_url)
+    expected_parts = [part for part in expected.path.split("/") if part]
+    actual_parts = [part for part in actual.path.split("/") if part]
+    if (
+        expected.scheme.casefold() != "https"
+        or actual.scheme.casefold() != "https"
+        or (expected.hostname or "").casefold() != "jobs.smartrecruiters.com"
+        or (actual.hostname or "").casefold() != "jobs.smartrecruiters.com"
+        or len(expected_parts) < 2
+        or len(actual_parts) < 5
+        or actual_parts[:2] != ["oneclick-ui", "company"]
+        or actual_parts[3] != "publication"
+    ):
+        return False
+    tenant = expected_parts[0]
+    posting_id = expected_parts[1].split("-", 1)[0]
+    actual_tenant = actual_parts[2]
+    publication_id = actual_parts[4]
+    query_tenant = (parse_qs(actual.query).get("dcr_ci") or [""])[0]
+    if any(
+        key.casefold() not in VOLATILE_QUERY_KEYS | {"dcr_ci"}
+        for key, _value in parse_qsl(actual.query, keep_blank_values=True)
+    ):
+        return False
+    return bool(
+        provider_binding.get("resolved") is True
+        and str(provider_binding.get("provider") or "").casefold()
+        == "smartrecruiters"
+        and tenant.casefold() == actual_tenant.casefold() == query_tenant.casefold()
+        and str(provider_binding.get("tenant") or "").casefold() == tenant.casefold()
+        and str(provider_binding.get("posting_id") or "") == posting_id
+        and str(provider_binding.get("publication_id") or "").casefold()
+        == publication_id.casefold()
+    )
+
+
+def _application_url_is_bound(actual_url: str, binding: Mapping[str, object]) -> bool:
+    """Require the page to prove the exact launcher-selected job route."""
+    target_urls = binding.get("target_urls")
+    if not isinstance(target_urls, list):
+        return False
+    provider_binding = binding.get("provider_binding")
+    provider_binding = provider_binding if isinstance(provider_binding, Mapping) else {}
+    for expected_url in target_urls:
+        if not isinstance(expected_url, str):
+            continue
+        if _same_exact_application_path(expected_url, actual_url):
+            return True
+        if _smartrecruiters_application_is_bound(
+            expected_url, actual_url, provider_binding
+        ):
+            return True
+    return False
 
 
 def _target_descends_from(
@@ -298,6 +531,75 @@ def _target_descends_from(
         visited.add(current)
         current = str(target_infos.get(current, {}).get("openerId") or "")
     return False
+
+
+def _assert_identity_page_preflight(
+    cdp_port: int, binding: Mapping[str, object]
+) -> None:
+    """Verify one exact required FIN field before any identity decryption."""
+    root_target_ids = _root_target_ids()
+    if not root_target_ids:
+        raise CredentialRelayError(
+            "Protected-identity relay could not bind this request to the worker's application tab."
+        )
+    configured_hosts = _allowed_hosts()
+    if not configured_hosts:
+        raise CredentialRelayError(
+            "No authorized employer/ATS host was configured for this job."
+        )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+        browser_session = browser.new_browser_cdp_session()
+        target_infos = {
+            str(info.get("targetId") or ""): info
+            for info in browser_session.send("Target.getTargets").get("targetInfos", [])
+            if info.get("targetId")
+        }
+        matching_target_ids: set[str] = set()
+        matching_fields: list[dict[str, object]] = []
+        pages = [page for context in browser.contexts for page in context.pages]
+        for page in _candidate_pages(pages):
+            try:
+                target_info = page.context.new_cdp_session(page).send(
+                    "Target.getTargetInfo"
+                )["targetInfo"]
+            except Exception:  # noqa: BLE001, S112 - navigation can detach here
+                continue
+            target_id = str(target_info.get("targetId") or "")
+            target_infos[target_id] = target_info
+            if (
+                _target_descends_from(target_id, root_target_ids, target_infos)
+                and _application_url_is_bound(page.url, binding)
+            ):
+                matching_target_ids.add(target_id)
+            else:
+                continue
+            page_host = (urlparse(page.url).hostname or "").lower()
+            for frame in page.frames:
+                if frame is not page.main_frame and not _application_url_is_bound(
+                    frame.url, binding
+                ):
+                    continue
+                frame_host = (urlparse(frame.url).hostname or page_host).lower()
+                target_host = frame_host or page_host
+                if not host_is_allowed(target_host, configured_hosts):
+                    continue
+                for locator in _visible_locators(
+                    frame,
+                    (PROTECTED_IDENTIFIER_INPUT_SELECTOR,),
+                ):
+                    descriptor = _protected_identifier_descriptor(locator)
+                    if FIN_FIELD_RE.search(str(descriptor["text"])):
+                        matching_fields.append(descriptor)
+        if (
+            len(matching_target_ids) != 1
+            or len(matching_fields) != 1
+            or matching_fields[0].get("required") is not True
+        ):
+            raise CredentialRelayError(
+                "Protected-identity relay did not find one exact required FIN field on the "
+                "attempt-bound application page."
+            )
 
 
 def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[str, object]:
@@ -398,6 +700,178 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
             "email_filled": email_filled,
             "password_filled": password_fields_filled > 0,
             "password_fields_filled": password_fields_filled,
+            "submitted": False,
+        }
+
+
+def _protected_identifier_descriptor(locator: Locator) -> dict[str, object]:
+    """Read only non-secret label and required-state metadata for one input."""
+    value = locator.evaluate(
+        """element => {
+          const id = element.id || '';
+          const escaped = globalThis.CSS?.escape ? CSS.escape(id) : id.replace(/"/g, '\\"');
+          const explicit = id ? document.querySelector(`label[for="${escaped}"]`) : null;
+          const wrapping = element.closest('label');
+          const container = element.closest(
+            '[role="group"], [role="radiogroup"], .form-group, .field, [data-automation-id]'
+          );
+          const text = [
+            explicit?.innerText,
+            wrapping?.innerText,
+            element.getAttribute('aria-label'),
+            element.getAttribute('name'),
+            element.getAttribute('id'),
+            element.getAttribute('placeholder'),
+            container?.querySelector('label')?.innerText,
+          ].filter(Boolean).join(' ');
+          const required = Boolean(
+            element.required ||
+            element.getAttribute('aria-required') === 'true' ||
+            /(?:^|\\s)required(?:\\s|$)/i.test(text) ||
+            /\\*/.test(text)
+          );
+          return { text, required };
+        }"""
+    )
+    if not isinstance(value, dict):
+        return {"text": "", "required": False}
+    return {
+        "text": str(value.get("text") or ""),
+        "required": value.get("required") is True,
+    }
+
+
+def _apply_protected_display_mask(locator: Locator, kind: str, value: str) -> None:
+    """Apply and verify the mask after one microtask; clear on any instability."""
+    try:
+        state = locator.evaluate(
+            """async (element, kind) => {
+              element.setAttribute('data-applypilot-protected', kind);
+              element.setAttribute('autocomplete', 'off');
+              if (element.tagName === 'INPUT') element.type = 'password';
+              await Promise.resolve();
+              return {
+                type: element.getAttribute('type'),
+                marker: element.getAttribute('data-applypilot-protected'),
+              };
+            }""",
+            kind,
+        )
+        stable = bool(
+            isinstance(state, Mapping)
+            and str(state.get("type") or "").casefold() == "password"
+            and state.get("marker") == kind
+            and locator.input_value() == value
+        )
+    except Exception:  # noqa: BLE001 - detached/reactive fields must fail closed
+        stable = False
+    if stable:
+        return
+    try:
+        locator.fill("")
+    except Exception:  # noqa: BLE001, S110 - best-effort secret removal
+        pass
+    raise CredentialRelayError(
+        "Protected-identity field did not retain its verified display mask."
+    )
+
+
+def _fill_protected_identifier(cdp_port: int, kind: str, value: str) -> dict[str, object]:
+    """Fill one required protected identifier in the bound ATS tab without submitting."""
+    if kind != "fin":
+        raise CredentialRelayError("Unsupported protected identifier kind.")
+    if not _identity_relay_is_authorized():
+        raise CredentialRelayError(
+            "Protected-identity relay is not authorized by the trusted profile."
+        )
+    configured_hosts = _allowed_hosts()
+    if not configured_hosts:
+        raise CredentialRelayError("No authorized employer/ATS host was configured for this job.")
+    root_target_ids = _root_target_ids()
+    if not root_target_ids:
+        raise CredentialRelayError(
+            "Protected-identity relay could not bind this request to the worker's application tab."
+        )
+    application_binding = _application_context_binding()
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+        browser_session = browser.new_browser_cdp_session()
+        target_infos = {
+            str(info.get("targetId") or ""): info
+            for info in browser_session.send("Target.getTargets").get("targetInfos", [])
+            if info.get("targetId")
+        }
+        pages = [page for context in browser.contexts for page in context.pages]
+        candidates: list[dict[str, object]] = []
+        for page_index, page in enumerate(_candidate_pages(pages)):
+            try:
+                target_info = page.context.new_cdp_session(page).send("Target.getTargetInfo")[
+                    "targetInfo"
+                ]
+            except Exception:  # noqa: BLE001, S112 - navigation may detach between snapshots
+                continue
+            target_id = str(target_info.get("targetId") or "")
+            target_infos[target_id] = target_info
+            if not _target_descends_from(target_id, root_target_ids, target_infos):
+                continue
+            if not _application_url_is_bound(page.url, application_binding):
+                continue
+            page_host = (urlparse(page.url).hostname or "").lower()
+            for frame_index, frame in enumerate(page.frames):
+                frame_host = (urlparse(frame.url).hostname or page_host).lower()
+                target_host = frame_host or page_host
+                if frame is not page.main_frame and not _application_url_is_bound(
+                    frame.url, application_binding
+                ):
+                    continue
+                if host_is_allowed(target_host, configured_hosts):
+                    match = "exact"
+                else:
+                    continue
+                matching: list[tuple[Locator, dict[str, object]]] = []
+                for locator in _visible_locators(
+                    frame,
+                    (PROTECTED_IDENTIFIER_INPUT_SELECTOR,),
+                ):
+                    descriptor = _protected_identifier_descriptor(locator)
+                    if FIN_FIELD_RE.search(str(descriptor["text"])):
+                        matching.append((locator, descriptor))
+                if len(matching) != 1:
+                    continue
+                locator, descriptor = matching[0]
+                if descriptor["required"] is not True:
+                    continue
+                candidates.append(
+                    {
+                        "page_index": page_index,
+                        "target_id": target_id,
+                        "frame_index": frame_index,
+                        "page_url": page.url,
+                        "frame_url": frame.url,
+                        "host": target_host,
+                        "match": match,
+                        "field_count": 1,
+                        "locator": locator,
+                    }
+                )
+
+        selected = _select_candidate(candidates)
+        locator = selected["locator"]
+        locator.fill(value)
+        if locator.input_value() != value:
+            raise CredentialRelayError(
+                "Protected-identity field did not retain the exact secure value."
+            )
+        _apply_protected_display_mask(locator, kind, value)
+        return {
+            "status": "filled",
+            "kind": kind,
+            "host": selected["host"],
+            "selection": selected["match"],
+            "required_field_verified": True,
+            "value_persistence_verified": True,
+            "display_masked": True,
             "submitted": False,
         }
 

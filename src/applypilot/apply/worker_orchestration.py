@@ -14,6 +14,7 @@ from types import ModuleType
 from urllib.parse import urlparse
 
 from applypilot.apply import application_actor as application_actor_mod
+from applypilot.apply import recovery_execution as recovery_execution_mod
 from applypilot.apply.contracts import contract_json
 from applypilot.apply.email_routing import (
     normalize_prepared_email_application,
@@ -316,6 +317,7 @@ def _worker_loop_with_port(
         route_history: list[dict[str, object]] = []
         progress_submit_claimed = False
         progress_outcome: tuple[str, bool] | None = None
+        pre_submit_audit_failure: dict[str, object] | None = None
         raw_acquisition_metrics = acquisition_attempt
         acquisition_metrics: dict[str, float | int] = {}
         if isinstance(raw_acquisition_metrics, dict):
@@ -503,6 +505,65 @@ def _worker_loop_with_port(
                 jobs_done=jobs_done,
             )
             continue
+
+        ats_binding = read_only_preflight.get("ats_binding")
+        if (
+            read_only_preflight.get("provider") == "smartrecruiters"
+            and "ats_binding" not in read_only_preflight
+        ):
+            ats_binding = _resolve_ats_application_binding(job)
+        if isinstance(ats_binding, dict):
+            job["_ats_application_binding"] = ats_binding
+        if read_only_preflight.get("provider") == "smartrecruiters" and not (
+            isinstance(ats_binding, dict)
+            and ats_binding.get("provider") == "smartrecruiters"
+            and ats_binding.get("resolved") is True
+        ):
+            identity_reason = (
+                str(ats_binding.get("reason") or "unavailable")
+                if isinstance(ats_binding, dict)
+                else "unavailable"
+            )
+            reason = (
+                "smartrecruiters_provider_identity_unresolved:"
+                f"{identity_reason}"
+            )
+            if dry_run:
+                restore_preview_state(job)
+            else:
+                mark_result(
+                    job["url"],
+                    "failed",
+                    reason,
+                    permanent=False,
+                    task_id=job.get("_attempt_id"),
+                    evidence=attach_performance({
+                        "ats_application_binding": (
+                            dict(ats_binding)
+                            if isinstance(ats_binding, dict)
+                            else None
+                        ),
+                        "submit_started": False,
+                    }),
+                )
+            if run_progress is not None:
+                run_progress.record_terminal(job["url"], "failed")
+            if preview_ticket is not None:
+                run_progress.release_preview_ticket(preview_ticket)
+                preview_ticket = None
+            failed += 1
+            jobs_done += 1
+            add_event(
+                f"[W{worker_id}] SmartRecruiters identity blocked before browser: "
+                f"{identity_reason[:35]}"
+            )
+            update_state(
+                worker_id,
+                status="failed",
+                last_action="SmartRecruiters identity unresolved",
+                jobs_done=jobs_done,
+            )
+            continue
         try:
             active_route = initial_route(requested_browser_backend, phase="prepare")
             active_browser_backend = active_route.browser_runtime
@@ -522,14 +583,6 @@ def _worker_loop_with_port(
             add_event(f"[W{worker_id}] Launching {active_browser_backend} browser...")
             start_url = str(job.get("application_url") or job["url"])
             initial_linkedin_entry = _url_has_host(start_url, "linkedin.com")
-            ats_binding = read_only_preflight.get("ats_binding")
-            if (
-                read_only_preflight.get("provider") == "smartrecruiters"
-                and "ats_binding" not in read_only_preflight
-            ):
-                ats_binding = _resolve_ats_application_binding(job)
-            if ats_binding is not None:
-                job["_ats_application_binding"] = ats_binding
             chrome_proc = launch_chrome(
                 worker_id,
                 port=port,
@@ -703,10 +756,25 @@ def _worker_loop_with_port(
             actor_decision = application_actor_mod.decision_for_status(actor_state, result)
             job["_application_actor_decision"] = contract_json(actor_decision)
             recovery_action = actor_decision.recovery_action
+            recovery_admission = None
+            recovery_command = None
+            if recovery_action is not None:
+                recovery_admission = recovery_execution_mod.admit_recovery_decision(
+                    actor_decision,
+                    submit_started=submission_started,
+                )
+                job["_application_recovery_admission"] = contract_json(
+                    recovery_admission
+                )
+                recovery_command = recovery_admission.command
+                if recovery_command is not None:
+                    job["_application_recovery_command"] = contract_json(
+                        recovery_command
+                    )
             fallback_route = None
             if (
-                recovery_action is not None
-                and recovery_action.action == "retry_new_session"
+                recovery_command is not None
+                and recovery_command.command == "retry_new_session"
             ):
                 fallback_route = cloak_fallback_route(
                     result,
@@ -715,14 +783,31 @@ def _worker_loop_with_port(
                     current_runtime=active_browser_backend,
                     fallback_already_used=cloak_fallback_used,
                 )
-            if fallback_route is not None:
+
+            def execute_browser_recovery(
+                _command,
+                current_job=job,
+                current_fallback_route=fallback_route,
+                current_route_history=route_history,
+                current_start_url=start_url,
+            ):
+                nonlocal active_browser_backend
+                nonlocal active_route
+                nonlocal chrome_proc
+                nonlocal cloak_fallback_used
+                nonlocal cloak_lane_held
+                nonlocal duration_ms
+                nonlocal result
+
+                if current_fallback_route is None:
+                    raise RuntimeError("browser_recovery_route_unavailable")
                 edge_block_result = result
                 cloak_fallback_used = True
                 cloak_lane_held = _acquire_cloak_lane(worker_id)
-                active_route = fallback_route
+                active_route = current_fallback_route
                 active_browser_backend = active_route.browser_runtime
                 _attach_control_contract(
-                    job,
+                    current_job,
                     active_route,
                     interaction_mode=requested_interaction_mode,
                     resume_existing_page=False,
@@ -740,8 +825,8 @@ def _worker_loop_with_port(
                     edge_session = capture_browser_session(
                         port,
                         [
-                            str(job.get("url") or ""),
-                            str(job.get("application_url") or ""),
+                            str(current_job.get("url") or ""),
+                            str(current_job.get("application_url") or ""),
                         ],
                     )
                     cleanup_worker(worker_id, chrome_proc)
@@ -756,17 +841,17 @@ def _worker_loop_with_port(
                     restored_cookies = restore_browser_session(
                         port,
                         edge_session,
-                        start_url,
+                        current_start_url,
                     )
-                    root_ids = _open_bound_application_target(port, start_url)
-                    job["_browser_root_target_ids"] = sorted(root_ids)
-                    job["_browser_root_runtime"] = active_browser_backend
+                    root_ids = _open_bound_application_target(port, current_start_url)
+                    current_job["_browser_root_target_ids"] = sorted(root_ids)
+                    current_job["_browser_root_runtime"] = active_browser_backend
                     logger.info(
                         "[worker-%d] Bridged %d browser cookies into CloakBrowser",
                         worker_id,
                         restored_cookies,
                     )
-                    route_history.append({
+                    current_route_history.append({
                         **active_route.as_dict(),
                         "event": "runtime_transition",
                         "from": "playwright/edge",
@@ -775,12 +860,12 @@ def _worker_loop_with_port(
                         "session_cookies_restored": restored_cookies,
                         "submit_started": False,
                     })
-                    job["_application_actor_new_session_retries_remaining"] = 0
+                    current_job["_application_actor_new_session_retries_remaining"] = 0
                     result, stealth_duration = execute_entry_turn()
                     duration_ms += stealth_duration
                 except Exception as exc:
                     logger.exception("CloakBrowser fallback failed")
-                    route_history.append({
+                    current_route_history.append({
                         **active_route.as_dict(),
                         "event": "runtime_transition_failed",
                         "from": "playwright/edge",
@@ -790,12 +875,66 @@ def _worker_loop_with_port(
                         "submit_started": False,
                     })
                     result = f"failed:cloak_backend_unavailable:{type(exc).__name__}"
+                    raise
                 logger.info(
                     "[worker-%d] Browser fallback edge_result=%s cloak_result=%s",
                     worker_id,
                     edge_block_result,
                     result,
                 )
+                return {
+                    "browser_runtime": active_browser_backend,
+                    "fallback_applied": True,
+                    "recovery_turn_completed": True,
+                    "result_category": classify_failure(result).category,
+                }
+
+            if recovery_command is not None:
+                if dry_run:
+                    if recovery_command.command == "retry_new_session":
+                        try:
+                            execute_browser_recovery(recovery_command)
+                        except Exception:
+                            logger.debug("Dry-run browser recovery failed closed", exc_info=True)
+                else:
+                    recovery_handler = (
+                        execute_browser_recovery
+                        if recovery_command.command == "retry_new_session"
+                        else None
+                    )
+                    recovery_verifier = None
+                    if recovery_handler is not None:
+                        def verify_browser_recovery(_command, details):
+                            return (
+                                details.get("browser_runtime") == "cloak"
+                                and details.get("fallback_applied") is True
+                                and details.get("recovery_turn_completed") is True
+                            )
+
+                        recovery_verifier = verify_browser_recovery
+                    try:
+                        recovery_result = (
+                            recovery_execution_mod.execute_recovery_command(
+                                get_connection(),
+                                recovery_command,
+                                handler=recovery_handler,
+                                verifier=recovery_verifier,
+                            )
+                        )
+                        job["_application_recovery_execution"] = contract_json(
+                            recovery_result
+                        )
+                    except Exception as exc:  # noqa: BLE001 - persistence must fail closed
+                        logger.warning(
+                            "Recovery command persistence failed for %s: %s",
+                            actor_attempt_id,
+                            type(exc).__name__,
+                        )
+                        job["_application_recovery_execution"] = {
+                            "stage": "failed",
+                            "outcome": "recovery_control_persistence_failed",
+                            "error_type": type(exc).__name__,
+                        }
 
             if initial_linkedin_entry:
                 route_signal, route_observation = _observe_linkedin_external_handoff_page(
@@ -1222,6 +1361,7 @@ def _worker_loop_with_port(
                             )
                         continue
                     if audit_signal:
+                        pre_submit_audit_failure = dict(audit_report)
                         result = f"failed:manual_review_required:{audit_signal}"
                         break
                     from applypilot.database import update_application_attempt
@@ -1302,6 +1442,7 @@ def _worker_loop_with_port(
                                 time.perf_counter() - audit_started
                             ) * 1000
                             if audit_signal or audit_report.get("disposition") != "clear":
+                                pre_submit_audit_failure = dict(audit_report)
                                 result = (
                                     "failed:manual_review_required:"
                                     f"{audit_signal or 'page_changed_during_submission_gap'}"
@@ -1979,7 +2120,14 @@ def _worker_loop_with_port(
                     permanent=_is_permanent_failure(result),
                     duration_ms=duration_ms,
                     task_id=job.get("_attempt_id"),
-                    evidence=attach_performance(),
+                    evidence=attach_performance(
+                        {
+                            "pre_submit_audit": pre_submit_audit_failure,
+                            "submit_started": False,
+                        }
+                        if pre_submit_audit_failure is not None
+                        else None
+                    ),
                 )
                 failed += 1
                 progress_outcome = ("failed", False)

@@ -942,6 +942,174 @@ def test_complete_applied_import_returns_and_binds_persisted_snapshot_id(tmp_pat
     close_connection(tmp_path / "radar.db")
 
 
+def test_complete_applied_import_rejects_duplicate_linkedin_identity(tmp_path) -> None:
+    conn = init_db(tmp_path / "radar.db")
+    export_path = tmp_path / "duplicate-applied.json"
+    export_path.write_text(
+        json.dumps({
+            "source": "linkedin_job_tracker_visible_complete_read",
+            "complete": True,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_total": 2,
+            "pages_read": 2,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456710/"},
+                {
+                    "url": (
+                        "https://www.linkedin.com/jobs/view/123456710/"
+                        "?trackingId=duplicate-page"
+                    )
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    result = import_linkedin_applied_export(export_path, conn)
+    snapshot = get_latest_applied_exclusion_snapshot(
+        conn,
+        snapshot_id=str(result["snapshot_id"]),
+    )
+
+    assert result["completeness"] == "partial"
+    assert result["unique_record_count"] == 1
+    assert result["duplicate_record_count"] == 1
+    assert result["skipped"] == 1
+    assert snapshot["integrity_valid"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE platform_job_id='linkedin:123456710'"
+    ).fetchone()[0] == 1
+    close_connection(tmp_path / "radar.db")
+
+
+def test_incremental_applied_import_extends_ledger_without_claiming_full_coverage(
+    tmp_path,
+) -> None:
+    conn = init_db(tmp_path / "radar.db")
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps({
+            "source": "linkedin_job_tracker_visible_complete_read",
+            "complete": True,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_total": 1,
+            "pages_read": 1,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456711/"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    baseline = import_linkedin_applied_export(baseline_path, conn)
+    incremental_path = tmp_path / "incremental.json"
+    incremental_path.write_text(
+        json.dumps({
+            "source": "linkedin_job_tracker_incremental_read",
+            "sync_mode": "incremental",
+            "base_snapshot_id": baseline["snapshot_id"],
+            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_total": 2,
+            "pages_read": 1,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456712/"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    first = import_linkedin_applied_export(incremental_path, conn)
+    repeated = import_linkedin_applied_export(incremental_path, conn)
+    incremental_snapshot = get_latest_applied_exclusion_snapshot(
+        conn,
+        snapshot_id=str(first["snapshot_id"]),
+    )
+    baseline_snapshot = get_latest_applied_exclusion_snapshot(
+        conn,
+        snapshot_id=str(baseline["snapshot_id"]),
+    )
+
+    assert first["completeness"] == "incremental"
+    assert first["base_snapshot_id"] == baseline["snapshot_id"]
+    assert first["inserted"] == 1
+    assert first["cumulative_exclusion_count"] == 2
+    assert repeated["inserted"] == 0
+    assert repeated["updated"] == 1
+    assert repeated["cumulative_exclusion_count"] == 2
+    assert incremental_snapshot["integrity_valid"] is False
+    assert baseline_snapshot["integrity_valid"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status='applied'"
+    ).fetchone()[0] == 2
+    close_connection(tmp_path / "radar.db")
+
+
+def test_incremental_applied_import_requires_complete_base_snapshot(tmp_path) -> None:
+    conn = init_db(tmp_path / "radar.db")
+    incremental_path = tmp_path / "incremental.json"
+    incremental_path.write_text(
+        json.dumps({
+            "sync_mode": "incremental",
+            "base_snapshot_id": "missing",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "pages_read": 1,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456713/"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="complete, integrity-valid base snapshot"):
+        import_linkedin_applied_export(incremental_path, conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    close_connection(tmp_path / "radar.db")
+
+
+def test_incremental_applied_import_rejects_non_linkedin_source_before_writes(
+    tmp_path,
+) -> None:
+    conn = init_db(tmp_path / "radar.db")
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps({
+            "source": "linkedin_job_tracker_visible_complete_read",
+            "complete": True,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_total": 1,
+            "pages_read": 1,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456714/"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    baseline = import_linkedin_applied_export(baseline_path, conn)
+    incremental_path = tmp_path / "wrong-source.json"
+    incremental_path.write_text(
+        json.dumps({
+            "source": "custom",
+            "sync_mode": "incremental",
+            "base_snapshot_id": baseline["snapshot_id"],
+            "observed_at": datetime.now(UTC).isoformat(),
+            "pages_read": 1,
+            "applications": [
+                {"url": "https://www.linkedin.com/jobs/view/123456715/"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source must use the 'linkedin' namespace"):
+        import_linkedin_applied_export(incremental_path, conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM radar_exclusion_snapshots"
+    ).fetchone()[0] == 1
+    close_connection(tmp_path / "radar.db")
+
+
 def test_applied_snapshot_freshness_uses_observed_time_and_checks_counts(tmp_path) -> None:
     conn = init_db(tmp_path / "radar.db")
     export_path = tmp_path / "applied.json"

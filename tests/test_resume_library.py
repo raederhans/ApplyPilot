@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from typer.main import get_command
 
-from applypilot import single_job
+from applypilot import resume_library, single_job
 from applypilot.cli import app
 from applypilot.database import init_db
 from applypilot.resume_library import (
@@ -392,6 +393,51 @@ def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
     assert result["artifact"]["validation_status"] == "machine_validated"
 
 
+def test_stale_explicit_gpa_artifact_is_not_reused(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        content=(
+            "DATA ANALYST\nSQL, Python, data analysis\n"
+            "University of Pennsylvania, Master of City Planning, GPA: 3.6\n"
+            "Built a dashboard and reporting workflow."
+        ),
+    )
+    profile = _profile(base)
+    profile["education"] = [
+        {
+            "institution": "University of Pennsylvania",
+            "gpa": "3.46/4.0",
+            "gpa_may_be_disclosed": True,
+        }
+    ]
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": "https://careers.example.test/new-data",
+            "title": "Data Analyst",
+            "eligibility_status": "eligible",
+            "full_description": (
+                "Required: SQL. Build dashboards and reporting for business decisions."
+            ),
+        },
+        profile,
+    )
+
+    assert result["decision"] == "create_variant"
+    assert result["candidates"] == []
+    assert "conflict with current profile facts" in result["reason"]
+    assert result["profile_fact_rejections"][0]["artifact_id"].startswith("resume:")
+    error = result["profile_fact_rejections"][0]["errors"][0]
+    assert "current profile records 3.46" in error
+
+
 def test_configured_track_source_resolves_equal_artifact_scores(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "library.db")
     preferred_source = tmp_path / "preferred-source.txt"
@@ -600,6 +646,150 @@ def test_new_subtype_creates_variant_and_unsupported_hard_skill_needs_review(
     assert product["decision"] == "create_variant"
     assert unsupported["decision"] == "manual_review"
     assert unsupported["hard_gaps"] == ["aws"]
+
+
+def _unsupported_aws_job(suffix: str) -> dict[str, str]:
+    return {
+        "url": f"https://careers.example.test/aws-data-{suffix}",
+        "title": "Data Analyst",
+        "full_description": "Required: AWS. Build dashboards and reporting.",
+        "eligibility_status": "eligible",
+    }
+
+
+def _route_components(conn, route: dict[str, object]) -> dict[str, object]:
+    row = conn.execute(
+        "SELECT components_json FROM job_resume_assignments WHERE assignment_id=?",
+        (route["assignment_id"],),
+    ).fetchone()
+    return json.loads(row["components_json"])
+
+
+def test_confirmed_skill_experience_allows_variant_without_claiming_resume_coverage(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    profile["application_facts"] = [
+        {
+            "key": "aws_experience_years",
+            "value": 1,
+            "source": "user_confirmed",
+        }
+    ]
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(conn, _unsupported_aws_job("confirmed"), profile)
+
+    components = _route_components(conn, result)
+    assert result["decision"] == "create_variant"
+    assert result["decision"] != "reuse_exact"
+    assert result["hard_gaps"] == ["aws"]
+    assert components["unsupported_required_skills"] == []
+    assert components["confirmed_required_skill_facts"] == [
+        {
+            "confirmed_at": "",
+            "fact_key": "aws_experience_years",
+            "skill": "aws",
+            "source": "user_confirmed",
+            "value": 1,
+        }
+    ]
+    assert result["candidates"][0]["required_coverage"] == 0.0
+    assert result["candidates"][0]["missing_required"] == ["aws"]
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        {"key": "aws_experience_years", "value": 1, "source": "inferred"},
+        {"key": "aws_experience_years", "value": 0, "source": "user_confirmed"},
+        {"key": "aws_experience_years", "value": -1, "source": "user_confirmed"},
+        {"key": "aws_experience_years", "value": True, "source": "user_confirmed"},
+        {
+            "key": "talkwalker_experience_years",
+            "value": 1,
+            "source": "user_confirmed",
+        },
+        {"key": "aws_skill_level", "value": 1, "source": "user_confirmed"},
+    ],
+    ids=["unconfirmed", "zero", "negative", "boolean", "unknown-skill", "wrong-key"],
+)
+def test_only_positive_confirmed_known_skill_experience_facts_clear_unsupported_gap(
+    tmp_path: Path, fact: dict[str, object]
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    profile["application_facts"] = [fact]
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(conn, _unsupported_aws_job("invalid-fact"), profile)
+
+    assert result["decision"] == "manual_review"
+    assert result["hard_gaps"] == ["aws"]
+    components = _route_components(conn, result)
+    assert components["unsupported_required_skills"] == ["aws"]
+    assert components["confirmed_required_skill_facts"] == []
+
+
+def test_manual_selection_uses_confirmed_skill_experience_for_unsupported_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base, suffix="one")
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        suffix="two",
+        content=(
+            "DATA ANALYST\nSQL, Python, data analysis\n"
+            "Built a dashboard and reporting workflow. Additional verified detail."
+        ),
+    )
+    profile = _profile(base)
+    profile["application_facts"] = [
+        {
+            "key": "aws_experience_years",
+            "value": 1,
+            "source": "user_confirmed",
+        }
+    ]
+    sync_resume_library(conn, profile, tmp_path)
+    monkeypatch.setattr(resume_library, "REUSE_REQUIRED_COVERAGE", 0.0)
+    monkeypatch.setattr(resume_library, "REUSE_OVERALL_SCORE", 0.0)
+    job = _unsupported_aws_job("confirmed-manual-selection")
+
+    automatic = route_resume_for_job(conn, job, profile)
+    automatic_components = _route_components(conn, automatic)
+    selected = route_resume_for_job(
+        conn,
+        job,
+        profile,
+        artifact_id=automatic["candidates"][0]["artifact_id"],
+    )
+
+    assert automatic["decision"] == "manual_review"
+    assert automatic_components["unsupported_required_skills"] == []
+    assert automatic_components["confirmed_required_skill_facts"][0]["fact_key"] == (
+        "aws_experience_years"
+    )
+    assert selected["decision"] == "manual_selection"
+    assert selected["decision"] != "reuse_exact"
+    assert selected["hard_gaps"] == ["aws"]
+    selected_components = _route_components(conn, selected)
+    assert selected_components["unsupported_required_skills"] == []
+    assert selected_components["confirmed_required_skill_facts"][0]["source"] == (
+        "user_confirmed"
+    )
 
 
 def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(

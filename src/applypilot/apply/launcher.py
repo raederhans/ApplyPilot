@@ -48,6 +48,11 @@ from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
+from applypilot.apply.browser_broker import (
+    BrowserBroker,
+    BrowserLeaseBundle,
+    LeaseHeartbeat,
+)
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
     McpPackageSpec,
@@ -62,13 +67,15 @@ from applypilot.apply.chrome import (
     allocate_cdp_port,  # noqa: F401 - injected worker port
     capture_browser_session,  # noqa: F401 - injected worker port
     cleanup_on_exit,
-    cleanup_worker,  # noqa: F401 - injected worker port
     kill_all_chrome,
     launch_chrome,  # noqa: F401 - injected worker port
     release_cdp_port,  # noqa: F401 - injected worker port
     reset_worker_dir,
     resolve_browser_backend,
     restore_browser_session,  # noqa: F401 - injected worker port
+)
+from applypilot.apply.chrome import (
+    cleanup_worker as _cleanup_chrome_worker,
 )
 from applypilot.apply.contracts import (
     AgentCheckpoint,
@@ -79,6 +86,7 @@ from applypilot.apply.contracts import (
     ResourceClaim,
     TaskResult,
     TaskSpec,
+    application_actor_id,
     contract_json,
 )
 from applypilot.apply.dashboard import (
@@ -127,6 +135,21 @@ from applypilot.apply.specialists import (
 )
 from applypilot.database import get_connection
 from applypilot.runtime_settings import load_runtime_settings
+
+_browser_broker = BrowserBroker(default_ttl_seconds=45 * 60)
+_agent_subprocess_runtime = agent_runtime_mod.SubprocessAgentRuntime(
+    kill_process_tree=_kill_process_tree
+)
+atexit.register(_browser_broker.close)
+atexit.register(_agent_subprocess_runtime.close)
+
+
+def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
+    """Release browser resources together with the existing Chrome cleanup."""
+    try:
+        _cleanup_chrome_worker(worker_id, process)
+    finally:
+        _browser_broker.release_scope(f"worker:{worker_id}")
 
 # Document the compatibility surface consumed by the extracted worker. Tests
 # and callers may still replace these ports before ``worker_loop``.
@@ -289,6 +312,8 @@ def _make_mcp_config(
     runtime_metadata: dict | None = None,
     mailbox_mcp: MailboxMcpSpec | dict[str, object] | None = None,
     direct_email_send_authorized: bool = False,
+    credential_relay_authorized: bool = False,
+    identity_relay_authorized: bool = False,
 ) -> dict:
     return agent_runtime_mod.make_mcp_config(
         cdp_port,
@@ -298,6 +323,8 @@ def _make_mcp_config(
         python_executable=sys.executable,
         mailbox_mcp=mailbox_mcp,
         direct_email_send_authorized=direct_email_send_authorized,
+        credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
     )
 
 
@@ -321,6 +348,58 @@ def _start_timeout_watchdog(
         timeout_seconds,
         kill_process_tree=_kill_process_tree,
     )
+
+
+def _browser_lease_for_agent_turn(
+    job: dict,
+    *,
+    worker_id: int,
+    port: int,
+    agent_backend: str,
+    actor_id: str,
+    attempt_id: str,
+    submission_phase: str,
+    dry_run: bool,
+    resume_existing_page: bool,
+) -> BrowserLeaseBundle:
+    """Acquire or continue the non-authoritative browser continuity bundle."""
+    browser_runtime = str(job.get("_browser_root_runtime") or "isolated")
+    profile_id = f"{browser_runtime}:worker:{worker_id}"
+    page_id = f"application:{attempt_id}"
+    runtime_id = f"{agent_backend}:{browser_runtime}:cdp:{port}"
+    scope_id = f"worker:{worker_id}"
+    submit_started = submission_phase == "submit" and not dry_run
+    ttl_seconds = max(
+        60.0,
+        float(load_runtime_settings().application_lease_minutes * 60),
+    )
+    raw_previous = job.get("_browser_lease_binding")
+    if isinstance(raw_previous, Mapping):
+        previous = BrowserLeaseBundle.from_mapping(raw_previous)
+        bundle = _browser_broker.continue_bundle(
+            previous,
+            profile_id=profile_id,
+            page_id=page_id,
+            owner_id=actor_id,
+            scope_id=scope_id,
+            attempt_id=attempt_id,
+            runtime_id=runtime_id,
+            submit_started=submit_started,
+            resume_existing_page=resume_existing_page,
+            ttl_seconds=ttl_seconds,
+        )
+    else:
+        bundle = _browser_broker.acquire_bundle(
+            profile_id=profile_id,
+            page_id=page_id,
+            owner_id=actor_id,
+            scope_id=scope_id,
+            attempt_id=attempt_id,
+            runtime_id=runtime_id,
+            ttl_seconds=ttl_seconds,
+        )
+    job["_browser_lease_binding"] = bundle.as_dict()
+    return bundle
 
 
 def _runtime_timeout_status(*, submission_phase: str, dry_run: bool) -> str:
@@ -369,6 +448,7 @@ def _build_agent_command(
     mcp_config_path: Path,
     *,
     credential_relay_authorized: bool = False,
+    identity_relay_authorized: bool = False,
     playwright_mcp: McpPackageSpec | dict[str, object] | str | None = None,
     capability_registry: CapabilityRegistry | None = None,
     runtime_metadata: dict | None = None,
@@ -387,6 +467,7 @@ def _build_agent_command(
         resolve_codex=_resolve_codex_command,
         python_executable=sys.executable,
         credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
         playwright_mcp=playwright_mcp,
         capability_registry=capability_registry,
         runtime_metadata=runtime_metadata,
@@ -484,8 +565,9 @@ def _persist_agent_turn_started(
     from applypilot.database import append_agent_event
 
     occurred_at = _ordered_agent_event_time()
+    idempotency_key = f"agent-turn:v2:{request.actor_id}:{request.turn_id}:started"
     event = ApplicationEvent(
-        event_id=f"{request.run_id}:started",
+        event_id=idempotency_key,
         attempt_id=request.attempt_id,
         run_id=request.run_id,
         phase=request.phase,
@@ -498,7 +580,10 @@ def _persist_agent_turn_started(
             "available_tools": list(request.available_tools),
             "runtime": runtime_metadata,
         },
-        idempotency_key=f"{request.run_id}:started",
+        idempotency_key=idempotency_key,
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        schema_version="2",
         occurred_at=occurred_at,
     )
     try:
@@ -517,9 +602,13 @@ def _persist_agent_turn_completed(
     source: str,
     metrics: Mapping[str, object] | None = None,
     occurred_after: datetime | None = None,
+    expected_checkpoint_sequence: int | None = None,
 ) -> datetime:
     """Atomically save the terminal control event and resumable checkpoint."""
-    from applypilot.database import record_agent_turn_control
+    from applypilot.database import (
+        current_agent_checkpoint_sequence,
+        record_agent_turn_control,
+    )
 
     actor_decision = application_actor_mod.decision_for_turn(
         request,
@@ -527,6 +616,20 @@ def _persist_agent_turn_completed(
         application_status=application_status,
     )
     actor_decision_json = contract_json(actor_decision)
+    legacy_actor_decision_json = {
+        key: actor_decision_json[key]
+        for key in (
+            "run_id",
+            "attempt_id",
+            "phase",
+            "disposition",
+            "next_phase",
+            "recovery_action",
+            "human_interruption",
+            "shadow_only",
+        )
+    }
+    legacy_actor_decision_json["schema_version"] = "1"
     raw_evidence_refs = result.observations.get("evidence_refs", ())
     evidence_ref_count = (
         len(raw_evidence_refs) if isinstance(raw_evidence_refs, (list, tuple)) else 0
@@ -537,8 +640,11 @@ def _persist_agent_turn_completed(
             continue
         bounded_metrics[_bounded_control_text(key, maximum=80)] = max(0, value)
     occurred_at = _ordered_agent_event_time(occurred_after)
+    completed_idempotency_key = (
+        f"agent-turn:v2:{request.actor_id}:{request.turn_id}:completed"
+    )
     event = ApplicationEvent(
-        event_id=f"{request.run_id}:completed",
+        event_id=completed_idempotency_key,
         attempt_id=request.attempt_id,
         run_id=request.run_id,
         phase=request.phase,
@@ -555,24 +661,48 @@ def _persist_agent_turn_completed(
             "proposal_ids": [proposal.proposal_id for proposal in result.proposals],
             "evidence_ref_count": evidence_ref_count,
             "metrics": bounded_metrics,
-            "actor_decision": actor_decision_json,
+            # Preserve the established v1 key for existing readers while the
+            # native v2 envelope is published alongside it for durable actors.
+            "actor_decision": legacy_actor_decision_json,
+            "actor_decision_v2": actor_decision_json,
         },
         evidence_refs=(),
-        idempotency_key=f"{request.run_id}:completed",
+        idempotency_key=completed_idempotency_key,
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        schema_version="2",
         occurred_at=occurred_at,
     )
+    if expected_checkpoint_sequence is None:
+        try:
+            expected_checkpoint_sequence = current_agent_checkpoint_sequence(request.actor_id)
+        except Exception as exc:  # noqa: BLE001 - control state remains advisory
+            logger.warning(
+                "Could not read Agent actor sequence %s: %s",
+                request.actor_id,
+                exc,
+            )
+            return occurred_at
     checkpoint = AgentCheckpoint(
-        checkpoint_id=f"{request.run_id}:checkpoint:1",
+        checkpoint_id=f"{completed_idempotency_key}:checkpoint",
         run_id=request.run_id,
         attempt_id=request.attempt_id,
         phase=request.phase,
-        sequence=1,
+        sequence=expected_checkpoint_sequence + 1,
         state={
             "application_status": application_status,
             "result": _durable_agent_result(result),
             "source": source,
-            "actor_decision": actor_decision_json,
+            "actor_decision": legacy_actor_decision_json,
+            "actor_decision_v2": actor_decision_json,
         },
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        idempotency_key=completed_idempotency_key,
+        expected_sequence=expected_checkpoint_sequence,
+        fresh_turn_resume_authorized=False,
+        schema_version="2",
+        created_at=occurred_at,
     )
     human_request = application_actor_mod.human_request_for_decision(actor_decision)
     if (
@@ -593,6 +723,8 @@ def _persist_agent_turn_completed(
             request_type="agent_clarification",
             prompt="Agent requested human review; inspect the run evidence before continuing.",
             context={
+                "actor_id": request.actor_id,
+                "turn_id": request.turn_id,
                 "phase": request.phase,
                 "application_status": application_status,
                 "requested_input_length": len(result.requested_human_input),
@@ -878,8 +1010,11 @@ def _persist_agent_proposal_outcomes(
         if outcome.get("status") == "blocked"
     ]
     occurred_at = _ordered_agent_event_time(occurred_after)
+    idempotency_key = (
+        f"agent-turn:v2:{request.actor_id}:{request.turn_id}:proposals:1"
+    )
     event = ApplicationEvent(
-        event_id=f"{request.run_id}:proposals:1",
+        event_id=idempotency_key,
         attempt_id=request.attempt_id,
         run_id=request.run_id,
         phase=request.phase,
@@ -891,7 +1026,10 @@ def _persist_agent_proposal_outcomes(
             "blocked_ids": blocked,
             "max_workers": max_workers,
         },
-        idempotency_key=f"{request.run_id}:proposals:1",
+        idempotency_key=idempotency_key,
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        schema_version="2",
         occurred_at=occurred_at,
     )
     try:
@@ -2608,6 +2746,16 @@ def _credential_relay_allowed(profile: dict, job: dict) -> bool:
     )
 
 
+def _identity_relay_allowed(profile: dict, job: dict) -> bool:
+    identity = profile.get("identity_materials", {})
+    fin_policy = identity.get("fin", {}) if isinstance(identity, Mapping) else {}
+    return bool(
+        isinstance(fin_policy, Mapping)
+        and fin_policy.get("secure_relay_authorized") is True
+        and job.get("_browser_backend") != "cloak"
+    )
+
+
 def _safe_ats_target_url(job: Mapping[str, object]) -> str:
     """Return a query-free application target suitable for Agent context."""
     raw = str(job.get("application_url") or job.get("url") or "")
@@ -2618,6 +2766,72 @@ def _safe_ats_target_url(job: Mapping[str, object]) -> str:
     port = f":{parsed.port}" if parsed.port else ""
     scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
     return f"{scheme}://{hostname}{port}{parsed.path or '/'}"
+
+
+def _credential_application_id(job: Mapping[str, object]) -> str:
+    """Derive an opaque, stable identity for this exact selected posting."""
+    payload = {
+        "url": str(job.get("url") or ""),
+        "application_url": str(job.get("application_url") or ""),
+        "canonical_job_url": str(job.get("canonical_job_url") or ""),
+        "platform_job_id": str(job.get("platform_job_id") or ""),
+        "provider_application_id": str(job.get("provider_application_id") or ""),
+        "requisition_id": str(job.get("requisition_id") or ""),
+        "company": str(job.get("company_name") or ""),
+        "title": str(job.get("title") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _credential_target_urls(
+    job: Mapping[str, object], *, attempt_id: str
+) -> list[str]:
+    """Return only launcher-selected exact application routes for this attempt."""
+    primary_target = job.get("application_url") or job.get("url")
+    candidates: list[object] = [primary_target, job.get("_discovered_application_url")]
+    runtime_binding = job.get("_linkedin_runtime_route_binding")
+    if (
+        isinstance(runtime_binding, Mapping)
+        and str(runtime_binding.get("attempt_id") or "") == attempt_id
+        and runtime_binding.get("lineage_verified") is True
+    ):
+        candidates.append(runtime_binding.get("target_application_url"))
+    routes: set[str] = set()
+    identity_query_keys = {
+        "career_job_req_id",
+        "gh_jid",
+        "job",
+        "job_id",
+        "jobid",
+        "posting_id",
+        "postingid",
+        "reqid",
+        "requisition_id",
+        "requisitionid",
+    }
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        safe = _safe_ats_target_url({"application_url": raw})
+        if safe:
+            parsed = urlparse(raw)
+            identity_query = sorted(
+                (key, value)
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if key.casefold() in identity_query_keys
+            )
+            routes.add(
+                f"{safe}?{urlencode(identity_query)}" if identity_query else safe
+            )
+    return sorted(routes)
 
 
 def _available_semantic_fact_names(profile: Mapping[str, object], job: Mapping[str, object]) -> list[str]:
@@ -2655,7 +2869,10 @@ def _available_semantic_fact_names(profile: Mapping[str, object], job: Mapping[s
 
 
 def _build_ats_application_context(
-    job: Mapping[str, object], profile: Mapping[str, object]
+    job: Mapping[str, object],
+    profile: Mapping[str, object],
+    *,
+    attempt_id: str = "",
 ) -> dict[str, object]:
     """Build the bounded read/proposal-only context shared with ATS tools."""
     target_url = _safe_ats_target_url(job)
@@ -2668,6 +2885,19 @@ def _build_ats_application_context(
         "available_fact_names": _available_semantic_fact_names(profile, job),
         "side_effect": "proposal-only",
     }
+    if attempt_id:
+        provider_binding = job.get("_ats_application_binding")
+        context["credential_binding"] = {
+            "schema_version": "1",
+            "attempt_id": attempt_id,
+            "application_id": _credential_application_id(job),
+            "target_urls": _credential_target_urls(job, attempt_id=attempt_id),
+            "provider_binding": (
+                dict(provider_binding)
+                if isinstance(provider_binding, Mapping)
+                else {}
+            ),
+        }
     observation = job.get("_browser_observation")
     if isinstance(observation, Mapping):
         form_context = observation.get("ats_adapter_context")
@@ -2730,6 +2960,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     profile = config.load_profile()
     authentication = profile.get("authentication", {})
     credential_relay_authorized = _credential_relay_allowed(profile, job)
+    identity_relay_authorized = _identity_relay_allowed(profile, job)
     playwright_mcp, capability_registry = _resolve_agent_tool_surface(
         profile,
         job,
@@ -2816,8 +3047,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     else:
         worker_dir = reset_worker_dir(worker_id)
 
-    run_id = f"agent-{uuid.uuid4()}"
-    attempt_id = str(job.get("_attempt_id") or f"preview-{run_id}")
+    turn_id = f"agent-{uuid.uuid4()}"
+    run_id = turn_id  # Backward-compatible runtime/report identity.
+    attempt_id = str(job.get("_attempt_id") or f"preview-{turn_id}")
+    actor_id = application_actor_id(attempt_id)
+    broker_session_persistent = bool(job.get("_browser_root_runtime"))
+    browser_lease_bundle = _browser_lease_for_agent_turn(
+        job,
+        worker_id=worker_id,
+        port=port,
+        agent_backend=agent_backend,
+        actor_id=actor_id,
+        attempt_id=attempt_id,
+        submission_phase=submission_phase,
+        dry_run=dry_run,
+        resume_existing_page=resume_existing_page,
+    )
     report_path = worker_dir / "agent-turn-report.json"
     ats_context_path = worker_dir / "ats-application-context.json"
     if report_path.exists():
@@ -2833,7 +3078,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     # Build the prompt and stage attachments only inside this worker directory.
     job["_agent_backend"] = agent_backend
     job["_agent_reporting_enabled"] = True
-    ats_context = _build_ats_application_context(job, profile)
+    ats_context = _build_ats_application_context(job, profile, attempt_id=attempt_id)
+    credential_binding = ats_context.get("credential_binding")
+    if not isinstance(credential_binding, Mapping):
+        raise TypeError("Credential relay application binding was not generated")
+    ats_context_json = json.dumps(ats_context, ensure_ascii=False, sort_keys=True)
     job["_ats_adapter_context"] = ats_context
     prompt_started = time.perf_counter()
     agent_prompt = prompt_mod.build_prompt(
@@ -2846,6 +3095,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         resume_existing_page=resume_existing_page,
         submission_phase=submission_phase,
         credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
     )
     setup_metrics["prompt_build_ms"] = round(
         (time.perf_counter() - prompt_started) * 1000,
@@ -2860,6 +3110,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     runtime_metadata: dict = {}
+    runtime_metadata["browser_broker"] = {
+        "schema_version": "1",
+        "profile_id": browser_lease_bundle.profile.resource_id,
+        "profile_epoch": browser_lease_bundle.profile.epoch,
+        "page_id": browser_lease_bundle.page.resource_id,
+        "page_lease_epoch": browser_lease_bundle.page.epoch,
+        "page_epoch": browser_lease_bundle.page_binding.page_epoch,
+        "capabilities": list(browser_lease_bundle.page.capabilities),
+        "authority": "observation_only",
+    }
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
     mcp_config_path.write_text(
         json.dumps(
@@ -2870,6 +3130,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 runtime_metadata=runtime_metadata,
                 mailbox_mcp=mailbox_mcp,
                 direct_email_send_authorized=direct_email_send_authorized,
+                credential_relay_authorized=credential_relay_authorized,
+                identity_relay_authorized=identity_relay_authorized,
             )
         ),
         encoding="utf-8",
@@ -2882,6 +3144,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         worker_dir=worker_dir,
         mcp_config_path=mcp_config_path,
         credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
         playwright_mcp=playwright_mcp,
         capability_registry=runtime_capabilities,
         runtime_metadata=runtime_metadata,
@@ -2922,11 +3185,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env[ATS_CONTEXT_PATH_ENV] = str(ats_context_path)
     for key in (
         "APPLYPILOT_ATS_CREDENTIAL_FILE",
+        "APPLYPILOT_IDENTITY_CREDENTIAL_FILE",
         "APPLYPILOT_CREDENTIAL_ALLOWED_HOSTS",
         "APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS",
         "APPLYPILOT_CREDENTIAL_ALLOW_KNOWN_ATS_REDIRECT",
         "APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS",
+        "APPLYPILOT_CREDENTIAL_APPLICATION_CONTEXT_SHA256",
+        "APPLYPILOT_CREDENTIAL_ATTEMPT_ID",
+        "APPLYPILOT_CREDENTIAL_APPLICATION_ID",
         "APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED",
+        "APPLYPILOT_IDENTITY_RELAY_AUTHORIZED",
     ):
         env.pop(key, None)
     allowed_hosts = {
@@ -2944,15 +3212,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         env["APPLYPILOT_ATS_CREDENTIAL_FILE"] = str(
             config.APP_DIR / "credentials" / "ats-signup.json"
         )
-        env["APPLYPILOT_CREDENTIAL_ALLOWED_HOSTS"] = ",".join(
-            sorted(host for host in allowed_hosts if host)
-        )
         env["APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS"] = ",".join(
             sorted(
                 str(host).strip().casefold()
                 for host in configured_password_hosts
                 if str(host).strip()
             )
+        )
+    if identity_relay_authorized:
+        env["APPLYPILOT_IDENTITY_RELAY_AUTHORIZED"] = "1"
+        env["APPLYPILOT_IDENTITY_CREDENTIAL_FILE"] = str(
+            config.APP_DIR / "credentials" / "identity-protected.json"
+        )
+    if credential_relay_authorized or identity_relay_authorized:
+        env["APPLYPILOT_CREDENTIAL_ALLOWED_HOSTS"] = ",".join(
+            sorted(host for host in allowed_hosts if host)
         )
         # Permit a legitimate employer-page -> known ATS redirect, but the relay
         # still requires exactly one eligible browser tab before filling anything.
@@ -2963,6 +3237,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             credential_root_ids = set()
         env["APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS"] = ",".join(
             sorted(credential_root_ids)
+        )
+        env["APPLYPILOT_CREDENTIAL_APPLICATION_CONTEXT_SHA256"] = hashlib.sha256(
+            ats_context_json.encode("utf-8")
+        ).hexdigest()
+        env["APPLYPILOT_CREDENTIAL_ATTEMPT_ID"] = attempt_id
+        env["APPLYPILOT_CREDENTIAL_APPLICATION_ID"] = str(
+            credential_binding["application_id"]
         )
 
     agent_request = AgentRunRequest(
@@ -3012,6 +3293,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ),
         },
         available_tools=tuple(job["_available_tools"]),
+        actor_id=actor_id,
+        turn_id=turn_id,
         parent_run_id=(
             str(job["_parent_agent_run_id"])
             if job.get("_parent_agent_run_id")
@@ -3037,12 +3320,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     start = time.time()
     ats_context_path.write_text(
-        json.dumps(ats_context, ensure_ascii=False, sort_keys=True),
+        ats_context_json,
         encoding="utf-8",
     )
     stats: dict = {}
     proc = None
     watchdog: threading.Timer | None = None
+    lease_heartbeat: LeaseHeartbeat | None = None
     timed_out = threading.Event()
     agent_process_started = False
     last_agent_event_at: datetime | None = None
@@ -3071,6 +3355,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     prepare_search_events: list[tuple[object, object]] = []
     if submission_phase == "prepare":
         job.pop("_mailbox_prepare_duplicate_receipt", None)
+
+    def cancel_runtime_on_lease_failure(_exc: Exception) -> None:
+        try:
+            _agent_subprocess_runtime.cancel(run_id)
+        except KeyError:
+            return
 
     def record_mailbox_completion(
         tool_name: str,
@@ -3126,17 +3416,31 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     try:
         process_spawn_started = time.perf_counter()
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            actor_id=actor_id,
+            turn_id=turn_id,
+            command=tuple(cmd),
+            prompt=agent_prompt,
+            cwd=worker_dir,
             env=env,
-            cwd=str(worker_dir),
+            runtime_id=browser_lease_bundle.profile.runtime_id,
+            profile_id=browser_lease_bundle.profile.resource_id,
+            parent_run_id=agent_request.parent_run_id,
+            submit_started=submission_phase == "submit" and not dry_run,
         )
+        if agent_request.parent_run_id:
+            proc = _agent_subprocess_runtime.resume(
+                agent_request.parent_run_id,
+                launch_spec,
+                popen_factory=subprocess.Popen,
+            )
+        else:
+            proc = _agent_subprocess_runtime.start(
+                launch_spec,
+                popen_factory=subprocess.Popen,
+            )
         process_spawned_at = time.perf_counter()
         setup_metrics["process_spawn_ms"] = round(
             (process_spawned_at - process_spawn_started) * 1000,
@@ -3145,6 +3449,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
         agent_process_started = True
+        lease_heartbeat = LeaseHeartbeat(
+            _browser_broker,
+            browser_lease_bundle,
+            interval_seconds=30.0,
+            on_failure=cancel_runtime_on_lease_failure,
+        ).start()
         timed_out, watchdog = _start_timeout_watchdog(proc, agent_timeout_seconds)
         last_agent_event_at = _persist_agent_turn_started(
             agent_request,
@@ -3152,17 +3462,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             model=model,
             runtime_metadata=runtime_metadata,
         )
-
-        try:
-            proc.stdin.write(agent_prompt)
-            proc.stdin.close()
-        except BrokenPipeError as exc:
-            startup_output = proc.stdout.read() if proc.stdout else ""
-            proc.wait(timeout=5)
-            raise RuntimeError(
-                "Agent exited before accepting the prompt: "
-                + startup_output.strip()[:500]
-            ) from exc
 
         text_parts: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
@@ -3315,6 +3614,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if watchdog is not None:
             watchdog.cancel()
         proc.wait(timeout=5)
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_failed()
         returncode = proc.returncode
         proc = None
         job["_mailbox_runtime_evidence"] = dict(mailbox_runtime_evidence)
@@ -3605,11 +3906,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     finally:
         if watchdog is not None:
             watchdog.cancel()
+        if lease_heartbeat is not None:
+            lease_heartbeat.stop()
+            browser_lease_bundle = lease_heartbeat.bundle
+            job["_browser_lease_binding"] = browser_lease_bundle.as_dict()
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
         if agent_process_started:
+            _agent_subprocess_runtime.close(run_id)
+            job["_parent_agent_run_id"] = run_id
             final_duration_ms = turn_duration_ms or int((time.time() - start) * 1000)
             final_status = turn_application_status or (
                 "submission_uncertain"
@@ -3655,6 +3962,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "browser_tool_success_count": browser_tool_success_count,
                 },
             )
+        if not broker_session_persistent:
+            _browser_broker.release_scope(f"worker:{worker_id}")
+            job.pop("_browser_lease_binding", None)
         if report_path.exists():
             try:
                 report_path.unlink()

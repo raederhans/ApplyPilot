@@ -76,6 +76,29 @@ ecosystem company directory ──> source run ──> company seed
 .\run-radar.ps1 radar report --hours 24 --require-applied-snapshot <sync 返回的 snapshot_id> --output .\data\reports\daily-radar-YYYY-MM-DD.md
 ```
 
+LinkedIn Applied 同步支持两种明确语义：
+
+- `sync_mode: "full"`（默认）是翻完所有当前可见页的基线/校验快照。只有 `complete=true`、`observed_total`与输入记录数一致、无重复 job ID、无 skipped且观察时间带时区时，才能用于日报的完整性 gate。
+- `sync_mode: "incremental"` 是基于一个已通过完整性校验的 `base_snapshot_id` 追加新 Applied job ID。它会立即更新累计历史排重集，但不会伪装成当前 LinkedIn 全量覆盖，因此不能单独满足 `--require-applied-snapshot`。
+
+增量文件的最小格式：
+
+```json
+{
+  "source": "linkedin_job_tracker_incremental_read",
+  "sync_mode": "incremental",
+  "base_snapshot_id": "<a complete snapshot_id>",
+  "observed_at": "2026-08-31T09:00:00+08:00",
+  "observed_total": 74,
+  "pages_read": 1,
+  "applications": [
+    {"url": "https://www.linkedin.com/jobs/view/123456789/"}
+  ]
+}
+```
+
+实际排重账本仍是本地 `jobs` 表：完整基线、后续增量和 ApplyPilot 自身已接纳的 receipt 都会合并进这个只增不减的排除集。由于 LinkedIn 页面没有仓库内可验证的官方 cursor，快速增量不能证明“没有漏掉其他新记录”；证据型日报或分页/计数异常时仍必须做周期性完整校验。
+
 `run-radar.ps1` 是运行时能力白名单：只放行 Applied 同步和五个 radar 子命令，限制导入/报告路径和扩展，并在启动 Python 前拒绝 apply、pipeline、tailor、cover 等入口。两类导入都要求 `-AttendedReview`；source ID 必须出现在各自 allowlist，disabled 来源会在 Python registry 再次拒绝。日报必须绑定同一次同步返回的完整 Applied snapshot；快照观察时间超过 6 小时、计数不守恒、存在 skipped 或 ID 不匹配时，不会创建日报。
 
 LinkedIn 默认 prompt 采用实测更能压低全球泛帖噪声的本地招聘标签格式：

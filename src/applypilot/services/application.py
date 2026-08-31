@@ -15,9 +15,10 @@ from applypilot.runtime_settings import load_runtime_settings
 def load_profile(path: Path) -> dict:
     """Load a profile for command policy checks, preserving the legacy fallback."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        profile = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    return config.validate_profile_availability(profile)
 
 
 def resolve_apply_backend(override: str | None, environ: Mapping[str, str]) -> str:

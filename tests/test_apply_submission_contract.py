@@ -16,6 +16,7 @@ from applypilot.cli import (
     _standing_auto_authorization_enabled,
     app,
 )
+from applypilot.commands import apply as apply_command
 from applypilot.database import (
     admit_direct_email_sent_receipt,
     finalize_application_attempt,
@@ -254,6 +255,14 @@ def test_example_profile_declares_but_does_not_grant_standing_submission() -> No
     assert _standing_auto_authorization_enabled(explicitly_authorized) is True
 
 
+def test_profile_enables_manual_captcha_relay_without_repeating_cli_flag() -> None:
+    profile = {"submission_policy": {"manual_captcha_relay": True}}
+
+    assert apply_command._manual_captcha_relay_enabled(False, profile) is True
+    assert apply_command._manual_captcha_relay_enabled(True, {}) is True
+    assert apply_command._manual_captcha_relay_enabled(False, {}) is False
+
+
 def test_standing_authorization_binds_a_bounded_replacement_pool(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "standing-replacements.db")
     first = _job("https://careers.example.test/jobs/data-1")
@@ -382,6 +391,39 @@ def test_manifest_queue_claims_only_authorized_job_and_is_idempotent(
     assert claimed["url"] == authorized["url"]
     assert claimed["_authorization_entry"] == manifest["jobs"][0]
     assert second_claim is None
+
+
+def test_manifest_queue_preserves_fallback_application_url_for_material_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply.material_readiness import evaluate_material_readiness
+
+    conn = init_db(tmp_path / "fallback-application-url.db")
+    job = _job("https://job-boards.greenhouse.io/example/jobs/1002")
+    job["application_url"] = None
+    resume = tmp_path / "fallback-resume.pdf"
+    resume.write_bytes(b"%PDF-fallback-application-url")
+    _insert_ready_job(conn, job, resume)
+    manifest_job = dict(job, application_url=job["url"], tailored_resume_path=str(resume))
+    conn.execute(
+        "UPDATE jobs SET application_readiness_fingerprint=? WHERE url=?",
+        (authorization.compute_job_fingerprint(manifest_job), job["url"]),
+    )
+    conn.commit()
+    manifest = authorization.build_bound_manifest(
+        [manifest_job], now=datetime.now(UTC), ttl_minutes=30
+    )
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    claimed = launcher.acquire_job(
+        target_url=job["url"],
+        worker_id=0,
+        authorization_manifest=manifest,
+    )
+
+    assert claimed is not None
+    assert claimed["application_url"] == job["url"]
+    assert evaluate_material_readiness(claimed)["ready"] is True
 
 
 def test_manifest_queue_uses_profile_attempt_ceiling(
@@ -632,6 +674,45 @@ def test_confirmation_email_reconciles_manual_submission_from_resume_receipt(
     assert stored["apply_status"] == "applied"
     assert stored["application_evidence"] == "confirmation_email:gmail-example-resume-received"
     assert stored["verification_confidence"] == "durable_receipt_reconciled"
+
+
+def test_internsg_submission_record_email_is_a_durable_receipt(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "internsg-submission-record.db")
+    job_url = "https://www.internsg.com/job/example-data-engineer-intern/"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company_name, apply_status, apply_error) "
+        "VALUES (?, ?, ?, 'failed', 'captcha submission failed')",
+        (job_url, "Data Engineer Intern", "Example Data Pte. Ltd."),
+    )
+    conn.commit()
+
+    result = reconcile_submission_receipt(
+        {
+            "job_url": job_url,
+            "source": "confirmation_email",
+            "receipt_id": "gmail-internsg-submission-record",
+            "company_name": "Example Data Pte. Ltd.",
+            "job_title": "Data Engineer Intern",
+            "confirmation_text": (
+                "This email is a submission record for your application to an "
+                "InternSG listing."
+            ),
+        },
+        conn,
+    )
+
+    assert result["status"] == "applied" and result["changed"] is True
+    stored = conn.execute(
+        "SELECT apply_status, apply_error, verification_confidence, application_evidence "
+        "FROM jobs WHERE url=?",
+        (job_url,),
+    ).fetchone()
+    assert dict(stored) == {
+        "apply_status": "applied",
+        "apply_error": None,
+        "verification_confidence": "durable_receipt_reconciled",
+        "application_evidence": "confirmation_email:gmail-internsg-submission-record",
+    }
 
 
 def test_direct_email_provider_message_id_is_unique_across_jobs(tmp_path: Path) -> None:

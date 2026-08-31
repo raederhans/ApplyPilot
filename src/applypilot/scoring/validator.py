@@ -443,6 +443,53 @@ def validate_json_fields(
 
 # ── Full Resume Text Validation ───────────────────────────────────────────
 
+def current_profile_resume_fact_errors(text: str, profile: dict) -> list[str]:
+    """Return explicit resume facts that conflict with the current profile.
+
+    Omitted optional facts are allowed. Only an explicit GPA scoped to its
+    institution is checked, so historical artifacts can remain immutable while
+    stale factual claims are prevented from being reused.
+    """
+    education = [
+        item
+        for item in profile.get("education", [])
+        if isinstance(item, dict) and str(item.get("institution") or "").strip()
+    ]
+    if not education:
+        return []
+
+    text_lower = text.casefold()
+    institution_spans: list[tuple[int, int, dict]] = []
+    for item in education:
+        institution = str(item["institution"]).strip()
+        for match in re.finditer(re.escape(institution.casefold()), text_lower):
+            institution_spans.append((match.start(), match.end(), item))
+    institution_spans.sort(key=lambda span: span[0])
+
+    errors: list[str] = []
+    for index, (_, end, item) in enumerate(institution_spans):
+        expected_match = re.search(r"\b(\d+(?:\.\d+)?)\b", str(item.get("gpa") or ""))
+        if not expected_match or not item.get("gpa_may_be_disclosed", True):
+            continue
+        segment_end = (
+            institution_spans[index + 1][0]
+            if index + 1 < len(institution_spans)
+            else min(len(text), end + 500)
+        )
+        segment = text[end:segment_end]
+        claimed = re.search(r"\bgpa\s*[:=]?\s*(\d+(?:\.\d+)?)\b", segment, re.IGNORECASE)
+        if not claimed:
+            continue
+        expected = expected_match.group(1).rstrip("0").rstrip(".")
+        actual = claimed.group(1).rstrip("0").rstrip(".")
+        if actual != expected:
+            errors.append(
+                f"Education GPA for '{item['institution']}' is {actual}, "
+                f"but the current profile records {expected}."
+            )
+    return errors
+
+
 def validate_tailored_resume(text: str, profile: dict, original_text: str = "") -> dict:
     """Programmatic validation of a tailored resume against the user's profile.
 
@@ -504,6 +551,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     for school in [school.strip() for school in preserved_school.split(";") if school.strip()]:
         if school.casefold() not in text_lower:
             errors.append(f"Education '{school}' missing")
+
+    # Optional GPA omission remains valid, but an explicit stale value cannot.
+    errors.extend(current_profile_resume_fact_errors(text, profile))
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")

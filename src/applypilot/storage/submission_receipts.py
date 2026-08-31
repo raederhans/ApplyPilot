@@ -215,6 +215,7 @@ def admit_direct_email_sent_receipt(
 
 _STRONG_SUBMISSION_RECEIPT = re.compile(
     r"application (?:was |has been )?(?:successfully )?(?:submitted|received)|"
+    r"submission record for your application|"
     r"we(?:'ve| have) received your resume|"
     r"thank you for (?:applying|submitting your application)|"
     r"we (?:have )?received your application|"

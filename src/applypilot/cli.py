@@ -426,10 +426,13 @@ def sync_linkedin_applied(
         "--file",
         exists=True,
         dir_okay=False,
-        help="Lightweight LinkedIn Applied JSON or CSV export.",
+        help=(
+            "LinkedIn Applied full baseline or JSON incremental export; "
+            "incremental payloads require a complete base_snapshot_id."
+        ),
     ),
 ) -> None:
-    """Merge a browser/user export of LinkedIn Applied into local status."""
+    """Merge a full baseline or safe incremental LinkedIn Applied export."""
     from applypilot.config import RADAR_IMPORT_DIR
 
     if (

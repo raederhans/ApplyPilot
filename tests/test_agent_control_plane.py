@@ -13,6 +13,7 @@ from applypilot.apply.contracts import (
     ApplicationEvent,
     HumanRequest,
     ToolSpec,
+    application_actor_id,
     contract_json,
 )
 from applypilot.database import append_agent_event, init_db
@@ -34,6 +35,8 @@ def test_contracts_are_provider_and_workflow_extensible() -> None:
     )
     request = AgentRunRequest(
         run_id="run-1",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-1",
         attempt_id="attempt-1",
         agent_role="form-mapper",
         phase="tenant-specific-review-v2",
@@ -54,7 +57,18 @@ def test_contracts_are_provider_and_workflow_extensible() -> None:
 
     assert contract_json(tool)["side_effect"] == "proposal-only"
     assert contract_json(request)["created_at"].endswith("+00:00")
+    assert request.run_id == request.turn_id
     assert len(result.proposals) == 2
+    with pytest.raises(ValueError, match="compatibility alias"):
+        AgentRunRequest(
+            run_id="legacy-run-alias",
+            actor_id=application_actor_id("attempt-1"),
+            turn_id="different-turn",
+            attempt_id="attempt-1",
+            agent_role="form-mapper",
+            phase="prepare",
+            objective="Reject divergent turn identity",
+        )
 
 
 @pytest.mark.parametrize(
@@ -158,6 +172,45 @@ def test_idempotency_key_replay_is_a_noop_and_conflicts_are_rejected() -> None:
         )
 
 
+def test_v2_control_records_reject_noncanonical_actor_identity() -> None:
+    with pytest.raises(ValueError, match="actor_id|canonical"):
+        AgentRunRequest(
+            run_id="turn-1",
+            actor_id="application:different-attempt",
+            turn_id="turn-1",
+            attempt_id="attempt-1",
+            agent_role="form-mapper",
+            phase="prepare",
+            objective="Reject an actor/CAS identity fork",
+        )
+    with pytest.raises(ValueError, match="actor_id|canonical"):
+        ApplicationEvent(
+            event_id="event-divergent-actor",
+            attempt_id="attempt-1",
+            run_id="turn-1",
+            actor_id="application:different-attempt",
+            turn_id="turn-1",
+            phase="prepare",
+            actor="runtime",
+            event_type="agent.turn.completed",
+            schema_version="2",
+        )
+    with pytest.raises(ValueError, match="actor_id|canonical"):
+        AgentCheckpoint(
+            checkpoint_id="checkpoint-divergent-actor",
+            run_id="turn-1",
+            actor_id="application:different-attempt",
+            turn_id="turn-1",
+            attempt_id="attempt-1",
+            phase="prepare",
+            sequence=1,
+            expected_sequence=0,
+            idempotency_key="application:different-attempt:turn-1:completed",
+            schema_version="2",
+            state={},
+        )
+
+
 def test_latest_checkpoint_is_sequence_based_and_does_not_change_jobs() -> None:
     conn = connection()
     conn.execute("CREATE TABLE jobs (url TEXT PRIMARY KEY, apply_status TEXT)")
@@ -166,18 +219,28 @@ def test_latest_checkpoint_is_sequence_based_and_does_not_change_jobs() -> None:
     first = AgentCheckpoint(
         checkpoint_id="cp-1",
         run_id="run-1",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-1",
         attempt_id="attempt-1",
         phase="prepare",
         sequence=1,
+        expected_sequence=0,
+        idempotency_key="application:attempt-1:run-1:completed",
+        schema_version="2",
         state={"completed_proposals": []},
         created_at=now,
     )
     second = AgentCheckpoint(
         checkpoint_id="cp-2",
-        run_id="run-1",
+        run_id="run-2",
+        actor_id=application_actor_id("attempt-1"),
+        turn_id="run-2",
         attempt_id="attempt-1",
         phase="review",
         sequence=2,
+        expected_sequence=1,
+        idempotency_key="application:attempt-1:run-2:completed",
+        schema_version="2",
         state={"completed_proposals": ["p1"], "next": ["p2"]},
         created_at=now,
     )
@@ -185,9 +248,15 @@ def test_latest_checkpoint_is_sequence_based_and_does_not_change_jobs() -> None:
     assert agent_control.append_checkpoint(conn, first)
     assert agent_control.append_checkpoint(conn, second)
     assert agent_control.append_checkpoint(conn, second) is False
-    latest = agent_control.latest_checkpoint(conn, "run-1")
+    latest = agent_control.latest_actor_checkpoint(
+        conn, application_actor_id("attempt-1")
+    )
 
     assert latest == second
+    assert agent_control.latest_checkpoint(conn, "run-1") == first
+    assert agent_control.current_actor_sequence(
+        conn, application_actor_id("attempt-1")
+    ) == 2
     assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "in_progress"
 
 
@@ -224,12 +293,14 @@ def test_init_db_wires_control_schema_without_changing_jobs(tmp_path) -> None:
     }
 
     assert tables == {
-        "agent_events",
-        "agent_checkpoints",
-        "agent_human_requests",
-        "agent_human_responses",
-        "agent_tasks",
-    }
+            "agent_events",
+            "agent_exception_queue",
+            "agent_checkpoints",
+            "agent_human_requests",
+            "agent_human_responses",
+            "agent_recovery_results",
+            "agent_tasks",
+        }
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import ModuleType
 
@@ -67,6 +67,19 @@ def _worker_summary_lines(
         ],
         allocation["effective_workers"],
     )
+
+
+def _manual_captcha_relay_enabled(
+    cli_requested: bool,
+    profile: Mapping[str, object],
+) -> bool:
+    """Honor the persisted relay preference without requiring a repeat flag."""
+    submission_policy = profile.get("submission_policy")
+    profile_enabled = bool(
+        isinstance(submission_policy, Mapping)
+        and submission_policy.get("manual_captcha_relay") is True
+    )
+    return bool(cli_requested or profile_enabled)
 
 
 def run_apply(
@@ -149,6 +162,10 @@ def run_apply(
     profile = load_profile(_profile_path)
     standing_auto_authorize = _standing_auto_authorization_enabled(profile)
     submission_policy = profile.get("submission_policy", {})
+    manual_captcha_relay = _manual_captcha_relay_enabled(
+        manual_captcha_relay,
+        profile,
+    )
     final_batch_authorization_required = bool(
         isinstance(submission_policy, dict)
         and submission_policy.get("batch_final_authorization_required", False)

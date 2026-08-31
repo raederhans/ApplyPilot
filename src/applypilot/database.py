@@ -15,7 +15,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.apply import human_handoff as _human_handoff
-from applypilot.apply.contracts import AgentCheckpoint, ApplicationEvent, HumanRequest
+from applypilot.apply.contracts import (
+    AgentCheckpoint,
+    ApplicationEvent,
+    ApplicationException,
+    HumanRequest,
+    RecoveryExecutionResult,
+    application_actor_id,
+)
 from applypilot.config import DB_PATH
 from applypilot.storage import agent_control as _agent_control
 from applypilot.storage import application_ledger as _application_ledger
@@ -498,6 +505,17 @@ def append_agent_event(
         raise
 
 
+def current_agent_checkpoint_sequence(
+    actor_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Return the current native actor sequence for checkpoint CAS planning."""
+    if not actor_id:
+        raise ValueError("actor_id is required")
+    connection = conn or get_connection()
+    return _agent_control.current_actor_sequence(connection, actor_id)
+
+
 def record_agent_turn_control(
     event: ApplicationEvent,
     checkpoint: AgentCheckpoint,
@@ -505,8 +523,29 @@ def record_agent_turn_control(
     conn: sqlite3.Connection | None = None,
 ) -> tuple[bool, bool, bool | None]:
     """Atomically append a completed turn, checkpoint, and optional handoff."""
+    if event.schema_version != "2" or checkpoint.schema_version != "2":
+        raise ValueError("completed Agent turn control writes require schema v2")
+    canonical_actor_id = application_actor_id(event.attempt_id)
+    if event.actor_id != canonical_actor_id or checkpoint.actor_id != canonical_actor_id:
+        raise ValueError("completed Agent turn control writes require the canonical actor identity")
+    if (
+        event.attempt_id != checkpoint.attempt_id
+        or event.run_id != checkpoint.run_id
+        or event.actor_id != checkpoint.actor_id
+        or event.turn_id != checkpoint.turn_id
+    ):
+        raise ValueError("event and checkpoint durable identities must match")
+    if human_request is not None and (
+        human_request.attempt_id != event.attempt_id
+        or human_request.run_id != event.run_id
+    ):
+        raise ValueError("human request identity must match the completed turn")
     connection = conn or get_connection()
     owns_transaction = not connection.in_transaction
+    savepoint_name: str | None = None
+    if not owns_transaction:
+        savepoint_name = f"agent_turn_control_{uuid.uuid4().hex}"
+        connection.execute(f"SAVEPOINT {savepoint_name}")
     try:
         event_inserted = _agent_control.append_event(connection, event)
         checkpoint_inserted = _agent_control.append_checkpoint(connection, checkpoint)
@@ -517,7 +556,102 @@ def record_agent_turn_control(
         )
         if owns_transaction:
             connection.commit()
+        elif savepoint_name is not None:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
         return event_inserted, checkpoint_inserted, request_inserted
+    except (sqlite3.Error, TypeError, ValueError):
+        if owns_transaction:
+            connection.rollback()
+        elif savepoint_name is not None:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        raise
+
+
+def append_recovery_execution_result(
+    result: RecoveryExecutionResult,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Append one durable recovery lifecycle result."""
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    try:
+        inserted = _agent_control.append_recovery_result(connection, result)
+        if owns_transaction:
+            connection.commit()
+        return inserted
+    except (sqlite3.Error, TypeError, ValueError):
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def list_recovery_execution_results(
+    *,
+    command_id: str | None = None,
+    attempt_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[RecoveryExecutionResult]:
+    """Read recovery command lifecycle results without changing queue state."""
+    return _agent_control.list_recovery_results(
+        conn or get_connection(),
+        command_id=command_id,
+        attempt_id=attempt_id,
+    )
+
+
+def enqueue_application_exception(
+    item: ApplicationException,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Park one application exception idempotently."""
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    try:
+        inserted = _agent_control.enqueue_exception(connection, item)
+        if owns_transaction:
+            connection.commit()
+        return inserted
+    except (sqlite3.Error, TypeError, ValueError):
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def list_application_exceptions(
+    *,
+    status: str | None = "open",
+    attempt_id: str | None = None,
+    command_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[ApplicationException]:
+    """List parked application exceptions for operator handling."""
+    return _agent_control.list_exceptions(
+        conn or get_connection(),
+        status=status,
+        attempt_id=attempt_id,
+        command_id=command_id,
+    )
+
+
+def resolve_application_exception(
+    exception_id: str,
+    *,
+    resolved_at: datetime | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Resolve one queue item without authorizing a retry or submission."""
+    connection = conn or get_connection()
+    owns_transaction = not connection.in_transaction
+    try:
+        resolved = _agent_control.resolve_exception(
+            connection,
+            exception_id,
+            resolved_at=resolved_at,
+        )
+        if owns_transaction:
+            connection.commit()
+        return resolved
     except (sqlite3.Error, TypeError, ValueError):
         if owns_transaction:
             connection.rollback()
@@ -948,12 +1082,15 @@ def import_linkedin_applied_export(
     file_path: Path | str,
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
-    """Merge a lightweight LinkedIn Applied JSON/CSV export into local state.
+    """Merge a LinkedIn Applied baseline or incremental export into local state.
 
     The export may be a JSON list, ``{"applications": [...]}``, or CSV. Expected
     fields are ``url`` (or ``job_url``), plus optional title, company and
     applied_at. Existing descriptive data is preserved; the operation only adds
-    missing identity text and refreshes application state.
+    missing identity text and refreshes application state. A JSON payload with
+    ``sync_mode="incremental"`` must name a previously admitted complete
+    ``base_snapshot_id``. Incremental imports extend the cumulative exclusion
+    ledger but deliberately do not claim current full LinkedIn coverage.
     """
     path = Path(file_path)
     snapshot_metadata: dict = {}
@@ -971,10 +1108,45 @@ def import_linkedin_applied_export(
     if not isinstance(records, list):
         raise TypeError("LinkedIn Applied export must contain a list of records")
 
+    sync_mode = str(snapshot_metadata.get("sync_mode") or "full").strip().casefold()
+    if sync_mode not in {"full", "incremental"}:
+        raise ValueError("LinkedIn Applied sync_mode must be 'full' or 'incremental'")
+    source = str(
+        snapshot_metadata.get("source")
+        or (
+            "linkedin_applied_incremental"
+            if sync_mode == "incremental"
+            else "linkedin_applied_import"
+        )
+    )[:200]
+    if not source.casefold().startswith("linkedin"):
+        raise ValueError("LinkedIn Applied source must use the 'linkedin' namespace")
+
     if conn is None:
         conn = get_connection()
     ensure_radar_schema(conn)
+    base_snapshot_id = (
+        str(snapshot_metadata.get("base_snapshot_id") or "").strip() or None
+    )
+    base_snapshot: dict | None = None
+    if sync_mode == "incremental":
+        if not base_snapshot_id:
+            raise ValueError(
+                "Incremental LinkedIn Applied import requires base_snapshot_id"
+            )
+        base_snapshot = _radar.get_latest_applied_exclusion_snapshot(
+            conn,
+            snapshot_id=base_snapshot_id,
+        )
+        if base_snapshot.get("integrity_valid") is not True:
+            raise ValueError(
+                "Incremental LinkedIn Applied import requires a complete, "
+                "integrity-valid base snapshot"
+            )
+
     counts = {"inserted": 0, "updated": 0, "skipped": 0}
+    seen_platform_job_ids: set[str] = set()
+    duplicate_records = 0
     now = datetime.now(UTC).isoformat()
     for item in records:
         if not isinstance(item, dict):
@@ -988,6 +1160,11 @@ def import_linkedin_applied_export(
         if not platform_job_id or not canonical_url:
             counts["skipped"] += 1
             continue
+        if platform_job_id in seen_platform_job_ids:
+            counts["skipped"] += 1
+            duplicate_records += 1
+            continue
+        seen_platform_job_ids.add(platform_job_id)
         title = str(item.get("title") or "").strip()[:500] or None
         company = str(item.get("company") or item.get("company_name") or "").strip()[:500] or None
         location = str(item.get("location") or "").strip()[:500] or None
@@ -1061,16 +1238,36 @@ def import_linkedin_applied_export(
             observed_at_valid = observed_timestamp.tzinfo is not None
         except ValueError:
             observed_at_valid = False
-    completeness = (
-        "complete"
-        if snapshot_metadata.get("complete") is True
-        and declared_total == len(records)
-        and pages_read is not None
-        and pages_read > 0
-        and counts["skipped"] == 0
-        and observed_at_valid
-        else "partial"
-    )
+    if sync_mode == "incremental":
+        completeness = (
+            "incremental"
+            if pages_read is not None
+            and pages_read > 0
+            and counts["skipped"] == 0
+            and observed_at_valid
+            else "partial"
+        )
+    else:
+        completeness = (
+            "complete"
+            if snapshot_metadata.get("complete") is True
+            and declared_total == len(records)
+            and pages_read is not None
+            and pages_read > 0
+            and counts["skipped"] == 0
+            and observed_at_valid
+            else "partial"
+        )
+
+    snapshot_metadata.update({
+        "sync_mode": sync_mode,
+        "base_snapshot_id": base_snapshot_id,
+        "base_declared_total": (
+            base_snapshot.get("declared_total") if base_snapshot is not None else None
+        ),
+        "unique_record_count": len(seen_platform_job_ids),
+        "duplicate_record_count": duplicate_records,
+    })
     snapshot_id = uuid.uuid4().hex
     conn.execute(
         """
@@ -1082,7 +1279,7 @@ def import_linkedin_applied_export(
         """,
         (
             snapshot_id,
-            str(snapshot_metadata.get("source") or "linkedin_applied_import")[:200],
+            source,
             observed_at,
             now,
             declared_total,
@@ -1095,15 +1292,22 @@ def import_linkedin_applied_export(
         ),
     )
     conn.commit()
+    cumulative_exclusion_count = sum(
+        item.get("exclusion_source") == "linkedin_applied"
+        for item in _radar.get_applied_exclusion_set(conn)
+    )
     return {
         **counts,
         "snapshot_id": snapshot_id,
-        "source": str(
-            snapshot_metadata.get("source") or "linkedin_applied_import"
-        )[:200],
+        "source": source,
+        "sync_mode": sync_mode,
+        "base_snapshot_id": base_snapshot_id,
         "observed_at": observed_at,
         "declared_total": declared_total,
         "pages_read": pages_read,
+        "unique_record_count": len(seen_platform_job_ids),
+        "duplicate_record_count": duplicate_records,
+        "cumulative_exclusion_count": cumulative_exclusion_count,
         "completeness": completeness,
     }
 

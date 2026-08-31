@@ -2,7 +2,9 @@
 
 import os
 import platform
+import re
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,6 +37,57 @@ APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
+
+_DEPRECATED_AVAILABILITY_KEYS = frozenset({
+    "non_credit_internship",
+    "non_credit_internship_start",
+    "non_credit_internship_hours_per_week_max",
+    "non_credit_internship_availability",
+    "available_for_full_time_3_6_month_internship_starting_september",
+})
+_DEPRECATED_WEEKLY_LIMIT = re.compile(
+    r"\b16[\s-]*(?:hours?|h)(?:\s*(?:/|per)\s*week|\s+weekly)?\b",
+    flags=re.IGNORECASE,
+)
+
+
+def validate_profile_availability(profile: dict) -> dict:
+    """Reject retired candidate-availability facts before they reach an agent prompt."""
+    scoped = {
+        key: profile.get(key)
+        for key in (
+            "work_authorization",
+            "availability",
+            "screening",
+            "contact_preferences",
+            "application_facts",
+        )
+        if key in profile
+    }
+    violations: list[str] = []
+
+    def visit(value: object, path: str) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                child_path = f"{path}.{key}" if path else key
+                if key.casefold() in _DEPRECATED_AVAILABILITY_KEYS:
+                    violations.append(child_path)
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+        elif isinstance(value, str) and _DEPRECATED_WEEKLY_LIMIT.search(value):
+            violations.append(path)
+
+    visit(scoped, "")
+    if violations:
+        paths = ", ".join(dict.fromkeys(violations))
+        raise ValueError(
+            "Profile contains retired candidate availability facts; remove them before "
+            f"running an application: {paths}"
+        )
+    return profile
 
 
 def get_chrome_path() -> str:
@@ -128,7 +181,8 @@ def load_profile() -> dict:
         raise FileNotFoundError(
             f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    return validate_profile_availability(profile)
 
 
 def load_search_config() -> dict:

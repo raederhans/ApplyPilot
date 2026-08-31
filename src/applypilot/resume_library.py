@@ -25,9 +25,10 @@ from applypilot.apply.authorization import compute_file_binding, compute_job_fin
 from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
 from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.scoring.validator import current_profile_resume_fact_errors
 
 TAXONOMY_VERSION = "resume-library-v5"
-POLICY_VERSION = "reuse-policy-v2"
+POLICY_VERSION = "reuse-policy-v3"
 
 REUSE_REQUIRED_COVERAGE = 0.90
 REUSE_OVERALL_SCORE = 0.85
@@ -209,6 +210,75 @@ def _profile_skills(profile: Mapping[str, object]) -> set[str]:
             if isinstance(items, Iterable) and not isinstance(items, (str, bytes)):
                 result.update(_normalise_text(item) for item in items if _normalise_text(item))
     return result
+
+
+def _confirmed_experience_skill_facts(
+    profile: Mapping[str, object],
+) -> dict[str, dict[str, object]]:
+    """Return narrowly admitted user-confirmed positive skill experience facts.
+
+    These facts may prove that a hard gap is supported somewhere in the local
+    factual record, allowing a new tailored variant to be attempted. They do
+    not change the skill coverage of any existing resume artifact.
+    """
+    facts = profile.get("application_facts", [])
+    if not isinstance(facts, list):
+        return {}
+    known_skills = _profile_skills(profile)
+    admitted: dict[str, dict[str, object]] = {}
+    for fact in facts:
+        if not isinstance(fact, Mapping):
+            continue
+        if _normalise_text(fact.get("source")) != "user_confirmed":
+            continue
+        key = str(fact.get("key") or "").strip().casefold()
+        match = re.fullmatch(r"([a-z0-9]+(?:_[a-z0-9]+)*)_experience_years", key)
+        if match is None:
+            continue
+        skill = _normalise_text(match.group(1).replace("_", " "))
+        value = fact.get("value")
+        if (
+            skill not in known_skills
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value <= 0
+        ):
+            continue
+        admitted[skill] = {
+            "skill": skill,
+            "fact_key": key,
+            "value": value,
+            "source": "user_confirmed",
+            "confirmed_at": str(fact.get("confirmed_at") or "").strip(),
+        }
+    return admitted
+
+
+def _unsupported_required_skills(
+    conn: sqlite3.Connection,
+    profile: Mapping[str, object],
+    hard_gaps: Iterable[str],
+) -> tuple[list[str], list[dict[str, object]]]:
+    """Classify hard gaps against base resumes and narrow confirmed facts."""
+    all_source_text = "\n".join(
+        _normalise_text(read_resume_source(Path(str(row["text_path"]))))
+        for row in conn.execute(
+            "SELECT text_path FROM resume_artifacts WHERE active=1 AND kind='base'"
+        ).fetchall()
+        if Path(str(row["text_path"])).is_file()
+    )
+    confirmed_facts = _confirmed_experience_skill_facts(profile)
+    unsupported: list[str] = []
+    fact_support: list[dict[str, object]] = []
+    for gap in hard_gaps:
+        if _contains_phrase(all_source_text, gap):
+            continue
+        fact = confirmed_facts.get(_normalise_text(gap))
+        if fact is None:
+            unsupported.append(gap)
+        else:
+            fact_support.append(fact)
+    return unsupported, fact_support
 
 
 def _configured_source_paths_for_track(
@@ -1086,7 +1156,12 @@ def route_resume_for_job(
     hard_gaps: list[str] = []
     manual_selection_allowed = False
     candidates: list[dict] = []
-    components: dict[str, object] = {"job_profile": job_profile, "candidates": []}
+    profile_fact_rejections: list[dict[str, object]] = []
+    components: dict[str, object] = {
+        "job_profile": job_profile,
+        "candidates": [],
+        "profile_fact_rejections": profile_fact_rejections,
+    }
 
     if str(job.get("eligibility_status") or "").casefold() == "ineligible":
         decision = "ignore"
@@ -1112,6 +1187,16 @@ def route_resume_for_job(
         for row in rows:
             artifact = dict(row)
             if _artifact_is_current(artifact):
+                artifact_text = read_resume_source(Path(str(artifact["text_path"])))
+                fact_errors = current_profile_resume_fact_errors(artifact_text, dict(profile))
+                if fact_errors:
+                    profile_fact_rejections.append(
+                        {
+                            "artifact_id": artifact["artifact_id"],
+                            "errors": fact_errors,
+                        }
+                    )
+                    continue
                 exact_evidence = conn.execute(
                     """
                     SELECT 1 FROM resume_coverage_cells
@@ -1161,7 +1246,13 @@ def route_resume_for_job(
         ]
         if not candidates:
             decision = "create_variant"
-            reason = "This fine-grained role subtype has no current validated resume artifact."
+            if profile_fact_rejections:
+                reason = (
+                    "Validated artifacts for this subtype conflict with current profile facts; "
+                    "create a corrected variant."
+                )
+            else:
+                reason = "This fine-grained role subtype has no current validated resume artifact."
         else:
             top = candidates[0]
             artifact_id = str(top["artifact_id"])
@@ -1191,18 +1282,15 @@ def route_resume_for_job(
                     "This current artifact was machine-validated for the exact unchanged job fingerprint."
                 )
                 components["unsupported_required_skills"] = []
+                components["confirmed_required_skill_facts"] = []
             else:
-                all_source_text = "\n".join(
-                    _normalise_text(read_resume_source(Path(str(row["text_path"]))))
-                    for row in conn.execute(
-                        "SELECT text_path FROM resume_artifacts WHERE active=1 AND kind='base'"
-                    ).fetchall()
-                    if Path(str(row["text_path"])).is_file()
+                unsupported, confirmed_fact_support = _unsupported_required_skills(
+                    conn,
+                    profile,
+                    hard_gaps,
                 )
-                unsupported = [
-                    gap for gap in hard_gaps if not _contains_phrase(all_source_text, gap)
-                ]
                 components["unsupported_required_skills"] = unsupported
+                components["confirmed_required_skill_facts"] = confirmed_fact_support
             if not top["exact_job_validation"] and unsupported:
                 decision = "manual_review"
                 reason = "A required named skill is unsupported by every registered factual source."
@@ -1254,18 +1342,13 @@ def route_resume_for_job(
         ):
             raise ValueError("The requested candidate does not clear the existing reuse gates")
         selected_hard_gaps = list(selected["missing_required"])
-        all_source_text = "\n".join(
-            _normalise_text(read_resume_source(Path(str(row["text_path"]))))
-            for row in conn.execute(
-                "SELECT text_path FROM resume_artifacts WHERE active=1 AND kind='base'"
-            ).fetchall()
-            if Path(str(row["text_path"])).is_file()
+        unsupported, confirmed_fact_support = _unsupported_required_skills(
+            conn,
+            profile,
+            selected_hard_gaps,
         )
-        unsupported = [
-            gap
-            for gap in selected_hard_gaps
-            if not _contains_phrase(all_source_text, gap)
-        ]
+        components["unsupported_required_skills"] = unsupported
+        components["confirmed_required_skill_facts"] = confirmed_fact_support
         if unsupported:
             raise ValueError(
                 "Manual selection cannot resolve unsupported required skill review"
@@ -1309,6 +1392,7 @@ def route_resume_for_job(
         "hard_gaps": hard_gaps,
         "job_profile": job_profile,
         "candidates": components["candidates"],
+        "profile_fact_rejections": profile_fact_rejections,
     }
     if decision in {"reuse_exact", "manual_selection"} and artifact_id:
         artifact = dict(

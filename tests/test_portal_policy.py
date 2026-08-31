@@ -37,7 +37,7 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
 
     internsg = config.get_portal_policy("https://www.internsg.com/job-apply/123/")
     assert internsg is not None
-    assert internsg["application_mode"] == "review_only"
+    assert internsg["application_mode"] == "standing_authorized"
 
     career_axis = config.get_portal_policy(
         "https://careeraxis.ntu.edu.sg/students/jobs/882308"
@@ -59,9 +59,9 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     assert config.portal_application_gate(
         "https://www.internsg.com/job-apply/123/", preview_only=True
     ) is None
-    assert "must submit manually" in config.portal_application_gate(
+    assert config.portal_application_gate(
         "https://www.internsg.com/job-apply/123/", preview_only=False
-    )
+    ) is None
     assert config.portal_application_gate(
         "https://careers.example.com/apply/123",
         source_site="InternSG",
@@ -112,30 +112,6 @@ def test_portal_policy_allows_bound_external_ats_but_keeps_portal_boundaries(
     assert json.loads(attempt["evidence_json"])["reason_code"] == (
         "linkedin_apply_click:exact_job_page_count:0"
     )
-
-    internsg_url = "https://www.internsg.com/job-apply/456/"
-    _store_ready_job(conn, url=internsg_url, source_site="InternSG")
-    blocked_performance: dict[str, object] = {}
-    assert launcher.acquire_job(
-        target_url=internsg_url,
-        preview_only=False,
-        performance_sink=blocked_performance,
-    ) is None
-    assert blocked_performance["outcome"] == "blocked"
-    internsg_row = conn.execute(
-        "SELECT apply_status, apply_error FROM jobs WHERE url=?", (internsg_url,)
-    ).fetchone()
-    assert tuple(internsg_row) == (
-        "manual",
-        "InternSG permits only a visible fill-only review; the candidate must submit manually.",
-    )
-
-    conn.execute("UPDATE jobs SET apply_status=NULL, apply_error=NULL WHERE url=?", (internsg_url,))
-    conn.commit()
-    acquired = launcher.acquire_job(target_url=internsg_url, preview_only=True)
-    assert acquired is not None
-    assert acquired["url"] == internsg_url
-
 
 def test_manual_ats_is_a_runtime_capability_hint_not_an_acquisition_block(
     monkeypatch, tmp_path: Path

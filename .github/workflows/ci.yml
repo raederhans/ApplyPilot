@@ -64,9 +64,12 @@ jobs:
           applypilot --version
 
   windows-install-smoke:
-    name: Windows clean install smoke
+    name: Windows 3.12 core tests and clean install smoke
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      APPLYPILOT_DIR: ${{ runner.temp }}/applypilot-ci
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout
@@ -79,10 +82,14 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Install core and development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test core suite
+        run: python -m pytest -q
+
       - name: Build release artifacts
-        run: |
-          python -m pip install build
-          python scripts/build_release.py
+        run: python scripts/build_release.py
 
       - name: Exercise clean installed workspace
         run: python scripts/smoke_release.py

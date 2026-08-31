@@ -113,11 +113,11 @@ def _build_cover_letter_prompt(profile: dict, surface: str = "formal") -> str:
     if email_availability_policy or email_work_auth_statement:
         email_application_rule = (
             "\nEMAIL APPLICATION AVAILABILITY RULE:\n"
-            f"- Policy: {email_availability_policy or 'Do not state a specific start date.'}\n"
-            "- Do not disclose or infer any exact internship start date in this letter.\n"
+            f"- Policy: {email_availability_policy or 'A specific start date is optional unless the employer asks for it.'}\n"
+            "- Use the flexible confirmed month range when useful, and exact confirmed dates only when the employer or form asks for exact dates. It is acceptable to omit a start date from unsolicited narrative.\n"
             "- If work authorization or sponsorship is relevant, use only this approved statement: "
             f"{email_work_auth_statement or 'Omit the topic.'}\n"
-            "- Do not add a sentence offering, proposing, or negotiating a start date.\n"
+            "- Never invent an earlier date, a weekly-hours cap, or a part-time fallback schedule.\n"
         )
 
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
@@ -262,8 +262,8 @@ def load_evidence_sources(profile: dict, primary_path: Path, primary_text: str) 
             f"Email availability policy: {email_policy}\n"
             f"Current employer: {current_employment.get('company', '')}\n"
             f"Exact current title: {current_employment.get('title', '')}\n"
-            "Do not disclose a specific internship start date in an email or cover letter. "
-            "These are conditional application facts and must not be broadened."
+            "Use exact confirmed internship dates when availability is relevant. "
+            "Keep availability separate from post-offer university placement approval."
         ),
     })
     return sources
@@ -581,6 +581,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         "AND company_name IS NOT NULL AND company_name != '' "
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        "AND COALESCE(cover_letter_status, '') <> 'not_required' "
         f"AND COALESCE(cover_attempts, 0) < ? AND {ELIGIBLE_SQL} "
         "ORDER BY fit_score DESC LIMIT ?",
         (min_score, MAX_ATTEMPTS, limit),

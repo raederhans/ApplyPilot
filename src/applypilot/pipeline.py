@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import ensure_dirs, load_env
+from applypilot.config import ensure_dirs, load_env, load_profile
 from applypilot.database import get_connection, get_stats, init_db
 from applypilot.eligibility import ELIGIBLE_SQL
 
@@ -133,8 +133,43 @@ def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
-    """Stage: Cover letter generation."""
+def _cover_auto_generate_in_full_pipeline() -> bool:
+    """Return the opt-in policy for speculative cover-letter generation."""
+    try:
+        profile = load_profile()
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return False
+    cover_policy = profile.get("cover_letter", {}) if isinstance(profile, dict) else {}
+    return bool(
+        isinstance(cover_policy, dict)
+        and cover_policy.get("auto_generate_in_full_pipeline", False) is True
+    )
+
+
+def _run_cover(
+    min_score: int = 7,
+    validation_mode: str = "normal",
+    *,
+    allow_speculative: bool = True,
+) -> dict:
+    """Stage: Cover letter generation.
+
+    The explicit ``cover`` stage remains opt-in by invocation. The full
+    pipeline only generates letters when the private profile explicitly opts
+    into speculative generation; otherwise runtime requirement discovery
+    remains authoritative.
+    """
+    if not allow_speculative and not _cover_auto_generate_in_full_pipeline():
+        log.info(
+            "Skipping speculative cover-letter generation in the full pipeline; "
+            "runtime requirement discovery remains authoritative."
+        )
+        return {
+            "status": "skipped",
+            "generated": 0,
+            "errors": 0,
+            "reason": "speculative_cover_generation_disabled",
+        }
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
         run_cover_letters(min_score=min_score, validation_mode=validation_mode)
@@ -234,6 +269,7 @@ _PENDING_SQL: dict[str, str] = {
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
         "AND company_name IS NOT NULL AND company_name != '' "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        "AND COALESCE(cover_letter_status, '') <> 'not_required' "
         f"AND COALESCE(cover_attempts, 0) < 5 AND {ELIGIBLE_SQL}"
     ),
     "pdf": (
@@ -278,6 +314,7 @@ def _run_stage_streaming(
     min_score: int = 7,
     workers: int = 1,
     validation_mode: str = "normal",
+    full_pipeline: bool = False,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -286,14 +323,28 @@ def _run_stage_streaming(
     and repeats until upstream is done and no pending work remains.
     """
     runner = _STAGE_RUNNERS[stage]
+    upstream = _UPSTREAM[stage]
+    if stage == "cover" and full_pipeline and not _cover_auto_generate_in_full_pipeline():
+        if upstream:
+            tracker.wait(upstream)
+        tracker.mark_done(
+            stage,
+            {
+                "status": "skipped",
+                "generated": 0,
+                "errors": 0,
+                "reason": "speculative_cover_generation_disabled",
+            },
+        )
+        return
     kwargs: dict = {}
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["validation_mode"] = validation_mode
+    if stage == "cover":
+        kwargs["allow_speculative"] = not full_pipeline
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
-
-    upstream = _UPSTREAM[stage]
 
     if stage == "discover":
         # Discover runs once (its sub-scrapers already do their full crawl)
@@ -374,7 +425,8 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    validation_mode: str = "normal",
+                    full_pipeline: bool = False) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -395,6 +447,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
+            if name == "cover":
+                kwargs["allow_speculative"] = not full_pipeline
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
             result = runner(**kwargs)
@@ -418,7 +472,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
             console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
-        if status not in ("ok", "partial"):
+        if status not in ("ok", "partial", "skipped"):
             errors[name] = status
 
         console.print(f"\n  Stage '{name}' completed in {elapsed:.1f}s — {status}")
@@ -428,7 +482,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   validation_mode: str = "normal",
+                   full_pipeline: bool = False) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -450,7 +505,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, workers, validation_mode, full_pipeline),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -519,6 +574,7 @@ def run_pipeline(
     # Resolve stages
     if stages is None:
         stages = ["all"]
+    full_pipeline = "all" in stages
     ordered = _resolve_stages(stages)
 
     # Banner
@@ -547,11 +603,21 @@ def run_pipeline(
 
     # Execute
     if stream:
-        result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
+        result = _run_streaming(
+            ordered,
+            min_score,
+            workers=workers,
+            validation_mode=validation_mode,
+            full_pipeline=full_pipeline,
+        )
     else:
-        result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+        result = _run_sequential(
+            ordered,
+            min_score,
+            workers=workers,
+            validation_mode=validation_mode,
+            full_pipeline=full_pipeline,
+        )
 
     # Summary table
     console.print(f"\n{'=' * 70}")

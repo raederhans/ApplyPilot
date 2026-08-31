@@ -13,6 +13,7 @@ from applypilot.apply.contracts import (
     HumanInterruption,
     HumanRequest,
     RecoveryAction,
+    application_actor_id,
 )
 from applypilot.apply.failure_taxonomy import FailureDescriptor, classify_failure
 
@@ -87,10 +88,22 @@ class ApplicationActorState:
     submission_uncertain: bool = False
     same_application_retries_remaining: int = 0
     new_session_retries_remaining: int = 0
+    actor_id: str = ""
+    turn_id: str = ""
 
     def __post_init__(self) -> None:
+        actor_id = self.actor_id or application_actor_id(self.attempt_id)
+        turn_id = self.turn_id or self.run_id
+        object.__setattr__(self, "actor_id", actor_id)
+        object.__setattr__(self, "turn_id", turn_id)
         for name in ("run_id", "attempt_id", "application_id", "page_id", "write_owner"):
             _required(getattr(self, name), name)
+        _required(self.actor_id, "actor_id")
+        _required(self.turn_id, "turn_id")
+        if self.actor_id != application_actor_id(self.attempt_id):
+            raise ValueError("actor_id must be the canonical identity for attempt_id")
+        if self.turn_id != self.run_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
         if self.phase not in _ACTOR_PHASES:
             raise ValueError(f"unsupported actor phase: {self.phase}")
         if self.final_submit_count not in {0, 1}:
@@ -108,6 +121,10 @@ def advance_actor(state: ApplicationActorState, event: ApplicationEvent) -> Appl
     """Apply one legal phase event while enforcing identity and write invariants."""
     if event.run_id != state.run_id or event.attempt_id != state.attempt_id:
         raise ValueError("event identity does not match the application actor")
+    if event.schema_version == "2" and (
+        event.actor_id != state.actor_id or event.turn_id != state.turn_id
+    ):
+        raise ValueError("event durable identity does not match the application actor")
     next_phase = event.phase.strip().casefold()
     if next_phase not in _LEGAL_TRANSITIONS[state.phase]:
         raise ValueError(f"illegal actor transition: {state.phase} -> {next_phase}")
@@ -194,6 +211,8 @@ def _decision(
         next_phase=next_phase,
         recovery_action=recovery_action,
         human_interruption=human_interruption,
+        actor_id=state.actor_id,
+        turn_id=state.turn_id,
     )
 
 
@@ -216,6 +235,18 @@ def decide_recovery(state: ApplicationActorState, result: str) -> DecisionEnvelo
     if failure.category == "unclassified_application_failure":
         action = "park"
         next_action = "park_unclassified_failure_for_bounded_diagnosis"
+    elif failure.category == "answer_policy_needs_relaxed_retry":
+        interruption = _human_interruption(result, failure)
+        return _decision(
+            state,
+            RecoveryAction(
+                action="human_only",
+                failure_category=failure.category,
+                next_action="resolve_unsupported_fact_with_human_review",
+                missing_capability=failure.missing_capability,
+            ),
+            human_interruption=interruption,
+        )
     elif failure.recoverability in {
         "retry_same_application",
         "retry_with_larger_runtime_budget",
@@ -291,10 +322,14 @@ def apply_recovery(
     decision: DecisionEnvelope,
 ) -> ApplicationActorState:
     """Reduce a shadow recovery decision without performing its proposed action."""
+    if decision.upcast_from_schema_version == "1":
+        raise ValueError("legacy DecisionEnvelope is read-only and cannot drive recovery")
     if (
         decision.run_id != state.run_id
         or decision.attempt_id != state.attempt_id
         or decision.phase != state.phase
+        or decision.actor_id != state.actor_id
+        or decision.turn_id != state.turn_id
     ):
         raise ValueError("decision identity does not match the application actor")
     if decision.next_phase not in _LEGAL_TRANSITIONS[state.phase]:
@@ -340,6 +375,8 @@ def decision_for_status(
             phase=state.phase,
             disposition="complete",
             next_phase="complete",
+            actor_id=state.actor_id,
+            turn_id=state.turn_id,
         )
     if status in _CHECKPOINT_TURN_STATUSES or status.startswith("deferred:"):
         return DecisionEnvelope(
@@ -348,6 +385,8 @@ def decision_for_status(
             phase=state.phase,
             disposition="checkpoint",
             next_phase="checkpoint",
+            actor_id=state.actor_id,
+            turn_id=state.turn_id,
         )
     return decide_recovery(state, status)
 
@@ -387,12 +426,16 @@ def decision_for_turn(
         new_session_retries_remaining=retry_budget(
             "actor_new_session_retries_remaining"
         ),
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
     )
     return decision_for_status(state, status)
 
 
 def human_request_for_decision(decision: DecisionEnvelope) -> HumanRequest | None:
     """Convert a typed interruption to the existing durable HumanRequest contract."""
+    if decision.upcast_from_schema_version is not None:
+        raise ValueError("legacy DecisionEnvelope is read-only and cannot create a handoff")
     interruption = decision.human_interruption
     recovery = decision.recovery_action
     if interruption is None or recovery is None:
@@ -404,6 +447,8 @@ def human_request_for_decision(decision: DecisionEnvelope) -> HumanRequest | Non
         request_type=interruption.interruption_type,
         prompt="Application paused at a HUMAN_ONLY boundary; inspect evidence before resuming.",
         context={
+            "actor_id": decision.actor_id,
+            "turn_id": decision.turn_id,
             "actor_phase": decision.phase,
             "actor_next_phase": decision.next_phase,
             "failure_category": recovery.failure_category,

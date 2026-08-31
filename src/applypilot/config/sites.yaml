@@ -11,8 +11,8 @@
 #
 # `manual_only` blocks ApplyPilot browser actions, including a fill-only
 # preview. `review_only` permits one visible fill-only preview but never lets
-# ApplyPilot submit. Assessment, verification, CAPTCHA, and employer-site
-# hand-offs are always for the applicant to complete personally.
+# ApplyPilot submit. Assessment, verification, and CAPTCHA remain applicant
+# boundaries even when a portal permits standing-authorized submission.
 portal_policies:
   - name: "JobStreet Singapore"
     domains:
@@ -34,9 +34,11 @@ portal_policies:
     site_names:
       - "InternSG"
     discovery_mode: "manual_only"
-    application_mode: "review_only"
+    # Candidate-supplied exact listings may use the standing submission policy;
+    # discovery remains manual and visible CAPTCHA still requires the relay.
+    application_mode: "standing_authorized"
     assessment_mode: "employer_invited_manual_only"
-    external_application_mode: "manual_reconfirm"
+    external_application_mode: "continue_when_authorized"
     submitted_evidence: "candidate-visible confirmation page or receipt"
 
   - name: "NTU Career Axis"

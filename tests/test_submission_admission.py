@@ -110,7 +110,7 @@ def test_restricted_and_manual_surfaces_are_explicit() -> None:
             url="https://www.internsg.com/job-apply/123",
             application_url="https://www.internsg.com/job-apply/123",
         )
-    ) == "restricted_portal_review"
+    ) == "restricted_portal_authorized"
     assert classify_submission_surface(
         _job(
             source_site="TCS",

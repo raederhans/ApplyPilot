@@ -9,8 +9,12 @@ import sys
 from applypilot.apply.credential_relay import (
     CredentialRelayError,
     _credential_path,
+    _decrypt_fin,
     _decrypt_password,
     _fill_fields,
+    _fill_protected_identifier,
+    _identity_credential_path,
+    _read_identity_record,
     _read_record,
 )
 
@@ -63,6 +67,24 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
                             "required": ["field"],
                             "additionalProperties": False,
                         },
+                    },
+                    {
+                        "name": "fill_protected_identifier",
+                        "description": (
+                            "Fill one required FIN/NRIC field in the bound application tab "
+                            "from a local DPAPI record. Never returns the identifier and never submits."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["fin"],
+                                }
+                            },
+                            "required": ["kind"],
+                            "additionalProperties": False,
+                        },
                     }
                 ]
             },
@@ -70,10 +92,50 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
     if method == "tools/call":
         params = message.get("params")
         params = params if isinstance(params, dict) else {}
-        if params.get("name") != "fill_ats_credentials":
+        tool_name = str(params.get("name") or "")
+        if tool_name not in {"fill_ats_credentials", "fill_protected_identifier"}:
             return _error(request_id, "Unknown tool")
         arguments = params.get("arguments")
         arguments = arguments if isinstance(arguments, dict) else {}
+        if tool_name == "fill_protected_identifier":
+            kind = str(arguments.get("kind") or "")
+            if kind != "fin":
+                return _error(request_id, "kind must be fin")
+            if os.environ.get("APPLYPILOT_IDENTITY_RELAY_AUTHORIZED", "").strip() != "1":
+                return _result(
+                    request_id,
+                    {
+                        "content": [
+                            {"type": "text", "text": "Protected-identity relay is not authorized."}
+                        ],
+                        "isError": True,
+                    },
+                )
+            fin = ""
+            try:
+                path = _identity_credential_path().resolve()
+                _read_identity_record(path)
+                fin = _decrypt_fin(path)
+                port = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
+                outcome = _fill_protected_identifier(port, kind, fin)
+            except (CredentialRelayError, OSError, ValueError) as exc:
+                return _result(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": str(exc)}],
+                        "isError": True,
+                    },
+                )
+            finally:
+                fin = ""
+            return _result(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": json.dumps(outcome)}],
+                    "isError": False,
+                },
+            )
+
         field = str(arguments.get("field") or "")
         if field not in {"email", "password", "both"}:
             return _error(request_id, "field must be email, password, or both")

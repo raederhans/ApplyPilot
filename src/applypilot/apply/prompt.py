@@ -148,7 +148,13 @@ def _build_profile_summary(profile: dict) -> str:
     )
     for label, key in screening_labels:
         lines.append(f"{label}: {screening.get(key, 'Manual review')}")
-    lines.append("How Heard: Use the actual discovery source from the job record")
+    application_source = p.get("application_source", {})
+    source_default = application_source.get("form_source_default", "Other")
+    source_fallback = application_source.get("form_source_fallback", "Company website")
+    lines.append(
+        "How Heard: Use the actual discovery source when it is available as a visible option; "
+        f"otherwise use {source_default} or {source_fallback}"
+    )
 
     current = p.get("current_employment", {})
     if current:
@@ -165,9 +171,16 @@ def _build_profile_summary(profile: dict) -> str:
 
     education = p.get("education", [])
     for item in education:
-        date = item.get("expected_graduation") or item.get("graduation", "")
+        start_date = str(item.get("start_date") or item.get("start") or "").strip()
+        end_date = str(
+            item.get("expected_graduation") or item.get("graduation") or ""
+        ).strip()
+        date = " - ".join(value for value in (start_date, end_date) if value)
         gpa = item.get("gpa", "")
         detail = f"{item.get('institution')}: {item.get('degree')} ({date})"
+        country = str(item.get("country") or "").strip()
+        if country:
+            detail += f", Country of study {country}"
         if gpa and "leave blank" not in str(gpa).lower():
             detail += f", GPA {gpa}"
         lines.append(f"Education Record: {detail}")
@@ -243,18 +256,18 @@ def _build_availability_section(profile: dict) -> str:
     generic_date = availability.get("generic_application_availability_date", full_time_start)
     internship_end = availability.get("internship_end_date", "Manual review")
     exact_period_rule = availability.get("exact_period_answer_rule", "")
-    non_credit_start = availability.get("non_credit_internship_start", "Manual review")
-    non_credit_hours = availability.get("non_credit_internship_hours_per_week_max", "Manual review")
-    full_time_hours = availability.get("credit_bearing_internship_hours_per_week", "40+")
+    end_date_policy = availability.get("internship_end_date_policy", "")
+    full_time_hours = availability.get("credit_bearing_internship_hours_per_week", "Full-time")
 
     return f"""== AVAILABILITY GUIDANCE (truthful, but usually negotiable) ==
-- Full-time approved programme-credit-bearing internship: earliest start = {full_time_start}; availability = {full_time_hours} hours/week.
+- Confirmed full-time internship availability: earliest start = {full_time_start}; schedule = {full_time_hours}.
 - Confirmed internship end date = {internship_end}. When an employer requires an exact internship end date, use this value rather than treating it as unknown.
+- End-date policy: {end_date_policy or 'Use the confirmed internship end date independently of other education-date fields.'}
 - Exact-period answer rule: {exact_period_rule or 'Use only the confirmed start and end dates above.'}
-- Non-credit internship: start = {non_credit_start}; maximum = {non_credit_hours} hours/week.
 - Generic form date when one date is required: {generic_date}.
 - Treat start dates, duration, and days per week as fit signals that may be discussed with the employer, not automatic rejection gates. Answer No or the closest truthful option when the exact requested window does not match, then continue.
-- When a required question asks whether an exact period is available, answer truthfully from the facts above. Do not turn immediate part-time eligibility into immediate full-time eligibility.
+- When a required question asks whether an exact period is available, answer truthfully from the facts above.
+- Keep availability separate from work authorization: the user is available full-time from the confirmed date, while any required university placement approval is completed after an offer.
 - If the form asks for free-text availability, state the shortest supported answer from these facts. Never revive an older date from a cover letter, experiment profile, cached answer, or resume."""
 
 
@@ -263,10 +276,17 @@ def _build_work_authorization_section(profile: dict) -> str:
     work_auth = profile.get("work_authorization", {})
     policies = work_auth.get("form_answer_policy", {})
     lines = ["== WORK AUTHORIZATION DECISION TREE =="]
+    internship_classification = str(
+        work_auth.get("internship_classification_policy") or ""
+    ).strip()
+    if internship_classification:
+        lines.append(f"- Internship classification: {internship_classification}.")
     if policies:
         labels = (
-            ("programme_credit_bearing_internship", "Approved programme-credit-bearing internship"),
-            ("non_credit_internship", "Non-credit internship"),
+            (
+                "programme_credit_bearing_internship",
+                "Programme-credit-bearing internship (conditional on later university approval)",
+            ),
             ("post_graduation_full_time", "Post-graduation full-time employment"),
         )
         for key, label in labels:
@@ -330,8 +350,8 @@ def _build_application_facts_section(profile: dict) -> str:
             f"- {key}: {value} | context: {context} | source: {source} | confirmed: {confirmed_at}"
         )
     lines.append(
-        "- Context is binding: never copy a credit-bearing internship answer into a "
-        "non-credit internship or post-graduation full-time question."
+        "- Context is binding: never copy an internship answer into a "
+        "post-graduation full-time question."
     )
     lines.append(
         "- Key-answer review is guidance, not a rigid matrix: compare the question's meaning, "
@@ -414,11 +434,12 @@ Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: convictions to disclose = {screening.get('criminal_convictions_to_disclose', 'manual review')}; background check = {screening.get('willing_to_complete_background_check', 'manual review')}
-  - Previous employment or a named employee referral at this employer: determine for this exact employer; never use a global default. Family/close-relationship conflict questions may use only the exact standing facts below.
+  - Previous employment at this employer: {screening.get('previously_worked_for_target_employer', 'Manual review')}.
+  - A named employee referral still requires an explicitly confirmed referral for this application. Family/close-relationship conflict questions may use only the exact standing facts below.
 
 Standing screening facts (use only for the exact question scope shown):
 {standing_facts}
-These standing facts do not answer other identity, criminal, work-authorization, prior-employment, or legal questions. A missing value remains Manual review. Target-employer prior employment still requires exact-employer evidence.
+These standing facts do not answer other identity, criminal, work-authorization, or legal questions. A missing value remains Manual review. Use the configured previous-employment fact only for questions asking whether the applicant has worked for the target employer.
 
 Required experience and skills -> use the APPLICANT PROFILE, RESUME TEXT, and configured evidence policy. This candidate is a {target_role} with {years} years total experience. {related_yes_policy} Umbrella categories may be supported by explicit adjacent work: for example, documented LLM, generative-AI, hybrid-RAG, tool-calling, agent, or AI-workflow work can justify YES to a broadly phrased LLM/GenAI/AI-automation experience question. Do not require an exact keyword match when the underlying same-domain work is clear.
 
@@ -436,9 +457,21 @@ def _build_routine_form_defaults_section(profile: dict) -> str:
     country_of_birth = str(personal.get("country_of_birth") or "").strip()
     preferred_source = str(source.get("form_source_default") or "Other").strip()
     fallback_source = str(source.get("form_source_fallback") or "Company website").strip()
+    education = [
+        item for item in profile.get("education", [])
+        if isinstance(item, dict) and item.get("institution") and item.get("country")
+    ]
+    education_countries = "; ".join(
+        f"{item['institution']} -> {item['country']}" for item in education
+    )
+    education_country_policy = str(
+        profile.get("education_country_answer_policy") or ""
+    ).strip()
     return f"""== ROUTINE FORM DEFAULTS ==
 - Country/Region of Birth -> {country_of_birth or 'leave blank unless a confirmed profile value is available'}.
-- "How did you hear about us?" / application-source fields are non-material. Prefer "{preferred_source}". If that option is absent, select "{fallback_source}" or the first truthful non-referral option. Do not stop or create an unanswered-question record for this field.
+- Education countries -> {education_countries or 'use only the country attached to the matching education record'}.
+- Education-country answer policy -> {education_country_policy or 'Use the country attached to the matching education record; never substitute nationality or country of birth.'}
+- "How did you hear about us?" / application-source fields are non-material. Use the actual discovery source when it is available as a visible option. Otherwise prefer "{preferred_source}", then "{fallback_source}" or the first truthful non-referral option. Do not stop or create an unanswered-question record for this field.
 - Never claim a named employee referral, agency referral, or former-employer relationship unless it is explicitly confirmed for this employer."""
 
 
@@ -509,13 +542,68 @@ def _build_hard_rules(profile: dict) -> str:
 4. {education_rule}"""
 
 
-def _build_identity_materials_section() -> str:
-    """Separate routine identity facts from sensitive identity artifacts."""
-    return """== IDENTITY AND ELIGIBILITY MATERIALS ==
+def _build_identity_materials_section(
+    profile: dict | None = None,
+    *,
+    identity_relay_authorized: bool = False,
+) -> str:
+    """Separate routine facts, protected identifiers, and document artifacts."""
+    profile = profile or {}
+    policies = profile.get("application_material_policy", {})
+    lines = ["""== IDENTITY AND ELIGIBILITY MATERIALS ==
 - Fill ordinary identity and eligibility facts such as legal name, nationality/citizenship, and work-permit status exactly from the confirmed profile or reference registry; these are not automatic manual-review gates.
 - Identity-document numbers such as passport or national-ID numbers require an exact secure source. Never guess, approximate, or expose them in reports.
 - Upload an identity or eligibility document only when a verified artifact matching the exact requested document is present and explicitly authorized for this application. Never substitute the resume or another attachment.
-- Biometric capture, selfie, video/audio identity checks, financial identity data, and unsupported identity-document requests remain human-review gates."""
+- Biometric capture, selfie, video/audio identity checks, financial identity data, and unsupported identity-document requests remain human-review gates."""]
+
+    if isinstance(policies, dict):
+        for key, raw_policy in policies.items():
+            if not isinstance(raw_policy, dict):
+                continue
+            label = str(raw_policy.get("label") or key.replace("_", " ")).strip()
+            availability = str(
+                raw_policy.get("availability") or "not currently supplied"
+            ).strip()
+            optional_action = str(
+                raw_policy.get("optional_field_action") or "leave blank"
+            ).strip()
+            required_action = str(
+                raw_policy.get("required_field_action")
+                or "stop before submission and skip this job"
+            ).strip()
+            substitution = str(raw_policy.get("substitution_policy") or "").strip()
+            line = (
+                f"- {label}: availability = {availability}; optional field = "
+                f"{optional_action}; required field = {required_action}."
+            )
+            if substitution:
+                line += f" Substitution boundary: {substitution}."
+            lines.append(line)
+
+    fin_policy = profile.get("identity_materials", {}).get("fin", {})
+    if isinstance(fin_policy, dict) and fin_policy.get("secure_relay_authorized"):
+        if identity_relay_authorized:
+            lines.append(
+                "- FIN/NRIC number: leave an optional field blank. When the live ordinary "
+                "application makes the exact FIN/NRIC text field required, call "
+                "mcp__credential_relay__fill_protected_identifier with kind=fin. The relay "
+                "fills the bound field, verifies persistence, masks its display, and never "
+                "submits. Complete every other review first; after the relay succeeds, do not "
+                "inspect or snapshot that field again. Never type, repeat, report, or route "
+                "this number through an answer resolver."
+            )
+        else:
+            lines.append(
+                "- FIN/NRIC number: leave optional fields blank. The secure relay is unavailable "
+                "for this browser turn, so a required FIN/NRIC text field is a fail-closed stop."
+            )
+        lines.append(
+            "- A stored FIN/NRIC number is not an uploadable identity document. A required "
+            "document upload may proceed only with an exact verified, explicitly authorized "
+            "file matching that label; otherwise skip the job before submission."
+        )
+
+    return "\n".join(lines)
 
 
 def _build_specialist_context_section(job: dict) -> str:
@@ -663,8 +751,12 @@ def _build_compact_submit_prompt(
     structured_reporting_section: str,
     captcha_section: str,
     phone_digits: str,
+    identity_materials_section: str | None = None,
 ) -> str:
     """Build a submit delta instead of replaying the full prepare handbook."""
+    identity_materials_section = (
+        identity_materials_section or _build_identity_materials_section()
+    )
     return f"""You are a job application assistant. {mission_instruction}
 
 == SUBMIT TURN SCOPE ==
@@ -688,11 +780,12 @@ Cover-letter state: {'verified to have no cover-letter field' if job.get('cover_
 {profile_summary}
 
 {hard_rules}
-{_build_identity_materials_section()}
+{identity_materials_section}
 
 == ONE-SHOT SAFETY CONTRACT ==
 - Re-observe the current page and compare it with the frozen audit. A visible CAPTCHA, assessment, directly false identity/legal/credential answer, missing required authorized material, or changed page identity is a hard pause.
 - Ordinary identity/eligibility facts may be filled exactly from confirmed facts. Identity numbers require an exact secure source; document uploads require a verified explicitly authorized matching artifact.
+- After changing a select or radio that can rewrite dependent labels or options (for example nationality or country), re-observe every affected checkbox and radio and resolve it again from the confirmed facts. Never preserve a checkbox by position or its earlier label.
 - For an ordinary validation error, repair only the named field once. For a native dropdown, read bounded visible options, use resolve_answer if exposed, then call browser_select_option with the selected visible option text. For a controlled input, type sequentially once and verify visible persistence. Do not repeat unrelated work.
 - Lever ordinary application form and similar ordinary forms: preserve completed fields; never declare progress without visible state change.
 - Click the authorized final control exactly once. Absence of a receipt never authorizes a second click, browser restart, runtime switch, or new Agent turn.
@@ -1285,7 +1378,8 @@ def build_prompt(job: dict, tailored_resume: str,
                  manual_captcha_relay: bool = False,
                  resume_existing_page: bool = False,
                  submission_phase: str = "submit",
-                 credential_relay_authorized: bool | None = None) -> str:
+                 credential_relay_authorized: bool | None = None,
+                 identity_relay_authorized: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -1300,6 +1394,7 @@ def build_prompt(job: dict, tailored_resume: str,
         worker_id: Worker identifier used to isolate upload artifacts.
         worker_dir: Optional already-reset worker directory.
         credential_relay_authorized: Launcher's runtime-scoped relay decision.
+        identity_relay_authorized: Whether the protected-identifier relay is exposed.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -1432,6 +1527,10 @@ Before the final plain-text RESULT lines, call the attached applypilot_control r
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
+    identity_materials_section = _build_identity_materials_section(
+        profile,
+        identity_relay_authorized=identity_relay_authorized,
+    )
     captcha_section = _build_captcha_check_section()
     browser_observation_section = _build_browser_observation_section(job)
     specialist_context_section = _build_specialist_context_section(job)
@@ -1800,6 +1899,7 @@ RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a f
             control_contract_json=control_contract_json,
             profile_summary=profile_summary,
             hard_rules=hard_rules,
+            identity_materials_section=identity_materials_section,
             browser_observation_section=browser_observation_section,
             specialist_context_section=specialist_context_section,
             email_route_section=email_route_section,
@@ -1916,7 +2016,7 @@ Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 
 {hard_rules}
 
-{_build_identity_materials_section()}
+{identity_materials_section}
 
 == NEVER DO THESE (immediate RESULT:FAILED if encountered) ==
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions

@@ -14,9 +14,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, MutableMapping
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from applypilot import config
 from applypilot.apply.capabilities import (
@@ -32,12 +34,18 @@ from applypilot.apply.email_routing import MailboxMcpSpec, resolve_mailbox_mcp_s
 
 CREDENTIAL_RELAY_ENV_VARS = (
     "APPLYPILOT_ATS_CREDENTIAL_FILE",
+    "APPLYPILOT_IDENTITY_CREDENTIAL_FILE",
     "APPLYPILOT_CDP_PORT",
     "APPLYPILOT_CREDENTIAL_ALLOWED_HOSTS",
     "APPLYPILOT_CREDENTIAL_PASSWORD_ALLOWED_HOSTS",
     "APPLYPILOT_CREDENTIAL_ALLOW_KNOWN_ATS_REDIRECT",
     "APPLYPILOT_CREDENTIAL_ROOT_TARGET_IDS",
+    "APPLYPILOT_ATS_CONTEXT_PATH",
+    "APPLYPILOT_CREDENTIAL_APPLICATION_CONTEXT_SHA256",
+    "APPLYPILOT_CREDENTIAL_ATTEMPT_ID",
+    "APPLYPILOT_CREDENTIAL_APPLICATION_ID",
     "APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED",
+    "APPLYPILOT_IDENTITY_RELAY_AUTHORIZED",
 )
 APPLICATION_TOOL_ENV_VARS = ("APPLYPILOT_ATS_CONTEXT_PATH",)
 CONTROL_REPORT_ENV_VARS = (
@@ -102,6 +110,8 @@ def make_mcp_config(
     application_tools: bool = True,
     mailbox_mcp: MailboxMcpSpec | dict[str, object] | None = None,
     direct_email_send_authorized: bool = False,
+    credential_relay_authorized: bool = False,
+    identity_relay_authorized: bool = False,
 ) -> dict:
     """Build MCP config dict for a specific CDP port."""
     spec = resolve_playwright_mcp_spec(playwright_mcp)
@@ -135,6 +145,11 @@ def make_mcp_config(
         servers[mailbox_spec.server_name] = {
             "command": mailbox_spec.command,
             "args": mailbox_spec.process_args(),
+        }
+    if credential_relay_authorized or identity_relay_authorized:
+        servers["credential_relay"] = {
+            "command": python_executable or sys.executable,
+            "args": ["-m", "applypilot.apply.credential_relay_mcp"],
         }
     if runtime_metadata is not None:
         runtime_metadata["mailbox_mcp"] = mailbox_spec.metadata(
@@ -265,6 +280,7 @@ def build_agent_command(
     resolve_codex: Callable[[], list[str]] = resolve_codex_command,
     python_executable: str | None = None,
     credential_relay_authorized: bool = False,
+    identity_relay_authorized: bool = False,
     playwright_mcp: McpPackageSpec | dict[str, object] | str | None = None,
     capability_registry: CapabilityRegistry | None = None,
     runtime_metadata: dict[str, Any] | None = None,
@@ -318,6 +334,10 @@ def build_agent_command(
         ]
         if credential_relay_authorized:
             allowed_mcp_tools.append("mcp__credential_relay__fill_ats_credentials")
+        if identity_relay_authorized:
+            allowed_mcp_tools.append(
+                "mcp__credential_relay__fill_protected_identifier"
+            )
         if mailbox_spec.enabled:
             allowed_mcp_tools.extend(
                 f"mcp__{mailbox_spec.server_name}__{name}"
@@ -431,7 +451,12 @@ def build_agent_command(
                 "-c",
                 f"{server_key}.env_vars={_toml_value(sorted(mailbox_spec.env))}",
             ])
+    relay_tools = []
     if credential_relay_authorized:
+        relay_tools.append("fill_ats_credentials")
+    if identity_relay_authorized:
+        relay_tools.append("fill_protected_identifier")
+    if relay_tools:
         command.extend([
             "-c", f"mcp_servers.credential_relay.command={_toml_value(python_executable or sys.executable)}",
             "-c", f"mcp_servers.credential_relay.args={_toml_value(['-m', 'applypilot.apply.credential_relay_mcp'])}",
@@ -442,6 +467,7 @@ def build_agent_command(
             "-c", "mcp_servers.credential_relay.required=true",
             "-c", "mcp_servers.credential_relay.startup_timeout_sec=20",
             "-c", "mcp_servers.credential_relay.tool_timeout_sec=30",
+            "-c", f"mcp_servers.credential_relay.enabled_tools={_toml_value(relay_tools)}",
             "-c", 'mcp_servers.credential_relay.default_tools_approval_mode="approve"',
         ])
     command.extend([
@@ -475,6 +501,271 @@ def build_agent_command(
         "-",
     ])
     return command, final_message_path
+
+
+class SubprocessRuntimeError(RuntimeError):
+    """Base failure for the concrete subprocess runtime adapter."""
+
+
+class RuntimeContinuityError(SubprocessRuntimeError):
+    """A resumed turn violated actor, runtime, or profile continuity."""
+
+
+@dataclass(frozen=True, slots=True)
+class SubprocessLaunchSpec:
+    """Provider-neutral subprocess turn description.
+
+    The spec controls process lifecycle only.  It carries no browser-write,
+    submit, ledger, manifest, or receipt authority.
+    """
+
+    run_id: str
+    attempt_id: str
+    actor_id: str
+    turn_id: str
+    command: tuple[str, ...]
+    prompt: str
+    cwd: Path
+    env: MutableMapping[str, str]
+    runtime_id: str
+    profile_id: str
+    parent_run_id: str | None = None
+    submit_started: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "run_id",
+            "attempt_id",
+            "actor_id",
+            "turn_id",
+            "runtime_id",
+            "profile_id",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required")
+        if self.run_id != self.turn_id:
+            raise ValueError("run_id must remain the compatibility alias for turn_id")
+        if not self.command or any(not str(item).strip() for item in self.command):
+            raise ValueError("command must contain executable arguments")
+        if self.parent_run_id is not None and not self.parent_run_id.strip():
+            raise ValueError("parent_run_id must be non-empty when provided")
+
+    def redacted_for_history(self) -> SubprocessLaunchSpec:
+        """Retain continuity identity without keeping prompt or environment data."""
+        return replace(
+            self,
+            command=(self.command[0],),
+            prompt="",
+            env={},
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubprocessRuntimeHealth:
+    run_id: str
+    status: str
+    pid: int | None
+    returncode: int | None
+    started_at: float
+    updated_at: float
+
+
+@dataclass(slots=True)
+class _ManagedSubprocess:
+    spec: SubprocessLaunchSpec
+    process: subprocess.Popen[str]
+    status: str
+    started_at: float
+    updated_at: float
+
+
+@runtime_checkable
+class SubprocessRuntimeAdapter(Protocol):
+    """Lifecycle port implemented by concrete local/provider CLI adapters."""
+
+    def start(
+        self,
+        spec: SubprocessLaunchSpec,
+        *,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> subprocess.Popen[str]: ...
+
+    def resume(
+        self,
+        parent_run_id: str,
+        spec: SubprocessLaunchSpec,
+        *,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> subprocess.Popen[str]: ...
+
+    def cancel(self, run_id: str) -> None: ...
+
+    def health(self, run_id: str) -> SubprocessRuntimeHealth: ...
+
+    def close(self, run_id: str | None = None) -> None: ...
+
+
+class SubprocessAgentRuntime:
+    """Real subprocess lifecycle adapter with fresh-turn resume continuity."""
+
+    def __init__(
+        self,
+        *,
+        kill_process_tree: Callable[[int], None],
+        popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._kill_process_tree = kill_process_tree
+        self._popen_factory = popen_factory
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._runs: dict[str, _ManagedSubprocess] = {}
+        self._closed = False
+
+    def _spawn(
+        self,
+        spec: SubprocessLaunchSpec,
+        *,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> subprocess.Popen[str]:
+        with self._lock:
+            if self._closed:
+                raise SubprocessRuntimeError("subprocess runtime is closed")
+            if spec.run_id in self._runs:
+                raise SubprocessRuntimeError(f"run_id already exists: {spec.run_id}")
+            factory = popen_factory or self._popen_factory
+            process = factory(
+                list(spec.command),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=dict(spec.env),
+                cwd=str(spec.cwd),
+            )
+            now = self._clock()
+            managed = _ManagedSubprocess(
+                spec=spec,
+                process=process,
+                status="running",
+                started_at=now,
+                updated_at=now,
+            )
+            self._runs[spec.run_id] = managed
+        try:
+            if process.stdin is None:
+                raise SubprocessRuntimeError("subprocess stdin pipe was not created")
+            process.stdin.write(spec.prompt)
+            process.stdin.close()
+        except BrokenPipeError as exc:
+            startup_output = process.stdout.read() if process.stdout else ""
+            process.wait(timeout=5)
+            with self._lock:
+                managed.status = "failed"
+                managed.updated_at = self._clock()
+            raise SubprocessRuntimeError(
+                "Agent exited before accepting the prompt: "
+                + startup_output.strip()[:500]
+            ) from exc
+        return process
+
+    def start(
+        self,
+        spec: SubprocessLaunchSpec,
+        *,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> subprocess.Popen[str]:
+        """Start a new root turn."""
+        if spec.parent_run_id is not None:
+            raise RuntimeContinuityError("root start cannot declare parent_run_id")
+        return self._spawn(spec, popen_factory=popen_factory)
+
+    def resume(
+        self,
+        parent_run_id: str,
+        spec: SubprocessLaunchSpec,
+        *,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> subprocess.Popen[str]:
+        """Start a fresh child process bound to its completed parent turn."""
+        with self._lock:
+            parent = self._runs.get(parent_run_id)
+            if parent is None:
+                raise RuntimeContinuityError("resume parent run is unknown")
+            if spec.parent_run_id != parent_run_id:
+                raise RuntimeContinuityError("resume parent binding does not match")
+            if parent.process.poll() is None:
+                raise RuntimeContinuityError("cannot resume while parent is still running")
+            if (
+                parent.spec.actor_id != spec.actor_id
+                or parent.spec.attempt_id != spec.attempt_id
+            ):
+                raise RuntimeContinuityError(
+                    "resume must keep the same actor and application attempt"
+                )
+            switched = (
+                parent.spec.runtime_id != spec.runtime_id
+                or parent.spec.profile_id != spec.profile_id
+            )
+            if switched and (parent.spec.submit_started or spec.submit_started):
+                raise RuntimeContinuityError(
+                    "runtime/profile switch is forbidden after submit_started"
+                )
+        return self._spawn(spec, popen_factory=popen_factory)
+
+    def health(self, run_id: str) -> SubprocessRuntimeHealth:
+        """Return current process health without interpreting Agent output."""
+        with self._lock:
+            try:
+                managed = self._runs[run_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown subprocess run: {run_id}") from exc
+            returncode = managed.process.poll()
+            if managed.status == "running" and returncode is not None:
+                managed.status = "completed" if returncode == 0 else "failed"
+                managed.updated_at = self._clock()
+            return SubprocessRuntimeHealth(
+                run_id=run_id,
+                status=managed.status,
+                pid=managed.process.pid,
+                returncode=returncode,
+                started_at=managed.started_at,
+                updated_at=managed.updated_at,
+            )
+
+    def cancel(self, run_id: str) -> None:
+        """Cancel exactly one owned subprocess tree."""
+        with self._lock:
+            try:
+                managed = self._runs[run_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown subprocess run: {run_id}") from exc
+            if managed.process.poll() is None:
+                self._kill_process_tree(managed.process.pid)
+            managed.status = "cancelled"
+            managed.updated_at = self._clock()
+
+    def close(self, run_id: str | None = None) -> None:
+        """Close one run, or close the adapter and all live children."""
+        with self._lock:
+            targets = (
+                [self._runs[run_id]]
+                if run_id is not None and run_id in self._runs
+                else list(self._runs.values()) if run_id is None else []
+            )
+            if run_id is not None and not targets:
+                raise KeyError(f"unknown subprocess run: {run_id}")
+            for managed in targets:
+                if managed.process.poll() is None:
+                    self._kill_process_tree(managed.process.pid)
+                managed.status = "closed"
+                managed.updated_at = self._clock()
+                managed.spec = managed.spec.redacted_for_history()
+            if run_id is None:
+                self._closed = True
 
 
 # ---------------------------------------------------------------------------

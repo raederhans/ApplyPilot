@@ -128,6 +128,19 @@ def test_required_material_contract_separates_known_missing_and_unknown(
     assert result.result["unknown_required_labels"] == ["Essay response attachment"]
 
 
+def test_optional_transcript_is_not_promoted_to_a_material_block(tmp_path: Path) -> None:
+    job = _ready_job(tmp_path)
+    job["required_materials"] = [
+        {"label": "Academic transcript", "required": False}
+    ]
+
+    result = run_system_specialist("material-readiness-v1", job, mode="enforce")
+
+    assert result is not None
+    assert result.result["state"] == "ready"
+    assert "transcript" not in result.result["missing_kinds"]
+
+
 def test_byte_drift_after_manifest_binding_is_blocked(tmp_path: Path) -> None:
     job = _ready_job(tmp_path)
     Path(str(job["tailored_resume_path"])).write_bytes(b"%PDF-drift")
