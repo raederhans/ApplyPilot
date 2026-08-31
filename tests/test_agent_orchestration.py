@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -211,6 +214,52 @@ def test_report_tool_writes_one_idempotent_provider_neutral_result(
     assert conflicting["result"]["isError"] is True
     assert payload["run_id"] == "run-1"
     assert payload["proposals"][0]["concurrency_mode"] == "plugin-mode"
+
+
+def test_report_stdio_accepts_utf8_when_windows_text_encoding_is_legacy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unicode-turn.json"
+    env = {
+        **os.environ,
+        agent_report_mcp.RUN_ID_ENV: "run-unicode",
+        agent_report_mcp.REPORT_PATH_ENV: str(path),
+        "PYTHONIOENCODING": "cp1252:strict",
+    }
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "report_agent_turn",
+                "arguments": {
+                    "status": "ready_to_submit",
+                    "summary": "Verified six‑month internship plan",
+                    "observations": {"listing_evidence": "Apply by email — official listing"},
+                },
+            },
+        },
+    ]
+    stdin_bytes = b"".join(
+        (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        for message in messages
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "applypilot.apply.agent_report_mcp"],
+        input=stdin_bytes,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    responses = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert responses[-1]["result"]["isError"] is False
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["summary"] == "Verified six‑month internship plan"
 
 
 def test_report_tool_rejects_raw_secret_or_browser_handle(monkeypatch, tmp_path: Path) -> None:

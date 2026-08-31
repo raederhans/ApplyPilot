@@ -718,22 +718,37 @@ def mark_job(
     return canonical_url
 
 
-def reset_failed(connection: sqlite3.Connection) -> int:
-    """Reset all failed jobs so they can be retried.
+def reset_failed(connection: sqlite3.Connection, url: str | None = None) -> int:
+    """Reset failed jobs so they can be retried, optionally scoped to one URL.
 
     Returns:
         Number of jobs reset.
     """
     conn = connection
-    cursor = conn.execute("""
+    parameters: tuple[object, ...] = ()
+    exact_clause = ""
+    if url:
+        rows = conn.execute(
+            "SELECT url FROM jobs WHERE url = ? OR application_url = ? ORDER BY url LIMIT 2",
+            (url, url),
+        ).fetchall()
+        if not rows:
+            raise LookupError(f"No job found for URL: {url}")
+        if len(rows) > 1:
+            raise ValueError(
+                "Application URL matches multiple jobs; use the canonical job URL instead."
+            )
+        exact_clause = " AND url = ?"
+        parameters = (str(rows[0][0]),)
+    cursor = conn.execute(f"""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
                        apply_attempts = 0, apply_retry_blocked = 0,
                        apply_retry_reason = NULL, agent_id = NULL
-        WHERE apply_status = 'failed'
+        WHERE (apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status NOT IN (
               'applied', 'in_progress', 'submission_uncertain'
-          ))
-    """)
+          ))){exact_clause}
+    """, parameters)
     conn.commit()
     return cursor.rowcount
 

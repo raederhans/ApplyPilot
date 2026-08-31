@@ -43,6 +43,8 @@ from applypilot.apply import ats as ats_mod
 from applypilot.apply import orchestration as orchestration_mod
 from applypilot.apply import page_observation as page_observation_mod
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply import receipt_observer as receipt_observer_mod
+from applypilot.apply import resume_authorization as resume_authorization_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
@@ -1114,8 +1116,8 @@ def mark_job(url: str, status: str, reason: str | None = None) -> str:
     return application_jobs_mod.mark_job(get_connection(), url, status, reason)
 
 
-def reset_failed() -> int:
-    return application_jobs_mod.reset_failed(get_connection())
+def reset_failed(url: str | None = None) -> int:
+    return application_jobs_mod.reset_failed(get_connection(), url)
 
 
 def worker_loop(
@@ -2633,6 +2635,170 @@ def _wait_for_manual_captcha(
     return False
 
 
+def _issue_manual_resume_authorization(
+    job: dict,
+    *,
+    submit_started: bool,
+    timeout_seconds: int | None = None,
+) -> dict[str, object] | None:
+    """Persist an exact page-bound resume token before waiting for a human action."""
+    raw_bundle = job.get("_browser_lease_binding")
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    application_id = str(job.get("url") or "").strip()
+    if not isinstance(raw_bundle, Mapping) or not attempt_id or not application_id:
+        return None
+    bundle = BrowserLeaseBundle.from_mapping(raw_bundle)
+    policy = config.load_profile().get("submission_policy", {})
+    configured_timeout = (
+        int(timeout_seconds)
+        if timeout_seconds is not None
+        else int(
+            policy.get("manual_intervention_timeout_seconds", 1800)
+            if isinstance(policy, Mapping)
+            else 1800
+        )
+    )
+    authorization = resume_authorization_mod.issue_resume_authorization(
+        attempt_id=attempt_id,
+        application_id=application_id,
+        page_binding=bundle.page_binding,
+        trigger="captcha_cleared",
+        submit_started=submit_started,
+        ttl_seconds=max(60, min(configured_timeout, 3600)),
+    )
+    resume_authorization_mod.store_resume_authorization(
+        get_connection(),
+        authorization,
+    )
+    encoded = authorization.as_dict()
+    job["_resume_authorization"] = encoded
+    return encoded
+
+
+def _configured_receipt_observers(
+    profile: Mapping[str, object],
+) -> list[tuple[str, MailboxMcpSpec]]:
+    """Return configured Gmail/Outlook observers without exposing mailbox values."""
+    authentication = profile.get("authentication", {})
+    if not isinstance(authentication, Mapping):
+        return []
+    if not bool(
+        authentication.get(
+            "mailbox_read_authorized",
+            authentication.get("gmail_verification_authorized", False),
+        )
+    ):
+        return []
+    configured = authentication.get("receipt_mailboxes")
+    observers: list[tuple[str, MailboxMcpSpec]] = []
+    if isinstance(configured, list):
+        for item in configured:
+            if not isinstance(item, Mapping):
+                continue
+            provider = str(item.get("provider") or "").strip().casefold()
+            if provider not in receipt_observer_mod.SUPPORTED_PROVIDERS:
+                continue
+            raw_spec = item.get("mailbox_mcp")
+            if provider == "outlook" and not isinstance(raw_spec, Mapping):
+                # The built-in default is Gmail-specific.  Outlook must name
+                # its own read-only MCP surface so we never query one provider
+                # through another provider's credentials or tools.
+                continue
+            spec = resolve_mailbox_mcp_spec(
+                raw_spec if isinstance(raw_spec, Mapping) else None,
+            )
+            if spec.enabled and provider not in {name for name, _ in observers}:
+                observers.append((provider, spec))
+        return observers
+
+    mailbox = str(
+        authentication.get("mailbox")
+        or authentication.get("gmail_verification_mailbox")
+        or ""
+    ).casefold()
+    if not mailbox:
+        return []
+    provider = (
+        "outlook"
+        if mailbox.endswith(("@outlook.com", "@hotmail.com", "@live.com"))
+        else "gmail"
+    )
+    if provider == "outlook":
+        return []
+    return [(provider, resolve_mailbox_mcp_spec())]
+
+
+def _build_receipt_observer_context(
+    job: Mapping[str, object],
+    *,
+    provider: str,
+    submitted_at: datetime,
+) -> dict[str, object]:
+    return receipt_observer_mod.receipt_observer_context(
+        get_connection(),
+        job,
+        provider=provider,
+        submitted_at=submitted_at,
+    )
+
+
+def _process_receipt_observer_result(
+    job: Mapping[str, object],
+    *,
+    provider: str,
+    submitted_at: datetime,
+    observation: Mapping[str, object],
+) -> dict[str, object]:
+    return receipt_observer_mod.process_receipt_observation(
+        get_connection(),
+        job,
+        provider=provider,
+        submitted_at=submitted_at,
+        observation=observation,
+        gate_binding=(
+            job.get("_submission_gate_binding")
+            if isinstance(job.get("_submission_gate_binding"), Mapping)
+            else None
+        ),
+    )
+
+
+def _consume_manual_resume_authorization(
+    job: dict,
+    authorization: Mapping[str, object],
+    *,
+    submit_started: bool,
+) -> bool:
+    """Consume one resume token only while its exact page epoch remains bound."""
+    raw_bundle = job.get("_browser_lease_binding")
+    if not isinstance(raw_bundle, Mapping):
+        return False
+    try:
+        bundle = BrowserLeaseBundle.from_mapping(raw_bundle)
+        parsed = resume_authorization_mod.ResumeAuthorization.from_mapping(
+            authorization
+        )
+        resume_authorization_mod.validate_resume_authorization(
+            parsed,
+            attempt_id=str(job.get("_attempt_id") or ""),
+            application_id=str(job.get("url") or ""),
+            page_binding=bundle.page_binding,
+            trigger="captcha_cleared",
+            submit_started=submit_started,
+        )
+        return resume_authorization_mod.consume_resume_authorization(
+            get_connection(),
+            parsed,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        logger.warning(
+            "Resume authorization rejected for attempt %s",
+            job.get("_attempt_id"),
+            exc_info=True,
+        )
+        return False
+
+
 
 
 
@@ -2744,6 +2910,26 @@ def _credential_relay_allowed(profile: dict, job: dict) -> bool:
         authentication_capability(profile, "credential_relay_authorized")
         and job.get("_browser_backend") != "cloak"
     )
+
+
+def _runtime_application_route(
+    job: Mapping[str, object],
+    *,
+    submission_phase: str,
+    direct_email_send_authorized: bool,
+) -> str:
+    """Keep email-only preparation off the browser tool surface."""
+    if submission_phase == "receipt":
+        return "receipt_mailbox"
+    if direct_email_send_authorized:
+        return "direct_email"
+    if (
+        submission_phase == "prepare"
+        and submission_surfaces_mod.classify_submission_surface(job)
+        == "official_direct_email"
+    ):
+        return "direct_email"
+    return "browser"
 
 
 def _identity_relay_allowed(profile: dict, job: dict) -> bool:
@@ -2957,6 +3143,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     setup_metrics: dict[str, int | float] = {}
     runtime_settings = load_runtime_settings()
     agent_timeout_seconds = runtime_settings.agent_timeout_seconds
+    timeout_multiplier = job.get("_agent_timeout_multiplier", 1)
+    if (
+        isinstance(timeout_multiplier, (int, float))
+        and not isinstance(timeout_multiplier, bool)
+        and timeout_multiplier > 1
+    ):
+        agent_timeout_seconds = min(
+            3600,
+            max(
+                agent_timeout_seconds,
+                int(agent_timeout_seconds * min(float(timeout_multiplier), 2.0)),
+            ),
+        )
     profile = config.load_profile()
     authentication = profile.get("authentication", {})
     credential_relay_authorized = _credential_relay_allowed(profile, job)
@@ -3017,7 +3216,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if runtime_ats_adapter in {"", "generic"}
         else f"ats_{runtime_ats_adapter.casefold()}"
     )
-    runtime_route = "direct_email" if direct_email_send_authorized else "browser"
+    runtime_route = _runtime_application_route(
+        job,
+        submission_phase=submission_phase,
+        direct_email_send_authorized=direct_email_send_authorized,
+    )
     runtime_capabilities = scope_capability_registry(
         compose_runtime_capabilities(capability_registry),
         phase=submission_phase,

@@ -279,13 +279,28 @@ def reconcile_submission_receipt(
     if row is None:
         return {"status": "not_found", "job_url": job_url}
     prior_status = row["apply_status"]
+    requested_gate_identity = {
+        "gate_id": str(evidence.get("gate_id") or "").strip(),
+        "batch_id": str(evidence.get("batch_id") or "").strip(),
+        "attempt_id": str(evidence.get("attempt_id") or "").strip(),
+    }
+    exact_gate_binding_requested = all(requested_gate_identity.values())
     manual_external_receipt = source in {"browser_receipt", "confirmation_email"} and prior_status in {
         None,
         "",
         "failed",
         "previewed",
     }
-    if prior_status not in {"applied", "submission_uncertain"} and not manual_external_receipt:
+    in_flight_bound_receipt = (
+        source in {"browser_receipt", "confirmation_email"}
+        and prior_status == "applying"
+        and exact_gate_binding_requested
+    )
+    if (
+        prior_status not in {"applied", "submission_uncertain"}
+        and not manual_external_receipt
+        and not in_flight_bound_receipt
+    ):
         return {
             "status": "ignored",
             "reason": "job_not_submission_uncertain",
@@ -392,11 +407,7 @@ def reconcile_submission_receipt(
                 ),
             )
 
-        gate_identity = {
-            "gate_id": str(evidence.get("gate_id") or "").strip(),
-            "batch_id": str(evidence.get("batch_id") or "").strip(),
-            "attempt_id": str(evidence.get("attempt_id") or "").strip(),
-        }
+        gate_identity = requested_gate_identity
         binding_requested = any(gate_identity.values())
         if binding_requested:
             gate_bound = application_ledger.bind_admitted_receipt_to_gate(
@@ -472,6 +483,7 @@ def reconcile_submission_receipt(
                                 submission_observation_json = ?, submission_observed_at = ?
                 WHERE url = ?
                   AND (apply_status IN ('submission_uncertain', 'failed', 'previewed')
+                       OR (? = 1 AND apply_status = 'applying')
                        OR apply_status IS NULL)
                 """,
                 (
@@ -481,6 +493,7 @@ def reconcile_submission_receipt(
                     json.dumps(cleaned, ensure_ascii=False),
                     now,
                     job_url,
+                    int(exact_gate_binding_requested),
                 ),
             )
         if cursor.rowcount != 1:

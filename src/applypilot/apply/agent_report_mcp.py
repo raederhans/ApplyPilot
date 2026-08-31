@@ -190,15 +190,28 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
 
 
 def main() -> int:
-    for line in sys.stdin:
+    input_stream = getattr(sys.stdin, "buffer", sys.stdin)
+    output_stream = getattr(sys.stdout, "buffer", sys.stdout)
+    for raw_line in input_stream:
         try:
+            line = (
+                raw_line.decode("utf-8")
+                if isinstance(raw_line, (bytes, bytearray))
+                else raw_line
+            )
             message = json.loads(line)
             response = _handle(message) if isinstance(message, dict) else None
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             response = _error(None, f"Invalid request: {exc}")
         if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            response_line = json.dumps(response, ensure_ascii=True) + "\n"
+            if hasattr(output_stream, "write"):
+                output_stream.write(
+                    response_line.encode("utf-8")
+                    if output_stream is not sys.stdout
+                    else response_line
+                )
+            output_stream.flush()
     return 0
 
 

@@ -235,18 +235,6 @@ def decide_recovery(state: ApplicationActorState, result: str) -> DecisionEnvelo
     if failure.category == "unclassified_application_failure":
         action = "park"
         next_action = "park_unclassified_failure_for_bounded_diagnosis"
-    elif failure.category == "answer_policy_needs_relaxed_retry":
-        interruption = _human_interruption(result, failure)
-        return _decision(
-            state,
-            RecoveryAction(
-                action="human_only",
-                failure_category=failure.category,
-                next_action="resolve_unsupported_fact_with_human_review",
-                missing_capability=failure.missing_capability,
-            ),
-            human_interruption=interruption,
-        )
     elif failure.recoverability in {
         "retry_same_application",
         "retry_with_larger_runtime_budget",
@@ -440,12 +428,38 @@ def human_request_for_decision(decision: DecisionEnvelope) -> HumanRequest | Non
     recovery = decision.recovery_action
     if interruption is None or recovery is None:
         return None
+    prompt_by_type = {
+        "captcha": (
+            "Waiting for the visible CAPTCHA to be cleared on the bound ApplyPilot "
+            "page; the launcher will re-observe and resume automatically."
+        ),
+        "security_challenge": (
+            "Waiting for the account security challenge on the bound page; this is "
+            "a security action, not a request to re-authorize the application."
+        ),
+        "assessment": (
+            "The application reached an assessment boundary and remains paused; "
+            "routine application authorization is already recorded."
+        ),
+        "sensitive_identity_or_financial_material": (
+            "The application requires identity or financial material that ApplyPilot "
+            "cannot supply automatically."
+        ),
+        "unsupported_legal_declaration": (
+            "The application requires a material declaration that is not supported "
+            "by confirmed facts."
+        ),
+        "human_boundary": (
+            "The application reached a typed human-only boundary; routine application "
+            "authorization is already recorded."
+        ),
+    }
     return HumanRequest(
         request_id=f"{decision.run_id}:human:1",
         run_id=decision.run_id,
         attempt_id=decision.attempt_id,
         request_type=interruption.interruption_type,
-        prompt="Application paused at a HUMAN_ONLY boundary; inspect evidence before resuming.",
+        prompt=prompt_by_type[interruption.interruption_type],
         context={
             "actor_id": decision.actor_id,
             "turn_id": decision.turn_id,

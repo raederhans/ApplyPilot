@@ -124,7 +124,12 @@ def default_auxiliary_capabilities() -> CapabilityRegistry:
             "applypilot_ats",
             ("requires_state:ats_workday",),
         ),
-        ("report_agent_turn", ("prepare", "submit"), "applypilot_control", ()),
+        (
+            "report_agent_turn",
+            ("prepare", "submit", "receipt"),
+            "applypilot_control",
+            (),
+        ),
     )
     return CapabilityRegistry(
         ToolSpec(

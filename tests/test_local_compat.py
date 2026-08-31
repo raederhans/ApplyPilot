@@ -3174,6 +3174,45 @@ def test_email_route_prompt_requires_bound_prepare_and_sent_evidence() -> None:
     assert "body_sha256" in submit
 
 
+def test_email_route_prepare_prompt_makes_mailbox_the_primary_workflow(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    job = {
+        "url": "https://www.internsg.com/job/data-ai-intern/",
+        "title": "Data Engineering and AI Intern",
+        "company_name": "Example",
+        "source_site": "InternSG",
+        "full_description": "Apply by emailing a text CV to jobs@example.test.",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+        "_available_tools": ["mailbox_search", "mailbox_get_message"],
+        "_agent_reporting_enabled": True,
+    }
+
+    built = prompt.build_prompt(
+        job,
+        "Verified resume",
+        dry_run=False,
+        submission_phase="prepare",
+    )
+
+    assert "Follow EMAIL-ONLY APPLICATION ROUTE as the primary workflow" in built
+    assert "Do not look for, fill, or audit a browser application form" in built
+    assert "Call report_agent_turn exactly once" in built
+    assert "Do not call any send tool" in built
+    assert "== MAILBOX-ONLY CONTROL ==" in built
+    assert "REQUIRED BROWSER CONTROL" not in built
+    assert "browser_mcp_unavailable" not in built
+
+
 def test_email_route_submit_keeps_send_capability_gate() -> None:
     submit = prompt._build_email_route_section(
         {
@@ -3719,6 +3758,28 @@ def test_submission_uncertain_requires_manual_review_and_is_not_reacquired(
     assert conn.execute(
         "SELECT apply_retry_blocked FROM jobs WHERE url = ?", (url,)
     ).fetchone()[0] == 0
+
+
+def test_reset_failed_can_be_scoped_to_one_exact_job(monkeypatch, tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "jobs.db")
+    first = "https://example.com/failed-one"
+    second = "https://example.com/failed-two"
+    for url in (first, second):
+        conn.execute(
+            "INSERT INTO jobs (url, application_url, title, apply_status, apply_error, "
+            "apply_attempts) VALUES (?, ?, 'Intern', 'failed', 'prepare failed', 3)",
+            (url, url),
+        )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    assert launcher.reset_failed(first) == 1
+    states = {
+        row[0]: (row[1], row[2])
+        for row in conn.execute("SELECT url, apply_status, apply_attempts FROM jobs")
+    }
+    assert states[first] == (None, 0)
+    assert states[second] == ("failed", 3)
 
 
 def test_automatic_exact_submission_enforces_policy_minimum(

@@ -10,6 +10,7 @@ import pytest
 
 from applypilot import config
 from applypilot.apply import (
+    agent_output,
     agent_runtime,
     application_actor,
     launcher,
@@ -18,6 +19,11 @@ from applypilot.apply import (
     router,
     worker_orchestration,
 )
+from applypilot.apply.capabilities import (
+    compose_runtime_capabilities,
+    scope_capability_registry,
+)
+from applypilot.apply.contracts import AgentTurnResult
 from applypilot.apply.email_routing import MailboxMcpSpec, mailbox_prepare_duplicate_receipt
 from applypilot.apply.run_progress import RunProgress
 from applypilot.database import (
@@ -51,6 +57,131 @@ def test_prepare_guidance_fragments_are_selected_from_job_context() -> None:
         },
         dry_run=False,
     )
+
+
+def test_direct_email_guidance_uses_canonical_submission_surface() -> None:
+    fragments = prompt._select_prompt_fragments(
+        {
+            "title": "Data Engineering and AI Intern",
+            "source_site": "InternSG",
+            "url": "https://www.internsg.com/job/data-ai-intern/",
+            "full_description": (
+                "Apply by emailing a text CV to contactus@example.test. "
+                "Candidates must be available for six months."
+            ),
+        },
+        dry_run=False,
+    )
+
+    assert "direct_email" in fragments
+
+
+def test_email_only_prepare_route_excludes_browser_capabilities() -> None:
+    job = {
+        "url": "https://www.internsg.com/job/data-ai-intern/",
+        "source_site": "InternSG",
+        "full_description": "Apply by emailing a text CV to jobs@example.test.",
+    }
+
+    route = launcher._runtime_application_route(
+        job,
+        submission_phase="prepare",
+        direct_email_send_authorized=False,
+    )
+    registry = launcher.scope_capability_registry(
+        launcher.compose_runtime_capabilities(),
+        phase="prepare",
+        route=route,
+        state=("ats_unknown",),
+    )
+
+    assert route == "direct_email"
+    assert "report_agent_turn" in registry.names()
+    assert not any(name.startswith("browser_") for name in registry.names())
+
+
+def test_receipt_phase_exposes_report_and_mailbox_semantics_without_browser(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(config, "load_search_config", dict)
+    job = {
+        "url": "https://jobs.example.test/role",
+        "title": "Data Intern",
+        "company_name": "Example",
+        "_receipt_observer_context": {
+            "provider": "gmail",
+            "submitted_at": "2026-08-31T10:00:00+00:00",
+            "search_after": "2026-08-31T10:00:00+00:00",
+            "watermark": None,
+        },
+        "_control_contract": {
+            "phase": "receipt",
+            "interaction_driver": "mailbox",
+            "submit_owner": "none",
+        },
+    }
+
+    route = launcher._runtime_application_route(
+        job,
+        submission_phase="receipt",
+        direct_email_send_authorized=False,
+    )
+    capabilities = scope_capability_registry(
+        compose_runtime_capabilities(),
+        phase="receipt",
+        route=route,
+        state={"receipt"},
+    )
+    built = prompt.build_prompt(job, "", submission_phase="receipt")
+
+    assert route == "receipt_mailbox"
+    assert capabilities.names() == ["report_agent_turn"]
+    assert "Do not use a browser" in built
+    assert "any calendar capability" in built
+    assert "RESULT:APPLIED" in built
+
+
+def test_receipt_phase_rejects_incomplete_observer_context(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(config, "load_search_config", dict)
+    with pytest.raises(ValueError, match="missing required identity fields"):
+        prompt.build_prompt(
+            {
+                "url": "https://jobs.example.test/role",
+                "_receipt_observer_context": {
+                    "provider": "gmail",
+                    "submitted_at": "2026-08-31T10:00:00+00:00",
+                },
+            },
+            "",
+            submission_phase="receipt",
+        )
+
+
+def test_receipt_phase_requires_structured_confirmation_for_applied() -> None:
+    exact = AgentTurnResult(
+        run_id="turn-1",
+        status="applied",
+        summary="One exact confirmation",
+        observations={"confirmation_receipt": {"provider": "gmail"}},
+    )
+    missing = AgentTurnResult(
+        run_id="turn-2",
+        status="applied",
+        summary="Unsupported success",
+    )
+
+    assert agent_output.interpret_agent_turn_result(
+        exact,
+        dry_run=False,
+        submission_phase="receipt",
+    ) == ("applied", None)
+    assert agent_output.interpret_agent_turn_result(
+        missing,
+        dry_run=False,
+        submission_phase="receipt",
+    ) == ("failed:invalid_receipt_result", None)
 
 
 def test_reduced_specialist_results_are_bounded_context_for_the_next_turn() -> None:
@@ -986,6 +1117,10 @@ def _run_worker_contract(
     final_performance_records: list[dict] | None = None,
     acquire_error: Exception | None = None,
     control_connection: sqlite3.Connection | None = None,
+    receipt_observation: dict | None = None,
+    receipt_process_result: dict | None = None,
+    profile_overrides: dict | None = None,
+    resume_authorization_calls: list[dict] | None = None,
 ):
     job = {
         "url": "https://jobs.example.test/role",
@@ -1014,12 +1149,21 @@ def _run_worker_contract(
             performance_clock[0] += 0.02 if phase == "prepare" else 0.03
         expected_driver = (
             "mailbox"
-            if phase == "submit" and email_application is not None
+            if phase == "receipt"
+            or (phase == "submit" and email_application is not None)
             else "playwright"
         )
         assert current_job["_control_contract"]["interaction_driver"] == expected_driver
         assert current_job["_control_contract"]["browser_runtime"] == current_job["_browser_backend"]
         run_phases.append(phase)
+        if phase == "receipt":
+            current_job["_agent_observations"] = dict(receipt_observation or {})
+            return (
+                "applied"
+                if (receipt_process_result or {}).get("status") == "applied"
+                else "submission_uncertain",
+                10,
+            )
         if phase == "prepare":
             if prepare_hook is not None:
                 prepare_hook(current_job)
@@ -1074,6 +1218,7 @@ def _run_worker_contract(
                 },
             }
         else:
+            current_job["_submit_turn_binding_marker"] = "current-submit-page"
             current_job["_agent_submission_evidence"] = {
                 "receipt_visible": True,
                 "applied_badge_visible": False,
@@ -1104,7 +1249,11 @@ def _run_worker_contract(
         }
 
     launcher._stop_event.clear()
-    monkeypatch.setattr(config, "load_profile", dict)
+    monkeypatch.setattr(
+        config,
+        "load_profile",
+        lambda: dict(profile_overrides or {}),
+    )
     monkeypatch.setattr(launcher, "_submission_rate_status", lambda *args: (True, 0, "ready"))
     recovery_connection = control_connection or sqlite3.connect(":memory:")
     monkeypatch.setattr(launcher, "get_connection", lambda: recovery_connection)
@@ -1300,6 +1449,30 @@ def _run_worker_contract(
         return True
 
     monkeypatch.setattr(launcher, "_wait_for_manual_captcha", fake_verification_wait)
+    def fake_issue_resume_authorization(current_job, **_kwargs):
+        if resume_authorization_calls is not None:
+            resume_authorization_calls.append(
+                {"action": "issue", "job": dict(current_job)}
+            )
+        return {"authorization_id": "resume-auth-1"}
+
+    def fake_consume_resume_authorization(current_job, _authorization, **_kwargs):
+        if resume_authorization_calls is not None:
+            resume_authorization_calls.append(
+                {"action": "consume", "job": dict(current_job)}
+            )
+        return True
+
+    monkeypatch.setattr(
+        launcher,
+        "_issue_manual_resume_authorization",
+        fake_issue_resume_authorization,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_consume_manual_resume_authorization",
+        fake_consume_resume_authorization,
+    )
     monkeypatch.setattr(
         launcher,
         "_mark_runtime_cover_not_required",
@@ -1333,6 +1506,35 @@ def _run_worker_contract(
         launcher,
         "_has_admitted_submission_receipt",
         lambda *_args, **_kwargs: receipt_admitted,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_configured_receipt_observers",
+        lambda _profile: (
+            [("gmail", MailboxMcpSpec(package=None, command="mailbox-test"))]
+            if receipt_observation is not None
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_build_receipt_observer_context",
+        lambda _job, **kwargs: {
+            "provider": kwargs["provider"],
+            "submitted_at": kwargs["submitted_at"].isoformat(),
+        },
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_process_receipt_observer_result",
+        lambda _job, **_kwargs: dict(
+            receipt_process_result
+            or {
+                "status": "no_match",
+                "provider": "gmail",
+                "watermark_advanced": False,
+            }
+        ),
     )
     def fake_mark_result(*args, **kwargs):
         marked.append((args, kwargs))
@@ -1939,7 +2141,7 @@ def test_worker_uses_reserved_mailbox_submit_route_for_email_application(
         "listing_evidence": "Official listing says apply to jobs@example.test",
     }
 
-    result, phases, ledger, marked = _run_worker_contract(
+    result, phases, _ledger, _marked = _run_worker_contract(
         monkeypatch,
         email_application=email_plan,
         staged_attachment=str(attachment),
@@ -1947,10 +2149,33 @@ def test_worker_uses_reserved_mailbox_submit_route_for_email_application(
 
     assert result == (1, 0)
     assert phases == ["prepare", "submit"]
-    assert ledger[0][0] == "applied"
-    assert ledger[0][1]["agent"]["channel"] == "direct_email"
-    assert ledger[0][1]["observer"]["confirmed"] is True
-    assert marked[0][0][1] == "applied"
+    assert _ledger[0][0] == "applied"
+    assert _ledger[0][1]["agent"]["channel"] == "direct_email"
+    assert _ledger[0][1]["observer"]["confirmed"] is True
+    assert _marked[0][0][1] == "applied"
+
+
+def test_worker_never_falls_back_to_browser_audit_for_rejected_email_plan(
+    monkeypatch,
+) -> None:
+    def report_invalid_email_plan(job: dict) -> None:
+        job["_agent_observations"] = {
+            "email_application": {
+                "route": "direct_email",
+                "recipient": "jobs@example.test",
+                "subject": "Application - Data Analyst",
+            }
+        }
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_hook=report_invalid_email_plan,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert marked[0][0][1] == "failed"
+    assert "email_plan_unverified" in marked[0][0][2]
 
 
 def test_direct_email_submission_evidence_requires_send_and_sent_copy() -> None:
@@ -2151,6 +2376,178 @@ def test_manual_verification_receives_the_same_adaptive_lease(monkeypatch) -> No
     assert verification_calls[0]["application_lease_minutes"] == 62
 
 
+def test_same_application_recovery_repairs_once_then_continues(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["failed:resume_upload", "ready_to_submit"],
+        control_connection=connection,
+    )
+
+    lifecycle = list_recovery_execution_results(
+        attempt_id="https://jobs.example.test/role",
+        conn=connection,
+    )
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert [entry.stage for entry in lifecycle] == [
+        "started",
+        "executed",
+        "verified",
+    ]
+    assert lifecycle[1].details["same_application_retry"] is True
+    assert lifecycle[1].details["submit_started"] is False
+    assert marked[0][0][1] == "applied"
+
+
+def test_configured_zero_field_repair_budget_disables_prepare_retry(monkeypatch) -> None:
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "issues": ["required_field_empty:Application source"],
+        "blocking_issues": [],
+        "repairable_issues": ["required_field_empty:Application source"],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+    }
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        audit_results=[
+            ("pre_submit_repair:required_field_empty:Application source", repair_report)
+        ],
+        profile_overrides={"submission_policy": {"field_repair_limit": 0}},
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert marked[0][0][1] == "failed"
+
+
+def test_configured_zero_same_application_budget_disables_retry(monkeypatch) -> None:
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["failed:resume_upload", "ready_to_submit"],
+        profile_overrides={
+            "submission_policy": {"same_application_retry_limit": 0}
+        },
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert marked[0][0][1] == "failed"
+
+
+def test_post_submit_captcha_clearance_reobserves_without_second_submit_turn(
+    monkeypatch,
+) -> None:
+    verification_calls: list[dict] = []
+    resume_authorization_calls: list[dict] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="applied",
+        observer_results=[
+            {"confirmed": False, "captcha_visible": True},
+            {
+                "confirmed": True,
+                "receipt_visible": True,
+                "applied_badge_visible": False,
+                "confirmation_text": "Your application has been submitted",
+                "current_url": "https://jobs.example.test/confirmation",
+            },
+        ],
+        manual_captcha_relay=True,
+        verification_calls=verification_calls,
+        resume_authorization_calls=resume_authorization_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert verification_calls[0]["submit_started"] is True
+    assert [call["action"] for call in resume_authorization_calls] == [
+        "issue",
+        "consume",
+    ]
+    assert all(
+        call["job"].get("_submit_turn_binding_marker") == "current-submit-page"
+        for call in resume_authorization_calls
+    )
+    attempts = marked[0][1]["evidence"]["attempts"]
+    assert attempts[-1]["observer"]["submit_replayed"] is False
+
+
+def test_submission_uncertain_runs_mailbox_receipt_observer_and_reconciles(
+    monkeypatch,
+) -> None:
+    receipt_observation = {
+        "receipt_scan": {
+            "provider": "gmail",
+            "scan_succeeded": True,
+            "ambiguous": False,
+            "candidate_count": 1,
+        },
+        "confirmation_receipt": {
+            "provider": "gmail",
+            "provider_message_id": "message-1",
+        },
+    }
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="submission_uncertain",
+        observer_results=[{"confirmed": False, "reason": "receipt_missing"}],
+        receipt_observation=receipt_observation,
+        receipt_process_result={
+            "status": "applied",
+            "provider": "gmail",
+            "watermark_advanced": True,
+        },
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit", "receipt"]
+    assert [entry[0] for entry in ledger] == ["submission_uncertain", "applied"]
+    observers = marked[0][1]["evidence"]["mailbox_receipt_observers"]
+    assert observers == [
+        {
+            "provider": "gmail",
+            "turn_status": "applied",
+            "status": "applied",
+            "watermark_advanced": True,
+        }
+    ]
+
+
+def test_mailbox_source_failure_keeps_submission_uncertain(monkeypatch) -> None:
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        submit_result="submission_uncertain",
+        observer_results=[{"confirmed": False, "reason": "receipt_missing"}],
+        receipt_observation={
+            "receipt_scan": {
+                "provider": "gmail",
+                "scan_succeeded": False,
+                "ambiguous": False,
+                "candidate_count": 0,
+            }
+        },
+        receipt_process_result={
+            "status": "provider_error",
+            "provider": "gmail",
+            "watermark_advanced": False,
+        },
+    )
+
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit", "receipt"]
+    assert ledger[0][0] == "submission_uncertain"
+    assert marked[0][1]["evidence"]["mailbox_receipt_observers"][0][
+        "watermark_advanced"
+    ] is False
+
+
 def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypatch) -> None:
     launches: list[tuple[tuple, dict]] = []
 
@@ -2174,6 +2571,25 @@ def test_auto_browser_backend_retries_one_explicit_bot_block_with_cloak(monkeypa
         "runtime_transition",
         "phase_transition",
     ]
+
+
+def test_configured_zero_new_session_budget_disables_cloak_retry(monkeypatch) -> None:
+    launches: list[tuple[tuple, dict]] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        browser_backend="auto",
+        prepare_results=["failed:cloudflare_blocked", "ready_to_submit"],
+        launch_calls=launches,
+        profile_overrides={
+            "submission_policy": {"new_session_retry_limit": 0}
+        },
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert [call[1]["browser_backend"] for call in launches] == ["edge"]
+    assert marked[0][0][1] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -2790,6 +3206,22 @@ def test_worker_resolves_cover_material_after_opening_ats(
     assert marked[0][0][1] == "applied"
 
 
+def test_configured_zero_material_regeneration_budget_disables_retry(
+    monkeypatch,
+) -> None:
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["cover_letter_required", "ready_to_submit"],
+        profile_overrides={
+            "submission_policy": {"material_regeneration_limit": 0}
+        },
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert marked[0][0][1] == "failed"
+
+
 def test_worker_never_marks_applied_when_ledger_update_fails(monkeypatch) -> None:
     result, phases, ledger, marked = _run_worker_contract(
         monkeypatch, ledger_update_succeeds=False
@@ -3046,7 +3478,9 @@ def test_smartrecruiters_binding_resolves_public_posting_to_publication_uuid() -
     }
 
 
-def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> None:
+def test_worker_reobserves_once_after_manual_verification_without_resubmitting(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "3600")
     verification_calls: list[dict] = []
     verification_gate = {
@@ -3071,12 +3505,15 @@ def test_worker_resumes_once_after_manual_verification_clears(monkeypatch) -> No
         verification_calls=verification_calls,
     )
 
-    assert result == (1, 0)
-    assert phases == ["prepare", "submit", "submit"]
-    assert ledger[0][0] == "applied"
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "submission_uncertain"
     assert marked[0][1]["evidence"]["attempts"][0]["disposition"] == (
         "verification_required"
     )
+    assert marked[0][1]["evidence"]["attempts"][-1]["observer"][
+        "submit_replayed"
+    ] is False
     assert verification_calls[0]["submit_started"] is True
     assert verification_calls[0]["application_lease_minutes"] == 62
 

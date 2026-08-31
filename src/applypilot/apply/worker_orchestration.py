@@ -70,9 +70,12 @@ WORKER_RUNTIME_PORTS = (
     "_prepare_runtime_cover_letter", "_reserve_manifest_submission",
     "_runtime_linkedin_route_gate",
     "_admit_direct_email_receipt",
+    "_configured_receipt_observers", "_build_receipt_observer_context",
+    "_process_receipt_observer_result",
     "_route_for_phase", "_stop_event", "_submission_evidence_consistent",
     "_submission_rate_status", "_submit_writer_lane", "_update_submission_ledger",
     "_has_admitted_submission_receipt",
+    "_issue_manual_resume_authorization", "_consume_manual_resume_authorization",
     "_wait_for_manual_captcha", "acquire_job", "add_event", "allocate_cdp_port",
     "capture_browser_session", "cleanup_worker", "cloak_fallback_route",
     "computer_use_handoff_allowed", "config", "datetime", "get_connection",
@@ -147,6 +150,9 @@ def _worker_loop_with_port(
     _record_ats_fill_plan_feedback = runtime._record_ats_fill_plan_feedback
     _prepare_runtime_cover_letter = runtime._prepare_runtime_cover_letter
     _admit_direct_email_receipt = runtime._admit_direct_email_receipt
+    _configured_receipt_observers = runtime._configured_receipt_observers
+    _build_receipt_observer_context = runtime._build_receipt_observer_context
+    _process_receipt_observer_result = runtime._process_receipt_observer_result
     _reserve_manifest_submission = runtime._reserve_manifest_submission
     _runtime_linkedin_route_gate = runtime._runtime_linkedin_route_gate
     _route_for_phase = runtime._route_for_phase
@@ -156,6 +162,8 @@ def _worker_loop_with_port(
     _submit_writer_lane = runtime._submit_writer_lane
     _update_submission_ledger = runtime._update_submission_ledger
     _has_admitted_submission_receipt = runtime._has_admitted_submission_receipt
+    _issue_manual_resume_authorization = runtime._issue_manual_resume_authorization
+    _consume_manual_resume_authorization = runtime._consume_manual_resume_authorization
     _wait_for_manual_captcha = runtime._wait_for_manual_captcha
     acquire_job = runtime.acquire_job
     add_event = runtime.add_event
@@ -188,6 +196,26 @@ def _worker_loop_with_port(
     jobs_done = 0
     empty_polls = 0
     profile = config.load_profile()
+    submission_policy = profile.get("submission_policy", {})
+
+    def configured_retry_limit(name: str) -> int:
+        configured = (
+            submission_policy.get(name, 1)
+            if isinstance(submission_policy, dict)
+            else 1
+        )
+        return int(
+            isinstance(configured, int)
+            and not isinstance(configured, bool)
+            and configured > 0
+        )
+
+    same_retry_limit = configured_retry_limit("same_application_retry_limit")
+    new_session_retry_limit = configured_retry_limit("new_session_retry_limit")
+    field_repair_limit = configured_retry_limit("field_repair_limit")
+    material_regeneration_limit = configured_retry_limit(
+        "material_regeneration_limit"
+    )
     requested_browser_backend = resolve_browser_backend(browser_backend)
     requested_interaction_mode = resolve_interaction_mode(interaction_mode)
     run_attempted_urls = attempted_urls if attempted_urls is not None else set()
@@ -304,9 +332,11 @@ def _worker_loop_with_port(
 
         chrome_proc = None
         submission_started = False
+        submitted_at = None
+        email_application = None
         verification_relay_used = False
-        cover_material_resolved = False
-        pre_submit_repair_used = False
+        cover_material_retries_remaining = material_regeneration_limit
+        field_repair_retries_remaining = field_repair_limit
         ats_fill_plan_feedback: dict[str, object] | None = None
         ledger_reserved = False
         submission_evidence: dict | None = None
@@ -347,6 +377,7 @@ def _worker_loop_with_port(
             "submission_gate_wait_ms": 0.0,
             "submit_agent_ms": 0.0,
             "post_submit_observer_ms": 0.0,
+            "mailbox_receipt_observer_ms": 0.0,
             "prepare_repair_agent_ms": 0.0,
             "validation_repair_agent_ms": 0.0,
             "submit_lane_wait_ms": 0.0,
@@ -725,10 +756,16 @@ def _worker_loop_with_port(
                     login_duration,
                 )
 
-            job["_application_actor_new_session_retries_remaining"] = int(
-                requested_browser_backend == "auto"
-                and active_browser_backend == "edge"
-                and not cloak_fallback_used
+            job["_application_actor_same_application_retries_remaining"] = (
+                same_retry_limit
+            )
+            job["_application_actor_new_session_retries_remaining"] = min(
+                new_session_retry_limit,
+                int(
+                    requested_browser_backend == "auto"
+                    and active_browser_backend == "edge"
+                    and not cloak_fallback_used
+                ),
             )
             result, duration_ms = execute_entry_turn()
 
@@ -749,6 +786,9 @@ def _worker_loop_with_port(
                 write_owner=str(getattr(active_route, "submit_owner", "playwright")),
                 phase="verify",
                 submission_uncertain=str(result).casefold() == "submission_uncertain",
+                same_application_retries_remaining=int(
+                    job["_application_actor_same_application_retries_remaining"]
+                ),
                 new_session_retries_remaining=int(
                     job["_application_actor_new_session_retries_remaining"]
                 ),
@@ -889,6 +929,69 @@ def _worker_loop_with_port(
                     "result_category": classify_failure(result).category,
                 }
 
+            def execute_same_application_recovery(
+                _command,
+                current_job=job,
+                current_submit_started=submission_started,
+                current_route=active_route,
+                current_metrics=orchestration_metrics,
+            ):
+                """Re-observe and repair the same page once before any Submit."""
+                nonlocal duration_ms
+                nonlocal result
+
+                if current_submit_started:
+                    raise RuntimeError("same_application_retry_forbidden_after_submit")
+                previous_result = result
+                failure = classify_failure(previous_result)
+                current_job["_application_actor_same_application_retries_remaining"] = 0
+                current_job["_browser_observation"] = {
+                    "recovery_mode": "same_application",
+                    "signal": failure.category,
+                    "next_action": failure.next_action,
+                    "submit_started": False,
+                    "submission_gate": False,
+                }
+                if failure.recoverability == "retry_with_larger_runtime_budget":
+                    current_job["_agent_timeout_multiplier"] = 2
+                _attach_control_contract(
+                    current_job,
+                    current_route,
+                    interaction_mode=requested_interaction_mode,
+                    resume_existing_page=True,
+                )
+                add_event(
+                    f"[W{worker_id}] One same-page recovery: "
+                    f"{failure.category[:45]}"
+                )
+                update_state(
+                    worker_id,
+                    status="retrying",
+                    last_action="one bounded same-page repair",
+                )
+                result, retry_duration = run_job(
+                    current_job,
+                    port=port,
+                    worker_id=worker_id,
+                    model=model,
+                    dry_run=dry_run,
+                    agent_backend=agent_backend,
+                    manual_captcha_relay=manual_captcha_relay,
+                    resume_existing_page=True,
+                    submission_phase="prepare",
+                )
+                duration_ms += retry_duration
+                current_metrics["prepare_repair_agent_ms"] += max(
+                    0, retry_duration
+                )
+                return {
+                    "same_application_retry": True,
+                    "submit_started": False,
+                    "recovery_turn_completed": True,
+                    "previous_category": failure.category,
+                    "result_category": classify_failure(result).category,
+                }
+
             if recovery_command is not None:
                 if dry_run:
                     if recovery_command.command == "retry_new_session":
@@ -897,13 +1000,13 @@ def _worker_loop_with_port(
                         except Exception:
                             logger.debug("Dry-run browser recovery failed closed", exc_info=True)
                 else:
-                    recovery_handler = (
-                        execute_browser_recovery
-                        if recovery_command.command == "retry_new_session"
-                        else None
-                    )
+                    recovery_handler = None
+                    if recovery_command.command == "retry_new_session":
+                        recovery_handler = execute_browser_recovery
+                    elif recovery_command.command == "retry_same_application":
+                        recovery_handler = execute_same_application_recovery
                     recovery_verifier = None
-                    if recovery_handler is not None:
+                    if recovery_command.command == "retry_new_session":
                         def verify_browser_recovery(_command, details):
                             return (
                                 details.get("browser_runtime") == "cloak"
@@ -912,6 +1015,15 @@ def _worker_loop_with_port(
                             )
 
                         recovery_verifier = verify_browser_recovery
+                    elif recovery_command.command == "retry_same_application":
+                        def verify_same_application_recovery(_command, details):
+                            return (
+                                details.get("same_application_retry") is True
+                                and details.get("submit_started") is False
+                                and details.get("recovery_turn_completed") is True
+                            )
+
+                        recovery_verifier = verify_same_application_recovery
                     try:
                         recovery_result = (
                             recovery_execution_mod.execute_recovery_command(
@@ -1096,10 +1208,10 @@ def _worker_loop_with_port(
 
             while True:
                 if result in {"cover_not_required", "cover_letter_required"}:
-                    if cover_material_resolved:
+                    if cover_material_retries_remaining <= 0:
                         result = "failed:cover_material_discovery_loop"
                         break
-                    cover_material_resolved = True
+                    cover_material_retries_remaining -= 1
                     try:
                         if result == "cover_not_required":
                             job = _mark_runtime_cover_not_required(job)
@@ -1140,9 +1252,16 @@ def _worker_loop_with_port(
                         break
 
                 if result == "captcha":
+                    resume_authorization = (
+                        _issue_manual_resume_authorization(
+                            job,
+                            submit_started=False,
+                        )
+                        if manual_captcha_relay and not verification_relay_used
+                        else None
+                    )
                     if (
-                        manual_captcha_relay
-                        and not verification_relay_used
+                        resume_authorization is not None
                         and _wait_for_manual_captcha(
                             port,
                             worker_id,
@@ -1151,12 +1270,20 @@ def _worker_loop_with_port(
                             root_target_ids=set(job.get("_browser_root_target_ids") or []),
                             application_lease_minutes=application_lease_minutes,
                         )
+                        and _consume_manual_resume_authorization(
+                            job,
+                            resume_authorization,
+                            submit_started=False,
+                        )
                     ):
                         verification_relay_used = True
                         resumed_job = dict(job)
                         resumed_job["_browser_observation"] = {
                             "verification_resume": True,
                             "signal": "manual_verification_cleared",
+                            "resume_authorization_id": resume_authorization.get(
+                                "authorization_id"
+                            ),
                             "submission_gate": True,
                         }
                         _attach_control_contract(
@@ -1199,6 +1326,19 @@ def _worker_loop_with_port(
                         submit_lane_state["held_at"] = time.perf_counter()
                     audit_started = time.perf_counter()
                     email_application = _prepared_email_application(job)
+                    reported_observations = job.get("_agent_observations")
+                    reported_email_application = (
+                        reported_observations.get("email_application")
+                        if isinstance(reported_observations, dict)
+                        else None
+                    )
+                    if (
+                        email_application is None
+                        and isinstance(reported_email_application, dict)
+                        and reported_email_application.get("route") == "direct_email"
+                    ):
+                        result = "failed:email_plan_unverified"
+                        break
                     if email_application is not None:
                         audit_signal = None
                         audit_report = {
@@ -1242,11 +1382,11 @@ def _worker_loop_with_port(
                             str(issue)
                             for issue in audit_report.get("repairable_issues", [])
                         ]
-                        if pre_submit_repair_used:
+                        if field_repair_retries_remaining <= 0:
                             reason = repairable[0] if repairable else "pre_submit_state"
                             result = f"failed:pre_submit_not_ready:{reason}"
                             break
-                        pre_submit_repair_used = True
+                        field_repair_retries_remaining -= 1
                         submit_lane_held_at = submit_lane_state.get("held_at")
                         if isinstance(submit_lane_held_at, float):
                             orchestration_metrics["submit_lane_hold_ms"] += (
@@ -1510,6 +1650,7 @@ def _worker_loop_with_port(
                         }
                         break
                     submission_started = True
+                    submitted_at = datetime.now().astimezone()
                     active_route = _route_for_phase(
                         active_route,
                         "submit",
@@ -1701,60 +1842,55 @@ def _worker_loop_with_port(
                         })
                     elif (
                         email_application is None
-                        and
-                        disposition == "verification_required"
+                        and disposition == "verification_required"
                         and manual_captcha_relay
                         and not verification_relay_used
-                        and _wait_for_manual_captcha(
-                            port,
-                            worker_id,
-                            attempt_id=job.get("_attempt_id"),
-                            submit_started=True,
-                            root_target_ids=set(job.get("_browser_root_target_ids") or []),
-                            application_lease_minutes=application_lease_minutes,
-                        )
                     ):
-                        verification_relay_used = True
-                        verification_job = dict(observed_job)
-                        verification_job.pop("_agent_submission_evidence", None)
-                        verification_job["_browser_observation"] = {
-                            "verification_resume": True,
-                            "signal": "manual_verification_cleared",
-                            "submission_gate": True,
-                        }
-                        result, resumed_duration = run_job(
-                            verification_job,
-                            port=port,
-                            worker_id=worker_id,
-                            model=model,
-                            dry_run=False,
-                            agent_backend=agent_backend,
-                            manual_captcha_relay=manual_captcha_relay,
-                            resume_existing_page=True,
-                            submission_phase="submit",
+                        resume_authorization = _issue_manual_resume_authorization(
+                            observed_job,
+                            submit_started=True,
                         )
-                        duration_ms += resumed_duration
-                        orchestration_metrics["validation_repair_agent_ms"] += max(
-                            0, resumed_duration
-                        )
-                        agent_evidence = verification_job.get(
-                            "_agent_submission_evidence"
-                        )
-                        observer_started = time.perf_counter()
-                        observer_evidence = _observe_post_submit_page(
-                            port, worker_id, job, attempt=2
-                        )
-                        orchestration_metrics["post_submit_observer_ms"] += (
-                            time.perf_counter() - observer_started
-                        ) * 1000
-                        disposition = _classify_post_submit_observation(
-                            observer_evidence
-                        )
-                        attempts.append({
-                            "agent": agent_evidence,
-                            "observer": observer_evidence,
-                            "disposition": disposition,
-                        })
+                        if (
+                            resume_authorization is not None
+                            and _wait_for_manual_captcha(
+                                port,
+                                worker_id,
+                                attempt_id=job.get("_attempt_id"),
+                                submit_started=True,
+                                root_target_ids=set(
+                                    job.get("_browser_root_target_ids") or []
+                                ),
+                                application_lease_minutes=application_lease_minutes,
+                            )
+                            and _consume_manual_resume_authorization(
+                                observed_job,
+                                resume_authorization,
+                                submit_started=True,
+                            )
+                        ):
+                            verification_relay_used = True
+                            # Submit may already have reached the provider.  A
+                            # cleared challenge therefore authorizes only a
+                            # fresh observation, never another submit turn.
+                            observer_started = time.perf_counter()
+                            observer_evidence = _observe_post_submit_page(
+                                port, worker_id, job, attempt=2
+                            )
+                            orchestration_metrics["post_submit_observer_ms"] += (
+                                time.perf_counter() - observer_started
+                            ) * 1000
+                            observer_evidence["resume_authorization_id"] = (
+                                resume_authorization.get("authorization_id")
+                            )
+                            observer_evidence["submit_replayed"] = False
+                            disposition = _classify_post_submit_observation(
+                                observer_evidence
+                            )
+                            attempts.append({
+                                "agent": agent_evidence,
+                                "observer": observer_evidence,
+                                "disposition": disposition,
+                            })
 
                     submission_evidence = {
                         "browser_backend": active_browser_backend,
@@ -1873,6 +2009,119 @@ def _worker_loop_with_port(
                         observer_evidence["screenshot_path"] = str(final_archive)
                     break
                 break
+
+            if (
+                result == "submission_uncertain"
+                and submission_started
+                and submitted_at is not None
+                and email_application is None
+            ):
+                receipt_attempts: list[dict[str, object]] = []
+                configured_observers = _configured_receipt_observers(profile)
+                receipt_gate_ready = bool(
+                    configured_observers
+                    and ledger_reserved
+                    and _update_submission_ledger(
+                        authorization_manifest,
+                        job,
+                        "submission_uncertain",
+                        submission_evidence,
+                    )
+                )
+                configured_observers = (
+                    configured_observers if receipt_gate_ready else []
+                )
+                for provider, mailbox_spec in configured_observers:
+                    receipt_job = dict(job)
+                    receipt_job["_mailbox_mcp_spec"] = mailbox_spec
+                    receipt_job["_receipt_observer_context"] = (
+                        _build_receipt_observer_context(
+                            job,
+                            provider=provider,
+                            submitted_at=submitted_at,
+                        )
+                    )
+                    receipt_route = _route_for_phase(
+                        active_route,
+                        "receipt",
+                        "post_submit_receipt_reconciliation",
+                        interaction_driver="mailbox",
+                        submit_owner="none",
+                    )
+                    _attach_control_contract(
+                        receipt_job,
+                        receipt_route,
+                        interaction_mode=requested_interaction_mode,
+                        resume_existing_page=False,
+                    )
+                    add_event(
+                        f"[W{worker_id}] Checking {provider} for an exact receipt"
+                    )
+                    receipt_started = time.perf_counter()
+                    try:
+                        receipt_status, receipt_duration = run_job(
+                            receipt_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=False,
+                            resume_existing_page=False,
+                            submission_phase="receipt",
+                        )
+                        duration_ms += receipt_duration
+                        raw_observation = receipt_job.get("_agent_observations")
+                        receipt_observation = (
+                            raw_observation
+                            if isinstance(raw_observation, dict)
+                            else {
+                                "receipt_scan": {
+                                    "provider": provider,
+                                    "scan_succeeded": False,
+                                    "ambiguous": False,
+                                    "candidate_count": 0,
+                                }
+                            }
+                        )
+                        processed = _process_receipt_observer_result(
+                            job,
+                            provider=provider,
+                            submitted_at=submitted_at,
+                            observation=receipt_observation,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - source failure is isolated
+                        logger.warning(
+                            "Receipt observer failed for %s: %s",
+                            provider,
+                            type(exc).__name__,
+                        )
+                        receipt_status = "failed:mailbox_receipt_scan"
+                        processed = {
+                            "status": "provider_error",
+                            "provider": provider,
+                            "watermark_advanced": False,
+                            "error_type": type(exc).__name__,
+                        }
+                    orchestration_metrics["mailbox_receipt_observer_ms"] += (
+                        time.perf_counter() - receipt_started
+                    ) * 1000
+                    receipt_attempts.append(
+                        {
+                            "provider": provider,
+                            "turn_status": receipt_status,
+                            "status": processed.get("status"),
+                            "watermark_advanced": processed.get(
+                                "watermark_advanced", False
+                            ),
+                        }
+                    )
+                    if processed.get("status") == "applied":
+                        result = "applied"
+                        break
+                if receipt_attempts:
+                    submission_evidence = dict(submission_evidence or {})
+                    submission_evidence["mailbox_receipt_observers"] = receipt_attempts
 
             if (
                 submission_started

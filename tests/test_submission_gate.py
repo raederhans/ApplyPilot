@@ -566,6 +566,63 @@ def test_reconcile_requires_explicit_gate_identity_to_advance_current_run(tmp_pa
     assert stopped == {"claimed": False, "reason": "run_success_target_reached"}
 
 
+def test_exact_receipt_reconciles_while_worker_still_owns_applying_job(tmp_path) -> None:
+    conn = init_db(tmp_path / "reconcile-in-flight.db")
+    job_url = "https://jobs.example/reconcile-in-flight"
+    attempt_id = _ready_attempt(conn, job_url, "worker-1")
+    now = datetime.now(UTC)
+    claim = claim_submission_gate(
+        "batch-in-flight",
+        job_url,
+        1,
+        attempt_id,
+        success_target=1,
+        hourly_maximum=10,
+        minimum_gap_seconds=0,
+        conn=conn,
+        now=now,
+    )
+    conn.execute(
+        "UPDATE jobs SET apply_status='applying', company_name='Example', "
+        "title='Automation Intern' WHERE url=?",
+        (job_url,),
+    )
+    assert update_submission_gate_state(
+        attempt_id, "submission_uncertain", conn=conn
+    )
+    update_batch_submission_status(
+        "batch-in-flight", job_url, "submission_uncertain", conn=conn
+    )
+    conn.commit()
+
+    evidence = {
+        "source": "confirmation_email",
+        "receipt_id": "in-flight-confirmation-1",
+        "job_url": job_url,
+        "company_name": "Example",
+        "job_title": "Automation Intern",
+        "confirmation_text": "Application successfully submitted",
+        "gate_id": claim["gate_id"],
+        "batch_id": "batch-in-flight",
+        "attempt_id": attempt_id,
+    }
+    result = reconcile_submission_receipt(evidence, conn=conn)
+
+    assert result == {
+        "status": "applied",
+        "job_url": job_url,
+        "changed": True,
+        "gate_bound": True,
+        "source": "confirmation_email",
+    }
+    assert has_admitted_submission_receipt(
+        "batch-in-flight", job_url, attempt_id, conn=conn
+    )
+    assert conn.execute(
+        "SELECT apply_status FROM jobs WHERE url=?", (job_url,)
+    ).fetchone()[0] == "applied"
+
+
 def test_exact_reconcile_rolls_back_when_gate_is_not_uncertain(tmp_path) -> None:
     conn = init_db(tmp_path / "reconcile-invalid-transition.db")
     job_url = "https://jobs.example/reconcile-invalid"

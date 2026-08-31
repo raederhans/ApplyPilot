@@ -183,8 +183,6 @@ def test_submission_uncertain_can_only_enqueue_receipt_reconciliation() -> None:
         "failed:assessment_required",
         "failed:identity_material_missing:passport",
         "failed:financial_document_required",
-        "failed:unsupported_skill:required_answer",
-        "failed:unknown_required_fact",
     ],
 )
 def test_sensitive_and_unsupported_fact_boundaries_are_human_only(result: str) -> None:
@@ -198,6 +196,25 @@ def test_sensitive_and_unsupported_fact_boundaries_are_human_only(result: str) -
     assert admission.command.submit_authority is False
     assert admission.command.page_write_authority is False
     assert admission.command.ledger_write_authority is False
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "failed:unsupported_skill:required_answer",
+        "failed:unknown_required_fact",
+        "failed:resume_upload",
+        "failed:required_field_empty:country",
+    ],
+)
+def test_ordinary_resolution_failures_get_one_same_application_retry(result: str) -> None:
+    decision = decide_recovery(actor(), result)
+    admission = admit_recovery_decision(decision, submit_started=False)
+
+    assert decision.human_interruption is None
+    assert admission.command is not None
+    assert admission.command.command == "retry_same_application"
+    assert admission.command.retry_budget_remaining == 0
 
 
 def test_policy_rejects_any_automatic_retry_after_submit_started() -> None:

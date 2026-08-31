@@ -207,6 +207,15 @@ def interpret_agent_output(
             return "submission_uncertain", None
         return "submission_uncertain", None
 
+    if submission_phase == "receipt":
+        if marker == "APPLIED":
+            return "applied", None
+        if marker == "SUBMISSION_UNCERTAIN":
+            return "submission_uncertain", None
+        if marker == "FAILED":
+            return result_status(marker, reason), None
+        return "failed:invalid_receipt_result", None
+
     return "failed:invalid_submission_phase", None
 
 
@@ -228,6 +237,16 @@ def interpret_agent_turn_result(
 ) -> tuple[str, dict | None]:
     """Adapt an open Agent result to the existing fail-closed application state."""
     status = result.status.strip().casefold()
+    if submission_phase == "receipt":
+        if status == "applied" and isinstance(
+            result.observations.get("confirmation_receipt"), dict
+        ):
+            return "applied", None
+        if status == "submission_uncertain":
+            return "submission_uncertain", None
+        if status.startswith("failed:"):
+            return status, None
+        return "failed:invalid_receipt_result", None
     # Some browser agents use ``previewed`` to mean "the form is complete and
     # no submit action occurred" even during a real run's prepare phase.  That
     # is the same non-submitting state as ``ready_to_submit`` here; the launcher

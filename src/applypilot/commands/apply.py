@@ -104,6 +104,7 @@ def run_apply(
     mark_failed: str | None,
     fail_reason: str | None,
     reset_failed: bool,
+    reset_failed_url: str | None,
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
     _bootstrap = runtime._bootstrap
@@ -150,9 +151,13 @@ def run_apply(
         )
         return
 
-    if reset_failed:
+    if reset_failed or reset_failed_url:
         from applypilot.apply.launcher import reset_failed as do_reset
-        count = do_reset()
+        try:
+            count = do_reset(reset_failed_url)
+        except (LookupError, ValueError) as exc:
+            console.print(f"[red]Could not reset failed job:[/red] {exc}")
+            raise typer.Exit(code=1) from None
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 

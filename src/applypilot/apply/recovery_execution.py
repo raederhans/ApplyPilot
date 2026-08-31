@@ -42,7 +42,6 @@ _HUMAN_ONLY_CATEGORIES = frozenset(
         "sensitive_identity_boundary",
         "unsupported_legal_declaration",
         "truth_or_security_boundary",
-        "answer_policy_needs_relaxed_retry",
     }
 )
 _RECEIPT_ONLY_CATEGORIES = frozenset(

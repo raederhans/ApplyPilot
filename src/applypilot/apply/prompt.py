@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from applypilot import config
 from applypilot.apply.authentication_policy import authentication_capability
+from applypilot.apply.submission_surfaces import classify_submission_surface
 
 logger = logging.getLogger(__name__)
 
@@ -716,8 +717,7 @@ def _select_prompt_fragments(job: dict, *, dry_run: bool) -> tuple[str, ...]:
         selected.add("agent_orchestration")
     observation = job.get("_browser_observation")
     if (
-        "mailto:" in text
-        or "apply by email" in text
+        classify_submission_surface(job) == "official_direct_email"
         or isinstance(observation, dict)
         and isinstance(observation.get("email_application"), dict)
     ):
@@ -1447,8 +1447,39 @@ Before the final plain-text RESULT lines, call the attached applypilot_control r
             "Computer Use handoff is not enabled for this turn; output "
             "RESULT:FAILED:visual_only_control."
         )
-    if submission_phase not in {"prepare", "submit"}:
+    if submission_phase not in {"prepare", "submit", "receipt"}:
         raise ValueError(f"Unknown submission phase: {submission_phase}")
+    if submission_phase == "receipt":
+        receipt_context = job.get("_receipt_observer_context")
+        if not isinstance(receipt_context, dict):
+            raise ValueError("Receipt observation requires a bound observer context")
+        required_receipt_context = ("provider", "submitted_at", "search_after")
+        if any(
+            not str(receipt_context.get(name) or "").strip()
+            for name in required_receipt_context
+        ):
+            raise ValueError("Receipt observer context is missing required identity fields")
+        receipt_context_json = json.dumps(
+            receipt_context,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return f"""You are the read-only receipt observer for one submission that may already have occurred.
+
+== CONTROL ==
+CONTROL_CONTRACT: {control_contract_json}
+RECEIPT_CONTEXT: {receipt_context_json}
+
+Use only the exposed mailbox search/read tools and applypilot_control. Do not use a browser, Computer Use, shell commands, a send tool, or any calendar capability. Never click Submit or send a message. Search only the configured provider for messages received after search_after. The provider-specific watermark is advisory ordering/deduplication state and must never exclude a message later than this exact job's submitted_at, because another worker may have advanced it for a different application. Use a narrow query combining the company, role, platform job ID when present, ATS/provider domains, and application-received/submitted terms. Read at most five plausible messages.
+
+An exact confirmation requires all of: a provider message ID, a timezone-aware received timestamp later than submitted_at, sender domain, matching company, matching role, matching platform job ID when one is supplied, and decisive received/submitted confirmation text. Do not infer success from a generic newsletter, recruiter outreach, Sent mail, an old message, or a partial identity match. If more than one message remains plausible, mark the scan ambiguous and do not select one.
+
+Call report_agent_turn exactly once. Always include observations.receipt_scan with provider, scan_succeeded, ambiguous, candidate_count, max_received_at and max_message_id. Include observations.confirmation_receipt as null when there is no unique exact match; otherwise include only provider, provider_message_id, received_at, sender_domain, company_name, job_title, platform_job_id, a short decisive confirmation_text excerpt, and exact_job_identity_matched=true. Never report a full message body, recipient mailbox contents, OAuth data, attachments, codes, or secrets.
+
+Report status applied only for one unique exact confirmation. Report submission_uncertain for no match or ambiguity. Report failed:mailbox_receipt_scan only when the provider search/read operation itself failed. Then output exactly one matching standalone RESULT line followed by `UNANSWERED_QUESTIONS: []`:
+RESULT:APPLIED
+RESULT:SUBMISSION_UNCERTAIN
+RESULT:FAILED:mailbox_receipt_scan"""
     if job.get("tailor_status") != "machine_validated":
         raise ValueError(
             "Tailored resume must be machine_validated before application preparation."
@@ -1832,6 +1863,50 @@ RESULT:SUBMISSION_UNCERTAIN -- final action occurred without decisive confirmati
         if isinstance(email_observation, dict)
         else None
     )
+    direct_email_prepare = (
+        not dry_run
+        and submission_phase == "prepare"
+        and "direct_email" in selected_fragments
+    )
+    if direct_email_prepare:
+        mission_instruction = (
+            "Prepare and verify this email-only application without sending it."
+        )
+        mission_body = (
+            "The official listing requires email rather than a browser form. Follow "
+            "EMAIL-ONLY APPLICATION ROUTE as the primary workflow; the browser may only "
+            "confirm official listing evidence and is never the submit owner."
+        )
+        apply_navigation = (
+            "Do not look for, fill, or audit a browser application form. Read only enough "
+            "of the official listing to verify the advertised recipient, then use the "
+            "mailbox search route for the exact duplicate check."
+        )
+        resume_step = (
+            "6. Bind the staged Resume PDF from FILES, and any explicitly approved "
+            "cover-letter PDF, to the prepared email plan. Verify attachment filenames."
+        )
+        field_review_steps = (
+            "8. Draft a truthful role-specific subject and body from the confirmed profile "
+            "and source material; state the confirmed availability when relevant and never "
+            "imply an earlier start.\n"
+            "9. Search Sent mail for this exact recipient and role. A confirmed duplicate "
+            "must stop the route without sending."
+        )
+        final_steps = (
+            "10. Do not call any send tool and do not click any browser Submit control.\n"
+            "11. Call report_agent_turn exactly once with status ready_to_submit and the "
+            "complete observations.email_application object required by EMAIL-ONLY "
+            "APPLICATION ROUTE.\n"
+            "12. Only after that report succeeds, output RESULT:READY_TO_SUBMIT."
+        )
+        result_codes = (
+            "RESULT:READY_TO_SUBMIT -- verified direct-email plan recorded without sending\n"
+            "RESULT:FAILED:email_route_capability_missing -- required mailbox preparation "
+            "capability is unavailable\n"
+            "RESULT:FAILED:duplicate_application -- an exact prior Sent message exists\n"
+            "RESULT:FAILED:reason -- another preparation failure occurred"
+        )
     if (
         not dry_run
         and submission_phase == "submit"
@@ -1892,6 +1967,47 @@ RESULT:COVER_LETTER_REQUIRED -- the opened ATS requires cover-letter text or a f
             "to the JOB URL directly; do not wait for the user to type it into the address bar.\n"
             f"2. {captcha_navigation_instruction}"
         )
+
+    if direct_email_prepare:
+        return f"""You are a job application assistant. {mission_instruction}
+
+== MAILBOX-ONLY CONTROL ==
+CONTROL_CONTRACT: {control_contract_json}
+This is an email-only prepare turn. Do not use or require Playwright, a browser_* tool, Computer Use, shell commands, or any browser handoff. The official listing text below is already launcher-bound evidence. Use only the exposed mailbox search/read tools for the exact Sent duplicate check and applypilot_control for the final report. Do not send in this phase.
+
+== JOB ==
+URL: {job.get('application_url') or job['url']}
+Title: {job['title']}
+Company: {job.get('company_name') or 'Unknown employer'}
+Official listing: {job.get('full_description') or job.get('description') or ''}
+
+== BOUND FILES ==
+Resume PDF: {pdf_path}
+Approved Cover Letter PDF: {cl_upload_path or 'N/A'}
+
+== CONFIRMED APPLICANT PROFILE ==
+{profile_summary}
+
+== VERIFIED RESUME TEXT ==
+{tailored_resume}
+
+{email_route_section}
+
+== WORKFLOW ==
+{mission_body}
+{apply_navigation}
+{resume_step}
+{field_review_steps}
+{final_steps}
+
+Use only confirmed facts. The candidate is available full-time from November 2026 through June 2027; never state or imply a 16-hour weekly limit or an August start. Do not claim sponsorship is required. Do not expose message bodies, OAuth data, mailbox content, attachment paths, or file digests in the report.
+
+== RESULT CODES ==
+{result_codes}
+
+{structured_reporting_section}
+
+The RESULT marker must be one standalone plain-text line and appear exactly once. Immediately after it output `UNANSWERED_QUESTIONS: []`."""
 
     if not dry_run and submission_phase == "submit":
         return _build_compact_submit_prompt(

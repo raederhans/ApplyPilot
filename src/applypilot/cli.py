@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -17,9 +18,6 @@ from rich.console import Console
 from rich.table import Table
 
 from applypilot import __version__
-from applypilot.commands import apply as apply_command_mod
-from applypilot.commands import doctor as doctor_command_mod
-from applypilot.commands import radar as radar_command_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +55,11 @@ def _bootstrap() -> None:
     load_env()
     ensure_dirs()
     init_db()
+
+
+def _command_module(name: str):
+    """Import command bodies only after the global workspace callback runs."""
+    return importlib.import_module(f"applypilot.commands.{name}")
 
 
 def _standing_auto_authorization_enabled(profile: dict) -> bool:
@@ -236,6 +239,14 @@ def _version_callback(value: bool) -> None:
 @app.callback()
 def main(
     ctx: typer.Context,
+    workspace: Path | None = typer.Option(
+        None,
+        "--workspace",
+        envvar="APPLYPILOT_DIR",
+        file_okay=False,
+        resolve_path=True,
+        help="User-data workspace containing profile.json and applypilot.db.",
+    ),
     version: bool = typer.Option(
         False, "--version", "-V",
         help="Show version and exit.",
@@ -244,13 +255,15 @@ def main(
     ),
 ) -> None:
     """ApplyPilot Local — evidence-driven discovery, preparation, and application."""
+    if workspace is not None:
+        os.environ["APPLYPILOT_DIR"] = str(workspace)
     _assert_discovery_only_command(ctx.invoked_subcommand, {"sync-linkedin-applied", "radar"})
 
 
 @radar_app.callback()
 def radar_main(ctx: typer.Context) -> None:
     """Restrict discovery-only execution to the explicit radar allowlist."""
-    return radar_command_mod.run_radar_main(
+    return _command_module("radar").run_radar_main(
         sys.modules[__name__],
         {
             "ctx": ctx,
@@ -599,7 +612,7 @@ def radar_queries(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Generate candidate-operated LinkedIn Content Search URLs without browsing."""
-    return radar_command_mod.run_radar_queries(
+    return _command_module("radar").run_radar_queries(
         sys.modules[__name__],
         {
             "window": window,
@@ -625,7 +638,7 @@ def radar_collect(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show selected sources without HTTP or DB writes."),
 ) -> None:
     """Collect verified official jobs using bounded public GET adapters."""
-    return radar_command_mod.run_radar_collect(
+    return _command_module("radar").run_radar_collect(
         sys.modules[__name__],
         {
             "company": company,
@@ -641,7 +654,7 @@ def radar_import_leads(
     source_id: str = typer.Option("linkedin-content-manual", "--source-id"),
 ) -> None:
     """Import a candidate-reviewed JSON/CSV lead file without creating jobs."""
-    return radar_command_mod.run_radar_import_leads(
+    return _command_module("radar").run_radar_import_leads(
         sys.modules[__name__],
         {
             "file": file,
@@ -656,7 +669,7 @@ def radar_import_company_seeds(
     source_id: str = typer.Option(..., "--source-id"),
 ) -> None:
     """Import reviewed ecosystem companies without creating jobs or leads."""
-    return radar_command_mod.run_radar_import_company_seeds(
+    return _command_module("radar").run_radar_import_company_seeds(
         sys.modules[__name__],
         {
             "file": file,
@@ -676,7 +689,7 @@ def radar_report(
     ),
 ) -> None:
     """Render the auditable daily radar report."""
-    return radar_command_mod.run_radar_report(
+    return _command_module("radar").run_radar_report(
         sys.modules[__name__],
         {
             "hours": hours,
@@ -1009,9 +1022,14 @@ def apply(
     mark_failed: str | None = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: str | None = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    reset_failed_url: str | None = typer.Option(
+        None,
+        "--reset-failed-url",
+        help="Reset one exact failed job URL for retry.",
+    ),
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
-    return apply_command_mod.run_apply(
+    return _command_module("apply").run_apply(
         sys.modules[__name__],
         limit=limit,
         workers=workers,
@@ -1032,6 +1050,7 @@ def apply(
         mark_failed=mark_failed,
         fail_reason=fail_reason,
         reset_failed=reset_failed,
+        reset_failed_url=reset_failed_url,
     )
 
 
@@ -1503,7 +1522,7 @@ def dashboard(
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
-    return doctor_command_mod.run_doctor(sys.modules[__name__])
+    return _command_module("doctor").run_doctor(sys.modules[__name__])
 
 
 if __name__ == "__main__":

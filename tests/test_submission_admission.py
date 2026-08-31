@@ -100,6 +100,17 @@ def test_surface_classifier_covers_official_and_direct_email_routes() -> None:
     assert classify_submission_surface(
         _job(email_application={"route": "direct_email"})
     ) == "official_direct_email"
+    assert classify_submission_surface(
+        _job(
+            source_site="InternSG",
+            site="InternSG",
+            application_url="https://www.internsg.com/job/data-ai-intern/",
+            full_description=(
+                "Apply by emailing a text CV to contactus@example.test. "
+                "Candidates must be available for six months."
+            ),
+        )
+    ) == "official_direct_email"
 
 
 def test_restricted_and_manual_surfaces_are_explicit() -> None:
