@@ -5096,16 +5096,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
             return status, turn_duration_ms
 
+        final_text = ""
         if final_message_path and final_message_path.exists():
             final_text = final_message_path.read_text(encoding="utf-8").strip()
             if final_text and final_text not in text_parts:
                 text_parts.append(final_text)
             final_message_path.unlink()
         output = "\n".join(text_parts)
+        # Codex emits progress agent_message items as well as a dedicated final
+        # message. Only the latter is the legacy RESULT contract; parsing the
+        # aggregate can turn harmless progress prose into a duplicate marker.
+        contract_output = final_text or output
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
-        unanswered = _parse_unanswered_questions(output)
+        unanswered = _parse_unanswered_questions(contract_output)
         if unanswered is not None:
             from applypilot.database import record_unanswered_questions
             record_unanswered_questions(job["url"], unanswered)
@@ -5176,7 +5181,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 structured_report_invalid = True
                 logger.warning("Ignoring invalid Agent report for %s: %s", run_id, exc)
         status, evidence, result_source = _reconcile_agent_turn_outputs(
-            output,
+            contract_output,
             structured_result,
             dry_run=dry_run,
             submission_phase=submission_phase,
@@ -5206,7 +5211,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             and mailbox_runtime_evidence["post_send_read_completed"]
         ):
             reported_receipt = normalize_sent_receipt(
-                _reported_sent_receipt(output, structured_result),
+                _reported_sent_receipt(contract_output, structured_result),
                 email_plan,
             )
             if reported_receipt == provider_sent_receipt:
@@ -5214,7 +5219,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             job["_mailbox_runtime_evidence"] = dict(mailbox_runtime_evidence)
         if structured_report_invalid:
             result_source = f"legacy_after_invalid_structured:{result_source}"
-        failure_context = _parse_failure_context(output)
+        failure_context = _parse_failure_context(contract_output)
         normalized_status, failure_context = _normalize_browser_runtime_failure(
             status,
             browser_tool_call_count=browser_tool_call_count,

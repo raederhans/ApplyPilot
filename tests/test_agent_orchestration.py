@@ -432,6 +432,119 @@ def test_prepare_prefers_specific_cover_result_over_generic_preview_report(
     ) == (expected, None, "structured+legacy")
 
 
+def test_codex_final_message_is_the_only_legacy_output_for_preview_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Progress prose must not be cross-checked as the final RESULT contract."""
+    app_dir = tmp_path / "app"
+    worker_dir = app_dir / "workers" / "worker-0"
+    log_dir = app_dir / "logs"
+    worker_dir.mkdir(parents=True)
+    log_dir.mkdir(parents=True)
+    db_path = tmp_path / "control.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    database.init_db(db_path)
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", app_dir / "workers")
+    monkeypatch.setattr(config, "LOG_DIR", log_dir)
+    monkeypatch.setattr(config, "load_profile", lambda: {"authentication": {}})
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda _worker_id: worker_dir)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **_kwargs: "PROMPT")
+    monkeypatch.setattr(launcher, "_resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda *_args: None)
+    monkeypatch.setattr(launcher, "_archive_worker_evidence", lambda *_args: [])
+
+    class Timer:
+        def cancel(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        launcher,
+        "_start_timeout_watchdog",
+        lambda *_args: (threading.Event(), Timer()),
+    )
+    preview_audit = {
+        "submission_attempted": False,
+        "channel": "ats",
+        "resume_uploaded": True,
+        "filled_fields": [],
+        "manual_review_fields": [],
+        "final_control_label": "Submit application",
+    }
+    final_text = "RESULT:PREVIEWED\nPREVIEW_AUDIT: " + json.dumps(preview_audit)
+
+    class Process:
+        pid = 4321
+
+        def __init__(self, *, env: dict[str, str], final_message_path: Path) -> None:
+            self.returncode = 0
+            self.stdin = io.StringIO()
+            Path(env[agent_report_mcp.REPORT_PATH_ENV]).write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1",
+                        "run_id": env[agent_report_mcp.RUN_ID_ENV],
+                        "status": "previewed",
+                        "summary": "Preview completed through structured reporting",
+                        "observations": {"preview_audit": preview_audit},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            final_message_path.write_text(final_text, encoding="utf-8")
+            messages = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "Progress: preparing RESULT:PREVIEWED evidence.",
+                    },
+                },
+                {"type": "turn.completed", "usage": {}},
+            ]
+            self.stdout = io.StringIO("\n".join(json.dumps(item) for item in messages))
+
+        def wait(self, timeout: int | None = None) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(command: list[str], **kwargs) -> Process:
+        final_path = Path(command[command.index("--output-last-message") + 1])
+        return Process(env=kwargs["env"], final_message_path=final_path)
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(launcher, "_process_identity_tuple", lambda pid: (pid, 123_456))
+    job = {
+        "url": "https://example.test/jobs/preview",
+        "application_url": "https://example.test/apply/preview",
+        "title": "Data Intern",
+        "company_name": "Example",
+        "site": "example",
+        "fit_score": 9,
+        "_attempt_id": "attempt-final-message-preview",
+        "_browser_backend": "edge",
+    }
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        dry_run=True,
+        agent_backend="codex",
+        submission_phase="submit",
+    )
+
+    assert status == "previewed"
+    assert job["_agent_turn_source"] == "structured+legacy"
+    database.close_connection(db_path)
+
+
 def test_run_job_records_structured_turn_events_without_changing_status_contract(
     monkeypatch,
     tmp_path: Path,
