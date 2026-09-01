@@ -9,6 +9,7 @@ from applypilot.apply.agent_output import (
     interpret_agent_turn_result,
     load_agent_turn_report,
     reconcile_agent_turn_outputs,
+    reconcile_agent_turn_outputs_with_diagnostics,
 )
 from applypilot.apply.application_actor import decision_for_turn
 from applypilot.apply.contracts import (
@@ -310,6 +311,56 @@ def test_present_but_non_unique_or_malformed_result_marker_conflicts(
     assert reconciled == ("failed:conflicting_agent_results", None, "conflict")
     assert decision.recovery_action is not None
     assert decision.recovery_action.action == "park"
+
+
+def test_diagnostics_classifies_invalid_legacy_result_without_contract_text() -> None:
+    typed = AgentTurnResult(
+        run_id="run-failure-1",
+        status="failed",
+        summary="Typed retryable observation",
+        failure=_failure(),
+    )
+
+    assert reconcile_agent_turn_outputs_with_diagnostics(
+        "RESULT:DO_NOT_APPLY",
+        typed,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == (
+        "failed:conflicting_agent_results",
+        None,
+        "conflict",
+        "legacy_result_invalid",
+    )
+
+
+def test_diagnostics_classifies_divergent_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A future typed evidence carrier must still fail closed when it disagrees."""
+    typed = AgentTurnResult(
+        run_id="run-failure-1",
+        status="ready_to_submit",
+        summary="Typed preparation complete",
+    )
+    monkeypatch.setattr(
+        "applypilot.apply.agent_output.interpret_agent_turn_result",
+        lambda *_args, **_kwargs: ("ready_to_submit", {"receipt": "typed"}),
+    )
+    monkeypatch.setattr(
+        "applypilot.apply.agent_output.interpret_agent_output",
+        lambda *_args, **_kwargs: ("ready_to_submit", {"receipt": "legacy"}),
+    )
+
+    assert reconcile_agent_turn_outputs_with_diagnostics(
+        "RESULT:READY_TO_SUBMIT",
+        typed,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == (
+        "failed:conflicting_agent_results",
+        None,
+        "conflict",
+        "evidence_mismatch",
+    )
 
 
 def test_absent_result_marker_keeps_typed_path_but_malformed_submit_is_uncertain() -> None:

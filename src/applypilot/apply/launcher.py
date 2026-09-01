@@ -509,6 +509,9 @@ _result_status = agent_output_mod.result_status
 _validate_preview_audit = agent_output_mod.validate_preview_audit
 _validate_submission_evidence = agent_output_mod.validate_submission_evidence
 _reconcile_agent_turn_outputs = agent_output_mod.reconcile_agent_turn_outputs
+_reconcile_agent_turn_outputs_with_diagnostics = (
+    agent_output_mod.reconcile_agent_turn_outputs_with_diagnostics
+)
 _application_fact_value = page_observation_mod._application_fact_value
 _audit_live_pre_submit_page = page_observation_mod._audit_live_pre_submit_page
 _observe_linkedin_external_handoff_page = (
@@ -1313,6 +1316,48 @@ def _runtime_timeout_status(*, submission_phase: str, dry_run: bool) -> str:
     return "failed:agent_runtime_timeout"
 
 
+_TOOL_FAILURE_STATUSES = {
+    "cancelled",
+    "canceled",
+    "error",
+    "failed",
+    "timed_out",
+    "timeout",
+}
+_TOOL_SUCCESS_STATUSES = {"completed", "success", "succeeded"}
+
+
+def _tool_result_reports_error(payload: object) -> bool:
+    """Recognize transport and nested MCP failures without parsing tool prose."""
+    if isinstance(payload, list):
+        return any(_tool_result_reports_error(item) for item in payload)
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("isError") is True or payload.get("is_error") is True:
+        return True
+    status = str(payload.get("status") or "").strip().casefold()
+    if status in _TOOL_FAILURE_STATUSES:
+        return True
+    error = payload.get("error")
+    if error not in (None, "", False, (), [], {}):
+        return True
+    return any(
+        _tool_result_reports_error(payload.get(key))
+        for key in ("result", "output", "content")
+        if key in payload
+    )
+
+
+def _tool_result_succeeded(payload: object, *, terminal_event: bool) -> bool:
+    """Return true only for a terminal tool result with no typed error marker."""
+    if _tool_result_reports_error(payload):
+        return False
+    if not terminal_event or not isinstance(payload, Mapping):
+        return True
+    status = str(payload.get("status") or "completed").strip().casefold()
+    return status in _TOOL_SUCCESS_STATUSES
+
+
 def _normalize_browser_runtime_failure(
     status: str,
     *,
@@ -1505,6 +1550,7 @@ def _persist_agent_turn_completed(
     duration_ms: int,
     source: str,
     metrics: Mapping[str, object] | None = None,
+    conflict_classification: str | None = None,
     occurred_after: datetime | None = None,
     expected_checkpoint_sequence: int | None = None,
 ) -> datetime:
@@ -1547,6 +1593,28 @@ def _persist_agent_turn_completed(
     completed_idempotency_key = (
         f"agent-turn:v2:{request.actor_id}:{request.turn_id}:completed"
     )
+    payload: dict[str, object] = {
+        "reported_status": result.status,
+        "application_status": application_status,
+        # Free-form Agent/page text stays in the transient turn result. The
+        # durable control plane records only bounded workflow metadata.
+        "summary_length": len(result.summary),
+        "duration_ms": max(0, duration_ms),
+        "source": source,
+        "proposal_ids": [proposal.proposal_id for proposal in result.proposals],
+        "evidence_ref_count": evidence_ref_count,
+        "metrics": bounded_metrics,
+        # Preserve the established v1 key for existing readers while the
+        # native v2 envelope is published alongside it for durable actors.
+        "actor_decision": legacy_actor_decision_json,
+        "actor_decision_v2": actor_decision_json,
+    }
+    if conflict_classification in {
+        "evidence_mismatch",
+        "legacy_result_invalid",
+        "status_mismatch",
+    }:
+        payload["conflict_classification"] = conflict_classification
     event = ApplicationEvent(
         event_id=completed_idempotency_key,
         attempt_id=request.attempt_id,
@@ -1554,22 +1622,7 @@ def _persist_agent_turn_completed(
         phase=request.phase,
         actor=request.agent_role,
         event_type="agent.turn.completed",
-        payload={
-            "reported_status": result.status,
-            "application_status": application_status,
-            # Free-form Agent/page text stays in the transient turn result. The
-            # durable control plane records only bounded workflow metadata.
-            "summary_length": len(result.summary),
-            "duration_ms": max(0, duration_ms),
-            "source": source,
-            "proposal_ids": [proposal.proposal_id for proposal in result.proposals],
-            "evidence_ref_count": evidence_ref_count,
-            "metrics": bounded_metrics,
-            # Preserve the established v1 key for existing readers while the
-            # native v2 envelope is published alongside it for durable actors.
-            "actor_decision": legacy_actor_decision_json,
-            "actor_decision_v2": actor_decision_json,
-        },
+        payload=payload,
         evidence_refs=(),
         idempotency_key=completed_idempotency_key,
         actor_id=request.actor_id,
@@ -4753,6 +4806,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     turn_application_status: str | None = None
     turn_duration_ms: int | None = None
     turn_source = "runtime"
+    conflict_classification: str | None = None
     pending_mailbox_tools: dict[str, dict[str, object]] = {}
     mailbox_runtime_evidence = {
         "send_call_completed": False,
@@ -4767,10 +4821,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     first_tool_at: float | None = None
     last_tool_at: float | None = None
     tool_call_count = 0
+    tool_call_sequence = 0
+    seen_tool_calls: set[str] = set()
     unique_tools: set[str] = set()
     browser_tool_call_count = 0
     browser_tool_success_count = 0
-    pending_browser_tools: set[str] = set()
+    pending_browser_tools: dict[str, str] = {}
+    pending_report_tools: dict[str, str] = {}
+    browser_tool_names: dict[str, str] = {}
+    browser_tool_outcomes: dict[str, bool | None] = {}
+    report_tool_outcomes: dict[str, bool | None] = {}
     prepare_search_events: list[tuple[object, object]] = []
     if submission_phase == "prepare":
         job.pop("_mailbox_prepare_duplicate_receipt", None)
@@ -4780,6 +4840,64 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             _agent_subprocess_runtime.cancel(run_id)
         except KeyError:
             return
+
+    def record_tool_call(raw_id: object, canonical_name: str) -> str:
+        nonlocal tool_call_count, tool_call_sequence
+        event_id = str(raw_id or "").strip()
+        if event_id:
+            key = event_id
+        else:
+            tool_call_sequence += 1
+            key = f"anonymous-tool-{tool_call_sequence}"
+        if key not in seen_tool_calls:
+            seen_tool_calls.add(key)
+            tool_call_count += 1
+        unique_tools.add(canonical_name)
+        return key
+
+    def settle_tool_outcome(
+        outcomes: dict[str, bool | None], key: str, succeeded: bool
+    ) -> None:
+        previous = outcomes.get(key)
+        outcomes[key] = succeeded if previous is None else previous and succeeded
+
+    def runtime_tool_metrics() -> dict[str, int]:
+        metrics = {
+            "tool_call_count": tool_call_count,
+            "unique_tool_count": len(unique_tools),
+            "browser_tool_call_count": len(browser_tool_outcomes),
+            "browser_tool_success_count": sum(
+                outcome is True for outcome in browser_tool_outcomes.values()
+            ),
+            "browser_tool_failure_count": sum(
+                outcome is False for outcome in browser_tool_outcomes.values()
+            ),
+            "browser_tool_unresolved_count": sum(
+                outcome is None for outcome in browser_tool_outcomes.values()
+            ),
+            "report_tool_call_count": len(report_tool_outcomes),
+            "report_tool_success_count": sum(
+                outcome is True for outcome in report_tool_outcomes.values()
+            ),
+            "report_tool_failure_count": sum(
+                outcome is False for outcome in report_tool_outcomes.values()
+            ),
+        }
+        for tool_name in sorted(set(browser_tool_names.values()))[:20]:
+            outcomes = [
+                browser_tool_outcomes[key]
+                for key, name in browser_tool_names.items()
+                if name == tool_name
+            ]
+            safe_name = re.sub(r"[^a-z0-9_]+", "_", tool_name.casefold())[:48]
+            metrics[f"{safe_name}_call_count"] = len(outcomes)
+            metrics[f"{safe_name}_success_count"] = sum(
+                outcome is True for outcome in outcomes
+            )
+            metrics[f"{safe_name}_failure_count"] = sum(
+                outcome is False for outcome in outcomes
+            )
+        return metrics
 
     def record_mailbox_completion(
         tool_name: str,
@@ -4938,13 +5056,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 if first_tool_at is None:
                                     first_tool_at = now_tool
                                 last_tool_at = now_tool
-                                tool_call_count += 1
-                                unique_tools.add(str(raw_name))
+                                tool_key = record_tool_call(
+                                    block.get("id"), str(raw_name)
+                                )
                                 if str(raw_name).startswith("mcp__playwright__"):
-                                    browser_tool_call_count += 1
                                     browser_tool_id = str(block.get("id") or "")
+                                    browser_tool_name = str(raw_name).removeprefix(
+                                        "mcp__playwright__"
+                                    )
+                                    browser_tool_names[tool_key] = browser_tool_name
+                                    browser_tool_outcomes.setdefault(tool_key, None)
                                     if browser_tool_id:
-                                        pending_browser_tools.add(browser_tool_id)
+                                        pending_browser_tools[browser_tool_id] = tool_key
+                                if str(raw_name) == (
+                                    "mcp__applypilot_control__report_agent_turn"
+                                ):
+                                    report_tool_id = str(block.get("id") or "")
+                                    report_tool_outcomes.setdefault(tool_key, None)
+                                    if report_tool_id:
+                                        pending_report_tools[report_tool_id] = tool_key
                                 name = (
                                     raw_name
                                     .replace("mcp__playwright__", "")
@@ -4976,9 +5106,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 continue
                             tool_use_id = str(block.get("tool_use_id") or "")
                             if tool_use_id in pending_browser_tools:
-                                pending_browser_tools.discard(tool_use_id)
-                                if block.get("is_error") is not True:
-                                    browser_tool_success_count += 1
+                                browser_key = pending_browser_tools.pop(tool_use_id)
+                                settle_tool_outcome(
+                                    browser_tool_outcomes,
+                                    browser_key,
+                                    _tool_result_succeeded(
+                                        block,
+                                        terminal_event=False,
+                                    ),
+                                )
+                            if tool_use_id in pending_report_tools:
+                                report_key = pending_report_tools.pop(tool_use_id)
+                                settle_tool_outcome(
+                                    report_tool_outcomes,
+                                    report_key,
+                                    _tool_result_succeeded(
+                                        block,
+                                        terminal_event=False,
+                                    ),
+                                )
                             pending = pending_mailbox_tools.pop(
                                 tool_use_id,
                                 {},
@@ -4987,7 +5133,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if tool_name:
                                 record_mailbox_completion(
                                     tool_name,
-                                    succeeded=block.get("is_error") is not True,
+                                    succeeded=_tool_result_succeeded(
+                                        block,
+                                        terminal_event=False,
+                                    ),
                                     tool_input=pending.get("input"),
                                     tool_output=block.get("content"),
                                 )
@@ -5016,30 +5165,46 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if first_tool_at is None:
                                 first_tool_at = now_tool
                             last_tool_at = now_tool
-                            tool_call_count += 1
-                            unique_tools.add(f"{server}:{tool}")
+                            tool_key = record_tool_call(
+                                item.get("id"), f"{server}:{tool}"
+                            )
                             browser_tool = (
                                 "playwright" in str(server).casefold()
                                 and str(tool).casefold().startswith("browser_")
                             )
                             if browser_tool:
-                                browser_tool_call_count += 1
-                                if (
-                                    item.get("error") in (None, "")
-                                    and str(item.get("status") or "completed").casefold()
-                                    in {"completed", "success", "succeeded"}
-                                ):
-                                    browser_tool_success_count += 1
+                                browser_tool_names[tool_key] = str(tool)
+                                browser_tool_outcomes.setdefault(tool_key, None)
+                                settle_tool_outcome(
+                                    browser_tool_outcomes,
+                                    tool_key,
+                                    _tool_result_succeeded(
+                                        item,
+                                        terminal_event=True,
+                                    ),
+                                )
+                            if (
+                                str(server) == "applypilot_control"
+                                and str(tool) == "report_agent_turn"
+                            ):
+                                report_tool_outcomes.setdefault(tool_key, None)
+                                settle_tool_outcome(
+                                    report_tool_outcomes,
+                                    tool_key,
+                                    _tool_result_succeeded(
+                                        item,
+                                        terminal_event=True,
+                                    ),
+                                )
                             desc = f"{server}:{tool}"
                             lf.write(f"  >> {desc}\n")
                             _record_worker_action(worker_id, desc)
                             if server == mailbox_mcp.server_name:
                                 record_mailbox_completion(
                                     str(tool),
-                                    succeeded=(
-                                        item.get("error") in (None, "")
-                                        and str(item.get("status") or "completed").casefold()
-                                        in {"completed", "success", "succeeded"}
+                                    succeeded=_tool_result_succeeded(
+                                        item,
+                                        terminal_event=True,
                                     ),
                                     tool_input=item.get("input", item.get("arguments")),
                                     tool_output=item.get(
@@ -5069,6 +5234,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         returncode = proc.returncode
         proc = None
         job["_mailbox_runtime_evidence"] = dict(mailbox_runtime_evidence)
+        browser_tool_call_count = len(browser_tool_outcomes)
+        browser_tool_success_count = sum(
+            outcome is True for outcome in browser_tool_outcomes.values()
+        )
 
         if timed_out.is_set():
             duration_ms = int((time.time() - start) * 1000)
@@ -5186,11 +5355,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 structured_report_invalid = True
                 logger.warning("Ignoring invalid Agent report for %s: %s", run_id, exc)
-        status, evidence, result_source = _reconcile_agent_turn_outputs(
-            contract_output,
-            structured_result,
-            dry_run=dry_run,
-            submission_phase=submission_phase,
+        status, evidence, result_source, conflict_classification = (
+            _reconcile_agent_turn_outputs_with_diagnostics(
+                contract_output,
+                structured_result,
+                dry_run=dry_run,
+                submission_phase=submission_phase,
+            )
         )
         observation = job.get("_browser_observation")
         email_plan = (
@@ -5403,6 +5574,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     duration_ms=final_duration_ms,
                     source=turn_source,
                     occurred_after=last_agent_event_at,
+                    conflict_classification=conflict_classification,
                     metrics={
                         **setup_metrics,
                         **stats,
@@ -5421,10 +5593,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if last_tool_at is None or process_spawned_at is None
                             else round((last_tool_at - process_spawned_at) * 1000, 3)
                         ),
-                        "tool_call_count": tool_call_count,
-                        "unique_tool_count": len(unique_tools),
-                        "browser_tool_call_count": browser_tool_call_count,
-                        "browser_tool_success_count": browser_tool_success_count,
+                        **runtime_tool_metrics(),
                     },
                 )
                 checkpoint_id = _confirmed_agent_checkpoint_id(agent_request)

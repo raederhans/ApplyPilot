@@ -734,3 +734,345 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     assert not (worker_dir / "agent-turn-report.json").exists()
     assert not (worker_dir / "ats-application-context.json").exists()
     database.close_connection(db_path)
+
+
+def _run_codex_event_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    messages: list[dict[str, object]],
+    structured_status: str = "ready_to_submit",
+    final_text: str = "RESULT:READY_TO_SUBMIT",
+    dry_run: bool = False,
+    attempt_id: str = "attempt-codex-event-fixture",
+) -> tuple[str, dict[str, object]]:
+    """Run one deterministic Codex stream and return its durable completion event."""
+    app_dir = tmp_path / "app"
+    worker_dir = app_dir / "workers" / "worker-0"
+    log_dir = app_dir / "logs"
+    worker_dir.mkdir(parents=True)
+    log_dir.mkdir(parents=True)
+    db_path = tmp_path / "control.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    database.init_db(db_path)
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", app_dir / "workers")
+    monkeypatch.setattr(config, "LOG_DIR", log_dir)
+    monkeypatch.setattr(config, "load_profile", lambda: {"authentication": {}})
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda _worker_id: worker_dir)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **_kwargs: "PROMPT")
+    monkeypatch.setattr(launcher, "_resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda *_args: None)
+    monkeypatch.setattr(launcher, "_archive_worker_evidence", lambda *_args: [])
+
+    class Timer:
+        def cancel(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        launcher,
+        "_start_timeout_watchdog",
+        lambda *_args: (threading.Event(), Timer()),
+    )
+
+    class Process:
+        pid = 4321
+
+        def __init__(self, *, env: dict[str, str], final_message_path: Path) -> None:
+            self.returncode = 0
+            self.stdin = io.StringIO()
+            Path(env[agent_report_mcp.REPORT_PATH_ENV]).write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1",
+                        "run_id": env[agent_report_mcp.RUN_ID_ENV],
+                        "status": structured_status,
+                        "summary": "bounded fixture report",
+                        "observations": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            final_message_path.write_text(final_text, encoding="utf-8")
+            self.stdout = io.StringIO(
+                "\n".join(json.dumps(message) for message in messages)
+            )
+
+        def wait(self, timeout: int | None = None) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(command: list[str], **kwargs) -> Process:
+        final_path = Path(command[command.index("--output-last-message") + 1])
+        return Process(env=kwargs["env"], final_message_path=final_path)
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(launcher, "_process_identity_tuple", lambda pid: (pid, 123_456))
+    job = {
+        "url": "https://example.test/jobs/codex-events",
+        "application_url": "https://example.test/apply/codex-events",
+        "title": "Data Intern",
+        "company_name": "Example",
+        "site": "example",
+        "fit_score": 9,
+        "_attempt_id": attempt_id,
+        "_browser_backend": "edge",
+    }
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        dry_run=dry_run,
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+    conn = database.get_connection(db_path)
+    payload_json = conn.execute(
+        "SELECT payload_json FROM agent_events "
+        "WHERE attempt_id=? AND event_type='agent.turn.completed'",
+        (attempt_id,),
+    ).fetchone()[0]
+    database.close_connection(db_path)
+    return status, json.loads(payload_json)
+
+
+@pytest.mark.parametrize(
+    "result_field",
+    [
+        {"result": {"isError": True}},
+        {"output": {"is_error": True}},
+    ],
+    ids=["result-isError", "output-is_error"],
+)
+def test_codex_completed_browser_error_payload_is_not_counted_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result_field: dict[str, object],
+) -> None:
+    """A completed transport event can still carry an MCP-level failure."""
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "browser-error-1",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_file_upload",
+                    "status": "completed",
+                    **result_field,
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ],
+    )
+
+    assert status == "ready_to_submit"
+    assert payload["metrics"]["browser_tool_call_count"] == 1
+    assert payload["metrics"]["browser_tool_success_count"] == 0
+
+
+def test_codex_user_camel_case_tool_error_is_not_counted_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex's camel-case error flag has the same failure semantics as snake case."""
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "browser-user-error-1",
+                            "name": "mcp__playwright__browser_file_upload",
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "browser-user-error-1",
+                            "isError": True,
+                        }
+                    ]
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ],
+    )
+
+    assert status == "ready_to_submit"
+    assert payload["metrics"]["browser_tool_call_count"] == 1
+    assert payload["metrics"]["browser_tool_success_count"] == 0
+
+
+def test_codex_duplicate_tool_id_across_event_shapes_is_counted_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Equivalent lifecycle events describe one browser action, not three."""
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "browser-duplicate-1",
+                            "name": "mcp__playwright__browser_snapshot",
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "browser-duplicate-1",
+                            "isError": False,
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "browser-duplicate-1",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_snapshot",
+                    "status": "completed",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ],
+    )
+
+    assert status == "ready_to_submit"
+    assert payload["metrics"]["browser_tool_call_count"] == 1
+    assert payload["metrics"]["browser_tool_success_count"] == 1
+
+
+def test_durable_completed_event_classifies_status_conflict_without_raw_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The control plane keeps a bounded mismatch reason after transient files vanish."""
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[{"type": "turn.completed", "usage": {}}],
+        structured_status="failed:resume_upload",
+        final_text="RESULT:READY_TO_SUBMIT",
+        dry_run=True,
+        attempt_id="attempt-status-conflict",
+    )
+
+    serialized = json.dumps(payload)
+    assert status == "failed:conflicting_agent_results"
+    assert payload["source"] == "conflict"
+    assert payload["conflict_classification"] == "status_mismatch"
+    assert "failed:resume_upload" not in serialized
+    assert "RESULT:READY_TO_SUBMIT" not in serialized
+
+
+def test_codex_completed_tool_failures_are_counted_per_report_and_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex terminal failures can have null ``error`` and text-only results."""
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "report-success-1",
+                    "type": "mcp_tool_call",
+                    "server": "applypilot_control",
+                    "tool": "report_agent_turn",
+                    "status": "completed",
+                    "error": None,
+                    "result": {"content": [{"type": "text", "text": "recorded"}]},
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "report-failure-2",
+                    "type": "mcp_tool_call",
+                    "server": "applypilot_control",
+                    "tool": "report_agent_turn",
+                    "status": "failed",
+                    "error": None,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "a different report is already recorded",
+                            }
+                        ]
+                    },
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "upload-success-1",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_file_upload",
+                    "status": "completed",
+                    "error": None,
+                    "result": {"content": [{"type": "text", "text": "uploaded"}]},
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "upload-failure-2",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_file_upload",
+                    "status": "failed",
+                    "error": None,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": "file chooser unavailable"}
+                        ]
+                    },
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ],
+    )
+
+    assert status == "ready_to_submit"
+    assert payload["metrics"].get("report_tool_call_count") == 2
+    assert payload["metrics"].get("report_tool_success_count") == 1
+    assert payload["metrics"].get("report_tool_failure_count") == 1
+    assert payload["metrics"].get("browser_file_upload_call_count") == 2
+    assert payload["metrics"].get("browser_file_upload_success_count") == 1
+    assert payload["metrics"].get("browser_file_upload_failure_count") == 1

@@ -325,21 +325,21 @@ def _interpret_failure_observation(
     return f"failed:{failure.code}", None
 
 
-def reconcile_agent_turn_outputs(
+def reconcile_agent_turn_outputs_with_diagnostics(
     output: str,
     structured_result: AgentTurnResult | None,
     *,
     dry_run: bool,
     submission_phase: str,
-) -> tuple[str, dict | None, str]:
-    """Prefer a typed report, while retaining and cross-checking legacy output."""
+) -> tuple[str, dict | None, str, str | None]:
+    """Cross-check both contracts and return a bounded conflict classification."""
     if structured_result is None:
         status, evidence = interpret_agent_output(
             output,
             dry_run=dry_run,
             submission_phase=submission_phase,
         )
-        return status, evidence, "legacy"
+        return status, evidence, "legacy", None
 
     status, evidence = interpret_agent_turn_result(
         structured_result,
@@ -348,14 +348,14 @@ def reconcile_agent_turn_outputs(
     )
     parsed_legacy = parse_result_line(output)
     if parsed_legacy is None and "RESULT:" not in output:
-        return status, evidence, "structured"
+        return status, evidence, "structured", None
     if parsed_legacy is None:
         conflict = (
             "submission_uncertain"
             if submission_phase == "submit" and not dry_run
             else "failed:conflicting_agent_results"
         )
-        return conflict, None, "conflict"
+        return conflict, None, "conflict", "legacy_result_invalid"
 
     legacy_status, legacy_evidence = interpret_agent_output(
         output,
@@ -375,7 +375,7 @@ def reconcile_agent_turn_outputs(
         # split representation only when both say APPLIED and the receipt
         # payload has already passed strict validation.  The worker still
         # requires an independent browser observation before persistence.
-        return "applied", legacy_evidence, "structured+legacy"
+        return "applied", legacy_evidence, "structured+legacy", None
     if (
         submission_phase == "prepare"
         and not dry_run
@@ -385,15 +385,41 @@ def reconcile_agent_turn_outputs(
         # During cover discovery, ``previewed`` is a generic no-side-effect
         # control-plane status.  The legacy result carries the more specific
         # branch the worker needs in order to continue the same application.
-        return legacy_status, legacy_evidence, "structured+legacy"
-    if legacy_status != status or legacy_evidence != evidence:
+        return legacy_status, legacy_evidence, "structured+legacy", None
+    if legacy_status != status:
         conflict = (
             "submission_uncertain"
             if submission_phase == "submit" and not dry_run
             else "failed:conflicting_agent_results"
         )
-        return conflict, None, "conflict"
-    return status, evidence, "structured+legacy"
+        return conflict, None, "conflict", "status_mismatch"
+    if legacy_evidence != evidence:
+        conflict = (
+            "submission_uncertain"
+            if submission_phase == "submit" and not dry_run
+            else "failed:conflicting_agent_results"
+        )
+        return conflict, None, "conflict", "evidence_mismatch"
+    return status, evidence, "structured+legacy", None
+
+
+def reconcile_agent_turn_outputs(
+    output: str,
+    structured_result: AgentTurnResult | None,
+    *,
+    dry_run: bool,
+    submission_phase: str,
+) -> tuple[str, dict | None, str]:
+    """Prefer a typed report, while retaining and cross-checking legacy output."""
+    status, evidence, source, _classification = (
+        reconcile_agent_turn_outputs_with_diagnostics(
+            output,
+            structured_result,
+            dry_run=dry_run,
+            submission_phase=submission_phase,
+        )
+    )
+    return status, evidence, source
 
 
 def parse_unanswered_questions(output: str) -> list[dict] | None:
