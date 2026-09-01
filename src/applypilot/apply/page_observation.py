@@ -320,15 +320,60 @@ def _is_singapore_location(value: object) -> bool:
     return bool(text and ("singapore" in text.split() or text in {"sg", "sgp"}))
 
 
-def _work_authorization_answers(profile: dict, job: dict) -> tuple[bool, bool] | None:
+def _is_post_graduation_work_context(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:upon|following)\s+(?:your\s+)?graduation\b|"
+            r"\bafter\s+(?:(?:your|you)\s+)?graduat(?:ion|e|ing)\b|"
+            r"\b(?:when|once)\s+you\s+graduate\b|"
+            r"\bpost[ -]?graduation\b",
+            text,
+        )
+    )
+
+
+def _work_authorization_question_semantic(text: str) -> str | None:
+    sponsorship = bool(re.search(r"sponsor|sponsorship", text))
+    authorization = bool(re.search(
+        r"(?:authori[sz]ed|legal(?:ly)? (?:eligible|entitled)|right) to work",
+        text,
+    ))
+    without_sponsorship = bool(re.search(
+        r"\b(?:(?:be\s+)?(?:able|eligible|authori[sz]ed|entitled)\s+to\s+|"
+        r"(?:can|could|may|will|would)\s+you\s+(?:legally\s+)?)work\s+"
+        r"without\s+(?:(?:requiring|the\s+need\s+for)\s+)?"
+        r"(?:visa\s+)?sponsor(?:ship)?\b",
+        text,
+    ))
+    if without_sponsorship:
+        return "work_without_sponsorship"
+    if sponsorship and authorization:
+        return "ambiguous"
+    if sponsorship:
+        return "requires_sponsorship"
+    if authorization:
+        return "legally_authorized_to_work"
+    return None
+
+
+def _work_authorization_answers(
+    profile: dict,
+    job: dict,
+    *,
+    question: object = "",
+) -> tuple[bool, bool] | None:
     """Return (authorized, sponsorship-needed) for a clearly classified role."""
     policy = profile.get("work_authorization", {}).get("form_answer_policy", {})
+    question_text = " ".join(str(question or "").casefold().split())
+    post_graduation_context = _is_post_graduation_work_context(question_text)
     job_text = " ".join(
         str(job.get(field) or "").casefold()
         for field in ("title", "full_description", "application_readiness_reason")
     )
     branch = None
-    if "intern" in job_text:
+    if post_graduation_context:
+        branch = policy.get("post_graduation_full_time")
+    elif "intern" in job_text:
         explicit_non_qualifying_route = re.search(
             r"\bpart[ -]?time\b|\bnon[ -]?credit\b|"
             r"\bnot\s+(?:eligible\s+)?for\s+academic\s+credit\b|"
@@ -408,13 +453,13 @@ def _expected_screening_answer(
         )
         return ("united_states_person_status", expected) if expected is not None else None
 
-    work_answers = _work_authorization_answers(profile, job)
-    if re.search(r"sponsor|sponsorship", text) and work_answers is not None:
+    semantic = _work_authorization_question_semantic(text)
+    work_answers = _work_authorization_answers(profile, job, question=text)
+    if semantic == "work_without_sponsorship" and work_answers is not None:
+        return semantic, work_answers[0] and not work_answers[1]
+    if semantic == "requires_sponsorship" and work_answers is not None:
         return "requires_sponsorship", work_answers[1]
-    if re.search(
-        r"(?:authori[sz]ed|legal(?:ly)? (?:eligible|entitled)|right) to work",
-        text,
-    ) and work_answers is not None:
+    if semantic == "legally_authorized_to_work" and work_answers is not None:
         return "legally_authorized_to_work", work_answers[0]
 
     if _is_prior_target_employer_question(text, job):
@@ -445,6 +490,35 @@ def _expected_screening_answer(
             profile.get("screening", {}).get("willing_to_complete_background_check")
         )
         return ("background_check", expected) if expected is not None else None
+    return None
+
+
+def _screening_answer_issue(
+    question: object,
+    selected: object,
+    profile: dict,
+    job: dict,
+) -> str | None:
+    """Return a stable blocker for an unsupported or contradictory answer."""
+    text = " ".join(str(question or "").casefold().split())
+    semantic = _work_authorization_question_semantic(text)
+    post_graduation = _is_post_graduation_work_context(text)
+    if semantic == "ambiguous":
+        context = "post_graduation" if post_graduation else "role_context"
+        return f"ambiguous_work_authorization_question:{context}"
+    if (
+        post_graduation
+        and semantic is not None
+        and _work_authorization_answers(profile, job, question=text) is None
+    ):
+        return "work_authorization_policy_unavailable:post_graduation_full_time"
+
+    expected = _expected_screening_answer(text, profile, job)
+    if expected is None:
+        return None
+    key, value = expected
+    if not _selected_matches_boolean(selected, value):
+        return f"hard_answer_mismatch:{key}"
     return None
 
 
@@ -913,11 +987,9 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
         if selected and expected is not None and not _selected_matches_boolean(selected, expected):
             issues.append(f"hard_answer_mismatch:{key}")
 
-        generic_expected = _expected_screening_answer(text, profile, job)
-        if generic_expected is not None:
-            generic_key, generic_value = generic_expected
-            if not _selected_matches_boolean(selected, generic_value):
-                issues.append(f"hard_answer_mismatch:{generic_key}")
+        screening_issue = _screening_answer_issue(text, selected, profile, job)
+        if screening_issue:
+            issues.append(screening_issue)
 
     for field in snapshot.get("select_fields", []):
         text = field.get("text", "").casefold()
@@ -951,11 +1023,9 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
             and not _is_singapore_location(selected)
         ):
             issues.append("work_location_selection_not_singapore")
-        generic_expected = _expected_screening_answer(text, profile, job)
-        if generic_expected is not None:
-            generic_key, generic_value = generic_expected
-            if not _selected_matches_boolean(selected, generic_value):
-                issues.append(f"hard_answer_mismatch:{generic_key}")
+        screening_issue = _screening_answer_issue(text, selected, profile, job)
+        if screening_issue:
+            issues.append(screening_issue)
 
     if snapshot.get("submit_control_count", 0) < 1:
         issues.append("submit_control_missing")

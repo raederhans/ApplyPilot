@@ -129,6 +129,250 @@ def test_full_time_internship_uses_programme_credit_authorization_branch() -> No
 
 
 @pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        (
+            "Will you require any visa sponsorship in order to work in Singapore upon graduation?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship after your graduation?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship following graduation?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require post-graduation sponsorship?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship when you graduate?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship once you graduate?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship after graduating?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you require sponsorship after you graduate?",
+            ("requires_sponsorship", True),
+        ),
+        (
+            "Will you be able to work without sponsorship upon graduation?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Will you be able to work without requiring sponsorship upon graduation?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Will you be able to work without the need for sponsorship upon graduation?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Can you work without sponsorship when you graduate?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Could you legally work without requiring sponsorship when you graduate?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "May you work without visa sponsorship when you graduate?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Will you legally work without requiring visa sponsorship when you graduate?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Would you work without sponsorship when you graduate?",
+            ("work_without_sponsorship", False),
+        ),
+        (
+            "Will you require visa sponsorship for this internship?",
+            ("requires_sponsorship", False),
+        ),
+        (
+            "Are you legally authorized to work following graduation?",
+            ("legally_authorized_to_work", False),
+        ),
+        (
+            "Are you legally authorized to work for this internship?",
+            ("legally_authorized_to_work", True),
+        ),
+    ],
+)
+def test_screening_answers_honor_explicit_post_graduation_context(
+    question: str,
+    expected: tuple[str, bool],
+) -> None:
+    profile = _full_time_profile()
+    profile["work_authorization"]["form_answer_policy"]["post_graduation_full_time"] = {
+        "legally_authorized": "No",
+        "requires_sponsorship": "Yes",
+    }
+    job = {
+        "title": "Data Analyst Intern",
+        "full_description": "Full-time internship in Singapore.",
+        "application_readiness_reason": "Passed configured eligibility and fit checks.",
+    }
+
+    assert page_observation._expected_screening_answer(question, profile, job) == expected
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        None,
+        {"legally_authorized": "No"},
+        {"legally_authorized": "Unknown", "requires_sponsorship": "Yes"},
+    ],
+)
+@pytest.mark.parametrize("field_collection", ["radio_questions", "select_fields"])
+def test_post_graduation_policy_unavailable_is_a_blocker(
+    branch: dict[str, str] | None,
+    field_collection: str,
+) -> None:
+    profile = _full_time_profile()
+    if branch is not None:
+        profile["work_authorization"]["form_answer_policy"][
+            "post_graduation_full_time"
+        ] = branch
+    job = {
+        "title": "Data Analyst Intern",
+        "full_description": "Full-time internship in Singapore.",
+    }
+    issues = page_observation._validate_pre_submit_snapshot(
+        {
+            field_collection: [
+                {
+                    "text": "Will you require sponsorship when you graduate?",
+                    "selected": "Yes",
+                }
+            ]
+        },
+        profile,
+        job,
+    )
+
+    blocker = "work_authorization_policy_unavailable:post_graduation_full_time"
+    blockers, repairable, advisories = page_observation._partition_pre_submit_issues(
+        issues
+    )
+
+    assert blocker in issues
+    assert blocker in blockers
+    assert blocker not in repairable
+    assert blocker not in advisories
+
+
+def test_ambiguous_post_graduation_work_question_fails_closed() -> None:
+    profile = _full_time_profile()
+    profile["work_authorization"]["form_answer_policy"]["post_graduation_full_time"] = {
+        "legally_authorized": "No",
+        "requires_sponsorship": "Yes",
+    }
+    issues = page_observation._validate_pre_submit_snapshot(
+        {
+            "radio_questions": [
+                {
+                    "text": "Are you authorized to work or will you require sponsorship when you graduate?",
+                    "selected": "Yes",
+                }
+            ]
+        },
+        profile,
+        {"title": "Data Analyst Intern"},
+    )
+
+    blocker = "ambiguous_work_authorization_question:post_graduation"
+    blockers, repairable, advisories = page_observation._partition_pre_submit_issues(
+        issues
+    )
+
+    assert blocker in issues
+    assert blocker in blockers
+    assert blocker not in repairable
+    assert blocker not in advisories
+
+
+@pytest.mark.parametrize("field_collection", ["radio_questions", "select_fields"])
+def test_modal_work_without_sponsorship_uses_combined_post_graduation_policy(
+    field_collection: str,
+) -> None:
+    profile = _full_time_profile()
+    profile["work_authorization"]["form_answer_policy"]["post_graduation_full_time"] = {
+        "legally_authorized": "No",
+        "requires_sponsorship": "Yes",
+    }
+    job = {"title": "Data Analyst Intern"}
+    question = "Can you work without sponsorship when you graduate?"
+
+    selected_no = page_observation._validate_pre_submit_snapshot(
+        {field_collection: [{"text": question, "selected": "No"}]},
+        profile,
+        job,
+    )
+    selected_yes = page_observation._validate_pre_submit_snapshot(
+        {field_collection: [{"text": question, "selected": "Yes"}]},
+        profile,
+        job,
+    )
+
+    blocker = "hard_answer_mismatch:work_without_sponsorship"
+    assert blocker not in selected_no
+    assert blocker in selected_yes
+
+
+def test_pre_submit_accepts_post_graduation_sponsorship_yes_for_internship() -> None:
+    profile = _full_time_profile()
+    profile["work_authorization"]["form_answer_policy"]["post_graduation_full_time"] = {
+        "legally_authorized": "No",
+        "requires_sponsorship": "Yes",
+    }
+    job = {
+        "title": "Data Analyst Intern",
+        "full_description": "Full-time internship in Singapore.",
+        "application_readiness_reason": "Passed configured eligibility and fit checks.",
+    }
+
+    post_graduation = page_observation._validate_pre_submit_snapshot(
+        {
+            "radio_questions": [
+                {
+                    "text": "Will you require any visa sponsorship in order to work in Singapore upon graduation?",
+                    "selected": "Yes",
+                }
+            ]
+        },
+        profile,
+        job,
+    )
+    ordinary_internship = page_observation._validate_pre_submit_snapshot(
+        {
+            "radio_questions": [
+                {
+                    "text": "Will you require visa sponsorship for this internship?",
+                    "selected": "Yes",
+                }
+            ]
+        },
+        profile,
+        job,
+    )
+
+    assert "hard_answer_mismatch:requires_sponsorship" not in post_graduation
+    assert "hard_answer_mismatch:requires_sponsorship" in ordinary_internship
+
+
+@pytest.mark.parametrize(
     "description",
     [
         "This is a part time internship.",
