@@ -171,6 +171,13 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
     if not run_id or not raw_path:
         raise ValueError("structured reporting is not configured for this Agent turn")
     path = Path(raw_path)
+    if (
+        str(arguments.get("status") or "").strip().casefold()
+        == "prepared_for_audit"
+        and isinstance(arguments.get("observations"), dict)
+        and "answer_mappings" in arguments["observations"]
+    ):
+        raise ValueError("prepared_for_audit cannot carry answer_mappings")
     contract_error = validate_ready_answer_mappings(
         arguments.get("status"),
         arguments.get("observations"),

@@ -160,6 +160,29 @@ def compose_runtime_capabilities(
     return combined
 
 
+_AUDIT_VERIFICATION_TOOL_NAMES = (
+    "browser_snapshot",
+    "browser_take_screenshot",
+    "browser_wait_for",
+    "get_application_context",
+    "build_answer_mapping",
+    "report_agent_turn",
+)
+
+
+def audit_verification_capabilities(
+    registry: CapabilityRegistry,
+) -> CapabilityRegistry:
+    """Return the fixed non-writing surface for one provenance verification child."""
+    selected: list[ToolSpec] = []
+    for name in _AUDIT_VERIFICATION_TOOL_NAMES:
+        capability = registry.get(name)
+        if capability is None:
+            raise ValueError(f"audit verification capability is missing: {name}")
+        selected.append(capability)
+    return CapabilityRegistry(selected)
+
+
 def scope_capability_registry(
     registry: CapabilityRegistry,
     *,

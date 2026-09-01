@@ -64,6 +64,7 @@ _LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
 _COMPLETE_TURN_STATUSES = frozenset({"applied", "already_applied", "previewed"})
 _CHECKPOINT_TURN_STATUSES = frozenset(
     {
+        "prepared_for_audit",
         "ready_to_submit",
         "cover_not_required",
         "cover_letter_required",

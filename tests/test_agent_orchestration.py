@@ -883,6 +883,75 @@ def test_structured_only_result_keeps_legacy_application_status_contract() -> No
     ) == ("ready_to_submit", None, "structured")
 
 
+def test_prepared_for_audit_is_non_authorizing_and_prepare_only() -> None:
+    result = AgentTurnResult(
+        run_id="run-prepared-audit",
+        status="prepared_for_audit",
+        summary="Form filled for host audit",
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:PREPARED_FOR_AUDIT",
+        result,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("prepared_for_audit", None, "structured+legacy")
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:PREPARED_FOR_AUDIT",
+        result,
+        dry_run=True,
+        submission_phase="prepare",
+    )[0] != "prepared_for_audit"
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:PREPARED_FOR_AUDIT",
+        result,
+        dry_run=False,
+        submission_phase="submit",
+    )[0] == "submission_uncertain"
+
+
+def test_prepared_for_audit_rejects_answer_mappings_and_legacy_only_authority() -> None:
+    mapped = AgentTurnResult(
+        run_id="run-prepared-mapped",
+        status="prepared_for_audit",
+        summary="Invalid staged result",
+        observations=_ready_provenance_observations(),
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:PREPARED_FOR_AUDIT",
+        mapped,
+        dry_run=False,
+        submission_phase="prepare",
+    )[0] == "failed:prepared_for_audit_contract_invalid"
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:PREPARED_FOR_AUDIT",
+        None,
+        dry_run=False,
+        submission_phase="prepare",
+    )[0] == "failed:prepared_for_audit_report_missing"
+
+
+def test_report_tool_rejects_prepared_for_audit_with_mappings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "premature-mappings.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-premature-mappings")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    response = _tool_call(
+        {
+            "status": "prepared_for_audit",
+            "summary": "Premature mappings",
+            "observations": _ready_provenance_observations(),
+        }
+    )
+
+    assert response["result"]["isError"] is True
+    assert not path.exists()
+
+
 def test_prepare_reconciles_previewed_report_with_ready_to_submit_marker() -> None:
     result = AgentTurnResult(
         run_id="run-prepare-alias",

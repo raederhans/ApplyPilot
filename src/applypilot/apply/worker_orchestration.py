@@ -32,6 +32,9 @@ from applypilot.apply.operator_binding import operator_resume_binding
 from applypilot.apply.operator_dispatch import wait_for_requested_resume
 from applypilot.apply.operator_runtime import OperatorRuntime, verified_child_execution
 from applypilot.apply.run_progress import PreviewTicket, RunProgress
+from applypilot.apply.stateful_control_coverage import (
+    stateful_control_coverage_error as _stateful_control_coverage_error,
+)
 
 
 def _prepared_email_application(job: dict) -> dict | None:
@@ -130,6 +133,60 @@ def _consume_provenance_repair_artifacts(job: dict, repair_job: Mapping[str, obj
     return None
 
 
+def _provenance_only_audit(report: Mapping[str, object]) -> bool:
+    """Admit a child only when missing provenance is the sole host finding."""
+    issues = report.get("issues")
+    repairable = report.get("repairable_issues")
+    blockers = report.get("blocking_issues")
+    advisories = report.get("advisory_issues")
+    form = report.get("ats_adapter_context")
+    page_url = str(report.get("page_url") or "").strip()
+    return bool(
+        report.get("disposition") == "retry_prepare"
+        and isinstance(issues, list)
+        and issues
+        and all(str(issue).startswith("answer_provenance_missing:") for issue in issues)
+        and isinstance(repairable, list)
+        and set(map(str, repairable)) == set(map(str, issues))
+        and blockers == []
+        and advisories == []
+        and isinstance(form, Mapping)
+        and isinstance(form.get("fields"), list)
+        and page_url
+        and _stateful_control_coverage_error(report) is None
+    )
+
+
+def _enforce_stateful_control_coverage(
+    audit_signal: str | None,
+    report: Mapping[str, object],
+) -> tuple[str | None, dict]:
+    """Make the aggregate stateful-control proof mandatory at every host gate."""
+
+    normalized = dict(report)
+    error = _stateful_control_coverage_error(normalized)
+    if error is None:
+        return audit_signal, normalized
+
+    def _append_unique(name: str) -> list[str]:
+        values = normalized.get(name)
+        result = [str(value) for value in values] if isinstance(values, list) else []
+        if error not in result:
+            result.append(error)
+        return result
+
+    normalized.update(
+        {
+            "status": "attention",
+            "disposition": "block",
+            "issues": _append_unique("issues"),
+            "blocking_issues": _append_unique("blocking_issues"),
+            "submission_gate": False,
+        }
+    )
+    return audit_signal or f"pre_submit_audit:{error}", normalized
+
+
 WORKER_RUNTIME_PORTS = (
     "POLL_INTERVAL", "_acquire_cloak_lane", "_acquire_submit_writer_lane",
     "_archive_worker_evidence",
@@ -152,6 +209,7 @@ WORKER_RUNTIME_PORTS = (
     "_has_admitted_submission_receipt",
     "_issue_manual_resume_authorization", "_consume_manual_resume_authorization",
     "_heartbeat_operator_handoff", "_runtime_operator_resume_scope",
+    "_runtime_audit_verification_scope",
     "_wait_for_manual_captcha", "acquire_job", "add_event", "allocate_cdp_port",
     "capture_browser_session", "cleanup_worker", "cloak_fallback_route",
     "computer_use_handoff_allowed", "config", "datetime", "get_connection",
@@ -260,6 +318,7 @@ def _worker_loop_with_port(
     _consume_manual_resume_authorization = runtime._consume_manual_resume_authorization
     _heartbeat_operator_handoff = runtime._heartbeat_operator_handoff
     _runtime_operator_resume_scope = runtime._runtime_operator_resume_scope
+    _runtime_audit_verification_scope = runtime._runtime_audit_verification_scope
     _wait_for_manual_captcha = runtime._wait_for_manual_captcha
     acquire_job = runtime.acquire_job
     add_event = runtime.add_event
@@ -442,6 +501,8 @@ def _worker_loop_with_port(
         submitted_at = None
         email_application = None
         verification_relay_used = False
+        provenance_verification_child_used = False
+        provenance_audit_page_url: str | None = None
         cover_material_retries_remaining = material_regeneration_limit
         field_repair_retries_remaining = field_repair_limit
         ats_fill_plan_feedback: dict[str, object] | None = None
@@ -1393,6 +1454,90 @@ def _worker_loop_with_port(
                 )
 
             while True:
+                if result == "prepared_for_audit":
+                    if dry_run or provenance_verification_child_used:
+                        result = "failed:prepared_for_audit_not_admitted"
+                        break
+                    if _prepared_email_application(job) is not None:
+                        result = "failed:prepared_for_audit_not_admitted"
+                        break
+                    audit_started = time.perf_counter()
+                    audit_signal, audit_report = _audit_live_pre_submit_page(
+                        port, worker_id, job
+                    )
+                    audit_signal, audit_report = _enforce_stateful_control_coverage(
+                        audit_signal, audit_report
+                    )
+                    orchestration_metrics["pre_submit_audit_ms"] += (
+                        time.perf_counter() - audit_started
+                    ) * 1000
+                    if not _provenance_only_audit(audit_report):
+                        pre_submit_audit_failure = dict(audit_report)
+                        result = (
+                            "failed:manual_review_required:"
+                            f"{audit_signal or 'prepared_for_audit_not_provenance_only'}"
+                        )
+                        break
+                    provenance_verification_child_used = True
+                    provenance_audit_page_url = str(audit_report["page_url"])
+                    verification_job = dict(job)
+                    for protected_key in (
+                        "_browser_lease_binding",
+                        "_answer_provenance_binding",
+                        "_agent_observations",
+                    ):
+                        if protected_key in verification_job:
+                            verification_job[protected_key] = deepcopy(
+                                verification_job[protected_key]
+                            )
+                    verification_job["_answer_provenance_verification_child"] = True
+                    verification_job["_browser_observation"] = {
+                        **audit_report,
+                        "signal": audit_signal,
+                        "advisory_only": False,
+                        "submission_gate": False,
+                    }
+                    _attach_control_contract(
+                        verification_job,
+                        active_route,
+                        interaction_mode=requested_interaction_mode,
+                        resume_existing_page=True,
+                    )
+                    with _runtime_audit_verification_scope(verification_job):
+                        result, verification_duration = run_job(
+                            verification_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=False,
+                            resume_existing_page=True,
+                            submission_phase="prepare",
+                        )
+                    duration_ms += verification_duration
+                    provenance_error = _consume_provenance_repair_artifacts(
+                        job, verification_job
+                    )
+                    if provenance_error is not None:
+                        result = (
+                            "failed:manual_review_required:"
+                            f"answer_provenance_verification:{provenance_error}"
+                        )
+                        break
+                    for parent_key in (
+                        "_parent_agent_run_id",
+                        "_parent_agent_checkpoint_id",
+                    ):
+                        if verification_job.get(parent_key):
+                            job[parent_key] = verification_job[parent_key]
+                    if result != "ready_to_submit":
+                        result = (
+                            "failed:answer_provenance_verification:"
+                            f"{result}"
+                        )
+                        break
+
                 if result in {"cover_not_required", "cover_letter_required"}:
                     if cover_material_retries_remaining <= 0:
                         result = "failed:cover_material_discovery_loop"
@@ -1647,6 +1792,20 @@ def _worker_loop_with_port(
                         audit_signal, audit_report = _audit_live_pre_submit_page(
                             port, worker_id, job
                         )
+                        audit_signal, audit_report = _enforce_stateful_control_coverage(
+                            audit_signal, audit_report
+                        )
+                        if (
+                            provenance_audit_page_url is not None
+                            and str(audit_report.get("page_url") or "")
+                            != provenance_audit_page_url
+                        ):
+                            audit_signal = "answer_provenance_verification:page_drift"
+                            audit_report = {
+                                **audit_report,
+                                "disposition": "block",
+                                "blocking_issues": ["page_drift"],
+                            }
                     orchestration_metrics["pre_submit_audit_ms"] += (
                         time.perf_counter() - audit_started
                     ) * 1000
@@ -1935,6 +2094,9 @@ def _worker_loop_with_port(
                                 port,
                                 worker_id,
                                 job,
+                            )
+                            audit_signal, audit_report = _enforce_stateful_control_coverage(
+                                audit_signal, audit_report
                             )
                             orchestration_metrics["pre_submit_audit_ms"] += (
                                 time.perf_counter() - audit_started

@@ -23,6 +23,10 @@ from applypilot.apply.specialists import (
     ATS_FORM_SNAPSHOT_SCHEMA_VERSION,
     freeze_ats_fill_plan_snapshot,
 )
+from applypilot.apply.stateful_control_coverage import (
+    STATEFUL_CONTROL_COVERAGE_SCRIPT,
+    stateful_control_coverage_error,
+)
 from applypilot.apply.workday_state import (
     ProgressAction,
     evaluate_page_progress,
@@ -31,6 +35,8 @@ from applypilot.apply.workday_state import (
 from applypilot.storage.job_identity import extract_platform_job_id
 
 logger = logging.getLogger(__name__)
+
+_STATEFUL_CONTROL_COVERAGE_SCRIPT = STATEFUL_CONTROL_COVERAGE_SCRIPT
 
 
 def _verified_agent_resume_upload(job: dict) -> bool:
@@ -2820,11 +2826,17 @@ def _audit_live_pre_submit_page(
             }""",
             expected_education,
         )
+        snapshot["stateful_control_coverage"] = application_surface.evaluate(
+            _STATEFUL_CONTROL_COVERAGE_SCRIPT
+        )
         _merge_same_page_submit_evidence(snapshot, page, application_surface)
         _redact_protected_identifier_snapshot(snapshot)
         snapshot["document_url"] = snapshot.get("url", "")
         snapshot["url"] = page.url
         issues = _validate_pre_submit_snapshot(snapshot, profile, job)
+        coverage_error = stateful_control_coverage_error(snapshot)
+        if coverage_error is not None:
+            issues.append(coverage_error)
         ats_context, workday_context, adapter_issues = _adapter_observation_context(
             snapshot, job
         )
@@ -2857,6 +2869,7 @@ def _audit_live_pre_submit_page(
             "advisory_issues": advisories,
             "lossy_answer_mappings": lossy_mappings,
             "answer_provenance": provenance_audit.report,
+            "stateful_control_coverage": snapshot.get("stateful_control_coverage"),
             "advisory_only": disposition == "proceed_with_advisories",
             "submission_gate": True,
             "required_unfilled_count": len(snapshot.get("required_unfilled", [])),

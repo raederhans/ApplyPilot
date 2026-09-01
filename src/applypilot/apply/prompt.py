@@ -1429,6 +1429,19 @@ def build_prompt(job: dict, tailored_resume: str,
     }
     control_contract_json = json.dumps(control_contract, ensure_ascii=False, sort_keys=True)
     structured_reporting_enabled = bool(job.get("_agent_reporting_enabled"))
+    verification_child = job.get("_answer_provenance_verification_child") is True
+    staged_observation = job.get("_browser_observation")
+    observed_form_available = bool(
+        isinstance(staged_observation, dict)
+        and isinstance(staged_observation.get("ats_adapter_context"), dict)
+    )
+    initial_browser_prepare = bool(
+        submission_phase == "prepare"
+        and not dry_run
+        and not verification_child
+        and not observed_form_available
+        and classify_submission_surface(job) != "official_direct_email"
+    )
     structured_reporting_section = ""
     if structured_reporting_enabled:
         proposal_instruction = (
@@ -1438,7 +1451,29 @@ def build_prompt(job: dict, tailored_resume: str,
             if job.get("_agent_orchestration_available") is True
             else "No specialist runner is registered for this turn; do not emit proposals."
         )
-        if submission_phase == "prepare":
+        if verification_child:
+            report_call_instruction = (
+                "This is the single host-authorized provenance verification child. "
+                "Use only browser read tools plus get_application_context, "
+                "build_answer_mapping, and report_agent_turn. Never navigate, click, fill, "
+                "type, select, upload, resolve an answer, access a mailbox or credential "
+                "relay, switch tabs, or invoke Submit. browser_tabs is not available. "
+                "Build mappings only from the host-staged observed "
+                "form. Report ready_to_submit only with a complete strict-v2 envelope; "
+                "prepared_for_audit is forbidden in this child. Any error or page drift "
+                "must be reported as failed:answer_provenance_verification."
+            )
+        elif submission_phase == "prepare" and initial_browser_prepare:
+            report_call_instruction = (
+                "This is the initial real browser prepare and the host has not yet staged "
+                "an observed_form. Fill and visibly verify the final review state without "
+                "submitting. Then call report_agent_turn exactly once with status "
+                "prepared_for_audit and no answer_mappings, and output "
+                "RESULT:PREPARED_FOR_AUDIT. This result is non-authorizing: never describe "
+                "or emit it as READY, never click Submit, and never invent mappings before "
+                "the host audit."
+            )
+        elif submission_phase == "prepare":
             report_call_instruction = (
                 "For a browser ready_to_submit result, call report_agent_turn once only after "
                 "all answer mappings are assembled. Only a successful report_agent_turn call "

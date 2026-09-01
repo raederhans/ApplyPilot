@@ -1,0 +1,129 @@
+"""Fail-closed coverage proof for checkbox, radio, and toggle controls."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+STATEFUL_CONTROL_COVERAGE_SCHEMA_VERSION = 1
+STATEFUL_CONTROL_COVERAGE_LIMIT = 200
+_STATEFUL_CONTROL_COVERAGE_KEYS = frozenset(
+    {
+        "schema_version",
+        "discovered_count",
+        "classified_visible_native_count",
+        "unclassified_count",
+        "selected_or_filled_count",
+        "overflow",
+        "proof_complete",
+    }
+)
+
+STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
+  const limit = 200;
+  const roots = [document];
+  const elements = [];
+  for (let index = 0; index < roots.length; index += 1) {
+    const descendants = [...roots[index].querySelectorAll('*')];
+    elements.push(...descendants);
+    for (const element of descendants) {
+      if (element.shadowRoot) roots.push(element.shadowRoot);
+    }
+  }
+  const rendered = (element) => {
+    const view = element.ownerDocument && element.ownerDocument.defaultView;
+    if (!view) return false;
+    const style = view.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      element.getClientRects().length > 0;
+  };
+  const nativeActive = (element) => !element.matches(':disabled');
+  const customActive = (element) => !element.matches(':disabled') &&
+    String(element.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+  const selected = (element) => element.checked === true ||
+    ['true', 'mixed'].includes(
+      String(element.getAttribute('aria-checked') || '').toLowerCase()
+    ) || String(element.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+  const required = (element) => element.required === true ||
+    String(element.getAttribute('aria-required') || '').toLowerCase() === 'true';
+  const proxySelected = (element) => [...(element.labels || [])]
+    .filter(rendered)
+    .some(selected);
+  const natives = elements.filter((element) =>
+    element.matches('input[type="checkbox"],input[type="radio"]') &&
+    nativeActive(element)
+  );
+  const visibleNatives = natives.filter(rendered);
+  const hiddenNatives = natives.filter((element) => !rendered(element));
+  const customCandidates = [...new Set(elements.filter((element) =>
+    !element.matches('input[type="checkbox"],input[type="radio"]') &&
+    element.matches(
+      '[role="checkbox"],[role="radio"],[role="switch"],[aria-checked],[aria-pressed]'
+    ) && customActive(element)
+  ))];
+  const activeCustom = customCandidates.filter((element) =>
+    rendered(element) || selected(element) || required(element)
+  );
+  const unclassified = [...hiddenNatives, ...activeCustom];
+  const discoveredCount = visibleNatives.length + unclassified.length;
+  const selectedOrFilledCount = visibleNatives.filter(selected).length +
+    hiddenNatives.filter((element) => selected(element) || proxySelected(element)).length +
+    activeCustom.filter(selected).length;
+  const overflow = discoveredCount > limit;
+  return {
+    schema_version: 1,
+    discovered_count: discoveredCount,
+    classified_visible_native_count: visibleNatives.length,
+    unclassified_count: unclassified.length,
+    selected_or_filled_count: selectedOrFilledCount,
+    overflow,
+    proof_complete: !overflow && unclassified.length === 0
+  };
+}"""
+
+
+def stateful_control_coverage_error(report: Mapping[str, object]) -> str | None:
+    """Validate a bounded host proof and reject every unclassified control."""
+
+    coverage = report.get("stateful_control_coverage")
+    if not isinstance(coverage, Mapping):
+        return "stateful_control_coverage_unproven"
+    if set(coverage) != _STATEFUL_CONTROL_COVERAGE_KEYS:
+        return "stateful_control_coverage_unproven"
+    schema_version = coverage.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != STATEFUL_CONTROL_COVERAGE_SCHEMA_VERSION
+    ):
+        return "stateful_control_coverage_unproven"
+
+    count_names = (
+        "discovered_count",
+        "classified_visible_native_count",
+        "unclassified_count",
+        "selected_or_filled_count",
+    )
+    counts: dict[str, int] = {}
+    for name in count_names:
+        value = coverage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "stateful_control_coverage_unproven"
+        counts[name] = value
+
+    overflow = coverage.get("overflow")
+    proof_complete = coverage.get("proof_complete")
+    if not isinstance(overflow, bool) or not isinstance(proof_complete, bool):
+        return "stateful_control_coverage_unproven"
+    if counts["discovered_count"] != (
+        counts["classified_visible_native_count"] + counts["unclassified_count"]
+    ):
+        return "stateful_control_coverage_unproven"
+    if counts["selected_or_filled_count"] > counts["discovered_count"]:
+        return "stateful_control_coverage_unproven"
+    if overflow != (counts["discovered_count"] > STATEFUL_CONTROL_COVERAGE_LIMIT):
+        return "stateful_control_coverage_unproven"
+    expected_complete = not overflow and counts["unclassified_count"] == 0
+    if proof_complete is not expected_complete:
+        return "stateful_control_coverage_unproven"
+    if not proof_complete:
+        return "stateful_control_unclassified"
+    return None

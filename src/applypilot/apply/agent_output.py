@@ -254,7 +254,7 @@ def validate_submission_evidence(output: str) -> dict | None:
 
 
 _RESULT_LINE = re.compile(
-    r"^RESULT:(READY_TO_SUBMIT|PREVIEWED|APPLIED|SUBMISSION_UNCERTAIN|"
+    r"^RESULT:(PREPARED_FOR_AUDIT|READY_TO_SUBMIT|PREVIEWED|APPLIED|SUBMISSION_UNCERTAIN|"
     r"COVER_NOT_REQUIRED|COVER_LETTER_REQUIRED|LINKEDIN_LOGIN_COMPLETED|"
     r"EXPIRED|CAPTCHA|LOGIN_ISSUE|FAILED)(?::([^\r\n]+))?$"
 )
@@ -321,6 +321,8 @@ def interpret_agent_output(
             return "linkedin_login_completed", None
         if marker in {"READY_TO_SUBMIT", "PREVIEWED"}:
             return "ready_to_submit", None
+        if marker == "PREPARED_FOR_AUDIT":
+            return "prepared_for_audit", None
         if marker == "COVER_NOT_REQUIRED":
             return "cover_not_required", None
         if marker == "COVER_LETTER_REQUIRED":
@@ -359,6 +361,15 @@ def load_agent_turn_report(path: Path, *, expected_run_id: str) -> AgentTurnResu
     if not isinstance(raw, dict):
         raise TypeError("structured Agent report must be an object")
     result = agent_turn_result_from_mapping(raw, expected_run_id=expected_run_id)
+    if (
+        result.status.strip().casefold() == "prepared_for_audit"
+        and "answer_mappings" in result.observations
+    ):
+        return AgentTurnResult(
+            run_id=result.run_id,
+            status="failed:prepared_for_audit_contract_invalid",
+            summary="Prepared-for-audit report carried premature answer mappings",
+        )
     contract_error = validate_ready_answer_mappings(result.status, result.observations)
     if contract_error is None:
         return result
@@ -401,10 +412,15 @@ def interpret_agent_turn_result(
     # still performs its independent pre-submit observation before reservation.
     if status == "previewed" and not dry_run and submission_phase == "prepare":
         status = "ready_to_submit"
+    if status == "prepared_for_audit":
+        if dry_run or submission_phase != "prepare" or "answer_mappings" in result.observations:
+            return "failed:prepared_for_audit_contract_invalid", None
+        return "prepared_for_audit", None
     contract_error = validate_ready_answer_mappings(status, result.observations)
     if contract_error is not None:
         return "failed:answer_provenance_report_invalid", None
     marker_by_status = {
+        "prepared_for_audit": "PREPARED_FOR_AUDIT",
         "linkedin_login_completed": "LINKEDIN_LOGIN_COMPLETED",
         "ready_to_submit": "READY_TO_SUBMIT",
         "previewed": "PREVIEWED",
@@ -493,6 +509,13 @@ def reconcile_agent_turn_outputs_with_diagnostics(
                 "legacy",
                 "structured_ready_report_missing",
             )
+        if status == "prepared_for_audit":
+            return (
+                "failed:prepared_for_audit_report_missing",
+                None,
+                "legacy",
+                "structured_prepared_report_missing",
+            )
         return status, evidence, "legacy", None
 
     status, evidence = interpret_agent_turn_result(
@@ -516,6 +539,12 @@ def reconcile_agent_turn_outputs_with_diagnostics(
         dry_run=dry_run,
         submission_phase=submission_phase,
     )
+    if (
+        submission_phase == "prepare"
+        and status == "failed:prepared_for_audit_contract_invalid"
+        and legacy_status == "prepared_for_audit"
+    ):
+        return status, None, "structured", None
     if (
         submission_phase == "prepare"
         and status == "failed:answer_provenance_report_invalid"

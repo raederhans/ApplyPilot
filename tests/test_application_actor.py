@@ -278,6 +278,13 @@ def test_decision_envelope_cannot_claim_application_authority() -> None:
         decision_for_status(actor(), "ready_to_submit")
 
 
+def test_prepared_for_audit_is_a_checkpoint_not_completion_or_recovery() -> None:
+    decision = decision_for_status(actor(phase="verify"), "prepared_for_audit")
+
+    assert decision.disposition == "checkpoint"
+    assert decision.next_phase == "checkpoint"
+
+
 def test_persisted_decision_envelope_round_trips_as_v2_and_upcasts_v1_read_only() -> None:
     decision = decide_recovery(actor(phase="verify"), "failed:mfa")
     encoded = contract_json(decision)

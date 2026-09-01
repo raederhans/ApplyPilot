@@ -7,6 +7,7 @@ from applypilot.apply.capabilities import (
     CapabilityRegistry,
     McpPackageSpec,
     ToolCapability,
+    audit_verification_capabilities,
     compose_runtime_capabilities,
     default_browser_capabilities,
     resolve_capability_registry,
@@ -241,6 +242,34 @@ def test_prepare_runtime_surfaces_expose_answer_mapping_only_before_submit(
     assert f"mcp__applypilot_ats__{mapping_tool}" not in claude_submit_allowed
     assert mapping_tool in codex_prepare_rendered
     assert mapping_tool not in codex_submit_rendered
+
+
+def test_audit_verification_child_surface_is_physical_read_only() -> None:
+    scoped = audit_verification_capabilities(compose_runtime_capabilities())
+
+    assert scoped.names() == [
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_wait_for",
+        "get_application_context",
+        "build_answer_mapping",
+        "report_agent_turn",
+    ]
+    assert all(
+        capability.side_effect == "read"
+        for capability in scoped.values()
+        if capability.name.startswith("browser_")
+    )
+    assert not {
+        "browser_navigate",
+        "browser_click",
+        "browser_fill_form",
+        "browser_file_upload",
+        "browser_select_option",
+        "browser_type",
+        "browser_tabs",
+        "resolve_answer",
+    }.intersection(scoped.names())
 
 
 def test_reasoning_effort_is_configurable_by_workload_without_model_binding(

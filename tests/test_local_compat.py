@@ -2559,6 +2559,13 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
         worker_id=3,
         submission_phase="prepare",
     )
+    real_prepare = prompt.build_prompt(
+        job,
+        "Verified resume",
+        dry_run=False,
+        worker_id=3,
+        submission_phase="prepare",
+    )
 
     assert "must-not-appear" not in built
     assert "CAPSOLVER_API_KEY" not in built
@@ -2592,6 +2599,9 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "Only a successful report_agent_turn call permits browser RESULT:READY_TO_SUBMIT" in built
     assert "at most one corrected report_agent_turn call" in built
     assert "RESULT:FAILED:answer_provenance_report_invalid" in built
+    assert "prepared_for_audit and no answer_mappings" in real_prepare
+    assert "RESULT:PREPARED_FOR_AUDIT" in real_prepare
+    assert "RESULT:PREPARED_FOR_AUDIT" not in built
     assert "Video/audio upload contradiction" in built
     assert "RESULT:FAILED:unsafe_verification" in built
     assert "conditional questions can appear dynamically" not in built

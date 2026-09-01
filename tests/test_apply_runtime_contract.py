@@ -1476,14 +1476,30 @@ def _run_worker_contract(
     )
     audits = list(audit_results or [])
 
+    def with_stateful_control_coverage(result):
+        signal, report = result
+        if isinstance(report, dict) and "stateful_control_coverage" not in report:
+            report["stateful_control_coverage"] = {
+                "schema_version": 1,
+                "discovered_count": 0,
+                "classified_visible_native_count": 0,
+                "unclassified_count": 0,
+                "selected_or_filled_count": 0,
+                "overflow": False,
+                "proof_complete": True,
+            }
+        return signal, report
+
     def fake_audit(*args):
         if performance_clock is not None:
             performance_clock[0] += 0.04
         if audit_hook is not None:
-            return audit_hook(args[2])
+            return with_stateful_control_coverage(audit_hook(args[2]))
         if audits:
-            return audits.pop(0)
-        return None, {"status": "clear", "disposition": "clear"}
+            return with_stateful_control_coverage(audits.pop(0))
+        return with_stateful_control_coverage(
+            (None, {"status": "clear", "disposition": "clear"})
+        )
 
     monkeypatch.setattr(launcher, "_audit_live_pre_submit_page", fake_audit)
     monkeypatch.setattr(
@@ -1720,6 +1736,285 @@ def _run_worker_contract(
         run_progress=run_progress,
     )
     return result, run_phases, ledger, marked
+
+
+def test_worker_runs_one_read_only_provenance_child_between_host_audits(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_orchestration,
+        "_consume_provenance_repair_artifacts",
+        lambda _job, _child: None,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_audit_verification_scope",
+        lambda _job: nullcontext(),
+    )
+    calls: list[dict] = []
+    provenance_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:abc"],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:abc"],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": [{"field_key": "work-auth"}]},
+    }
+    clear_report = {
+        "status": "clear",
+        "disposition": "clear",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+    }
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit", "ready_to_submit"],
+        audit_results=[
+            ("pre_submit_repair:answer_provenance_missing:abc", provenance_report),
+            (None, clear_report),
+        ],
+        run_job_calls=calls,
+    )
+
+    assert phases == ["prepare", "prepare", "submit"], (result, calls, marked)
+    assert result == (1, 0)
+    verification = calls[1]
+    assert verification["_answer_provenance_verification_child"] is True
+    assert verification["_browser_observation"]["ats_adapter_context"] == {
+        "fields": [{"field_key": "work-auth"}]
+    }
+    assert verification["_parent_agent_run_id"] == "fake-prepare-turn-1"
+    assert verification["_parent_agent_checkpoint_id"] == (
+        "checkpoint:fake-prepare-turn-1"
+    )
+
+
+def test_worker_fails_closed_on_clear_empty_provenance_without_control_coverage(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+    clear_empty = {
+        "status": "clear",
+        "disposition": "clear",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": []},
+        "answer_provenance": {
+            "schema_version": "2",
+            "adapter": "generic",
+            "adapter_version": "generic/ats-ir-1",
+            "snapshot_digest": "a" * 64,
+            "eligible_count": 0,
+            "verified_count": 0,
+            "blocked_count": 0,
+            "coverage_ratio": 1.0,
+            "fields": [],
+        },
+    }
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_results=[(None, clear_empty)],
+        run_job_calls=calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert all("_answer_provenance_verification_child" not in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "extra_issue",
+    [
+        "required_field_empty:Phone",
+        "answer_provenance_high_risk_unknown:terms-checkbox",
+    ],
+)
+def test_provenance_child_rejects_any_non_missing_issue(extra_issue: str) -> None:
+    report = {
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:abc", extra_issue],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:abc", extra_issue],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": []},
+    }
+
+    assert not worker_orchestration._provenance_only_audit(report)
+
+
+def test_provenance_child_rejects_unclassified_custom_terms_control() -> None:
+    report = {
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:ordinary-text"],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:ordinary-text"],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": [{"field_key": "ordinary-text"}]},
+        "stateful_control_coverage": {
+            "schema_version": 1,
+            "discovered_count": 1,
+            "classified_visible_native_count": 0,
+            "unclassified_count": 1,
+            "selected_or_filled_count": 1,
+            "overflow": False,
+            "proof_complete": False,
+        },
+    }
+
+    assert not worker_orchestration._provenance_only_audit(report)
+
+
+def test_worker_never_starts_child_for_unclassified_custom_terms_control(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+    report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:ordinary-text"],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:ordinary-text"],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": [{"field_key": "ordinary-text"}]},
+        "stateful_control_coverage": {
+            "schema_version": 1,
+            "discovered_count": 1,
+            "classified_visible_native_count": 0,
+            "unclassified_count": 1,
+            "selected_or_filled_count": 1,
+            "overflow": False,
+            "proof_complete": False,
+        },
+    }
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_results=[("pre_submit_audit:stateful_control_unclassified", report)],
+        run_job_calls=calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert all("_answer_provenance_verification_child" not in call for call in calls)
+
+
+def test_worker_stops_if_custom_terms_appears_after_provenance_child(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_orchestration,
+        "_consume_provenance_repair_artifacts",
+        lambda _job, _child: None,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_audit_verification_scope",
+        lambda _job: nullcontext(),
+    )
+    calls: list[dict] = []
+    first = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:ordinary-text"],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:ordinary-text"],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": [{"field_key": "ordinary-text"}]},
+    }
+    second = {
+        "status": "clear",
+        "disposition": "clear",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "stateful_control_coverage": {
+            "schema_version": 1,
+            "discovered_count": 1,
+            "classified_visible_native_count": 0,
+            "unclassified_count": 1,
+            "selected_or_filled_count": 1,
+            "overflow": False,
+            "proof_complete": False,
+        },
+    }
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit", "ready_to_submit"],
+        audit_results=[
+            ("pre_submit_repair:answer_provenance_missing:ordinary-text", first),
+            (None, second),
+        ],
+        run_job_calls=calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare", "prepare"]
+    assert len(calls) == 2
+
+
+def test_worker_stops_if_page_drifts_after_provenance_child(monkeypatch) -> None:
+    monkeypatch.setattr(
+        worker_orchestration,
+        "_consume_provenance_repair_artifacts",
+        lambda _job, _child: None,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_audit_verification_scope",
+        lambda _job: nullcontext(),
+    )
+    phases: list[dict] = []
+    first = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": ["answer_provenance_missing:abc"],
+        "blocking_issues": [],
+        "repairable_issues": ["answer_provenance_missing:abc"],
+        "advisory_issues": [],
+        "ats_adapter_context": {"fields": []},
+    }
+    drifted = {
+        "status": "clear",
+        "disposition": "clear",
+        "page_url": "https://jobs.example.test/other/apply",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+    }
+
+    result, run_phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit", "ready_to_submit"],
+        audit_results=[
+            ("pre_submit_repair:answer_provenance_missing:abc", first),
+            (None, drifted),
+        ],
+        run_job_calls=phases,
+    )
+
+    assert result == (0, 1)
+    assert run_phases == ["prepare", "prepare"]
 
 
 @pytest.mark.parametrize("dispatcher_status", ["expired", "lease_lost"])

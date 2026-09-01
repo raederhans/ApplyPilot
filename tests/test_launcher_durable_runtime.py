@@ -502,6 +502,68 @@ def test_operator_resume_scope_binds_one_prepare_only_child_without_submit_autho
     assert events[:4] == ["reserve", "popen", "attach", "prompt"]
 
 
+def test_audit_verification_scope_binds_one_read_only_child_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempt_id = "attempt-audit-verification"
+    parent_job, db_path, _events = _prepared_parent(
+        attempt_id, monkeypatch, tmp_path
+    )
+    parent_turn_id = str(parent_job["_parent_agent_run_id"])
+    checkpoint_id = str(parent_job["_parent_agent_checkpoint_id"])
+    monkeypatch.setattr(
+        launcher._durable_agent_runtime,
+        "reconcile_actor",
+        lambda actor_id, current_attempt_id: RuntimeRecoveryAdmission(
+            disposition="recovery_required",
+            actor_id=actor_id,
+            attempt_id=current_attempt_id,
+            parent_turn_id=parent_turn_id,
+            reason_code="HOST_PROVENANCE_AUDIT",
+            requires_fresh_observation=True,
+        ),
+    )
+    child_job = _job(
+        attempt_id,
+        _parent_agent_run_id=parent_turn_id,
+        _parent_agent_checkpoint_id=checkpoint_id,
+        _answer_provenance_verification_child=True,
+        _browser_observation={
+            "ats_adapter_context": {"fields": []},
+            "answer_provenance": {"snapshot_digest": "a" * 64},
+        },
+    )
+
+    with launcher._runtime_audit_verification_scope(child_job):
+        assert launcher.run_job(
+            child_job,
+            port=9432,
+            worker_id=0,
+            model="model",
+            agent_backend="codex",
+            resume_existing_page=True,
+            submission_phase="prepare",
+        )[0] == "ready_to_submit"
+        assert launcher._scoped_audit_verification() is None
+
+    assert child_job["_available_tools"] == [
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_wait_for",
+        "get_application_context",
+        "build_answer_mapping",
+        "report_agent_turn",
+    ]
+    turn = _durable_child_turn(db_path, attempt_id, parent_turn_id)
+    assert (turn["parent_turn_id"], turn["checkpoint_id"], turn["resume_mode"]) == (
+        parent_turn_id,
+        checkpoint_id,
+        "resume",
+    )
+    assert turn["submit_started"] == 0
+
+
 def test_operator_resume_scope_rejects_submit_phase_before_popen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

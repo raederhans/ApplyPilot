@@ -66,6 +66,7 @@ from applypilot.apply.browser_broker import (
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
     McpPackageSpec,
+    audit_verification_capabilities,
     compose_runtime_capabilities,
     resolve_capability_registry,
     resolve_playwright_mcp_spec,
@@ -314,6 +315,38 @@ def _runtime_submit_scope(job: Mapping[str, object]):
             del _runtime_recovery_local.state
 
 
+@contextmanager
+def _runtime_audit_verification_scope(job: Mapping[str, object]):
+    """Authorize one host-created, non-writing provenance verification child."""
+    if getattr(_runtime_recovery_local, "state", None) is not None:
+        raise RuntimeError("nested runtime continuation scope is forbidden")
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    parent_turn_id = str(job.get("_parent_agent_run_id") or "").strip()
+    checkpoint_id = str(job.get("_parent_agent_checkpoint_id") or "").strip()
+    if (
+        job.get("_answer_provenance_verification_child") is not True
+        or not attempt_id
+        or not parent_turn_id
+        or not checkpoint_id
+    ):
+        raise RuntimeError("audit verification child binding is incomplete")
+    state = {
+        "kind": "audit_verification",
+        "authorization_id": f"audit-verification:{parent_turn_id}:{checkpoint_id}",
+        "actor_id": application_actor_id(attempt_id),
+        "attempt_id": attempt_id,
+        "parent_turn_id": parent_turn_id,
+        "checkpoint_id": checkpoint_id,
+        "consumed": False,
+    }
+    _runtime_recovery_local.state = state
+    try:
+        yield
+    finally:
+        if getattr(_runtime_recovery_local, "state", None) is state:
+            del _runtime_recovery_local.state
+
+
 def _active_runtime_recovery(
     *,
     actor_id: str,
@@ -363,6 +396,17 @@ def _scoped_operator_resume() -> dict[str, object] | None:
     return state
 
 
+def _scoped_audit_verification() -> dict[str, object] | None:
+    state = getattr(_runtime_recovery_local, "state", None)
+    if (
+        not isinstance(state, dict)
+        or state.get("kind") != "audit_verification"
+        or bool(state.get("consumed"))
+    ):
+        return None
+    return state
+
+
 def _consume_runtime_recovery_authorization(
     intent: DurableLaunchIntent,
     parent,
@@ -399,6 +443,21 @@ def _consume_runtime_recovery_authorization(
                 return False
             state = operator_resume
             state["consumed"] = True
+            return True
+        audit_verification = _scoped_audit_verification()
+        if audit_verification is not None:
+            if (
+                intent.resume_mode != "resume"
+                or intent.spec.submit_started
+                or audit_verification.get("authorization_id")
+                != intent.recovery_authorization_id
+                or audit_verification.get("actor_id") != intent.spec.actor_id
+                or audit_verification.get("attempt_id") != intent.spec.attempt_id
+                or audit_verification.get("parent_turn_id") != parent.turn_id
+                or audit_verification.get("checkpoint_id") != intent.checkpoint_id
+            ):
+                return False
+            audit_verification["consumed"] = True
             return True
         continuation = _scoped_submit_continuation()
         if continuation is None:
@@ -4318,6 +4377,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     ).strip()
     recovery_command = _scoped_runtime_recovery()
     operator_resume = _scoped_operator_resume()
+    audit_verification = _scoped_audit_verification()
     submit_continuation = _scoped_submit_continuation()
     if recovery_command is not None:
         if (
@@ -4343,6 +4403,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         runtime_parent_checkpoint_id = stored_parent_checkpoint_id
         runtime_authorization_id = str(
             operator_resume.get("authorization_id") or ""
+        )
+    elif audit_verification is not None:
+        if (
+            submission_phase != "prepare"
+            or job.get("_answer_provenance_verification_child") is not True
+            or audit_verification.get("actor_id") != actor_id
+            or audit_verification.get("attempt_id") != attempt_id
+            or audit_verification.get("parent_turn_id") != stored_parent_turn_id
+            or audit_verification.get("checkpoint_id")
+            != stored_parent_checkpoint_id
+        ):
+            raise RuntimeError("audit verification parent/checkpoint binding is stale")
+        runtime_parent_turn_id = stored_parent_turn_id
+        runtime_parent_checkpoint_id = stored_parent_checkpoint_id
+        runtime_authorization_id = str(
+            audit_verification.get("authorization_id") or ""
         )
     elif submit_continuation is not None:
         if (
@@ -4380,7 +4456,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         return "submission_uncertain", 0
     if restart_admission.disposition == "recovery_required":
         scoped_recovery_matches = bool(
-            (recovery_command is not None or operator_resume is not None)
+            (
+                recovery_command is not None
+                or operator_resume is not None
+                or audit_verification is not None
+            )
             and runtime_parent_turn_id == restart_admission.parent_turn_id
         )
         if not scoped_recovery_matches:
@@ -4406,6 +4486,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     authentication = profile.get("authentication", {})
     credential_relay_authorized = _credential_relay_allowed(profile, job)
     identity_relay_authorized = _identity_relay_allowed(profile, job)
+    verification_child = job.get("_answer_provenance_verification_child") is True
+    if verification_child:
+        credential_relay_authorized = False
+        identity_relay_authorized = False
     playwright_mcp, capability_registry = _resolve_agent_tool_surface(
         profile,
         job,
@@ -4473,12 +4557,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         submission_phase=submission_phase,
         direct_email_send_authorized=direct_email_send_authorized,
     )
+    if verification_child:
+        mailbox_mcp = MailboxMcpSpec(package=None, enabled=False, source="audit_verification")
     runtime_capabilities = scope_capability_registry(
         compose_runtime_capabilities(capability_registry),
         phase=submission_phase,
         route=runtime_route,
         state=runtime_state,
     )
+    if verification_child:
+        runtime_capabilities = audit_verification_capabilities(runtime_capabilities)
     semantic_email_tools: list[str] = []
     if mailbox_mcp.enabled and mailbox_access_authorized:
         semantic_email_tools.extend(("mailbox_search", "mailbox_get_message"))
@@ -5363,6 +5451,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 submission_phase=submission_phase,
             )
         )
+        if status == "prepared_for_audit" and not (
+            submission_phase == "prepare"
+            and not dry_run
+            and runtime_route == "browser"
+            and not verification_child
+            and structured_result is not None
+            and structured_result.status.strip().casefold() == "prepared_for_audit"
+        ):
+            status = "failed:prepared_for_audit_not_admitted"
+            evidence = None
+            result_source = "host_policy"
         observation = job.get("_browser_observation")
         email_plan = (
             observation.get("email_application")
