@@ -1440,7 +1440,7 @@ def build_prompt(job: dict, tailored_resume: str,
         )
         structured_reporting_section = f"""== STRUCTURED AGENT LOOP AND TURN REPORT ==
 Observe the current page, resolve uncertain ordinary answers through the profile/reference registry and exposed proposal-only tools, execute the selected browser actions as the single page writer, then verify the visible result. Independent read-only evidence may be gathered serially or in parallel, but no helper may click, fill, or authorize submission. For every filled supported control, including optional fields, call get_application_context and the proposal-only build_answer_mapping tool after the visible value is stable. Copy fact_ref only from its available_fact_refs list; never guess or derive one. Copy the returned v2 adapter, adapter_version, opaque_binding, and snapshot_digest exactly; combine only returned mapping items whose envelope fields are identical under observations.answer_mappings. Never invent or hand-calculate a field hash, value digest, risk, semantic, scope, or binding. Do not emit a legacy/list-shaped mapping. A protected identifier, declaration, unsupported control, or field without a current typed fact or host exact checker must remain a manual pre-submit blocker; do not manufacture provenance for it.
-Before the final plain-text RESULT lines, call the attached applypilot_control report_agent_turn tool exactly once. Report the same normalized status (for example ready_to_submit, previewed, cover_not_required or cover_letter_required, applied, submission_uncertain, captcha, login_issue, or failed:reason), a short summary, and only compact JSON-safe observations. Put PREVIEW_AUDIT data under observations.preview_audit, SUBMISSION_EVIDENCE under observations.submission_evidence, and technical failures under observations.failure_context. When a browser application uploaded a resume and the exact labelled Resume/CV container visibly listed the filename, include `observations.resume_upload={{"verified":true,"field_label":"<exact visible label>","visible_filename":true}}`; never emit this proof from an autocomplete, cover-letter, or generic attachment control. {proposal_instruction} If human input is needed, use requested_human_input without including passwords, cookies, verification codes, identity numbers, mailbox contents, or live browser handles. The report tool records this turn only and does not change application state. If it is unavailable, keep the legacy RESULT contract below so the launcher can remain compatible."""
+Before the final plain-text RESULT lines, call the attached applypilot_control report_agent_turn tool exactly once. Report the same normalized status (for example ready_to_submit, previewed, cover_not_required or cover_letter_required, applied, submission_uncertain, captcha, login_issue, or failed:reason), a short summary, and only compact JSON-safe observations. Put PREVIEW_AUDIT data under observations.preview_audit, SUBMISSION_EVIDENCE under observations.submission_evidence, and technical failures under observations.failure_context. When status is a legacy/open label such as `failed:stuck`, omit the top-level typed `failure` and keep only bounded diagnostics in `observations.failure_context`. Include top-level typed `failure` only when its code and every other field satisfy the exposed enum schema. For a typed failure, `submit_started=true` requires status `submission_uncertain`. Otherwise use `failed` or `failed:<failure.code>`; `captcha_required` may use `captcha`, and `expired` may use `expired`. Never invent or approximate an enum value. When a browser application uploaded a resume and the exact labelled Resume/CV container visibly listed the filename, include `observations.resume_upload={{"verified":true,"field_label":"<exact visible label>","visible_filename":true}}`; never emit this proof from an autocomplete, cover-letter, or generic attachment control. {proposal_instruction} If human input is needed, use requested_human_input without including passwords, cookies, verification codes, identity numbers, mailbox contents, or live browser handles. The report tool records this turn only and does not change application state. If it is unavailable, keep the legacy RESULT contract below so the launcher can remain compatible."""
     computer_use_handoff_enabled = (
         "computer_use" in control_contract.get("requestable_handoffs", [])
     )
@@ -2073,8 +2073,21 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         else ""
     )
     smartrecruiters_form_trick = (
-        "- SmartRecruiters: choose the exact city autocomplete option and upload the required "
-        "resume in the labelled Resume section, not the optional Easy Apply prefill picker."
+        "- SmartRecruiters: handle the Institution and School location/city autocomplete "
+        "fields strictly serially. Never include either autocomplete in a bulk "
+        "browser_fill_form call or activate both at once. Complete Institution first, then "
+        "School location/city. For each field, type its supported value, take a fresh snapshot "
+        "after typing each autocomplete value, and use only the latest snapshot's exact option "
+        "ref. After selecting the option, take another fresh snapshot and verify that the "
+        "invalid state is gone, the listbox is closed, and the selected value remains before "
+        "starting the next field. Do not use a manual-entry fallback when an exact Singapore "
+        "option is visible. Allow at most one fresh-ref corrective retry per autocomplete field; "
+        "never reuse an old ref. Once any field or attachment progress is visible, do not call "
+        "browser_navigate, reload, reset, or reopen the application. If the bounded correction "
+        "does not converge, preserve the current page and output RESULT:FAILED:stuck. Upload the "
+        "required resume in the labelled Resume section, not the optional Easy Apply prefill "
+        "picker, and continue only after that Resume section shows the visible uploaded filename "
+        "or a Delete/replace control."
         if "ats_smartrecruiters" in selected_fragments
         else ""
     )
@@ -2089,6 +2102,15 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         "then snapshot once; retry only the failed operation with fresh refs."
         if "ats_lever" in selected_fragments
         else ""
+    )
+    bulk_fill_instruction = (
+        "- SmartRecruiters bulk-fill scope: bulk-fill only ordinary non-autocomplete fields "
+        "in one browser_fill_form call; exclude Institution and School location/city. Handle "
+        "those autocomplete fields strictly serially under the SmartRecruiters rule below."
+        if "ats_smartrecruiters" in selected_fragments
+        else "- Fill ALL fields in ONE browser_fill_form call, except Workday "
+        "segmented/composite controlled dates; those dates must follow the dedicated Workday "
+        "date rule below. Do not fill other fields one at a time."
     )
 
     prompt = f"""You are a job application assistant. {mission_instruction}
@@ -2200,7 +2222,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - Only snapshot again when you need element refs to click/fill.
 {multipage_efficiency}
 - Optional fields: leave unsupported optional fields blank. A field labelled optional becomes conditionally required only when the live form later shows a specific blocking validation error; fill it only when it is an ordinary field backed by confirmed facts. Recording/media, camera/microphone, identity-document, financial, assessment, identity-provider/MFA/security-challenge code, and CAPTCHA requirements are never optional automation work even when the label is contradictory. This does not prohibit the exact employer ATS mailbox OTP admitted by the Authentication policy.
-- Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite controlled dates; those dates must follow the dedicated Workday date rule below. Do not fill other fields one at a time.
+{bulk_fill_instruction}
 - Keep your thinking SHORT. Don't repeat page structure back.
 - {captcha_efficiency_instruction}
 

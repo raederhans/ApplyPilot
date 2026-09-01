@@ -216,6 +216,108 @@ def test_report_tool_writes_one_idempotent_provider_neutral_result(
     assert payload["proposals"][0]["concurrency_mode"] == "plugin-mode"
 
 
+def test_report_tool_documents_and_accepts_legacy_open_failure_status(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tool = agent_report_mcp._report_tool()
+    properties = tool["inputSchema"]["properties"]
+    assert "legacy/open status label such as failed:stuck" in properties["status"]["description"]
+    assert "omit this top-level typed failure" in properties["failure"]["description"]
+    failure_description = properties["failure"]["description"]
+    assert "submit_started=true requires status submission_uncertain" in failure_description
+    assert "Otherwise use failed or failed:<failure.code>" in failure_description
+    assert "captcha_required may use captcha" in failure_description
+    assert "expired may use expired" in failure_description
+
+    path = tmp_path / "legacy-failure-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-legacy-failure")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+    arguments = {
+        "status": "failed:stuck",
+        "summary": "Autocomplete did not converge after one correction",
+        "observations": {
+            "failure_context": {
+                "category": "autocomplete_stuck",
+                "visible_state": "Invalid institution remained visible",
+                "attempts": 1,
+            }
+        },
+    }
+
+    response = _tool_call(arguments)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-legacy-failure",
+    )
+
+    assert response["result"]["isError"] is False
+    assert payload["status"] == "failed:stuck"
+    assert "failure" not in payload
+    assert payload["observations"]["failure_context"]["attempts"] == 1
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:FAILED:stuck",
+        report,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("failed:stuck", None, "structured+legacy")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "submit_started", "phase", "legacy_marker"),
+    [
+        (
+            "submission_uncertain",
+            "provider_submission_error",
+            True,
+            "submit",
+            "RESULT:SUBMISSION_UNCERTAIN",
+        ),
+        ("captcha", "captcha_required", False, "prepare", "RESULT:CAPTCHA"),
+        ("expired", "expired", False, "prepare", "RESULT:EXPIRED"),
+    ],
+)
+def test_report_tool_persists_and_reconciles_typed_failure_status_matrix(
+    monkeypatch,
+    tmp_path: Path,
+    status: str,
+    code: str,
+    submit_started: bool,
+    phase: str,
+    legacy_marker: str,
+) -> None:
+    run_id = f"run-{code}"
+    path = tmp_path / f"{code}.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, run_id)
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+    arguments = {
+        "status": status,
+        "summary": f"Observed {code}",
+        "failure": {
+            "schema_version": "1",
+            "code": code,
+            "source": "agent",
+            "provider": "generic",
+            "phase": phase,
+            "submit_started": submit_started,
+        },
+    }
+
+    response = _tool_call(arguments)
+    report = agent_output.load_agent_turn_report(path, expected_run_id=run_id)
+
+    assert response["result"]["isError"] is False
+    assert report.failure is not None
+    assert report.failure.code == code
+    assert agent_output.reconcile_agent_turn_outputs(
+        legacy_marker,
+        report,
+        dry_run=False,
+        submission_phase=phase,
+    ) == (status, None, "structured+legacy")
+
+
 def test_report_stdio_accepts_utf8_when_windows_text_encoding_is_legacy(
     tmp_path: Path,
 ) -> None:

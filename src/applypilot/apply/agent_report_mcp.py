@@ -49,16 +49,34 @@ def _report_tool() -> dict[str, object]:
         "name": "report_agent_turn",
         "description": (
             "Record the final structured result for the active ApplyPilot Agent turn. "
-            "This is reporting only and never changes or submits the application."
+            "This is reporting only and never changes or submits the application. "
+            "Legacy/open failure labels omit the optional typed failure object."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "status": {"type": "string", "minLength": 1, "maxLength": 200},
+                "status": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": (
+                        "Final normalized or legacy/open status label. For a legacy/open "
+                        "status label such as failed:stuck, omit top-level failure and put "
+                        "bounded diagnostics under observations.failure_context."
+                    ),
+                },
                 "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
                 "observations": {"type": "object"},
                 "failure": {
                     "type": "object",
+                    "description": (
+                        "Optional enum-typed v1 failure observation. Include it only when every "
+                        "field satisfies this schema. submit_started=true requires status "
+                        "submission_uncertain. Otherwise use failed or failed:<failure.code>; "
+                        "captcha_required may use captcha, and expired may use expired. For a "
+                        "legacy/open status, omit this top-level typed failure and use "
+                        "observations.failure_context instead."
+                    ),
                     "properties": {
                         "schema_version": {"const": "1"},
                         "code": {"enum": sorted(FAILURE_OBSERVATION_CODES)},
@@ -173,6 +191,8 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
     # The launcher owns timing. Omitting a call-time timestamp also makes an
     # exact tool retry byte-for-byte idempotent.
     report_payload.pop("completed_at", None)
+    if report_payload.get("failure") is None:
+        report_payload.pop("failure", None)
     payload = {
         "schema_version": REPORT_SCHEMA_VERSION,
         **report_payload,

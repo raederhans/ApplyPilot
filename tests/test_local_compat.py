@@ -2591,6 +2591,12 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "cover_not_required or cover_letter_required" in built
     assert "observations.resume_upload" in built
     assert "visible_filename" in built
+    assert "legacy/open label such as `failed:stuck`" in built
+    assert "omit the top-level typed `failure`" in built
+    assert "`submit_started=true` requires status `submission_uncertain`" in built
+    assert "Otherwise use `failed` or `failed:<failure.code>`" in built
+    assert "`captcha_required` may use `captcha`" in built
+    assert "`expired` may use `expired`" in built
     assert "Same page signature after one corrective attempt" in built
     assert (
         "Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite "
@@ -2626,6 +2632,79 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "do not fill a field, sign in, upload a file" not in rebound
     assert "current host is linkedin.com" not in rebound
     assert "linkedin_launcher_entry_required" not in rebound
+
+
+def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
+    monkeypatch, tmp_path: Path
+) -> None:
+    profile = _application_profile()
+    resume_txt = tmp_path / "tailored.txt"
+    resume_txt.write_text("Verified resume", encoding="utf-8")
+    resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(config, "load_profile", lambda: profile)
+    monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    base_job = {
+        "url": "https://example.test/jobs/123",
+        "title": "Business Analyst Intern",
+        "full_description": "Support business and AI projects.",
+        "company_name": "Example Employer",
+        "tailored_resume_path": str(resume_txt),
+        "tailor_status": "machine_validated",
+        "cover_letter_status": "not_required",
+    }
+    smartrecruiters_job = {
+        **base_job,
+        "application_url": (
+            "https://jobs.smartrecruiters.com/oneclick-ui/company/Example/"
+            "publication/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        ),
+        "_ats_adapter_context": {"adapter": "smartrecruiters"},
+    }
+
+    built = prompt.build_prompt(
+        smartrecruiters_job,
+        "Verified resume",
+        dry_run=False,
+        worker_id=7,
+        submission_phase="prepare",
+    )
+
+    assert "Institution and School location/city autocomplete fields strictly serially" in built
+    assert "Never include either autocomplete in a bulk browser_fill_form call" in built
+    assert "take a fresh snapshot after typing each autocomplete value" in built
+    assert "latest snapshot's exact option ref" in built
+    assert "the invalid state is gone, the listbox is closed, and the selected value remains" in built
+    assert "Do not use a manual-entry fallback when an exact Singapore option is visible" in built
+    assert "one fresh-ref corrective retry per autocomplete field" in built
+    assert "do not call browser_navigate, reload, reset, or reopen the application" in built
+    assert "preserve the current page and output RESULT:FAILED:stuck" in built
+    assert "visible uploaded filename or a Delete/replace control" in built
+    conflicting_bulk_rule = (
+        "Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite "
+        "controlled dates"
+    )
+    assert conflicting_bulk_rule not in built
+    assert "bulk-fill only ordinary non-autocomplete fields" in built
+    assert "exclude Institution and School location/city" in built
+
+    non_smartrecruiters = prompt.build_prompt(
+        {
+            **base_job,
+            "application_url": "https://example.wd5.myworkdayjobs.com/job/123",
+            "_ats_adapter_context": {"adapter": "workday"},
+        },
+        "Verified resume",
+        dry_run=False,
+        worker_id=8,
+        submission_phase="prepare",
+    )
+    assert "Institution and School location/city autocomplete fields strictly serially" not in (
+        non_smartrecruiters
+    )
+    assert "one fresh-ref corrective retry per autocomplete field" not in non_smartrecruiters
+    assert conflicting_bulk_rule in non_smartrecruiters
+    assert "bulk-fill only ordinary non-autocomplete fields" not in non_smartrecruiters
 
 
 def test_apply_prompt_scopes_one_time_validation_repair() -> None:
