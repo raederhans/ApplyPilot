@@ -64,6 +64,13 @@ class FakeKernel:
         return value
 
 
+def test_non_windows_profile_lock_remains_fail_closed(monkeypatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+
+    with pytest.raises(ProfileRecoveryRequired, match="Windows profile mutex is unavailable"):
+        _Kernel32()
+
+
 def test_process_identity_helper_preserves_pid_and_birth_token() -> None:
     kernel = FakeKernel()
     kernel.identities[77] = ProcessIdentity(77, 123_456)
@@ -457,6 +464,15 @@ def test_worker_generation_blocks_concurrent_launch_reservation(
     with pytest.raises(RuntimeError, match="unresolved browser generation"):
         chrome.launch_chrome(worker_id, port=9772)
     chrome._launching_workers.remove(worker_id)
+
+
+def test_atexit_cleanup_treats_untyped_profile_lock_as_unowned() -> None:
+    worker_id = 721
+    chrome._profile_locks[worker_id] = object()
+    try:
+        chrome.cleanup_on_exit()
+    finally:
+        chrome._profile_locks.pop(worker_id, None)
 
 
 def test_cleanup_does_not_prune_when_actual_child_is_still_alive(

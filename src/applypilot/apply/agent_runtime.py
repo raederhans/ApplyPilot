@@ -34,6 +34,7 @@ from applypilot.apply.capabilities import (
 from applypilot.apply.email_routing import MailboxMcpSpec, resolve_mailbox_mcp_spec
 
 logger = logging.getLogger(__name__)
+_REAL_POPEN_TYPE = subprocess.Popen
 
 CREDENTIAL_RELAY_ENV_VARS = (
     "APPLYPILOT_ATS_CREDENTIAL_FILE",
@@ -741,6 +742,15 @@ class SubprocessAgentRuntime:
                 raise SubprocessRuntimeError("subprocess stdin pipe was not created")
             process.stdin.write(spec.prompt)
             process.stdin.close()
+            # The runtime owns stdin exclusively: the prompt is the complete
+            # request, so closing it is how the child receives EOF.  CPython's
+            # POSIX ``Popen.communicate()`` may still try to flush a closed
+            # public ``stdin`` handle, however.  Detach the consumed pipe from
+            # real Popen instances so callers can safely use ``communicate()``
+            # to collect output after start().  Keep injected test doubles
+            # intact because they model the pipe contract directly.
+            if isinstance(process, _REAL_POPEN_TYPE):
+                process.stdin = None
         except BaseException as error:
             terminated = self._quarantine_spawn_failure(spec, process, managed)
             if isinstance(error, BrokenPipeError) and terminated:

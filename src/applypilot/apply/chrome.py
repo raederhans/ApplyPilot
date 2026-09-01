@@ -48,6 +48,19 @@ _cdp_port_claims: dict[int, tuple[int, Path]] = {}
 SUPPORTED_BROWSER_BACKENDS = {"edge", "cloak", "auto"}
 
 
+def _profile_lock_owned_by_current_thread(profile_lock: object | None) -> bool:
+    """Return confirmed lock ownership without trusting shutdown-time state.
+
+    Process shutdown can observe partially initialized test doubles or objects
+    left by a failed launch.  Treat an absent or unreadable ownership marker as
+    unowned so cleanup never prunes or releases a profile without proof.
+    """
+    try:
+        return bool(getattr(profile_lock, "owned_by_current_thread", False))
+    except AttributeError:
+        return False
+
+
 def resolve_worker_profile_path(worker_id: int, browser_backend: str) -> Path:
     """Purely resolve the concrete profile identity before any mutation."""
     backend = resolve_browser_backend(browser_backend, allow_auto=False)
@@ -618,7 +631,6 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     backend = resolve_browser_backend(browser_backend, allow_auto=False)
     profile_dir = resolve_worker_profile_path(worker_id, backend)
-    profile_lock = ProfileLock(profile_dir)
     with _chrome_lock:
         if (
             worker_id in _launching_workers
@@ -629,15 +641,19 @@ def launch_chrome(worker_id: int, port: int | None = None,
         ):
             raise RuntimeError(f"Worker {worker_id} already has an unresolved browser generation")
         _launching_workers.add(worker_id)
-        _profile_locks[worker_id] = profile_lock
-        _profile_paths[worker_id] = profile_dir
+    profile_lock: ProfileLock | None = None
     try:
+        profile_lock = ProfileLock(profile_dir)
+        with _chrome_lock:
+            _profile_locks[worker_id] = profile_lock
+            _profile_paths[worker_id] = profile_dir
         profile_lock.acquire()
     finally:
         with _chrome_lock:
             _launching_workers.discard(worker_id)
             if (
-                not profile_lock.has_native_resource
+                profile_lock is not None
+                and not profile_lock.has_native_resource
                 and not profile_lock.requires_recovery
                 and not profile_lock.sidecar_path.exists()
             ):
@@ -791,7 +807,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
             worker_id,
         )
     actual_browser_stopped = False
-    if browser_is_stopped and profile_lock is not None and profile_lock.owned_by_current_thread:
+    if browser_is_stopped and _profile_lock_owned_by_current_thread(profile_lock):
         try:
             actual_browser_stopped = profile_lock.actual_browser_stopped()
         except ProfileLockError:
@@ -805,7 +821,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         and actual_browser_stopped
         and profile_lock is not None
         and locked_profile is not None
-        and profile_lock.owned_by_current_thread
+        and _profile_lock_owned_by_current_thread(profile_lock)
     ):
         profile_dir = locked_profile
         profile_root = profile_dir.parent
@@ -886,7 +902,7 @@ def kill_all_chrome() -> None:
         if (
             proc is None
             and profile_lock is not None
-            and profile_lock.owned_by_current_thread
+            and _profile_lock_owned_by_current_thread(profile_lock)
             and not profile_lock.spawn_attempted
         ):
             try:
@@ -916,7 +932,7 @@ def kill_all_chrome() -> None:
             stopped
             and profile_lock is not None
             and profile_path is not None
-            and profile_lock.owned_by_current_thread
+            and _profile_lock_owned_by_current_thread(profile_lock)
         ):
             try:
                 profile_lock.release_after_stop(
@@ -977,7 +993,7 @@ def cleanup_on_exit() -> None:
         if (
             proc is None
             and profile_lock is not None
-            and profile_lock.owned_by_current_thread
+            and _profile_lock_owned_by_current_thread(profile_lock)
             and not profile_lock.spawn_attempted
         ):
             try:
@@ -1007,7 +1023,7 @@ def cleanup_on_exit() -> None:
             stopped
             and profile_lock is not None
             and profile_path is not None
-            and profile_lock.owned_by_current_thread
+            and _profile_lock_owned_by_current_thread(profile_lock)
         ):
             try:
                 profile_lock.release_after_stop(

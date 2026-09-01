@@ -4,7 +4,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -127,7 +127,11 @@ def test_clone_preserves_session_state_but_skips_regenerable_content(
     monkeypatch.setattr(chrome.config, "get_chrome_user_data", lambda: source)
     monkeypatch.setenv("APPLYPILOT_BROWSER_PROFILE_MODE", "clone")
 
-    result = chrome.setup_worker_profile(7, "edge")
+    result = chrome.setup_worker_profile(
+        7,
+        "edge",
+        profile_lock=SimpleNamespace(profile_path=(profile_root / "worker-7").resolve()),
+    )
 
     assert (result / OWNERSHIP_MARKER).is_file()
     assert (result / "Default" / "Network" / "Cookies").read_bytes() == b"session"

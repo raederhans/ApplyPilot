@@ -39,6 +39,9 @@ jobs:
       - name: Install core and development dependencies
         run: python -m pip install -e ".[dev]"
 
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Verify optional job-board dependency chain
         if: matrix.python-version == '3.12'
         run: |
@@ -87,6 +90,9 @@ jobs:
 
       - name: Install core and development dependencies
         run: python -m pip install -e ".[dev]"
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
 
       - name: Test core suite
         run: python -m pytest -q

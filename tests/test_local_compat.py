@@ -327,7 +327,10 @@ def test_fresh_browser_profile_does_not_clone_daily_profile(monkeypatch, tmp_pat
     stale_extension.mkdir(parents=True)
     (stale_extension / "manifest.json").write_text("{}", encoding="utf-8")
 
-    profile = chrome.setup_worker_profile(0)
+    profile = chrome.setup_worker_profile(
+        0,
+        profile_lock=SimpleNamespace(profile_path=(tmp_path / "worker-0").resolve()),
+    )
 
     assert profile == tmp_path / "worker-0"
     assert profile.is_dir()
@@ -342,7 +345,12 @@ def test_persistent_browser_profile_never_clones_daily_profile(monkeypatch, tmp_
     (daily_profile / "Cookies").write_text("sensitive", encoding="utf-8")
     monkeypatch.setattr(config, "get_chrome_user_data", lambda: daily_profile.parent)
 
-    profile = chrome.setup_worker_profile(0)
+    profile = chrome.setup_worker_profile(
+        0,
+        profile_lock=SimpleNamespace(
+            profile_path=(tmp_path / "workers" / "worker-0").resolve()
+        ),
+    )
 
     assert profile == tmp_path / "workers" / "worker-0"
     assert profile.is_dir()
@@ -357,7 +365,13 @@ def test_cloak_clone_mode_becomes_an_isolated_persistent_profile(monkeypatch, tm
     (daily_profile / "Cookies").write_text("sensitive", encoding="utf-8")
     monkeypatch.setattr(config, "get_chrome_user_data", lambda: daily_profile.parent)
 
-    profile = chrome.setup_worker_profile(0, "cloak")
+    profile = chrome.setup_worker_profile(
+        0,
+        "cloak",
+        profile_lock=SimpleNamespace(
+            profile_path=(tmp_path / "cloak-workers" / "worker-0").resolve()
+        ),
+    )
 
     assert profile == tmp_path / "cloak-workers" / "worker-0"
     assert profile.is_dir()
@@ -504,7 +518,10 @@ def test_unknown_browser_profile_mode_is_rejected(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
 
     with pytest.raises(ValueError, match="fresh, persistent, or clone"):
-        chrome.setup_worker_profile(0)
+        chrome.setup_worker_profile(
+            0,
+            profile_lock=SimpleNamespace(profile_path=(tmp_path / "worker-0").resolve()),
+        )
 
 
 def test_cdp_readiness_accepts_edge_zero_exit_relaunch(monkeypatch) -> None:

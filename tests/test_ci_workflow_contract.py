@@ -50,6 +50,20 @@ def test_ci_exposes_all_required_checks() -> None:
         "Windows 3.12 core tests and clean install smoke",
     }
 
+    verify_steps = verify["steps"]
+    assert isinstance(verify_steps, list)
+    chromium_step = next(
+        step for step in verify_steps if step.get("name") == "Install Playwright Chromium"
+    )
+    assert chromium_step["run"] == "python -m playwright install --with-deps chromium"
+
+    windows_steps = windows["steps"]
+    assert isinstance(windows_steps, list)
+    windows_chromium_step = next(
+        step for step in windows_steps if step.get("name") == "Install Playwright Chromium"
+    )
+    assert windows_chromium_step["run"] == "python -m playwright install chromium"
+
     bind_step = next(step for step in windows["steps"] if step.get("name") == "Bind isolated ApplyPilot workspace")
     assert bind_step["shell"] == "pwsh"
     assert "$env:RUNNER_TEMP" in bind_step["run"]

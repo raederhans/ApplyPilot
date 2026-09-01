@@ -77,7 +77,10 @@ def test_subprocess_resume_rejects_runtime_or_profile_switch_after_submit_starte
         kill_process_tree=lambda pid: os.kill(pid, 15)
     )
     root = runtime.start(_spec(tmp_path, "turn-1"))
-    root.communicate(timeout=5)
+    assert root.stdin is None
+    output, stderr = root.communicate(timeout=5)
+    assert stderr is None
+    assert output.strip() == '{"prompt": "prompt:turn-1"}'
 
     with pytest.raises(RuntimeContinuityError, match="submit_started"):
         runtime.resume(
@@ -92,6 +95,51 @@ def test_subprocess_resume_rejects_runtime_or_profile_switch_after_submit_starte
             ),
         )
     runtime.close()
+
+
+def test_subprocess_start_survives_shared_popen_monkeypatch_and_detaches_real_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    prompt = _spec(tmp_path, "turn-monkeypatch")
+
+    class FakeStdin:
+        closed = False
+
+        def write(self, value: str) -> int:
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        pid = 42
+        stdin = FakeStdin()
+        stdout = None
+
+        def poll(self) -> int:
+            return 0
+
+    fake_process = FakeProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: fake_process)
+
+    fake_runtime = SubprocessAgentRuntime(
+        kill_process_tree=lambda _pid: None,
+        popen_factory=lambda *_args, **_kwargs: fake_process,  # type: ignore[arg-type]
+    )
+    assert fake_runtime.start(prompt) is fake_process  # type: ignore[comparison-overlap]
+    assert fake_process.stdin.closed
+
+    real_runtime = SubprocessAgentRuntime(
+        kill_process_tree=lambda pid: os.kill(pid, 15),
+        popen_factory=real_popen,
+    )
+    process = real_runtime.start(_spec(tmp_path, "turn-real-popen"))
+    assert process.stdin is None
+    output, stderr = process.communicate(timeout=5)
+    assert stderr is None
+    assert output.strip() == '{"prompt": "prompt:turn-real-popen"}'
 
 
 def test_subprocess_cancel_targets_only_owned_run(tmp_path: Path) -> None:
