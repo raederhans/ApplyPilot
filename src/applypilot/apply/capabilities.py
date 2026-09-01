@@ -121,6 +121,7 @@ def default_auxiliary_capabilities() -> CapabilityRegistry:
         ("detect_ats", ("prepare",), "applypilot_ats", ("requires_state:ats_unknown",)),
         ("get_application_context", ("prepare",), "applypilot_ats", ()),
         ("build_fill_plan", ("prepare",), "applypilot_ats", ()),
+        ("build_answer_mapping", ("prepare",), "applypilot_ats", ()),
         ("resolve_answer", ("prepare", "submit"), "applypilot_ats", ()),
         (
             "evaluate_workday_progress",

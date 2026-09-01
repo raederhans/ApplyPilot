@@ -31,6 +31,15 @@ from applypilot.apply.contracts import (
 REPORT_SCHEMA_VERSION = "1"
 REPORT_PATH_ENV = "APPLYPILOT_AGENT_REPORT_PATH"
 RUN_ID_ENV = "APPLYPILOT_AGENT_RUN_ID"
+_CONTRACT_DENIAL_STATUS = "failed:answer_provenance_report_invalid"
+_CONTRACT_DENIAL_SUMMARY = "Provenance-aware ready report failed its structured contract"
+_ANSWER_MAPPING_CONTRACT_ERRORS = frozenset(
+    {
+        "answer_mappings_v2_required",
+        "answer_mappings_v2_envelope_invalid",
+        "answer_mappings_v2_item_invalid",
+    }
+)
 
 
 def _result(request_id: object, result: object) -> dict[str, object]:
@@ -221,27 +230,77 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
         existing = path.read_text(encoding="utf-8")
         if existing == serialized:
             return {"recorded": False, "run_id": run_id, "status": report.status}
-        raise ValueError("a different report is already recorded for this Agent turn")
+        if not (
+            report.status.strip().casefold() == "ready_to_submit"
+            and _has_valid_strict_v2_browser_mappings(report.observations)
+            and _is_exact_contract_denial(existing, run_id=run_id)
+        ):
+            raise ValueError("a different report is already recorded for this Agent turn")
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(serialized, encoding="utf-8")
     os.replace(temporary, path)
     return {"recorded": True, "run_id": run_id, "status": report.status}
 
 
-def _write_fail_closed_contract_report(path: Path, *, run_id: str, reason: str) -> None:
-    """Persist a bounded denial so legacy text cannot recover ready authority."""
-    if path.exists():
-        return
-    payload = {
+def _contract_denial_payload(*, run_id: str, reason: str) -> dict[str, object]:
+    return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "run_id": run_id,
-        "status": "failed:answer_provenance_report_invalid",
-        "summary": "Provenance-aware ready report failed its structured contract",
+        "status": _CONTRACT_DENIAL_STATUS,
+        "summary": _CONTRACT_DENIAL_SUMMARY,
         "proposals": [],
         "observations": {"report_contract_error": reason},
         "requested_human_input": None,
     }
-    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _serialize_payload(payload: dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _has_valid_strict_v2_browser_mappings(observations: object) -> bool:
+    if not isinstance(observations, dict) or "email_application" in observations:
+        return False
+    envelope = observations.get("answer_mappings")
+    return validate_ready_answer_mappings(
+        "ready_to_submit",
+        {"answer_mappings": envelope},
+    ) is None
+
+
+def _is_exact_contract_denial(existing: str, *, run_id: str) -> bool:
+    try:
+        payload = json.loads(existing)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    observations = payload.get("observations") if isinstance(payload, dict) else None
+    reason = (
+        observations.get("report_contract_error")
+        if isinstance(observations, dict)
+        else None
+    )
+    return bool(
+        reason in _ANSWER_MAPPING_CONTRACT_ERRORS
+        and existing == _serialize_payload(_contract_denial_payload(run_id=run_id, reason=reason))
+    )
+
+
+def _write_fail_closed_contract_report(path: Path, *, run_id: str, reason: str) -> None:
+    """Persist a bounded denial so legacy text cannot recover ready authority."""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        if _is_exact_contract_denial(existing, run_id=run_id):
+            exhausted = _serialize_payload(
+                _contract_denial_payload(
+                    run_id=run_id,
+                    reason="answer_mappings_v2_correction_exhausted",
+                )
+            )
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(exhausted, encoding="utf-8")
+            os.replace(temporary, path)
+        return
+    serialized = _serialize_payload(_contract_denial_payload(run_id=run_id, reason=reason))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(serialized, encoding="utf-8")

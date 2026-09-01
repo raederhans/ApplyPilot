@@ -517,6 +517,17 @@ def reconcile_agent_turn_outputs_with_diagnostics(
         submission_phase=submission_phase,
     )
     if (
+        submission_phase == "prepare"
+        and status == "failed:answer_provenance_report_invalid"
+        and legacy_status == "ready_to_submit"
+        and structured_result.status.strip().casefold()
+        == "failed:answer_provenance_report_invalid"
+    ):
+        # A persisted strict-v2 denial is authoritative during the non-submit
+        # phase.  A legacy READY marker cannot erase the specific contract
+        # failure or turn it into generic conflict telemetry.
+        return status, None, "structured", None
+    if (
         submission_phase == "submit"
         and not dry_run
         and structured_result.status.strip().casefold() == "applied"

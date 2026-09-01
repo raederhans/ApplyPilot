@@ -289,7 +289,7 @@ def test_ready_report_with_provenance_rejects_invalid_v2_answer_mappings_fail_cl
         report,
         dry_run=False,
         submission_phase="prepare",
-    ) == ("failed:conflicting_agent_results", None, "conflict")
+    ) == ("failed:answer_provenance_report_invalid", None, "structured")
 
 
 def test_ready_report_accepts_strict_v2_answer_mappings_when_provenance_is_enabled(
@@ -311,6 +311,172 @@ def test_ready_report_accepts_strict_v2_answer_mappings_when_provenance_is_enabl
 
     assert response["result"]["isError"] is False
     assert report.status == "ready_to_submit"
+
+
+def test_invalid_ready_report_allows_one_strict_v2_correction_for_same_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "corrected-ready-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-corrected-ready")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    invalid = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Form prepared without mappings",
+            "observations": {},
+        }
+    )
+    denial = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-corrected-ready",
+    )
+    corrected = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Form prepared with verified mappings",
+            "observations": _ready_provenance_observations(),
+        }
+    )
+    repeated = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Form prepared with verified mappings",
+            "observations": _ready_provenance_observations(),
+        }
+    )
+    conflicting = _tool_call({"status": "failed", "summary": "Different"})
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-corrected-ready",
+    )
+
+    assert invalid["result"]["isError"] is True
+    assert denial.status == "failed:answer_provenance_report_invalid"
+    assert corrected["result"]["isError"] is False
+    assert corrected["result"]["structuredContent"]["recorded"] is True
+    assert repeated["result"]["isError"] is False
+    assert repeated["result"]["structuredContent"]["recorded"] is False
+    assert conflicting["result"]["isError"] is True
+    assert report.status == "ready_to_submit"
+
+
+def test_invalid_ready_denial_cannot_be_replaced_by_direct_email_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "browser-denial-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-browser-denial")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Browser form prepared without mappings",
+            "observations": {},
+        }
+    )
+    response = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Different route",
+            "observations": {
+                "email_application": _direct_email_prepare_plan(),
+                "answer_mappings": {},
+            },
+        }
+    )
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-browser-denial",
+    )
+
+    assert response["result"]["isError"] is True
+    assert report.status == "failed:answer_provenance_report_invalid"
+
+
+def test_second_invalid_ready_report_exhausts_the_only_correction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "exhausted-ready-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-exhausted-ready")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    first = _tool_call(
+        {"status": "ready_to_submit", "summary": "Missing", "observations": {}}
+    )
+    second = _tool_call(
+        {"status": "ready_to_submit", "summary": "Still invalid", "observations": {}}
+    )
+    third = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Too late",
+            "observations": _ready_provenance_observations(),
+        }
+    )
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-exhausted-ready",
+    )
+
+    assert first["result"]["isError"] is True
+    assert second["result"]["isError"] is True
+    assert third["result"]["isError"] is True
+    assert report.status == "failed:answer_provenance_report_invalid"
+    assert report.observations == {
+        "report_contract_error": "answer_mappings_v2_correction_exhausted"
+    }
+
+
+def test_submit_phase_never_recovers_contract_denial_as_ready() -> None:
+    report = AgentTurnResult(
+        run_id="run-submit-denial",
+        status="failed:answer_provenance_report_invalid",
+        summary="Strict report denied",
+        observations={"report_contract_error": "answer_mappings_v2_required"},
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        report,
+        dry_run=False,
+        submission_phase="submit",
+    ) == ("submission_uncertain", None, "structured+legacy")
+
+
+@pytest.mark.parametrize(
+    "legacy_output",
+    [
+        "RESULT:CAPTCHA",
+        "RESULT:APPLIED",
+        "RESULT:SUBMISSION_UNCERTAIN",
+        "RESULT:FAILED:stuck",
+    ],
+)
+def test_prepare_contract_denial_only_dominates_stale_legacy_ready(
+    legacy_output: str,
+) -> None:
+    report = AgentTurnResult(
+        run_id="run-prepare-denial-conflict",
+        status="failed:answer_provenance_report_invalid",
+        summary="Strict report denied",
+        observations={"report_contract_error": "answer_mappings_v2_required"},
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs_with_diagnostics(
+        legacy_output,
+        report,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == (
+        "failed:conflicting_agent_results",
+        None,
+        "conflict",
+        "status_mismatch",
+    )
 
 
 def test_loader_fail_closes_existing_invalid_provenance_ready_report(
@@ -341,7 +507,7 @@ def test_loader_fail_closes_existing_invalid_provenance_ready_report(
         report,
         dry_run=False,
         submission_phase="prepare",
-    ) == ("failed:conflicting_agent_results", None, "conflict")
+    ) == ("failed:answer_provenance_report_invalid", None, "structured")
 
 
 def test_previewed_and_failure_reports_do_not_require_final_answer_mappings() -> None:

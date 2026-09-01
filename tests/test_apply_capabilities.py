@@ -88,6 +88,7 @@ def test_make_mcp_config_preserves_default_and_records_resolved_surface() -> Non
         "detect_ats",
         "get_application_context",
         "build_fill_plan",
+        "build_answer_mapping",
         "resolve_answer",
         "evaluate_workday_progress",
     ]
@@ -121,12 +122,14 @@ def test_runtime_capabilities_are_phase_scoped_from_one_registry() -> None:
 
     assert "detect_ats" in prepare.names()
     assert "build_fill_plan" in prepare.names()
+    assert "build_answer_mapping" in prepare.names()
     assert "resolve_answer" in prepare.names()
     assert "evaluate_workday_progress" not in prepare.names()
     assert "detect_ats" not in workday.names()
     assert "evaluate_workday_progress" in workday.names()
     assert "detect_ats" not in submit.names()
     assert "build_fill_plan" not in submit.names()
+    assert "build_answer_mapping" not in submit.names()
     assert "resolve_answer" in submit.names()
     assert "report_agent_turn" in submit.names()
     assert "browser_fill_form" not in submit.names()
@@ -179,6 +182,65 @@ def test_claude_surface_includes_resolver_from_canonical_registry(tmp_path: Path
 
     assert "mcp__applypilot_ats__resolve_answer" in allowed
     assert "mcp__applypilot_ats__detect_ats" not in allowed
+
+
+def test_prepare_runtime_surfaces_expose_answer_mapping_only_before_submit(
+    tmp_path: Path,
+) -> None:
+    prepare = scope_capability_registry(
+        compose_runtime_capabilities(), phase="prepare"
+    )
+    submit = scope_capability_registry(compose_runtime_capabilities(), phase="submit")
+
+    claude_prepare, _ = agent_runtime.build_agent_command(
+        "claude",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "claude-prepare-mcp.json",
+        resolve_claude=lambda: ["claude"],
+        capability_registry=prepare,
+    )
+    claude_submit, _ = agent_runtime.build_agent_command(
+        "claude",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "claude-submit-mcp.json",
+        resolve_claude=lambda: ["claude"],
+        capability_registry=submit,
+    )
+    codex_prepare, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused-codex-prepare.json",
+        resolve_codex=lambda: ["codex"],
+        capability_registry=prepare,
+    )
+    codex_submit, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused-codex-submit.json",
+        resolve_codex=lambda: ["codex"],
+        capability_registry=submit,
+    )
+
+    claude_prepare_allowed = claude_prepare[
+        claude_prepare.index("--allowedTools") + 1
+    ]
+    claude_submit_allowed = claude_submit[claude_submit.index("--allowedTools") + 1]
+    codex_prepare_rendered = " ".join(codex_prepare)
+    codex_submit_rendered = " ".join(codex_submit)
+    mapping_tool = "build_answer_mapping"
+
+    assert f"mcp__applypilot_ats__{mapping_tool}" in claude_prepare_allowed
+    assert f"mcp__applypilot_ats__{mapping_tool}" not in claude_submit_allowed
+    assert mapping_tool in codex_prepare_rendered
+    assert mapping_tool not in codex_submit_rendered
 
 
 def test_reasoning_effort_is_configurable_by_workload_without_model_binding(
