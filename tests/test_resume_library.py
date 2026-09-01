@@ -950,3 +950,118 @@ def test_tailoring_pipeline_reuses_without_calling_llm(tmp_path: Path, monkeypat
     assert result["results"][0]["resume_library_decision"] == "reuse_exact"
     assert stored["tailor_status"] == "machine_validated"
     assert stored["tailor_attempts"] == 0
+
+
+def test_exact_target_reevaluates_existing_material_and_creates_variant(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    previous = tmp_path / "previous.txt"
+    previous.write_text("Previous material with stale facts.", encoding="utf-8")
+    target_url = "https://careers.example.test/exact-refresh"
+    _insert_job(
+        conn,
+        url=target_url,
+        title="Data Analyst",
+        description="Required: SQL. Build dashboards and reporting for business decisions.",
+        fit_score=8,
+        tailored_resume_path=str(previous),
+        tailor_status="machine_validated",
+    )
+    profile = _profile(base)
+    monkeypatch.setattr(tailor, "get_connection", lambda: conn)
+    monkeypatch.setattr(tailor, "load_profile", lambda: profile)
+    monkeypatch.setattr(tailor, "TAILORED_DIR", tmp_path / "tailored")
+    monkeypatch.setattr(resume_library, "sync_resume_library", lambda *args, **kwargs: None)
+
+    routed: list[str] = []
+
+    def route_existing(_conn, job, _profile):
+        routed.append(job["tailored_resume_path"])
+        return {
+            "decision": "create_variant",
+            "assignment_id": "assignment-refresh",
+            "reason": "Existing material conflicts with current facts.",
+        }
+
+    monkeypatch.setattr(resume_library, "route_resume_for_job", route_existing)
+    monkeypatch.setattr(tailor, "select_resume_source", lambda *args: (base, {"track": "data"}))
+    monkeypatch.setattr(tailor, "read_resume_source", lambda path: Path(path).read_text())
+    monkeypatch.setattr(
+        tailor,
+        "tailor_resume",
+        lambda *args, **kwargs: (
+            "DATA ANALYST\nSQL and Python dashboard delivery.",
+            {"status": "machine_validated", "attempts": 1},
+        ),
+    )
+
+    from applypilot.scoring import pdf as scoring_pdf
+
+    def fake_pdf(text_path: Path) -> Path:
+        pdf_path = text_path.with_suffix(".pdf")
+        pdf_path.write_bytes(b"synthetic-pdf")
+        return pdf_path
+
+    monkeypatch.setattr(scoring_pdf, "convert_to_pdf", fake_pdf)
+    monkeypatch.setattr(
+        resume_library,
+        "register_tailored_artifact",
+        lambda *args, **kwargs: {"artifact_id": "artifact-refresh"},
+    )
+
+    result = tailor.run_tailoring(
+        min_score=0,
+        limit=1,
+        validation_mode="strict",
+        target_url=target_url,
+    )
+    stored = conn.execute(
+        "SELECT tailored_resume_path, tailor_status, tailor_attempts FROM jobs WHERE url=?",
+        (target_url,),
+    ).fetchone()
+
+    assert routed == [str(previous)]
+    assert result["approved"] == 1
+    assert result["results"][0]["resume_library_decision"] == "create_variant"
+    assert stored["tailored_resume_path"] != str(previous)
+    assert stored["tailor_status"] == "machine_validated"
+    assert stored["tailor_attempts"] == 1
+
+
+def test_batch_tailoring_still_skips_jobs_with_existing_material(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    previous = tmp_path / "previous.txt"
+    previous.write_text("Already tailored.", encoding="utf-8")
+    _insert_job(
+        conn,
+        url="https://careers.example.test/batch-existing",
+        title="Data Analyst",
+        description="Required: SQL. Build dashboards and reporting for business decisions.",
+        fit_score=8,
+        tailored_resume_path=str(previous),
+        tailor_status="machine_validated",
+    )
+    monkeypatch.setattr(tailor, "get_connection", lambda: conn)
+    monkeypatch.setattr(tailor, "load_profile", lambda: _profile(base))
+    monkeypatch.setattr(resume_library, "sync_resume_library", lambda *args, **kwargs: None)
+
+    def fail_if_routed(*args, **kwargs):
+        raise AssertionError("batch pending-tailor selection must keep filtering existing material")
+
+    monkeypatch.setattr(resume_library, "route_resume_for_job", fail_if_routed)
+
+    result = tailor.run_tailoring(min_score=0, limit=1, validation_mode="strict")
+
+    assert result == {
+        "approved": 0,
+        "failed": 0,
+        "errors": 0,
+        "elapsed": 0.0,
+    }

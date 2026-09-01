@@ -840,7 +840,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             WHERE (url = ? OR application_url = ?)
               AND fit_score >= ?
               AND full_description IS NOT NULL
-              AND tailored_resume_path IS NULL
               AND COALESCE(tailor_attempts, 0) < 5
               AND {ELIGIBLE_SQL}
             """,
