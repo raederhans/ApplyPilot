@@ -2676,6 +2676,13 @@ def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
     assert "latest snapshot's exact option ref" in built
     assert "the invalid state is gone, the listbox is closed, and the selected value remains" in built
     assert "Do not use a manual-entry fallback when an exact Singapore option is visible" in built
+    assert "Personal information City only" in built
+    assert "Cannot find your city? Click here to fill in manually" in built
+    assert "no selectable exact city/country option" in built
+    assert "click that provider-owned fallback at most once" in built
+    assert "the exact confirmed value persists" in built
+    assert "its associated required or validation alert is gone" in built
+    assert "Never use this personal-City fallback for Institution or Education" in built
     assert "one fresh-ref corrective retry per autocomplete field" in built
     assert "do not call browser_navigate, reload, reset, or reopen the application" in built
     assert "preserve the current page and output RESULT:FAILED:stuck" in built
@@ -2703,6 +2710,8 @@ def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
         non_smartrecruiters
     )
     assert "one fresh-ref corrective retry per autocomplete field" not in non_smartrecruiters
+    assert "Personal information City only" not in non_smartrecruiters
+    assert "Cannot find your city? Click here to fill in manually" not in non_smartrecruiters
     assert conflicting_bulk_rule in non_smartrecruiters
     assert "bulk-fill only ordinary non-autocomplete fields" not in non_smartrecruiters
 
