@@ -27,6 +27,28 @@ from applypilot.apply.operator_commands import OperatorCommand
 from applypilot.storage import agent_control, runtime_control
 
 
+def _ready_answer_mapping_observations() -> dict[str, object]:
+    """Minimal browser-ready strict-v2 provenance envelope for durable replays."""
+    return {
+        "answer_mappings": {
+            "schema_version": "2",
+            "adapter": "replay",
+            "adapter_version": "1",
+            "opaque_binding": "b" * 64,
+            "snapshot_digest": "a" * 64,
+            "mappings": [
+                {
+                    "field_key_hash": "c" * 64,
+                    "semantic": "work_authorization",
+                    "risk": "high",
+                    "selected_option_digest": "d" * 64,
+                    "fact_ref": "profile:work_authorization",
+                }
+            ],
+        }
+    }
+
+
 class _FakeStdin:
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -56,7 +78,7 @@ class _FakeProcess:
             "run_id": self.env[agent_report_mcp.RUN_ID_ENV],
             "status": "ready_to_submit",
             "summary": "Synthetic durable launcher result",
-            "observations": {},
+            "observations": _ready_answer_mapping_observations(),
         }
         Path(self.env[agent_report_mcp.REPORT_PATH_ENV]).write_text(
             json.dumps(report), encoding="utf-8"

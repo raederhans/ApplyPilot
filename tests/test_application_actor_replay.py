@@ -24,6 +24,28 @@ from applypilot.database import init_db
 from applypilot.storage import agent_control
 
 
+def _ready_answer_mapping_observations() -> dict[str, object]:
+    """Minimal browser-ready strict-v2 provenance envelope for launcher replays."""
+    return {
+        "answer_mappings": {
+            "schema_version": "2",
+            "adapter": "replay",
+            "adapter_version": "1",
+            "opaque_binding": "b" * 64,
+            "snapshot_digest": "a" * 64,
+            "mappings": [
+                {
+                    "field_key_hash": "c" * 64,
+                    "semantic": "work_authorization",
+                    "risk": "high",
+                    "selected_option_digest": "d" * 64,
+                    "fact_ref": "profile:work_authorization",
+                }
+            ],
+        }
+    }
+
+
 def request(*, actor_id: str, turn_id: str) -> AgentRunRequest:
     return AgentRunRequest(
         run_id=turn_id,
@@ -281,7 +303,7 @@ def test_run_job_persists_one_v2_actor_identity_across_the_real_control_chain(
                 "run_id": env[agent_report_mcp.RUN_ID_ENV],
                 "status": "ready_to_submit",
                 "summary": "Synthetic structured result",
-                "observations": {},
+                "observations": _ready_answer_mapping_observations(),
                 "proposals": [
                     {
                         "kind": "specialist-review",

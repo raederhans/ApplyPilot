@@ -13,6 +13,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from applypilot.apply.agent_output import validate_ready_answer_mappings
 from applypilot.apply.contracts import (
     FAILURE_MISSING_CAPABILITIES,
     FAILURE_MISSING_MATERIALS,
@@ -66,7 +67,14 @@ def _report_tool() -> dict[str, object]:
                     ),
                 },
                 "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "observations": {"type": "object"},
+                "observations": {
+                    "type": "object",
+                    "description": (
+                        "A browser ready_to_submit report must include strict v2 "
+                        "answer_mappings. The only exception is a complete direct-email "
+                        "prepare plan with verified attachments and duplicate search."
+                    ),
+                },
                 "failure": {
                     "type": "object",
                     "description": (
@@ -153,6 +161,14 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
     raw_path = os.environ.get(REPORT_PATH_ENV, "").strip()
     if not run_id or not raw_path:
         raise ValueError("structured reporting is not configured for this Agent turn")
+    path = Path(raw_path)
+    contract_error = validate_ready_answer_mappings(
+        arguments.get("status"),
+        arguments.get("observations"),
+    )
+    if contract_error is not None:
+        _write_fail_closed_contract_report(path, run_id=run_id, reason=contract_error)
+        raise ValueError(contract_error)
     if len(str(arguments.get("status") or "")) > 200:
         raise ValueError("status is too long")
     if len(str(arguments.get("summary") or "")) > 2000:
@@ -200,7 +216,6 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(serialized.encode("utf-8")) > MAX_AGENT_REPORT_BYTES:
         raise ValueError("structured Agent report is too large")
-    path = Path(raw_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         existing = path.read_text(encoding="utf-8")
@@ -211,6 +226,26 @@ def _write_report(arguments: dict[str, object]) -> dict[str, object]:
     temporary.write_text(serialized, encoding="utf-8")
     os.replace(temporary, path)
     return {"recorded": True, "run_id": run_id, "status": report.status}
+
+
+def _write_fail_closed_contract_report(path: Path, *, run_id: str, reason: str) -> None:
+    """Persist a bounded denial so legacy text cannot recover ready authority."""
+    if path.exists():
+        return
+    payload = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "status": "failed:answer_provenance_report_invalid",
+        "summary": "Provenance-aware ready report failed its structured contract",
+        "proposals": [],
+        "observations": {"report_contract_error": reason},
+        "requested_human_input": None,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(serialized, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _handle(message: dict[str, object]) -> dict[str, object] | None:

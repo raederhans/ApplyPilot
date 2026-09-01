@@ -18,6 +18,28 @@ from applypilot.apply.runtime_evaluation import (
 FIXTURE = Path(__file__).parent / "fixtures" / "runtime" / "scenarios.json"
 
 
+def _ready_answer_mapping_observations() -> dict[str, object]:
+    """Minimal browser-ready strict-v2 provenance envelope for replay results."""
+    return {
+        "answer_mappings": {
+            "schema_version": "2",
+            "adapter": "replay",
+            "adapter_version": "1",
+            "opaque_binding": "b" * 64,
+            "snapshot_digest": "a" * 64,
+            "mappings": [
+                {
+                    "field_key_hash": "c" * 64,
+                    "semantic": "work_authorization",
+                    "risk": "high",
+                    "selected_option_digest": "d" * 64,
+                    "fact_ref": "profile:work_authorization",
+                }
+            ],
+        }
+    }
+
+
 def test_same_fixture_compares_dynamic_runtimes_without_provider_benchmark_claim() -> None:
     registry, scenarios = replay_registry_from_fixture(FIXTURE)
 
@@ -61,6 +83,7 @@ def test_registry_supports_factories_replacement_and_removal() -> None:
                         "run_id": request.run_id,
                         "status": "ready_to_submit",
                         "summary": "ready",
+                        "observations": _ready_answer_mapping_observations(),
                     }
                 }
             }
@@ -101,6 +124,7 @@ def test_tool_side_effect_and_latency_regressions_are_independent_metrics() -> N
                     status="ready_to_submit",
                     summary="contract-valid but behaviorally different",
                     observations={
+                        **_ready_answer_mapping_observations(),
                         "tool_calls": [
                             {"name": "browser_click", "side_effect": "write"}
                         ]

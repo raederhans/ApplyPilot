@@ -3690,6 +3690,217 @@ def test_smartrecruiters_final_page_uses_same_turn_resume_upload_proof() -> None
     assert "resume_state_unconfirmed" not in issues
 
 
+@pytest.mark.parametrize(
+    ("actual_url", "expected_match"),
+    [
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+                "9a04b9a9-424f-4afc-a4c9-5eedc493b048/screening?dcr_ci=NCS3"
+            ),
+            True,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/Other/publication/"
+                "9a04b9a9-424f-4afc-a4c9-5eedc493b048/screening?dcr_ci=Other"
+            ),
+            False,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/screening?dcr_ci=NCS3"
+            ),
+            False,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+                "9a04b9a9-424f-4afc-a4c9-5eedc493b048/screening?dcr_ci=Other"
+            ),
+            False,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+                "9a04b9a9-424f-4afc-a4c9-5eedc493b048/review?dcr_ci=NCS3"
+            ),
+            False,
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+                "9a04b9a9-424f-4afc-a4c9-5eedc493b048/screening/deep?dcr_ci=NCS3"
+            ),
+            False,
+        ),
+    ],
+)
+def test_smartrecruiters_oneclick_root_only_allows_bound_application_subroutes(
+    actual_url: str,
+    expected_match: bool,
+) -> None:
+    expected_url = (
+        "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+        "9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=NCS3"
+    )
+
+    assert page_observation._same_bound_application_flow(
+        expected_url,
+        actual_url,
+        {},
+    ) is expected_match
+
+
+def test_pre_submit_snapshot_only_combines_main_and_selected_application_surface() -> None:
+    class Surface:
+        def __init__(self, url: str, **signals: bool) -> None:
+            self.url = url
+            self.signals = signals
+            self.evaluate_calls = 0
+
+        def evaluate(self, script: str) -> dict:
+            assert script == page_observation._APPLICATION_SURFACE_SIGNALS
+            self.evaluate_calls += 1
+            return {
+                "receipt": False,
+                "final_submit": False,
+                "review": False,
+                "dialog": False,
+                "form_controls": 1,
+                "text_length": 100,
+                "captcha_visible": False,
+                "assessment_visible": False,
+                "verification_visible": False,
+                **self.signals,
+            }
+
+    application_root = (
+        "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/publication/"
+        "9a04b9a9-424f-4afc-a4c9-5eedc493b048"
+    )
+    main = Surface(application_root, final_submit=True, form_controls=1)
+    application_child = Surface(
+        f"{application_root}/screening",
+        form_controls=9,
+    )
+    unrelated_sibling = Surface(
+        "https://support.example.test/subscription",
+        final_submit=True,
+        form_controls=20,
+        captcha_visible=True,
+        assessment_visible=True,
+        verification_visible=True,
+    )
+    selected_page = SimpleNamespace(
+        url=application_root,
+        main_frame=main,
+        frames=[main, application_child, unrelated_sibling],
+    )
+    snapshot = {
+        "resume_field_present": False,
+        "submit_control_count": 0,
+        "captcha_visible": False,
+        "assessment_visible": False,
+        "verification_visible": False,
+    }
+
+    selected_surface, _score = page_observation._score_application_page(selected_page)
+    page_observation._merge_same_page_submit_evidence(
+        snapshot,
+        selected_page,
+        selected_surface,
+    )
+
+    assert selected_surface is application_child
+    assert snapshot["submit_control_count"] == 1
+    assert snapshot["captcha_visible"] is False
+    assert snapshot["assessment_visible"] is False
+    assert snapshot["verification_visible"] is False
+    assert unrelated_sibling.evaluate_calls == 0
+    issues = launcher._validate_pre_submit_snapshot(
+        snapshot,
+        _application_profile(),
+        {
+            "_agent_observations": {
+                "resume_upload": {
+                    "verified": True,
+                    "field_label": "Resume *",
+                    "visible_filename": "candidate-resume.pdf",
+                }
+            }
+        },
+    )
+    assert "resume_state_unconfirmed" not in issues
+    assert "submit_control_missing" not in issues
+
+
+@pytest.mark.parametrize(
+    ("gate_surface", "gate_signal", "expected_issue"),
+    [
+        ("main", "captcha_visible", "visible_captcha"),
+        ("selected", "assessment_visible", "assessment_present"),
+        ("selected", "verification_visible", "verification_required"),
+    ],
+)
+def test_pre_submit_snapshot_propagates_manual_gates_from_allowed_surfaces(
+    gate_surface: str,
+    gate_signal: str,
+    expected_issue: str,
+) -> None:
+    class Surface:
+        def __init__(self, name: str, url: str) -> None:
+            self.name = name
+            self.url = url
+
+        def evaluate(self, script: str) -> dict:
+            assert script == page_observation._APPLICATION_SURFACE_SIGNALS
+            return {
+                "receipt": False,
+                "final_submit": self.name == "main",
+                "review": False,
+                "dialog": False,
+                "form_controls": 1,
+                "text_length": 100,
+                "captcha_visible": (
+                    self.name == gate_surface and gate_signal == "captcha_visible"
+                ),
+                "assessment_visible": (
+                    self.name == gate_surface and gate_signal == "assessment_visible"
+                ),
+                "verification_visible": (
+                    self.name == gate_surface and gate_signal == "verification_visible"
+                ),
+            }
+
+    application_root = "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3"
+    main = Surface("main", application_root)
+    selected = Surface("selected", f"{application_root}/screening")
+    page = SimpleNamespace(
+        url=application_root,
+        main_frame=main,
+        frames=[main, selected],
+    )
+    snapshot = {
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "submit_control_count": 0,
+        "captcha_visible": False,
+        "assessment_visible": False,
+        "verification_visible": False,
+    }
+
+    page_observation._merge_same_page_submit_evidence(snapshot, page, selected)
+    issues = launcher._validate_pre_submit_snapshot(
+        snapshot,
+        _application_profile(),
+        {},
+    )
+
+    assert expected_issue in issues
+
+
 def test_manual_captcha_response_token_overrides_stale_visible_iframe() -> None:
     class ResponseField:
         def __init__(self, value: str) -> None:

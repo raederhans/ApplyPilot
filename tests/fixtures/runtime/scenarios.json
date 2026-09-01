@@ -94,6 +94,20 @@
           "status": "ready_to_submit",
           "summary": "Recorded form preparation completed",
           "observations": {
+            "answer_mappings": {
+              "schema_version": "2",
+              "adapter": "replay",
+              "adapter_version": "1",
+              "opaque_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "snapshot_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "mappings": [{
+                "field_key_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "semantic": "work_authorization",
+                "risk": "high",
+                "selected_option_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "fact_ref": "profile:work_authorization"
+              }]
+            },
             "tool_calls": [
               {"name": "browser_snapshot", "side_effect": "read"},
               {"name": "browser_fill_form", "side_effect": "write"}
@@ -168,6 +182,20 @@
           "status": "ready_to_submit",
           "summary": "Alternative recorded runtime prepared the form",
           "observations": {
+            "answer_mappings": {
+              "schema_version": "2",
+              "adapter": "replay",
+              "adapter_version": "1",
+              "opaque_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "snapshot_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "mappings": [{
+                "field_key_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "semantic": "work_authorization",
+                "risk": "high",
+                "selected_option_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "fact_ref": "profile:work_authorization"
+              }]
+            },
             "tool_calls": [
               {"name": "browser_snapshot", "side_effect": "read"},
               {"name": "browser_fill_form", "side_effect": "write"}

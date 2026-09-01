@@ -194,6 +194,7 @@ def test_report_tool_writes_one_idempotent_provider_neutral_result(
     arguments = {
         "status": "ready_to_submit",
         "summary": "Form prepared",
+        "observations": _ready_provenance_observations(),
         "proposals": [
             {
                 "proposal_id": "review-1",
@@ -214,6 +215,242 @@ def test_report_tool_writes_one_idempotent_provider_neutral_result(
     assert conflicting["result"]["isError"] is True
     assert payload["run_id"] == "run-1"
     assert payload["proposals"][0]["concurrency_mode"] == "plugin-mode"
+
+
+def _ready_provenance_observations() -> dict[str, object]:
+    return {
+        "answer_provenance": {"snapshot_digest": "a" * 64},
+        "answer_mappings": {
+            "schema_version": "2",
+            "adapter": "smartrecruiters",
+            "adapter_version": "1",
+            "opaque_binding": "b" * 64,
+            "snapshot_digest": "a" * 64,
+            "mappings": [
+                {
+                    "field_key_hash": "c" * 64,
+                    "semantic": "work_authorization",
+                    "risk": "high",
+                    "selected_option_digest": "d" * 64,
+                    "fact_ref": "profile:work_authorization",
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        {},
+        {
+            "answer_provenance": {"snapshot_digest": "a" * 64},
+            "answer_mapping": _ready_provenance_observations()["answer_mappings"],
+        },
+        {
+            "answer_provenance": {"snapshot_digest": "a" * 64},
+            "answer_mappings": [],
+        },
+        {
+            "answer_provenance": {"snapshot_digest": "a" * 64},
+            "answer_mappings": {
+                **_ready_provenance_observations()["answer_mappings"],
+                "legacy_key": True,
+            },
+        },
+    ],
+    ids=["omitted-browser-ready", "wrong-key", "legacy-list", "extra-envelope-key"],
+)
+def test_ready_report_with_provenance_rejects_invalid_v2_answer_mappings_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    observations: dict[str, object],
+) -> None:
+    path = tmp_path / "invalid-ready-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-invalid-ready")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    response = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Form prepared",
+            "observations": observations,
+        }
+    )
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-invalid-ready",
+    )
+
+    assert response["result"]["isError"] is True
+    assert report.status == "failed:answer_provenance_report_invalid"
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        report,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("failed:conflicting_agent_results", None, "conflict")
+
+
+def test_ready_report_accepts_strict_v2_answer_mappings_when_provenance_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "valid-ready-turn.json"
+    monkeypatch.setenv(agent_report_mcp.RUN_ID_ENV, "run-valid-ready")
+    monkeypatch.setenv(agent_report_mcp.REPORT_PATH_ENV, str(path))
+
+    response = _tool_call(
+        {
+            "status": "ready_to_submit",
+            "summary": "Form prepared",
+            "observations": _ready_provenance_observations(),
+        }
+    )
+    report = agent_output.load_agent_turn_report(path, expected_run_id="run-valid-ready")
+
+    assert response["result"]["isError"] is False
+    assert report.status == "ready_to_submit"
+
+
+def test_loader_fail_closes_existing_invalid_provenance_ready_report(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "externally-written-invalid-ready.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "run_id": "run-invalid-loader",
+                "status": "ready_to_submit",
+                "summary": "Form prepared",
+                "observations": {"answer_provenance": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = agent_output.load_agent_turn_report(
+        path,
+        expected_run_id="run-invalid-loader",
+    )
+
+    assert report.status == "failed:answer_provenance_report_invalid"
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        report,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("failed:conflicting_agent_results", None, "conflict")
+
+
+def test_previewed_and_failure_reports_do_not_require_final_answer_mappings() -> None:
+    preview_audit = {
+        "submission_attempted": False,
+        "resume_uploaded": True,
+        "filled_fields": [],
+        "manual_review_fields": [],
+        "final_control_label": "Submit",
+    }
+    cases = (
+        ("previewed", {"answer_provenance": {}, "preview_audit": preview_audit}),
+        ("failed:stuck", {"answer_provenance": {}}),
+    )
+
+    for status, observations in cases:
+        result = AgentTurnResult(
+            run_id=f"run-{status}",
+            status=status,
+            summary="Bounded result",
+            observations=observations,
+        )
+        interpreted, _ = agent_output.interpret_agent_turn_result(
+            result,
+            dry_run=True,
+            submission_phase="prepare",
+        )
+        assert interpreted == status
+
+
+def test_non_dry_prepare_previewed_alias_requires_final_answer_mappings() -> None:
+    result = AgentTurnResult(
+        run_id="run-preview-alias-without-mappings",
+        status="previewed",
+        summary="Browser form completed",
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        result,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("failed:conflicting_agent_results", None, "conflict")
+
+
+def _direct_email_prepare_plan() -> dict[str, object]:
+    return {
+        "route": "direct_email",
+        "recipient": "jobs@example.test",
+        "recipient_domain": "example.test",
+        "recipient_source": "official_listing",
+        "listing_evidence": "Official listing: apply to jobs@example.test",
+        "subject": "Application for Data Intern",
+        "body_sha256": "e" * 64,
+        "attachment_names": ["Candidate_Resume.pdf"],
+        "attachments_verified": True,
+        "duplicate_check": {
+            "folder": "sent",
+            "completed": True,
+            "duplicate_found": False,
+            "provider_query_id": "query-digest-1",
+        },
+    }
+
+
+def test_complete_direct_email_prepare_plan_does_not_require_browser_mappings() -> None:
+    result = AgentTurnResult(
+        run_id="run-direct-email-ready",
+        status="ready_to_submit",
+        summary="Email plan prepared without sending",
+        observations={"email_application": _direct_email_prepare_plan()},
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        result,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("ready_to_submit", None, "structured+legacy")
+
+
+def test_partial_direct_email_key_cannot_bypass_browser_mapping_contract() -> None:
+    result = AgentTurnResult(
+        run_id="run-forged-direct-email-ready",
+        status="ready_to_submit",
+        summary="Incomplete email plan",
+        observations={"email_application": {"route": "direct_email"}},
+    )
+
+    assert agent_output.reconcile_agent_turn_outputs(
+        "RESULT:READY_TO_SUBMIT",
+        result,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == ("failed:conflicting_agent_results", None, "conflict")
+
+
+def test_legacy_only_browser_ready_fails_closed_without_structured_mappings() -> None:
+    assert agent_output.reconcile_agent_turn_outputs_with_diagnostics(
+        "RESULT:READY_TO_SUBMIT",
+        None,
+        dry_run=False,
+        submission_phase="prepare",
+    ) == (
+        "failed:answer_provenance_report_missing",
+        None,
+        "legacy",
+        "structured_ready_report_missing",
+    )
 
 
 def test_report_tool_documents_and_accepts_legacy_open_failure_status(
@@ -339,7 +576,7 @@ def test_report_stdio_accepts_utf8_when_windows_text_encoding_is_legacy(
                 "arguments": {
                     "status": "ready_to_submit",
                     "summary": "Verified six‑month internship plan",
-                    "observations": {"listing_evidence": "Apply by email — official listing"},
+                    "observations": _ready_provenance_observations(),
                 },
             },
         },
@@ -469,6 +706,7 @@ def test_structured_only_result_keeps_legacy_application_status_contract() -> No
         run_id="run-prepare",
         status="ready_to_submit",
         summary="Prepared by another runtime",
+        observations=_ready_provenance_observations(),
     )
 
     assert agent_output.reconcile_agent_turn_outputs(
@@ -484,6 +722,7 @@ def test_prepare_reconciles_previewed_report_with_ready_to_submit_marker() -> No
         run_id="run-prepare-alias",
         status="previewed",
         summary="Form completed without submitting",
+        observations=_ready_provenance_observations(),
     )
 
     assert agent_output.reconcile_agent_turn_outputs(
@@ -499,6 +738,7 @@ def test_prepare_reconciles_previewed_report_with_previewed_marker() -> None:
         run_id="run-prepare-preview-alias",
         status="previewed",
         summary="Form completed without submitting",
+        observations=_ready_provenance_observations(),
     )
 
     assert agent_output.reconcile_agent_turn_outputs(
@@ -703,7 +943,7 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
                 "run_id": env[agent_report_mcp.RUN_ID_ENV],
                 "status": "ready_to_submit",
                 "summary": "Form prepared through structured reporting",
-                "observations": {},
+                "observations": _ready_provenance_observations(),
                 "proposals": [
                     {
                         "kind": "specialist-review",
@@ -892,7 +1132,11 @@ def _run_codex_event_fixture(
                         "run_id": env[agent_report_mcp.RUN_ID_ENV],
                         "status": structured_status,
                         "summary": "bounded fixture report",
-                        "observations": {},
+                        "observations": (
+                            _ready_provenance_observations()
+                            if structured_status == "ready_to_submit"
+                            else {}
+                        ),
                     }
                 ),
                 encoding="utf-8",

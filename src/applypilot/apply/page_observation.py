@@ -105,36 +105,38 @@ def _same_bound_application_flow(
     ):
         return False
 
-    expected_path = unquote(expected.path).rstrip("/").removesuffix("/apply")
-    actual_path = unquote(actual.path).rstrip("/").removesuffix("/apply")
-    expected_tokens = tuple(re.findall(r"[a-z0-9]+", expected_path.casefold()))
-    actual_tokens = tuple(re.findall(r"[a-z0-9]+", actual_path.casefold()))
-    if expected_tokens and expected_tokens == actual_tokens:
-        return True
-
     if (
         ats_mod.detect_ats_site(expected_url) == "smartrecruiters"
         and ats_mod.detect_ats_site(actual_url) == "smartrecruiters"
     ):
+        expected_oneclick = _smartrecruiters_oneclick_route(expected_url)
+        actual_oneclick = _smartrecruiters_oneclick_route(actual_url)
+        expected_is_oneclick = unquote(expected.path).casefold().startswith(
+            "/oneclick-ui/company/"
+        )
+        actual_is_oneclick = unquote(actual.path).casefold().startswith(
+            "/oneclick-ui/company/"
+        )
+        if expected_is_oneclick:
+            return bool(
+                expected_oneclick
+                and expected_oneclick[2] == ()
+                and actual_oneclick
+                and expected_oneclick[:2] == actual_oneclick[:2]
+            )
+        if not actual_is_oneclick:
+            return _same_exact_application_path(expected_url, actual_url)
+
         expected_parts = [part for part in expected.path.split("/") if part]
-        actual_parts = [part for part in actual.path.split("/") if part]
         expected_tenant = expected_parts[0] if len(expected_parts) >= 2 else ""
         expected_posting_id = (
             expected_parts[1].split("-", 1)[0] if len(expected_parts) >= 2 else ""
         )
-        actual_tenant = (
-            actual_parts[2]
-            if len(actual_parts) >= 5
-            and actual_parts[:2] == ["oneclick-ui", "company"]
-            and actual_parts[3] == "publication"
-            else ""
-        )
-        actual_publication_id = actual_parts[4] if len(actual_parts) >= 5 else ""
-        query_tenant = (parse_qs(actual.query).get("dcr_ci") or [""])[0]
+        actual_tenant = actual_oneclick[0] if actual_oneclick else ""
+        actual_publication_id = actual_oneclick[1] if actual_oneclick else ""
         return bool(
             expected_tenant
             and expected_tenant.casefold() == actual_tenant.casefold()
-            and actual_tenant.casefold() == query_tenant.casefold()
             and isinstance(binding, dict)
             and binding.get("resolved") is True
             and str(binding.get("provider") or "").casefold() == "smartrecruiters"
@@ -144,6 +146,13 @@ def _same_bound_application_flow(
             and str(binding.get("publication_id") or "").casefold()
             == actual_publication_id.casefold()
         )
+
+    expected_path = unquote(expected.path).rstrip("/").removesuffix("/apply")
+    actual_path = unquote(actual.path).rstrip("/").removesuffix("/apply")
+    expected_tokens = tuple(re.findall(r"[a-z0-9]+", expected_path.casefold()))
+    actual_tokens = tuple(re.findall(r"[a-z0-9]+", actual_path.casefold()))
+    if expected_tokens and expected_tokens == actual_tokens:
+        return True
 
     # Workday changes the URL from the public job route to a tenant-local
     # application/review route.  Bind that path change to the same HTTPS
@@ -330,6 +339,31 @@ def _is_post_graduation_work_context(text: str) -> bool:
             text,
         )
     )
+
+
+def _smartrecruiters_oneclick_route(
+    url: str,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    parsed = urlparse(url)
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if (
+        len(parts) < 5
+        or [part.casefold() for part in parts[:2]] != ["oneclick-ui", "company"]
+        or parts[3].casefold() != "publication"
+    ):
+        return None
+    suffix = tuple(part.casefold() for part in parts[5:])
+    if suffix not in {(), ("screening",)}:
+        return None
+    tenant = parts[2]
+    publication_id = parts[4]
+    query_tenants = parse_qs(parsed.query).get("dcr_ci") or []
+    if (
+        len(query_tenants) != 1
+        or query_tenants[0].casefold() != tenant.casefold()
+    ):
+        return None
+    return tenant.casefold(), publication_id.casefold(), suffix
 
 
 def _work_authorization_question_semantic(text: str) -> str | None:
@@ -826,6 +860,8 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
 
     if snapshot.get("captcha_visible"):
         issues.append("visible_captcha")
+    if snapshot.get("verification_visible"):
+        issues.append("verification_required")
 
     issues.extend(
         f"required_field_empty:{label[:80]}"
@@ -1055,6 +1091,25 @@ _APPLICATION_SURFACE_SIGNALS = r"""() => {
   ).some((el) => visible(el) && /^(submit|submit application|send application|finish|complete application|提交申请|投递)$/i.test(
     (el.innerText || el.value || el.getAttribute('aria-label') || '').trim()
   ));
+  const assessmentVisible = /\b(complete|take|start) (an? )?(online |coding |video )?assessment\b|\bcoding assessment\b|\bonline assessment\b/i.test(text);
+  const captchaVisible = deepAll(
+    'iframe,[class*="turnstile" i],[id*="turnstile" i],[class*="hcaptcha" i],[class*="recaptcha" i],[data-sitekey]'
+  ).filter(visible).some((el) => {
+    const rect = el.getBoundingClientRect();
+    const marker = `${el.title || ''} ${el.src || ''} ${el.id || ''} ${el.className || ''}`.toLowerCase();
+    return rect.width >= 80 && rect.height >= 40 && /captcha|turnstile|challenge/.test(marker);
+  });
+  const verificationText = /security code|verification code|one[- ]time (?:code|password)|\botp\b|verify (?:your )?email|email verification|验证码|校验码|验证邮箱/i;
+  const codeInputs = deepAll('input:not([type=hidden])').filter((el) => {
+    if (!visible(el)) return false;
+    const maxLength = Number(el.maxLength || 0);
+    const descriptor = `${el.name || ''} ${el.id || ''} ${el.autocomplete || ''}`;
+    return maxLength === 1 || /otp|verification|security.?code|one-time-code/i.test(descriptor);
+  });
+  const verificationVisible =
+    (codeInputs.length > 0 && verificationText.test(text)) ||
+    deepAll('form,section,dialog,[role="dialog"]')
+      .filter(visible).some((el) => verificationText.test(el.innerText || ''));
   const review = /review your application/i.test(text);
   const dialog = deepAll('dialog,[role="dialog"]').some(visible);
   const formControls = deepAll(
@@ -1063,6 +1118,9 @@ _APPLICATION_SURFACE_SIGNALS = r"""() => {
   return {
     receipt,
     final_submit: finalSubmit,
+    captcha_visible: captchaVisible,
+    assessment_visible: assessmentVisible,
+    verification_visible: verificationVisible,
     review,
     dialog,
     form_controls: formControls,
@@ -1082,6 +1140,67 @@ def _application_surface_score(signals: dict) -> int:
     )
 
 
+def _application_surface_selection_score(signals: dict) -> int:
+    """Prefer the field-bearing surface while preserving receipt priority."""
+    return (
+        1000 * int(bool(signals.get("receipt")))
+        + 100 * int(bool(signals.get("review")))
+        + 50 * int(bool(signals.get("dialog")))
+        + 10 * min(int(signals.get("form_controls") or 0), 200)
+        + 5 * int(bool(signals.get("final_submit")))
+        + min(int(signals.get("text_length") or 0) // 500, 9)
+    )
+
+
+def _http_origin(url: object) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlparse(str(url or ""))
+        scheme = parsed.scheme.casefold()
+        host = (parsed.hostname or "").casefold()
+        if scheme not in {"http", "https"} or not host:
+            return None
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    return scheme, host, port
+
+
+def _application_surface_is_allowed(page, surface) -> bool:
+    """Allow main, same-origin, or inherited-origin application surfaces only."""
+    main_frame = getattr(page, "main_frame", page)
+    if surface is main_frame:
+        return True
+
+    # Compatibility for non-browser test doubles. Real Playwright pages always
+    # expose both a top-level URL and main_frame, so missing lineage at runtime
+    # remains fail closed.
+    if not hasattr(page, "url") and not hasattr(page, "main_frame"):
+        return True
+
+    top_origin = _http_origin(getattr(page, "url", None)) or _http_origin(
+        getattr(main_frame, "url", None)
+    )
+    if top_origin is None:
+        return False
+    surface_url = str(getattr(surface, "url", "") or "").strip()
+    if _http_origin(surface_url) == top_origin:
+        return True
+    if surface_url.casefold() not in {"about:blank", "about:srcdoc"}:
+        return False
+
+    seen: set[int] = set()
+    parent = getattr(surface, "parent_frame", None)
+    while parent is not None and id(parent) not in seen:
+        if parent is main_frame or _http_origin(getattr(parent, "url", None)) == top_origin:
+            return True
+        seen.add(id(parent))
+        parent_url = str(getattr(parent, "url", "") or "").strip().casefold()
+        if parent_url not in {"about:blank", "about:srcdoc"}:
+            return False
+        parent = getattr(parent, "parent_frame", None)
+    return False
+
+
 def _select_application_frame(page):
     """Choose the populated application surface across the page and child frames."""
     selected, _score = _score_application_page(page)
@@ -1089,21 +1208,28 @@ def _select_application_frame(page):
 
 
 def _score_application_page(page):
-    """Return one page's best surface and score after evaluating each surface once."""
-    candidates = list(getattr(page, "frames", ()) or (page,))
+    """Return one page's trusted field surface and aggregate page score."""
+    candidates = [
+        frame
+        for frame in list(getattr(page, "frames", ()) or (page,))
+        if _application_surface_is_allowed(page, frame)
+    ]
+    if not candidates:
+        candidates = [getattr(page, "main_frame", page)]
     selected = candidates[0]
-    selected_score = -1
+    selected_surface_score = -1
+    page_score = -1
     for frame in candidates:
         try:
-            score = _application_surface_score(
-                frame.evaluate(_APPLICATION_SURFACE_SIGNALS)
-            )
-            if score > selected_score:
+            signals = frame.evaluate(_APPLICATION_SURFACE_SIGNALS)
+            page_score = max(page_score, _application_surface_score(signals))
+            surface_score = _application_surface_selection_score(signals)
+            if surface_score > selected_surface_score:
                 selected = frame
-                selected_score = score
+                selected_surface_score = surface_score
         except Exception:
             logger.debug("Unable to score browser frame for application evidence", exc_info=True)
-    return selected, selected_score
+    return selected, page_score
 
 
 def _select_application_page_and_frame(pages: list):
@@ -1127,6 +1253,51 @@ def _select_application_page(pages: list):
     """Choose the tab carrying a review/receipt rather than relying on tab order."""
     selected, _surface = _select_application_page_and_frame(pages)
     return selected
+
+
+def _allowed_application_surface_signals(page, application_surface) -> list[dict]:
+    """Read only the selected application surface and its owning main frame."""
+    surfaces = []
+    for surface in (getattr(page, "main_frame", page), application_surface):
+        if (
+            surface is not None
+            and _application_surface_is_allowed(page, surface)
+            and all(surface is not item for item in surfaces)
+        ):
+            surfaces.append(surface)
+    signals = []
+    for surface in surfaces:
+        try:
+            observed = surface.evaluate(_APPLICATION_SURFACE_SIGNALS)
+            if isinstance(observed, dict):
+                signals.append(observed)
+        except Exception:
+            logger.debug(
+                "Unable to inspect an allowed application surface",
+                exc_info=True,
+            )
+    return signals
+
+
+def _merge_same_page_submit_evidence(
+    snapshot: dict,
+    page,
+    application_surface,
+) -> None:
+    """Merge Submit and manual-gate evidence from the same allowed surfaces."""
+    try:
+        selected_surface_count = int(snapshot.get("submit_control_count") or 0)
+    except (TypeError, ValueError):
+        selected_surface_count = 0
+    signals = _allowed_application_surface_signals(page, application_surface)
+    snapshot["submit_control_count"] = max(
+        selected_surface_count,
+        sum(int(bool(item.get("final_submit"))) for item in signals),
+    )
+    for key in ("captcha_visible", "assessment_visible", "verification_visible"):
+        snapshot[key] = bool(snapshot.get(key)) or any(
+            bool(item.get(key)) for item in signals
+        )
 
 
 def _bound_application_pages(browser, pages: list, job: dict) -> list:
@@ -2649,6 +2820,7 @@ def _audit_live_pre_submit_page(
             }""",
             expected_education,
         )
+        _merge_same_page_submit_evidence(snapshot, page, application_surface)
         _redact_protected_identifier_snapshot(snapshot)
         snapshot["document_url"] = snapshot.get("url", "")
         snapshot["url"] = page.url
@@ -2695,6 +2867,7 @@ def _audit_live_pre_submit_page(
             "captcha_token_present": snapshot.get("captcha_token_present", False),
             "captcha_candidates": snapshot.get("captcha_candidates", []),
             "assessment_visible": snapshot.get("assessment_visible", False),
+            "verification_visible": snapshot.get("verification_visible", False),
             "sensitive_required_unknown_count": len(
                 snapshot.get("sensitive_required_unknown", [])
             ),

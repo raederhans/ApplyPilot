@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from applypilot.apply.contracts import (
@@ -18,6 +19,136 @@ from applypilot.apply.contracts import (
     agent_turn_result_from_mapping,
 )
 from applypilot.apply.failure_taxonomy import classify_failure
+
+_ANSWER_MAPPING_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "adapter",
+        "adapter_version",
+        "opaque_binding",
+        "snapshot_digest",
+        "mappings",
+    }
+)
+_ANSWER_MAPPING_ITEM_KEYS = frozenset(
+    {
+        "field_key_hash",
+        "semantic",
+        "risk",
+        "selected_option_digest",
+        "fact_ref",
+        "safe_default_rule_id",
+    }
+)
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_EMAIL_ADDRESS = re.compile(r"[^@\s]+@([^@\s]+)")
+_MAX_ANSWER_MAPPINGS = 128
+_DIRECT_EMAIL_PLAN_KEYS = frozenset(
+    {
+        "route",
+        "recipient",
+        "recipient_domain",
+        "recipient_source",
+        "listing_evidence",
+        "subject",
+        "body_sha256",
+        "attachment_names",
+        "attachments_verified",
+        "duplicate_check",
+    }
+)
+_DIRECT_EMAIL_DUPLICATE_KEYS = frozenset(
+    {"folder", "completed", "duplicate_found", "provider_query_id"}
+)
+
+
+def _is_strict_direct_email_prepare_plan(observations: object) -> bool:
+    if not isinstance(observations, Mapping):
+        return False
+    plan = observations.get("email_application")
+    if (
+        not isinstance(plan, Mapping)
+        or set(plan) != _DIRECT_EMAIL_PLAN_KEYS
+        or plan.get("route") != "direct_email"
+    ):
+        return False
+    recipient = str(plan.get("recipient") or "").strip().casefold()
+    match = _EMAIL_ADDRESS.fullmatch(recipient)
+    domain = str(plan.get("recipient_domain") or "").strip().casefold().strip(".")
+    duplicate = plan.get("duplicate_check")
+    attachment_names = plan.get("attachment_names")
+    valid_attachment_names = bool(
+        isinstance(attachment_names, list)
+        and attachment_names
+        and all(isinstance(name, str) and name.strip() for name in attachment_names)
+        and len(attachment_names) == len(set(attachment_names))
+    )
+    return bool(
+        match is not None
+        and domain == match.group(1).casefold().strip(".")
+        and plan.get("recipient_source") == "official_listing"
+        and recipient in str(plan.get("listing_evidence") or "").casefold()
+        and str(plan.get("subject") or "").strip()
+        and isinstance(plan.get("body_sha256"), str)
+        and _SHA256_HEX.fullmatch(str(plan["body_sha256"]).casefold()) is not None
+        and valid_attachment_names
+        and plan.get("attachments_verified") is True
+        and isinstance(duplicate, Mapping)
+        and set(duplicate) == _DIRECT_EMAIL_DUPLICATE_KEYS
+        and str(duplicate.get("folder") or "").strip().casefold() == "sent"
+        and duplicate.get("completed") is True
+        and duplicate.get("duplicate_found") is False
+        and str(duplicate.get("provider_query_id") or "").strip()
+    )
+
+
+def validate_ready_answer_mappings(
+    status: object,
+    observations: object,
+) -> str | None:
+    """Validate the v2 envelope required by browser-ready reports."""
+    if str(status or "").strip().casefold() != "ready_to_submit":
+        return None
+    if _is_strict_direct_email_prepare_plan(observations):
+        return None
+    envelope = (
+        observations.get("answer_mappings")
+        if isinstance(observations, Mapping)
+        else None
+    )
+    if not isinstance(envelope, Mapping):
+        return "answer_mappings_v2_required"
+    if set(envelope) != _ANSWER_MAPPING_ENVELOPE_KEYS:
+        return "answer_mappings_v2_envelope_invalid"
+    if envelope.get("schema_version") != "2":
+        return "answer_mappings_v2_envelope_invalid"
+    for key in ("adapter", "adapter_version"):
+        if not isinstance(envelope.get(key), str) or not str(envelope[key]).strip():
+            return "answer_mappings_v2_envelope_invalid"
+    for key in ("opaque_binding", "snapshot_digest"):
+        value = envelope.get(key)
+        if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+            return "answer_mappings_v2_envelope_invalid"
+    mappings = envelope.get("mappings")
+    if not isinstance(mappings, list) or len(mappings) > _MAX_ANSWER_MAPPINGS:
+        return "answer_mappings_v2_envelope_invalid"
+    for mapping in mappings:
+        if not isinstance(mapping, Mapping) or not set(mapping) <= _ANSWER_MAPPING_ITEM_KEYS:
+            return "answer_mappings_v2_item_invalid"
+        for key in ("field_key_hash", "selected_option_digest"):
+            value = mapping.get(key)
+            if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+                return "answer_mappings_v2_item_invalid"
+        for key in ("semantic", "risk"):
+            if not isinstance(mapping.get(key), str) or not str(mapping[key]).strip():
+                return "answer_mappings_v2_item_invalid"
+        fact_ref = mapping.get("fact_ref")
+        rule_id = mapping.get("safe_default_rule_id")
+        has_fact = isinstance(fact_ref, str) and bool(fact_ref.strip())
+        has_rule = isinstance(rule_id, str) and bool(rule_id.strip())
+        if has_fact == has_rule:
+            return "answer_mappings_v2_item_invalid"
+    return None
 
 
 def _preview_audit_error(audit: object) -> str | None:
@@ -227,7 +358,16 @@ def load_agent_turn_report(path: Path, *, expected_run_id: str) -> AgentTurnResu
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise TypeError("structured Agent report must be an object")
-    return agent_turn_result_from_mapping(raw, expected_run_id=expected_run_id)
+    result = agent_turn_result_from_mapping(raw, expected_run_id=expected_run_id)
+    contract_error = validate_ready_answer_mappings(result.status, result.observations)
+    if contract_error is None:
+        return result
+    return AgentTurnResult(
+        run_id=result.run_id,
+        status="failed:answer_provenance_report_invalid",
+        summary="Provenance-aware ready report failed its structured contract",
+        observations={"report_contract_error": contract_error},
+    )
 
 
 def interpret_agent_turn_result(
@@ -261,6 +401,9 @@ def interpret_agent_turn_result(
     # still performs its independent pre-submit observation before reservation.
     if status == "previewed" and not dry_run and submission_phase == "prepare":
         status = "ready_to_submit"
+    contract_error = validate_ready_answer_mappings(status, result.observations)
+    if contract_error is not None:
+        return "failed:answer_provenance_report_invalid", None
     marker_by_status = {
         "linkedin_login_completed": "LINKEDIN_LOGIN_COMPLETED",
         "ready_to_submit": "READY_TO_SUBMIT",
@@ -339,6 +482,17 @@ def reconcile_agent_turn_outputs_with_diagnostics(
             dry_run=dry_run,
             submission_phase=submission_phase,
         )
+        if (
+            status == "ready_to_submit"
+            and submission_phase == "prepare"
+            and not dry_run
+        ):
+            return (
+                "failed:answer_provenance_report_missing",
+                None,
+                "legacy",
+                "structured_ready_report_missing",
+            )
         return status, evidence, "legacy", None
 
     status, evidence = interpret_agent_turn_result(
