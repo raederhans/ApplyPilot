@@ -4385,6 +4385,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         )
     )
     runtime_state = {submission_phase}
+    if dry_run:
+        # Preview uses the submit result contract but still needs bounded form
+        # writes on the already-bound page. Keep this state launcher-owned so
+        # an Agent report or browser observation cannot grant it to a real
+        # submit turn.
+        runtime_state.add("preview")
     observation = job.get("_browser_observation")
     if isinstance(observation, Mapping):
         if observation.get("repair_mode") is True:

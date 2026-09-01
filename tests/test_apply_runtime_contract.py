@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,6 +104,79 @@ def test_email_only_prepare_route_excludes_browser_capabilities() -> None:
     assert route == "direct_email"
     assert "report_agent_turn" in registry.names()
     assert not any(name.startswith("browser_") for name in registry.names())
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "preview_writes"),
+    [
+        (True, True),
+        (False, False),
+    ],
+)
+def test_run_job_exposes_preview_writes_without_widening_real_submit(
+    monkeypatch,
+    dry_run: bool,
+    preview_writes: bool,
+) -> None:
+    """Preview has a bounded writer surface; real submit needs repair evidence."""
+
+    class StopAfterToolSurface(RuntimeError):
+        pass
+
+    monkeypatch.setattr(config, "load_profile", lambda: {"authentication": {}})
+    monkeypatch.setattr(
+        launcher._durable_agent_runtime,
+        "reconcile_actor",
+        lambda *_args: SimpleNamespace(
+            disposition="ready",
+            parent_turn_id=None,
+            reason_code="test",
+            requires_fresh_observation=False,
+        ),
+    )
+
+    def stop_after_tool_surface(_job: dict, **_kwargs):
+        raise StopAfterToolSurface
+
+    monkeypatch.setattr(
+        launcher,
+        "_browser_lease_for_agent_turn",
+        stop_after_tool_surface,
+    )
+    job = {
+        "url": "https://jobs.smartrecruiters.com/NCS3/6000000001307056",
+        "application_url": (
+            "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+            "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048"
+        ),
+        "title": "Business and Strategy Analyst Intern",
+        "company_name": "NCS",
+        "_attempt_id": f"preview-surface-{dry_run}",
+        "_browser_backend": "edge",
+    }
+
+    with pytest.raises(StopAfterToolSurface):
+        launcher.run_job(
+            job,
+            port=9432,
+            worker_id=0,
+            model="model",
+            dry_run=dry_run,
+            agent_backend="codex",
+            submission_phase="submit",
+        )
+
+    available = set(job["_available_tools"])
+    writer_tools = {
+        "browser_fill_form",
+        "browser_select_option",
+        "browser_type",
+        "browser_file_upload",
+    }
+    if preview_writes:
+        assert writer_tools <= available
+    else:
+        assert writer_tools.isdisjoint(available)
 
 
 def test_receipt_phase_exposes_report_and_mailbox_semantics_without_browser(

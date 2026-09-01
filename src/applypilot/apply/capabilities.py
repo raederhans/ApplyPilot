@@ -87,9 +87,13 @@ def default_browser_capabilities() -> CapabilityRegistry:
             "browser_select_option",
             "browser_type",
         }:
-            tags.append("phase_requires_state:submit:repair")
+            tags.append(
+                "phase_requires_any_state:submit:repair|preview"
+            )
         if name == "browser_file_upload":
-            tags.append("phase_requires_state:submit:repair_resume_upload")
+            tags.append(
+                "phase_requires_any_state:submit:repair_resume_upload|preview"
+            )
         capabilities.append(
             ToolSpec(
                 name=name,
@@ -166,7 +170,9 @@ def scope_capability_registry(
 
     Empty phase metadata remains open for plugin compatibility. Optional
     ``route:*`` and ``requires_state:*`` tags allow future extensions without
-    hard-coding an ATS, model, or application provider here.
+    hard-coding an ATS, model, or application provider here. A
+    ``phase_requires_any_state:<phase>:state_a|state_b`` tag admits a tool only
+    when at least one explicitly listed state is active for that phase.
     """
     active_state = {str(item).casefold() for item in state}
     active_route = (route or "").casefold()
@@ -198,6 +204,22 @@ def scope_capability_registry(
             and parts[1].casefold() == phase.casefold()
             and parts[2].casefold() not in active_state
             for parts in phase_state_requirements
+        ):
+            continue
+        phase_any_state_requirements = [
+            tag.split(":", 2)
+            for tag in capability.tags
+            if tag.startswith("phase_requires_any_state:")
+        ]
+        if any(
+            len(parts) == 3
+            and parts[1].casefold() == phase.casefold()
+            and not {
+                state_name.casefold()
+                for state_name in parts[2].split("|")
+                if state_name
+            }.intersection(active_state)
+            for parts in phase_any_state_requirements
         ):
             continue
         selected.append(capability)

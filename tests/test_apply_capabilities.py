@@ -103,6 +103,12 @@ def test_runtime_capabilities_are_phase_scoped_from_one_registry() -> None:
         registry, phase="prepare", state=("ats_workday",)
     )
     submit = scope_capability_registry(registry, phase="submit")
+    preview = scope_capability_registry(
+        registry,
+        phase="submit",
+        route="browser",
+        state=("preview", "ats_smartrecruiters"),
+    )
     ordinary_repair = scope_capability_registry(
         registry, phase="submit", route="browser", state=("repair",)
     )
@@ -123,7 +129,15 @@ def test_runtime_capabilities_are_phase_scoped_from_one_registry() -> None:
     assert "build_fill_plan" not in submit.names()
     assert "resolve_answer" in submit.names()
     assert "report_agent_turn" in submit.names()
+    assert "browser_fill_form" not in submit.names()
+    assert "browser_select_option" not in submit.names()
+    assert "browser_type" not in submit.names()
     assert "browser_file_upload" not in submit.names()
+    assert "browser_fill_form" in preview.names()
+    assert "browser_select_option" in preview.names()
+    assert "browser_type" in preview.names()
+    assert "browser_file_upload" in preview.names()
+    assert "report_agent_turn" in preview.names()
     assert "browser_file_upload" not in ordinary_repair.names()
     assert "browser_file_upload" in resume_repair.names()
 
