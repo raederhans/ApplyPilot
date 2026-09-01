@@ -72,14 +72,33 @@ def _worker_summary_lines(
 def _manual_captcha_relay_enabled(
     cli_requested: bool,
     profile: Mapping[str, object],
+    *,
+    dry_run: bool = False,
+    continuous: bool = False,
+    headless: bool = False,
+    workers: int = 1,
+    limit: int | None = None,
 ) -> bool:
-    """Honor the persisted relay preference without requiring a repeat flag."""
+    """Apply the persisted relay preference only to bounded visible submissions.
+
+    An explicit CLI request is deliberately preserved for the caller's strict
+    mode validation.  A persisted preference is a convenience for real,
+    attended submissions, not an instruction to relay CAPTCHAs during previews
+    or unbounded/background work.
+    """
     submission_policy = profile.get("submission_policy")
     profile_enabled = bool(
         isinstance(submission_policy, Mapping)
         and submission_policy.get("manual_captcha_relay") is True
     )
-    return bool(cli_requested or profile_enabled)
+    profile_scope_is_valid = (
+        not dry_run
+        and not continuous
+        and not headless
+        and workers == 1
+        and limit in (None, 1)
+    )
+    return bool(cli_requested or (profile_enabled and profile_scope_is_valid))
 
 
 def run_apply(
@@ -170,7 +189,23 @@ def run_apply(
     manual_captcha_relay = _manual_captcha_relay_enabled(
         manual_captcha_relay,
         profile,
+        dry_run=dry_run,
+        continuous=continuous,
+        headless=headless,
+        workers=workers,
+        limit=limit,
     )
+    if manual_captcha_relay and (
+        dry_run
+        or continuous
+        or headless
+        or workers != 1
+        or limit not in (None, 1)
+    ):
+        console.print(
+            "[red]Manual CAPTCHA relay requires bounded visible submission mode.[/red]"
+        )
+        raise typer.Exit(code=1)
     final_batch_authorization_required = bool(
         isinstance(submission_policy, dict)
         and submission_policy.get("batch_final_authorization_required", False)
@@ -240,17 +275,6 @@ def run_apply(
             "--authorization-file.[/red]"
         )
         raise typer.Exit(code=2)
-    if manual_captcha_relay and (dry_run or continuous or headless):
-        console.print(
-            "[red]Manual CAPTCHA relay requires bounded visible submission mode.[/red]"
-        )
-        raise typer.Exit(code=1)
-        if continuous or headless or workers != 1 or (limit not in (None, 1)):
-            console.print(
-                "[red]Fill-only review requires a visible browser, one worker, one URL, and limit 1.[/red]"
-            )
-            raise typer.Exit(code=1)
-
     # --- Full apply mode ---
 
     backend = resolve_apply_backend(agent_backend, os.environ)

@@ -263,6 +263,121 @@ def test_profile_enables_manual_captcha_relay_without_repeating_cli_flag() -> No
     assert apply_command._manual_captcha_relay_enabled(False, {}) is False
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        {"dry_run": True},
+        {"continuous": True},
+        {"headless": True},
+        {"workers": 2},
+        {"limit": 2},
+    ],
+)
+def test_profile_manual_captcha_relay_does_not_escape_bounded_visible_submission(
+    mode: dict[str, object],
+) -> None:
+    profile = {"submission_policy": {"manual_captcha_relay": True}}
+
+    assert apply_command._manual_captcha_relay_enabled(False, profile, **mode) is False
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        {"dry_run": True},
+        {"continuous": True},
+        {"headless": True},
+    ],
+)
+def test_explicit_manual_captcha_relay_remains_enabled_for_mode_rejection(
+    mode: dict[str, object],
+) -> None:
+    assert apply_command._manual_captcha_relay_enabled(True, {}, **mode) is True
+
+
+def test_profile_manual_captcha_relay_is_disabled_for_dry_run_before_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps({"submission_policy": {"manual_captcha_relay": True}}),
+        encoding="utf-8",
+    )
+    launch_calls: list[dict[str, object]] = []
+    monkeypatch.setattr("applypilot.cli._bootstrap", lambda: None)
+    monkeypatch.setattr("applypilot.config.PROFILE_PATH", profile)
+    monkeypatch.setattr(
+        "applypilot.services.application.count_submission_ready_jobs",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "applypilot.services.application.resolve_apply_backend",
+        lambda *_args, **_kwargs: "codex",
+    )
+    monkeypatch.setattr(
+        "applypilot.services.application.resolve_apply_model",
+        lambda *_args, **_kwargs: "test-model",
+    )
+    monkeypatch.setattr("applypilot.database.get_connection", lambda: object())
+    monkeypatch.setattr("applypilot.apply.chrome.get_browser_executable", lambda *_: "edge")
+    monkeypatch.setattr("applypilot.apply.chrome.resolve_browser_backend", lambda *_: "edge")
+    monkeypatch.setattr("applypilot.apply.router.resolve_interaction_mode", lambda *_: "playwright")
+    monkeypatch.setattr("shutil.which", lambda *_: "codex")
+    monkeypatch.setattr(
+        "applypilot.apply.launcher.main",
+        lambda **kwargs: launch_calls.append(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["apply", "--dry-run", "--url", "https://careers.example.test/jobs/data"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "CAPTCHA:  stop on blocker" in result.output
+    assert launch_calls == [
+        {
+            "limit": 1,
+            "target_url": "https://careers.example.test/jobs/data",
+            "min_score": 6,
+            "headless": False,
+            "model": "test-model",
+            "dry_run": True,
+            "continuous": False,
+            "workers": 1,
+            "agent_backend": "codex",
+            "manual_captcha_relay": False,
+            "browser_backend": "edge",
+            "interaction_mode": "playwright",
+            "authorization_manifest": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--dry-run"],
+        ["--continuous"],
+        ["--headless"],
+        ["--workers", "2"],
+        ["--limit", "2"],
+    ],
+)
+def test_explicit_manual_captcha_relay_rejects_incompatible_mode(
+    tmp_path: Path, monkeypatch, arguments: list[str]
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"submission_policy": {}}), encoding="utf-8")
+    monkeypatch.setattr("applypilot.cli._bootstrap", lambda: None)
+    monkeypatch.setattr("applypilot.config.PROFILE_PATH", profile)
+
+    result = CliRunner().invoke(app, ["apply", "--manual-captcha-relay", *arguments])
+
+    assert result.exit_code == 1
+    assert "Manual CAPTCHA relay requires bounded visible submission mode" in result.output
+
+
 def test_standing_authorization_binds_a_bounded_replacement_pool(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "standing-replacements.db")
     first = _job("https://careers.example.test/jobs/data-1")
