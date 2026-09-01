@@ -2160,21 +2160,73 @@ def _resolve_ats_application_binding(
     transport=None,
 ) -> dict[str, object] | None:
     """Resolve an immutable provider job-to-application identity when needed."""
-    target_url = str(job.get("application_url") or job.get("url") or "")
-    if ats_mod.detect_ats_site(target_url) != "smartrecruiters":
+    smartrecruiters_urls = tuple(
+        str(value)
+        for value in (job.get("url"), job.get("application_url"))
+        if value and ats_mod.detect_ats_site(str(value)) == "smartrecruiters"
+    )
+    if not smartrecruiters_urls:
         return None
-    parsed = urlparse(target_url)
-    parts = [part for part in parsed.path.split("/") if part]
-    tenant = parts[0] if len(parts) >= 2 else ""
-    posting_id = parts[1].split("-", 1)[0] if len(parts) >= 2 else ""
     unresolved = {
         "provider": "smartrecruiters",
-        "tenant": tenant,
-        "posting_id": posting_id,
+        "tenant": "",
+        "posting_id": "",
         "resolved": False,
     }
-    if not tenant or not posting_id or tenant.casefold() == "oneclick-ui":
+    public_identities: dict[tuple[str, str], tuple[str, str]] = {}
+    for candidate_url in smartrecruiters_urls:
+        parts = [part for part in urlparse(candidate_url).path.split("/") if part]
+        if len(parts) < 2 or parts[0].casefold() == "oneclick-ui":
+            continue
+        tenant = parts[0]
+        posting_id = parts[1].split("-", 1)[0]
+        if tenant and posting_id:
+            public_identities.setdefault(
+                (tenant.casefold(), posting_id.casefold()),
+                (tenant, posting_id),
+            )
+    if not public_identities:
         return {**unresolved, "reason": "public_posting_identity_missing"}
+    if len(public_identities) != 1:
+        return {**unresolved, "reason": "public_posting_identity_conflict"}
+    tenant, posting_id = next(iter(public_identities.values()))
+    unresolved = {
+        **unresolved,
+        "tenant": tenant,
+        "posting_id": posting_id,
+    }
+    oneclick_publication_ids: list[str] = []
+    for candidate_url in smartrecruiters_urls:
+        parsed = urlparse(candidate_url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if not parts or parts[0].casefold() != "oneclick-ui":
+            continue
+        if (
+            len(parts) < 5
+            or parts[1].casefold() != "company"
+            or parts[3].casefold() != "publication"
+            or not parts[2]
+            or not parts[4]
+        ):
+            return {**unresolved, "reason": "oneclick_application_identity_invalid"}
+        try:
+            oneclick_publication_id = str(uuid.UUID(parts[4]))
+        except (ValueError, AttributeError):
+            return {**unresolved, "reason": "oneclick_application_identity_invalid"}
+        if parts[2].casefold() != tenant.casefold():
+            return {**unresolved, "reason": "oneclick_tenant_mismatch"}
+        dcr_ci_values = [
+            value
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.casefold() == "dcr_ci"
+        ]
+        if not dcr_ci_values or not dcr_ci_values[0].strip():
+            return {**unresolved, "reason": "oneclick_dcr_ci_missing"}
+        if len(dcr_ci_values) != 1:
+            return {**unresolved, "reason": "oneclick_dcr_ci_invalid"}
+        if dcr_ci_values[0].casefold() != tenant.casefold():
+            return {**unresolved, "reason": "oneclick_dcr_ci_mismatch"}
+        oneclick_publication_ids.append(oneclick_publication_id)
 
     detail_url = (
         "https://api.smartrecruiters.com/v1/companies/"
@@ -2206,6 +2258,8 @@ def _resolve_ats_application_binding(
         != tenant.casefold()
     ):
         return {**unresolved, "reason": "identity_response_mismatch"}
+    if any(candidate != publication_id for candidate in oneclick_publication_ids):
+        return {**unresolved, "reason": "oneclick_publication_identity_mismatch"}
     return {
         "provider": "smartrecruiters",
         "tenant": tenant,

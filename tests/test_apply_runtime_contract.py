@@ -3796,7 +3796,7 @@ def test_post_submit_observer_reconnects_read_only_without_repeating_submit(
     )
 
 
-def test_smartrecruiters_binding_resolves_public_posting_to_publication_uuid() -> None:
+def test_smartrecruiters_binding_resolves_public_job_url_when_application_url_is_oneclick() -> None:
     requested: list[str] = []
 
     def transport(url: str) -> dict:
@@ -3804,31 +3804,240 @@ def test_smartrecruiters_binding_resolves_public_posting_to_publication_uuid() -
         return {
             "status_code": 200,
             "json": {
-                "id": "744000145885499",
-                "uuid": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
-                "company": {"identifier": "Grab"},
+                "id": "6000000001307056",
+                "uuid": "9a04b9a9-424f-4afc-a4c9-5eedc493b048",
+                "company": {"identifier": "NCS3"},
             },
         }
 
     binding = launcher._resolve_ats_application_binding(
         {
+            "url": (
+                "https://jobs.smartrecruiters.com/NCS3/"
+                "6000000001307056-business-strategy-analyst-intern"
+            ),
             "application_url": (
-                "https://jobs.smartrecruiters.com/Grab/"
-                "744000145885499-intern-strategy-insights?oga=true"
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=NCS3"
             )
         },
         transport=transport,
     )
 
     assert requested == [
-        "https://api.smartrecruiters.com/v1/companies/Grab/postings/744000145885499"
+        "https://api.smartrecruiters.com/v1/companies/NCS3/postings/6000000001307056"
     ]
     assert binding == {
         "provider": "smartrecruiters",
-        "tenant": "Grab",
-        "posting_id": "744000145885499",
-        "publication_id": "4df5dd16-4fc7-48b4-a943-492fbc508b62",
+        "tenant": "NCS3",
+        "posting_id": "6000000001307056",
+        "publication_id": "9a04b9a9-424f-4afc-a4c9-5eedc493b048",
         "resolved": True,
+    }
+
+
+def test_smartrecruiters_binding_resolves_public_application_url_after_linkedin() -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "url": "https://www.linkedin.com/jobs/view/4455274411/",
+            "application_url": (
+                "https://jobs.smartrecruiters.com/NCS3/"
+                "6000000001307056-business-strategy-analyst-intern"
+            ),
+        },
+        transport=lambda url: requested.append(url)
+        or {
+            "status_code": 200,
+            "json": {
+                "id": "6000000001307056",
+                "uuid": "9a04b9a9-424f-4afc-a4c9-5eedc493b048",
+                "company": {"identifier": "NCS3"},
+            },
+        },
+    )
+
+    assert requested == [
+        "https://api.smartrecruiters.com/v1/companies/NCS3/postings/6000000001307056"
+    ]
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "NCS3",
+        "posting_id": "6000000001307056",
+        "publication_id": "9a04b9a9-424f-4afc-a4c9-5eedc493b048",
+        "resolved": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("application_url", "reason"),
+    [
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication?dcr_ci=NCS3"
+            ),
+            "oneclick_application_identity_invalid",
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/not-a-uuid?dcr_ci=NCS3"
+            ),
+            "oneclick_application_identity_invalid",
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/Other/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=Other"
+            ),
+            "oneclick_tenant_mismatch",
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048"
+            ),
+            "oneclick_dcr_ci_missing",
+        ),
+        (
+            (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=Other"
+            ),
+            "oneclick_dcr_ci_mismatch",
+        ),
+    ],
+)
+def test_smartrecruiters_binding_rejects_invalid_oneclick_claim_before_api(
+    application_url: str,
+    reason: str,
+) -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "url": "https://jobs.smartrecruiters.com/NCS3/6000000001307056-role",
+            "application_url": application_url,
+        },
+        transport=lambda url: requested.append(url),
+    )
+
+    assert requested == []
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "NCS3",
+        "posting_id": "6000000001307056",
+        "resolved": False,
+        "reason": reason,
+    }
+
+
+def test_smartrecruiters_binding_rejects_oneclick_publication_mismatch() -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "url": "https://jobs.smartrecruiters.com/NCS3/6000000001307056-role",
+            "application_url": (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=NCS3"
+            ),
+        },
+        transport=lambda url: requested.append(url)
+        or {
+            "status_code": 200,
+            "json": {
+                "id": "6000000001307056",
+                "uuid": "0b90e08c-421a-4f9b-aa99-4ca4eb3673b4",
+                "company": {"identifier": "NCS3"},
+            },
+        },
+    )
+
+    assert requested == [
+        "https://api.smartrecruiters.com/v1/companies/NCS3/postings/6000000001307056"
+    ]
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "NCS3",
+        "posting_id": "6000000001307056",
+        "resolved": False,
+        "reason": "oneclick_publication_identity_mismatch",
+    }
+
+
+def test_smartrecruiters_binding_rejects_conflicting_public_job_identities() -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "url": "https://jobs.smartrecruiters.com/NCS3/6000000001307056-role",
+            "application_url": (
+                "https://jobs.smartrecruiters.com/NCS3/"
+                "6000000001307057-different-role"
+            ),
+        },
+        transport=lambda url: requested.append(url),
+    )
+
+    assert requested == []
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "",
+        "posting_id": "",
+        "resolved": False,
+        "reason": "public_posting_identity_conflict",
+    }
+
+
+def test_smartrecruiters_binding_preserves_public_identity_on_api_failure() -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "url": "https://jobs.smartrecruiters.com/NCS3/6000000001307056-role",
+            "application_url": (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=NCS3"
+            ),
+        },
+        transport=lambda url: requested.append(url) or {"status_code": 503, "json": None},
+    )
+
+    assert requested == [
+        "https://api.smartrecruiters.com/v1/companies/NCS3/postings/6000000001307056"
+    ]
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "NCS3",
+        "posting_id": "6000000001307056",
+        "resolved": False,
+        "reason": "identity_lookup_http_503",
+    }
+
+
+def test_smartrecruiters_binding_rejects_oneclick_without_public_job_url() -> None:
+    requested: list[str] = []
+
+    binding = launcher._resolve_ats_application_binding(
+        {
+            "application_url": (
+                "https://jobs.smartrecruiters.com/oneclick-ui/company/NCS3/"
+                "publication/9a04b9a9-424f-4afc-a4c9-5eedc493b048?dcr_ci=NCS3"
+            )
+        },
+        transport=lambda url: requested.append(url),
+    )
+
+    assert requested == []
+    assert binding == {
+        "provider": "smartrecruiters",
+        "tenant": "",
+        "posting_id": "",
+        "resolved": False,
+        "reason": "public_posting_identity_missing",
     }
 
 
