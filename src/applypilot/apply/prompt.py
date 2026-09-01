@@ -344,15 +344,26 @@ def _build_application_facts_section(profile: dict) -> str:
         if not key:
             continue
         value = fact.get("value", "Manual review")
-        context = str(fact.get("context", "general")).strip() or "general"
-        source = str(fact.get("source", "profile")).strip() or "profile"
+        context = str(fact.get("scope") or fact.get("context") or "").strip()
+        source = str(fact.get("source") or "").strip()
         confirmed_at = str(fact.get("confirmed_at", "not recorded")).strip()
+        production_status = (
+            "current scoped fact"
+            if context and source and confirmed_at not in {"", "not recorded"}
+            else "legacy reference only; never auto-answer medium/high-risk fields"
+        )
         lines.append(
-            f"- {key}: {value} | context: {context} | source: {source} | confirmed: {confirmed_at}"
+            f"- {key}: {value} | context: {context or 'not recorded'} | "
+            f"source: {source or 'not recorded'} | confirmed: {confirmed_at} | "
+            f"status: {production_status}"
         )
     lines.append(
         "- Context is binding: never copy an internship answer into a "
         "post-graduation full-time question."
+    )
+    lines.append(
+        "- Only the current profile registry is authoritative. Revision history is not an answer "
+        "source; medium/high-risk facts also require explicit source, scope, and freshness."
     )
     lines.append(
         "- Key-answer review is guidance, not a rigid matrix: compare the question's meaning, "
@@ -385,8 +396,9 @@ def _build_salary_section(profile: dict) -> str:
     current_currency = current.get("current_salary_currency", currency)
     current_salary_rule = (
         f"5. Current salary with an explicit monthly period and {current_currency} currency -> "
-        f"enter {current_monthly}. If the period or currency differs or is unclear, record it as an "
-        "unanswered question for confirmation."
+        f"the configured reference is {current_monthly}. Do not enter {current_monthly} unless a current typed fact "
+        "with matching employment scope, source, and freshness. If the period, currency, or fact "
+        "binding differs or is unclear, record it as an unanswered question for confirmation."
         if current_monthly not in (None, "")
         else "5. Current salary -> record it as an unanswered question for confirmation."
     )
@@ -396,11 +408,11 @@ Finding a suitable role takes priority. Never reject or stop an application beca
 
 Decision tree:
 1. Optional compensation field -> leave blank; if text is required, enter "Negotiable".
-2. Internship field requiring one monthly number -> enter {currency} {internship_default} per month.
-3. Internship field requesting a range -> enter {currency} {internship_min}-{internship_max} per month.
+2. Internship field requiring one monthly number -> the configured reference is {currency} {internship_default} per month. Enter it only when a current typed preference fact supplies source, exact internship scope, and freshness; otherwise request review.
+3. Internship field requesting a range -> the configured reference is {currency} {internship_min}-{internship_max} per month, subject to the same typed-fact gate.
 4. Full-time field shows an employer range -> do not invent a floor or convert it. Use the employer's range only if the form accepts a range.
 {current_salary_rule}
-6. Full-time expected salary requiring one annual number -> enter the configured preference {currency} {full_time_default or full_time_min} per year. If the control offers buckets, select the bucket containing that value. This is a preference answer, not a minimum or a reason to reject the job.
+6. Full-time expected salary requiring one annual number -> the configured reference is {currency} {full_time_default or full_time_min} per year. Enter or bucket it only from a current typed preference fact bound to the full-time scope; when that gate passes, select the bucket containing that value. This is not a safe default, minimum, or reason to reject the job.
 7. Never add a dollar sign automatically, never assume annual versus monthly, and never convert annual salary to hourly pay without explicit user review."""
 
 
@@ -469,10 +481,10 @@ def _build_routine_form_defaults_section(profile: dict) -> str:
         profile.get("education_country_answer_policy") or ""
     ).strip()
     return f"""== ROUTINE FORM DEFAULTS ==
-- Country/Region of Birth -> {country_of_birth or 'leave blank unless a confirmed profile value is available'}.
-- Education countries -> {education_countries or 'use only the country attached to the matching education record'}.
+- Country/Region of Birth -> {country_of_birth or 'not available'} (configured reference). Use only through a current typed high-sensitivity fact with exact identity scope, source, and freshness; otherwise leave blank or review when required.
+- Education countries -> configured references: {education_countries or 'not available'}. Use only the country from a current typed fact bound to the matching education record.
 - Education-country answer policy -> {education_country_policy or 'Use the country attached to the matching education record; never substitute nationality or country of birth.'}
-- "How did you hear about us?" / application-source fields are non-material. Use the actual discovery source when it is available as a visible option. Otherwise prefer "{preferred_source}", then "{fallback_source}" or the first truthful non-referral option. Do not stop or create an unanswered-question record for this field.
+- "How did you hear about us?" / application-source fields are non-material. Use the actual discovery source when it is available as a visible option. Otherwise prefer "{preferred_source}" only when an adapter/version/semantic/context-bound registered safe-default rule authorizes it; the same binding is required for "{fallback_source}", and the first visible option is never a generic fallback. Do not stop the whole application merely for this field; leave it blank when optional or request policy review when required and no bound rule matches.
 - Never claim a named employee referral, agency referral, or former-employer relationship unless it is explicitly confirmed for this employer."""
 
 
@@ -484,9 +496,9 @@ For every non-sensitive field, resolve in this order and use the attached resolv
 2. Confirmed alias/equivalent spelling.
 3. A broader category, containing numeric/date bucket, or same-level taxonomy option; record the selected option and relation.
 4. A truthful negative (No/None/0/Not applicable) and continue. A negative availability, skill, seniority, or preference answer is not an application failure.
-5. A configured preference/default for negotiable fields such as salary or application source.
+5. An exact configured preference fact, or a low-risk adapter/version/semantic/context-bound registered safe-default rule. Medium/high-risk fields have no safe defaults.
 6. Consult the supplied profile, resume, application-facts registry, ATS context, and read-only reference tools; then choose the closest non-contradictory option and record it.
-7. Leave an optional low-impact unknown blank. For a required low-impact unknown, choose the closest non-contradictory answer rather than stopping.
+7. Leave an optional low-impact unknown blank. For a required low-impact unknown, use only a registered safe-default rule; otherwise request the fact or review it.
 Standard applicant truthfulness certifications, acknowledgements that the supplied application is complete to the applicant's best knowledge, and confirmations that the displayed policy was read are not a separate human-review boundary. When the visible statement only attests to the already-audited answers and ordinary application terms, select the affirmative option and continue. Stop only when the statement itself adds a materially specific fact that is unconfirmed or directly contradicted by the profile.
 Only stop when a required field directly affects the truth of identity, a legal/regulated declaration, a confirmed credential, security/financial data, or submission authorization and every available answer would be false. Never put passwords, OTPs, security codes, identity numbers, or mailbox contents into answer-resolution tools or audit records."""
 
@@ -1427,7 +1439,7 @@ def build_prompt(job: dict, tailored_resume: str,
             else "No specialist runner is registered for this turn; do not emit proposals."
         )
         structured_reporting_section = f"""== STRUCTURED AGENT LOOP AND TURN REPORT ==
-Observe the current page, resolve uncertain ordinary answers through the profile/reference registry and exposed proposal-only tools, execute the selected browser actions as the single page writer, then verify the visible result. Independent read-only evidence may be gathered serially or in parallel, but no helper may click, fill, or authorize submission. Record accepted lossy mappings under observations.answer_mappings.
+Observe the current page, resolve uncertain ordinary answers through the profile/reference registry and exposed proposal-only tools, execute the selected browser actions as the single page writer, then verify the visible result. Independent read-only evidence may be gathered serially or in parallel, but no helper may click, fill, or authorize submission. For every filled supported control, including optional fields, call get_application_context and the proposal-only build_answer_mapping tool after the visible value is stable. Copy fact_ref only from its available_fact_refs list; never guess or derive one. Copy the returned v2 adapter, adapter_version, opaque_binding, and snapshot_digest exactly; combine only returned mapping items whose envelope fields are identical under observations.answer_mappings. Never invent or hand-calculate a field hash, value digest, risk, semantic, scope, or binding. Do not emit a legacy/list-shaped mapping. A protected identifier, declaration, unsupported control, or field without a current typed fact or host exact checker must remain a manual pre-submit blocker; do not manufacture provenance for it.
 Before the final plain-text RESULT lines, call the attached applypilot_control report_agent_turn tool exactly once. Report the same normalized status (for example ready_to_submit, previewed, cover_not_required or cover_letter_required, applied, submission_uncertain, captcha, login_issue, or failed:reason), a short summary, and only compact JSON-safe observations. Put PREVIEW_AUDIT data under observations.preview_audit, SUBMISSION_EVIDENCE under observations.submission_evidence, and technical failures under observations.failure_context. When a browser application uploaded a resume and the exact labelled Resume/CV container visibly listed the filename, include `observations.resume_upload={{"verified":true,"field_label":"<exact visible label>","visible_filename":true}}`; never emit this proof from an autocomplete, cover-letter, or generic attachment control. {proposal_instruction} If human input is needed, use requested_human_input without including passwords, cookies, verification codes, identity numbers, mailbox contents, or live browser handles. The report tool records this turn only and does not change application state. If it is unavailable, keep the legacy RESULT contract below so the launcher can remain compatible."""
     computer_use_handoff_enabled = (
         "computer_use" in control_contract.get("requestable_handoffs", [])

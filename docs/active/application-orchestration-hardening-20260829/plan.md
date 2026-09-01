@@ -12,7 +12,7 @@ Make ApplyPilot's submission-surface policy, candidate admission, evidence class
 - Activate one bounded read-only specialist through a production runner, deterministic reducer, durable journal, replay/idempotency, and proposal lifecycle telemetry.
 - Report effective concurrency and schedule workers against explicit resource capacity.
 - Reduce avoidable MCP/process overhead where existing runtime boundaries allow it safely.
-- Run focused tests, controlled two-worker smoke tests, and supervised real applications when all gates pass.
+- Run phase-specific focused tests, cross-phase integration tests, controlled synthetic/browser smoke tests, and only then multiple supervised real end-to-end applications when every promotion gate passes.
 
 ## Sources of truth
 
@@ -35,6 +35,49 @@ Make ApplyPilot's submission-surface policy, candidate admission, evidence class
 - [ ] Stage 10: Strangle the monolithic worker one vertical slice at a time. Start with prepare/recover, compare legacy and Actor decisions on replay fixtures, and retain the legacy path as the only writer until decision parity is proven.
 - [ ] Stage 11: Introduce provider-neutral Agent session continuation, browser-profile leases, and high-level idempotent form operations with page-version preconditions. Do not adopt a new Agent framework until one ATS adapter proves a measured need.
 - [ ] Stage 12: Park per-job exceptions without blocking the batch, establish ATS-specific fast paths, and run matched 1/2/4-worker cohorts before changing the supported production worker limit.
+
+## 2026-08-31 durable-control-plane continuation
+
+The continuation baseline is `12d20b6ad4dc57f10e85974e8240d3c203944d43`. GitHub Actions run `33395218637` failed before scheduling and created zero jobs. The prior green run proves an older revision only; it is not the current integration gate. Work proceeds in the following order, with no live application wave resumed until the entire local and remote programme below is green.
+
+1. **P0 CI and release truth** — remove the invalid job-level `runner.temp` expression, bind the isolated Windows workspace after the runner starts, add local workflow validation, and require evidence that the expected jobs were actually created. Branch-protection changes remain an explicit repository-permission action and are not implied by code changes.
+2. **P1 Durable Control Plane v3** — persist browser/profile leases and runtime turns, enforce database CAS plus physical profile exclusion, and resume from Actor checkpoints without treating provider sessions as correctness state.
+3. **P2 Semantic Browser Ops** — land page-versioned semantic writes and postcondition verification behind the existing PolicyEngine/SubmissionGate, first for Workday and then SmartRecruiters.
+4. **P3 Typed accuracy contracts** — introduce source-emitted typed failures, scoped fact provenance, field risk classes, adapter-only safe defaults, and a redacted golden corpus. Generic `options[0]` fallback is removed rather than made more permissive.
+5. **P4 Exception Operator Center** — expose the existing durable exception queue through typed CLI/operator commands, bounded semantic grouping, circuit breakers, and explicit resume/reconcile flows; the frontend remains unable to write SQLite directly.
+6. **P5 Benchmarks and composition-root strangling** — add deterministic replay and local synthetic ATS benchmarks, then extract one vertical responsibility at a time from the monoliths. Worker promotion uses matched evidence, not fixture latency.
+7. **P6 Overall qualification and live canaries** — run the complete isolated suite, lint/build/install/migration checks, current remote CI with every expected job present, and only after all of those pass run multiple serial supervised real end-to-end applications across supported ATS routes.
+
+P1 is complete locally as of 2026-09-01. The accepted production slice reserves before `Popen`, binds exact PID/birth, persists crash and terminal outcomes, keeps `unknown` recovery or receipt admission across repeated launcher restarts, and permits only exact scoped recovery or SubmissionGate continuation. The focused P1-C composition passed `228` tests, two real OS-child kill/restart cases passed, the isolated combined P0/P1 gate passed `553` tests, and independent review returned `ACCEPT`. No provider, live browser, default database, commit, or remote action was used.
+
+P2 is complete locally as of 2026-09-01. The accepted slice adds an attempt-bound, page-versioned, resume-only semantic capability for Workday (`myworkdayjobs.com` and `myworkdaysite.com`) and SmartRecruiters. Provider acceptance requires an exact filename token in the bound container, no error or in-progress state, and a stable acceptance/remove/replace signal; local `input.files` alone is never sufficient. Any dispatched operation blocks legacy fallback and a second provider writer for that attempt. A crashed `started/d1` operation parks unless the same exact operation has explicit `failed_no_effect` evidence; only that state permits one bounded replay. Two real OS-process restart cases, real local Chromium cases, focused provider/storage/worker gates, and the final `414`-test P0-P2 composition passed; scoped Ruff passed and fourth-round independent review returned `ACCEPT`. No real ATS, default database, Submit, receipt, commit, push, or remote action was used.
+
+P3 is complete locally as of 2026-09-01. Source-emitted typed failures now survive MCP/result/Actor boundaries; facts and safe defaults are host-scoped, fresh, sealed, and value-redacted; automatic answers carry exact fact or registered safe-default provenance; every filled supported control is covered by the pre-submit denominator; and the golden corpus scores actual resolver output. The final worker repair path deep-copies authoritative nested state, then returns only current lease/page binding, a host-recomputed provenance binding, and answer mappings before a second live audit. Root gates passed `48` focused, `333` typed-accuracy composition, `305` compatibility, and scoped Ruff; fourth-round independent review returned `ACCEPT`. No live browser, default database, provider, Submit, receipt, commit, push, or remote action was used.
+
+P5 is complete locally as of 2026-09-01. One immutable replay fixture drives matched 1/2/4 runtime cohorts with exactly-once task accounting, fresh runtime/task copies, forward/reverse decision invariance, isolated benchmark namespaces, and explicit non-provider/non-promotion labels. Concurrency is measured only inside the instrumented runtime `run()` interval; a serial gate produces peak one and fails. A separate real local headless-Chromium lane covers eight offline DOM scenarios with fresh contexts/pages, abort-all networking, session restart, and four active Submit traps. Root composition passed `31` tests and scoped Ruff; independent re-review replayed all three original false-green findings plus broken-barrier and Chromium safety paths and returned `ACCEPT`. This evidence cannot promote the production worker cap; supervised live performance remains after P6.
+
+P6 is complete locally as of 2026-09-01 on the isolated 81-file task candidate rooted at `12d20b6ad4dc57f10e85974e8240d3c203944d43`. Full Ruff and the single complete suite (`1529 passed in 77.35s`) passed. The audited release contained exactly one wheel, one sdist, one bundle, and the checksum manifest; a clean environment installed the wheel and passed CLI/init/doctor/dashboard smoke. The legacy SQLite migration, backup, restore, integrity, foreign-key, sentinel conversion, required-table, and second-init idempotency checks passed without creating the default DB. Static workflow expansion produced the required four checks. Remote CI remains unproven and P6 remains open until an explicitly authorized push of this candidate creates and passes all four jobs.
+
+### Stage-specific test and promotion matrix
+
+| Stage | Required specialist tests | Promotion condition |
+| --- | --- | --- |
+| P0 | YAML parse, expression/context lint, expected job-name/count contract, Windows path binding and clean-install smoke | Local checks pass; a pushed revision creates and passes every expected Linux/Windows job |
+| P1 | migration upgrade/replay/rollback, lease CAS, stale epoch rejection, kill/restart, launcher restart, two-process profile contention, recovery-start crash replay | No stale checkpoint/page/lease accepted; no unknown side effect replayed; `submit_started` never returns to ordinary recovery |
+| P2 | local synthetic Workday and SmartRecruiters forms, semantic patch replay, upload hash/postcondition checks, validation repair, stale-page rejection, SubmitGate isolation | Replayed writes converge; stale-page writes are zero; adapter cannot bypass final-submit admission |
+| P3 | typed-failure compatibility, fact scope/expiry/provenance, low/medium/high field policy, golden-corpus regression, property/state-machine tests | Unsupported high-risk auto-answer is zero; every automatic answer has a fact or registered safe-default provenance |
+| P4 | CLI command parsing, command-plane authorization, idempotent resolve/resume, batch continuation, semantic grouping scope, circuit-breaker and recovery-budget tests | One blocked application does not block the batch; sensitive/employer-specific answers cannot be promoted to global scope |
+| P5 | deterministic replay benchmark, synthetic browser benchmark, 1/2/4 matched dry cohorts, import-boundary/type/build checks | No unexplained decision drift, duplicate Submit, profile cross-talk, stale write, receipt false positive, or quality regression |
+| P6 | isolated full suite, full Ruff, workflow validation, wheel build/clean install, migration/backup-restore, current remote matrix with non-zero expected jobs | All prior gates pass on the same candidate revision before any real provider action begins |
+
+### Final supervised real end-to-end programme
+
+- `/root` is the sole owner of the browser, live SQLite database, profile/CDP resources, final Submit, mailbox observation, and receipt reconciliation.
+- Run one exact application at a time. Freeze job/material/fact identity, exercise discovery or exact-route admission through durable receipt reconciliation, and reconcile the receipt before starting the next case.
+- Use multiple cases across the adapters that passed synthetic qualification, including at least Workday and SmartRecruiters when suitable current jobs and truthful materials are available. A hard-gated or expired job is replaced; it is not forced through or counted as success.
+- Record prepare duration, Agent turns, browser tool calls, validation retries, manual interruptions, receipt latency, stale-write count, profile cross-talk, and submission uncertainty for every case.
+- CAPTCHA, assessment, MFA/security recovery, identity/financial document requirements, unsupported legal/material answers, stale identity, and uncertain receipts remain hard stops. An uncertain Submit is never retried automatically.
+- Live completion requires multiple exact-job decisive receipts plus zero duplicate Submit, zero stale-page write, zero profile cross-talk, and no regression in hard-stop behavior. A clicked button, saved draft, Agent assertion, or third-party tracker state never counts.
 
 ## M3 execution wave (2026-08-30)
 
@@ -94,6 +137,8 @@ M3-A is accepted only if replay of the same completed turn is a no-op even when 
 - The current launcher/worker remains behavior-authoritative until replay comparison has zero unexplained decision drift and no receipt, identity, manifest, or single-writer regression.
 - Session/profile reuse never allows two writers to share one page or user-data directory, never changes runtime after submit starts, and survives process restart without repeating an admitted action.
 - Throughput promotion uses receipt-confirmed suitable submissions per hour plus quality guardrails; worker count is not raised from telemetry-free intuition.
+- Every implementation stage passes its named specialist tests before cross-stage qualification; multiple supervised real end-to-end cases run only after the same candidate revision passes the complete local and remote gate.
+- A current CI run is valid only when every expected job is created and reaches a successful conclusion; a workflow run with zero jobs is a release blocker, not a test result.
 
 ## Non-goals
 
@@ -105,6 +150,7 @@ M3-A is accepted only if replay of the same completed turn is a no-op even when 
 - No big-bang rewrite of `launcher.py` or `worker_orchestration.py`.
 - No duplicate policy, event, checkpoint, human-request, task-journal, or receipt source of truth.
 - No immediate full migration to OpenAI Agents SDK, LangGraph, Temporal, or a peer-to-peer Agent swarm.
+- No real provider submission or resumption of the paused `5/6` wave before P0-P6 qualification reaches the live-canary promotion gate.
 
 ## Risks and constraints
 
@@ -114,3 +160,5 @@ M3-A is accepted only if replay of the same completed turn is a no-op even when 
 - Live test execution has one owner: `/root`. Subagents may inspect completed logs and static code only.
 - The 2026-08-30 shared-chat review is an architectural hypothesis source, not repository truth; current code, tests, durable ledgers, and exact remote CI logs take precedence.
 - P0 and the Actor vertical slice run in separate user-visible Codex tasks with disjoint ownership. The Actor task may edit one bounded non-submit launcher/worker seam, but neither task may commit, push, publish, run live submissions, change ledger/Submit authority, or edit this task record.
+- The parent worktree currently contains independently owned changes under `src/applypilot/scoring/` plus `tmp/`; every continuation slice must preserve and avoid staging or reverting them.
+- Repository branch-protection settings are external permission/governance state. Code may document the required check names, but changing protection rules requires explicit authorization and separate verification.

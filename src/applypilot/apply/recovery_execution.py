@@ -17,6 +17,7 @@ from applypilot.apply.contracts import (
     RecoveryTerminalStatus,
 )
 from applypilot.apply.exception_queue import exception_for_command
+from applypilot.apply.operator_binding import OPERATOR_RESUME_BINDING_KEYS
 from applypilot.storage import agent_control
 
 RecoveryHandler = Callable[[RecoveryCommand], Mapping[str, object]]
@@ -83,6 +84,7 @@ def admit_recovery_decision(
     decision: DecisionEnvelope,
     *,
     submit_started: bool,
+    operator_context: Mapping[str, object] | None = None,
 ) -> RecoveryPolicyAdmission:
     """Convert one v2 proposal to an allowlisted command or reject it closed."""
     if decision.upcast_from_schema_version is not None:
@@ -116,6 +118,28 @@ def admit_recovery_decision(
         payload["missing_material"] = recovery.missing_material
     if decision.human_interruption is not None:
         payload["interruption_type"] = decision.human_interruption.interruption_type
+    if recovery.action == "human_only" and operator_context is not None:
+        keys = set(operator_context)
+        complete = keys == OPERATOR_RESUME_BINDING_KEYS
+        text_keys = OPERATOR_RESUME_BINDING_KEYS - {
+            "browser_lease_epoch",
+            "page_epoch",
+        }
+        valid_text = all(
+            isinstance(operator_context.get(key), str)
+            and bool(str(operator_context[key]).strip())
+            for key in text_keys
+        )
+        valid_epochs = (
+            isinstance(operator_context.get("browser_lease_epoch"), int)
+            and not isinstance(operator_context["browser_lease_epoch"], bool)
+            and int(operator_context["browser_lease_epoch"]) > 0
+            and isinstance(operator_context.get("page_epoch"), int)
+            and not isinstance(operator_context["page_epoch"], bool)
+            and int(operator_context["page_epoch"]) >= 0
+        )
+        if complete and valid_text and valid_epochs:
+            payload.update(operator_context)
     command = RecoveryCommand(
         command_id=_command_id(decision, command_name),
         run_id=decision.run_id,

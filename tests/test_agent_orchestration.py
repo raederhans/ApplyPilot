@@ -542,6 +542,11 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
         return Process(env=kwargs["env"])
 
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        launcher,
+        "_process_identity_tuple",
+        lambda pid: (pid, 123_456),
+    )
     job = {
         "url": "https://example.test/jobs/1",
         "application_url": "https://example.test/apply/1",

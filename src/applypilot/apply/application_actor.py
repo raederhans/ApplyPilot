@@ -10,12 +10,17 @@ from applypilot.apply.contracts import (
     AgentTurnResult,
     ApplicationEvent,
     DecisionEnvelope,
+    FailureObservation,
     HumanInterruption,
     HumanRequest,
     RecoveryAction,
     application_actor_id,
 )
-from applypilot.apply.failure_taxonomy import FailureDescriptor, classify_failure
+from applypilot.apply.failure_taxonomy import (
+    FailureDescriptor,
+    classify_failure,
+    classify_failure_observation,
+)
 
 ActorPhase = Literal[
     "observe",
@@ -167,9 +172,12 @@ def advance_actor(state: ApplicationActorState, event: ApplicationEvent) -> Appl
     )
 
 
-def _human_interruption(result: str, failure: FailureDescriptor) -> HumanInterruption:
+def _human_interruption(
+    result: str | FailureObservation, failure: FailureDescriptor
+) -> HumanInterruption:
     reason = str(result or "").strip().casefold()
-    if "captcha" in reason:
+    typed_code = result.code if isinstance(result, FailureObservation) else ""
+    if "captcha" in reason or typed_code == "captcha_required":
         interruption_type = "captcha"
     elif failure.category == "security_challenge_required":
         interruption_type = "security_challenge"
@@ -216,11 +224,17 @@ def _decision(
     )
 
 
-def decide_recovery(state: ApplicationActorState, result: str) -> DecisionEnvelope:
+def decide_recovery(
+    state: ApplicationActorState, result: str | FailureObservation
+) -> DecisionEnvelope:
     """Map the existing failure taxonomy to one deterministic canonical action."""
     if state.phase not in {"verify", "recover"}:
         raise ValueError("recovery decisions require a verified or recovering actor state")
-    failure = classify_failure(result)
+    failure = (
+        classify_failure_observation(result)
+        if isinstance(result, FailureObservation)
+        else classify_failure(result)
+    )
 
     if state.submission_uncertain or state.final_submit_count:
         return _decision(
@@ -396,6 +410,18 @@ def decision_for_turn(
         value = request.context.get(key, 0)
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
+    typed_failure = result.failure
+    typed_application_status = None
+    if typed_failure is not None:
+        if typed_failure.submit_started or typed_failure.code == "submission_uncertain":
+            typed_application_status = "submission_uncertain"
+        elif typed_failure.code == "captcha_required":
+            typed_application_status = "captcha"
+        elif typed_failure.code == "expired":
+            typed_application_status = "expired"
+        else:
+            typed_application_status = f"failed:{typed_failure.code}"
+    submit_started = typed_failure is not None and typed_failure.submit_started
     state = ApplicationActorState(
         run_id=request.run_id,
         attempt_id=request.attempt_id,
@@ -404,10 +430,13 @@ def decision_for_turn(
         write_owner=request.agent_role,
         phase="verify",
         final_submit_count=int(
-            request.phase.casefold() == "submit"
-            and status in {"applied", "submission_uncertain"}
+            submit_started
+            or (
+                request.phase.casefold() == "submit"
+                and status in {"applied", "submission_uncertain"}
+            )
         ),
-        submission_uncertain=status == "submission_uncertain",
+        submission_uncertain=submit_started or status == "submission_uncertain",
         same_application_retries_remaining=retry_budget(
             "actor_same_application_retries_remaining"
         ),
@@ -417,6 +446,8 @@ def decision_for_turn(
         actor_id=request.actor_id,
         turn_id=request.turn_id,
     )
+    if typed_failure is not None and status == typed_application_status:
+        return decide_recovery(state, typed_failure)
     return decision_for_status(state, status)
 
 

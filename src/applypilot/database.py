@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.apply import human_handoff as _human_handoff
+from applypilot.apply import operator_commands as _operator_commands
 from applypilot.apply.contracts import (
     AgentCheckpoint,
     ApplicationEvent,
@@ -29,6 +30,8 @@ from applypilot.storage import application_ledger as _application_ledger
 from applypilot.storage import job_identity as _job_identity
 from applypilot.storage import job_stats as _job_stats
 from applypilot.storage import radar as _radar
+from applypilot.storage import runtime_control as _runtime_control
+from applypilot.storage import semantic_browser_writes as _semantic_browser_writes
 from applypilot.storage import submission_receipts as _submission_receipts
 from applypilot.storage import task_journal as _task_journal
 
@@ -483,6 +486,8 @@ def ensure_application_batch_schema(conn: sqlite3.Connection | None = None) -> N
     connection = conn or get_connection()
     _application_ledger.ensure_schema(connection)
     _agent_control.ensure_schema(connection)
+    _runtime_control.ensure_schema(connection)
+    _semantic_browser_writes.ensure_schema(connection)
     _task_journal.ensure_schema(connection)
     _human_handoff.ensure_schema(connection)
 
@@ -656,6 +661,30 @@ def resolve_application_exception(
         if owns_transaction:
             connection.rollback()
         raise
+
+
+def execute_operator_command(
+    command: _operator_commands.OperatorCommand,
+    *,
+    executor: _operator_commands.OperatorExecutor | None = None,
+    verifier: _operator_commands.OperatorVerifier | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> _operator_commands.OperatorCommandResult:
+    """Execute one exact operator command without acquiring application authority."""
+    return _operator_commands.OperatorCommandService(
+        conn or get_connection(), executor=executor, verifier=verifier
+    ).execute(command)
+
+
+def list_operator_exception_groups(
+    *,
+    scope_resolver: _operator_commands.OperatorScopeResolver | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> Mapping[str, tuple[str, ...]]:
+    """Return bounded semantic groups for read-only operator triage."""
+    return _operator_commands.semantic_exception_groups(
+        conn or get_connection(), scope_resolver=scope_resolver
+    )
 
 
 def start_application_attempt(

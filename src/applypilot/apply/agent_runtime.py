@@ -8,6 +8,7 @@ watchdog construction.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import shutil
@@ -31,6 +32,8 @@ from applypilot.apply.capabilities import (
     resolve_playwright_mcp_spec,
 )
 from applypilot.apply.email_routing import MailboxMcpSpec, resolve_mailbox_mcp_spec
+
+logger = logging.getLogger(__name__)
 
 CREDENTIAL_RELAY_ENV_VARS = (
     "APPLYPILOT_ATS_CREDENTIAL_FILE",
@@ -512,6 +515,18 @@ class RuntimeContinuityError(SubprocessRuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class SubprocessParentIdentity:
+    """Durable parent identity used when the old launcher is no longer in memory."""
+
+    run_id: str
+    actor_id: str
+    attempt_id: str
+    runtime_id: str
+    profile_id: str
+    submit_started: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SubprocessLaunchSpec:
     """Provider-neutral subprocess turn description.
 
@@ -589,6 +604,7 @@ class SubprocessRuntimeAdapter(Protocol):
         spec: SubprocessLaunchSpec,
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        on_spawned: Callable[[subprocess.Popen[str]], None] | None = None,
     ) -> subprocess.Popen[str]: ...
 
     def resume(
@@ -597,6 +613,8 @@ class SubprocessRuntimeAdapter(Protocol):
         spec: SubprocessLaunchSpec,
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        on_spawned: Callable[[subprocess.Popen[str]], None] | None = None,
+        persisted_parent: SubprocessParentIdentity | None = None,
     ) -> subprocess.Popen[str]: ...
 
     def cancel(self, run_id: str) -> None: ...
@@ -623,11 +641,64 @@ class SubprocessAgentRuntime:
         self._runs: dict[str, _ManagedSubprocess] = {}
         self._closed = False
 
+    @staticmethod
+    def _fallback_clock() -> float:
+        """Return a cleanup timestamp without relying on an injected clock."""
+        try:
+            return time.monotonic()
+        except BaseException as error:
+            logger.debug("fallback monotonic clock failed", exc_info=error)
+            return 0.0
+
+    @staticmethod
+    def _is_terminated(process: subprocess.Popen[str]) -> bool:
+        """Treat an unreadable process state as live so cleanup fails closed."""
+        try:
+            return process.poll() is not None
+        except BaseException as error:
+            logger.debug("subprocess poll failed during cleanup", exc_info=error)
+            return False
+
+    def _quarantine_spawn_failure(
+        self,
+        spec: SubprocessLaunchSpec,
+        process: subprocess.Popen[str],
+        managed: _ManagedSubprocess | None,
+    ) -> bool:
+        """Stop an exact spawned child, retaining ownership until death is proven."""
+        try:
+            if not self._is_terminated(process):
+                self._kill_process_tree(process.pid)
+        except BaseException as error:
+            logger.debug("subprocess tree kill failed during quarantine", exc_info=error)
+        try:
+            process.wait(timeout=5)
+        except BaseException as error:
+            logger.debug("subprocess wait failed during quarantine", exc_info=error)
+        terminated = self._is_terminated(process)
+        now = self._fallback_clock()
+        with self._lock:
+            current = managed or self._runs.get(spec.run_id)
+            if current is None:
+                current = _ManagedSubprocess(
+                    spec=spec,
+                    process=process,
+                    status="failed" if terminated else "quarantined",
+                    started_at=now,
+                    updated_at=now,
+                )
+                self._runs[spec.run_id] = current
+            else:
+                current.status = "failed" if terminated else "quarantined"
+                current.updated_at = now
+        return terminated
+
     def _spawn(
         self,
         spec: SubprocessLaunchSpec,
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        on_spawned: Callable[[subprocess.Popen[str]], None] | None = None,
     ) -> subprocess.Popen[str]:
         with self._lock:
             if self._closed:
@@ -646,30 +717,46 @@ class SubprocessAgentRuntime:
                 env=dict(spec.env),
                 cwd=str(spec.cwd),
             )
-            now = self._clock()
+            fallback_now = self._fallback_clock()
             managed = _ManagedSubprocess(
                 spec=spec,
                 process=process,
-                status="running",
-                started_at=now,
-                updated_at=now,
+                status="starting",
+                started_at=fallback_now,
+                updated_at=fallback_now,
             )
             self._runs[spec.run_id] = managed
         try:
+            # Register the exact returned handle before any callback, injected
+            # clock, or pipe operation can fail.  A failed cleanup keeps this
+            # entry quarantined so close() can retry it.
+            if on_spawned is not None:
+                on_spawned(process)
+            now = self._clock()
+            with self._lock:
+                managed.status = "running"
+                managed.started_at = now
+                managed.updated_at = now
             if process.stdin is None:
                 raise SubprocessRuntimeError("subprocess stdin pipe was not created")
             process.stdin.write(spec.prompt)
             process.stdin.close()
-        except BrokenPipeError as exc:
-            startup_output = process.stdout.read() if process.stdout else ""
-            process.wait(timeout=5)
-            with self._lock:
-                managed.status = "failed"
-                managed.updated_at = self._clock()
-            raise SubprocessRuntimeError(
-                "Agent exited before accepting the prompt: "
-                + startup_output.strip()[:500]
-            ) from exc
+        except BaseException as error:
+            terminated = self._quarantine_spawn_failure(spec, process, managed)
+            if isinstance(error, BrokenPipeError) and terminated:
+                try:
+                    startup_output = process.stdout.read() if process.stdout else ""
+                except BaseException as output_error:
+                    logger.debug(
+                        "startup output read failed after broken pipe",
+                        exc_info=output_error,
+                    )
+                    startup_output = ""
+                raise SubprocessRuntimeError(
+                    "Agent exited before accepting the prompt: "
+                    + startup_output.strip()[:500]
+                ) from error
+            raise
         return process
 
     def start(
@@ -677,11 +764,16 @@ class SubprocessAgentRuntime:
         spec: SubprocessLaunchSpec,
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        on_spawned: Callable[[subprocess.Popen[str]], None] | None = None,
     ) -> subprocess.Popen[str]:
         """Start a new root turn."""
         if spec.parent_run_id is not None:
             raise RuntimeContinuityError("root start cannot declare parent_run_id")
-        return self._spawn(spec, popen_factory=popen_factory)
+        return self._spawn(
+            spec,
+            popen_factory=popen_factory,
+            on_spawned=on_spawned,
+        )
 
     def resume(
         self,
@@ -689,32 +781,52 @@ class SubprocessAgentRuntime:
         spec: SubprocessLaunchSpec,
         *,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        on_spawned: Callable[[subprocess.Popen[str]], None] | None = None,
+        persisted_parent: SubprocessParentIdentity | None = None,
     ) -> subprocess.Popen[str]:
         """Start a fresh child process bound to its completed parent turn."""
         with self._lock:
             parent = self._runs.get(parent_run_id)
-            if parent is None:
+            if parent is None and persisted_parent is None:
                 raise RuntimeContinuityError("resume parent run is unknown")
             if spec.parent_run_id != parent_run_id:
                 raise RuntimeContinuityError("resume parent binding does not match")
-            if parent.process.poll() is None:
-                raise RuntimeContinuityError("cannot resume while parent is still running")
+            if parent is not None:
+                if parent.process.poll() is None:
+                    raise RuntimeContinuityError("cannot resume while parent is still running")
+                parent_identity = SubprocessParentIdentity(
+                    run_id=parent.spec.run_id,
+                    actor_id=parent.spec.actor_id,
+                    attempt_id=parent.spec.attempt_id,
+                    runtime_id=parent.spec.runtime_id,
+                    profile_id=parent.spec.profile_id,
+                    submit_started=parent.spec.submit_started,
+                )
+            else:
+                assert persisted_parent is not None
+                parent_identity = persisted_parent
+                if persisted_parent.run_id != parent_run_id:
+                    raise RuntimeContinuityError("persisted parent binding does not match")
             if (
-                parent.spec.actor_id != spec.actor_id
-                or parent.spec.attempt_id != spec.attempt_id
+                parent_identity.actor_id != spec.actor_id
+                or parent_identity.attempt_id != spec.attempt_id
             ):
                 raise RuntimeContinuityError(
                     "resume must keep the same actor and application attempt"
                 )
             switched = (
-                parent.spec.runtime_id != spec.runtime_id
-                or parent.spec.profile_id != spec.profile_id
+                parent_identity.runtime_id != spec.runtime_id
+                or parent_identity.profile_id != spec.profile_id
             )
-            if switched and (parent.spec.submit_started or spec.submit_started):
+            if switched and (parent_identity.submit_started or spec.submit_started):
                 raise RuntimeContinuityError(
                     "runtime/profile switch is forbidden after submit_started"
                 )
-        return self._spawn(spec, popen_factory=popen_factory)
+        return self._spawn(
+            spec,
+            popen_factory=popen_factory,
+            on_spawned=on_spawned,
+        )
 
     def health(self, run_id: str) -> SubprocessRuntimeHealth:
         """Return current process health without interpreting Agent output."""
@@ -743,10 +855,20 @@ class SubprocessAgentRuntime:
                 managed = self._runs[run_id]
             except KeyError as exc:
                 raise KeyError(f"unknown subprocess run: {run_id}") from exc
-            if managed.process.poll() is None:
-                self._kill_process_tree(managed.process.pid)
+            if not self._is_terminated(managed.process):
+                try:
+                    self._kill_process_tree(managed.process.pid)
+                    managed.process.wait(timeout=5)
+                except BaseException as error:
+                    logger.debug("subprocess cancel cleanup failed", exc_info=error)
+            if not self._is_terminated(managed.process):
+                managed.status = "quarantined"
+                managed.updated_at = self._fallback_clock()
+                raise SubprocessRuntimeError(
+                    f"cancel could not prove subprocess termination: {run_id}"
+                )
             managed.status = "cancelled"
-            managed.updated_at = self._clock()
+            managed.updated_at = self._fallback_clock()
 
     def close(self, run_id: str | None = None) -> None:
         """Close one run, or close the adapter and all live children."""
@@ -758,14 +880,29 @@ class SubprocessAgentRuntime:
             )
             if run_id is not None and not targets:
                 raise KeyError(f"unknown subprocess run: {run_id}")
+            quarantined: list[str] = []
             for managed in targets:
-                if managed.process.poll() is None:
-                    self._kill_process_tree(managed.process.pid)
+                if not self._is_terminated(managed.process):
+                    try:
+                        self._kill_process_tree(managed.process.pid)
+                        managed.process.wait(timeout=5)
+                    except BaseException as error:
+                        logger.debug("subprocess close cleanup failed", exc_info=error)
+                if not self._is_terminated(managed.process):
+                    managed.status = "quarantined"
+                    managed.updated_at = self._fallback_clock()
+                    quarantined.append(managed.spec.run_id)
+                    continue
                 managed.status = "closed"
-                managed.updated_at = self._clock()
+                managed.updated_at = self._fallback_clock()
                 managed.spec = managed.spec.redacted_for_history()
-            if run_id is None:
+            if run_id is None and not quarantined:
                 self._closed = True
+            if quarantined:
+                raise SubprocessRuntimeError(
+                    "close could not prove subprocess termination: "
+                    + ", ".join(quarantined)
+                )
 
 
 # ---------------------------------------------------------------------------

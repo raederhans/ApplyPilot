@@ -13,6 +13,15 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal
 
+from applypilot.apply.answer_policy import (
+    FieldRisk,
+    SafeDefaultRule,
+    field_requires_expiry,
+    field_risk,
+    sensitivity_satisfies_risk,
+)
+from applypilot.apply.application_facts import FactResolution
+
 Relation = Literal[
     "exact",
     "alias",
@@ -32,6 +41,7 @@ Action = Literal[
     "continue_unanswered",
     "review",
 ]
+FailureCode = Literal["answer_policy_unresolved", "unsupported_legal_declaration"]
 
 _SPACE_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
@@ -104,6 +114,7 @@ class AnswerRequest:
     field_semantic: str
     options: tuple[str, ...] = ()
     confirmed_fact: object | None = None
+    fact_resolution: FactResolution | None = None
     aliases: tuple[str, ...] = ()
     required: bool = False
     direct_impact: bool = False
@@ -111,6 +122,10 @@ class AnswerRequest:
     can_explain: bool = False
     preference: bool = False
     context: Mapping[str, object] = field(default_factory=dict)
+    adapter: str = "generic"
+    adapter_version: str = "unknown"
+    adapter_risk: FieldRisk | None = None
+    safe_default_rule: SafeDefaultRule | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +155,6 @@ def _fact_value(fact: object | None) -> object | None:
 def _audit(request: AnswerRequest, reason: str, **extra: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "field_semantic": request.field_semantic,
-        "confirmed_fact": _fact_value(request.confirmed_fact),
         "available_options": list(request.options),
         "required": request.required,
         "direct_impact": request.direct_impact,
@@ -148,6 +162,8 @@ def _audit(request: AnswerRequest, reason: str, **extra: object) -> dict[str, ob
         "can_explain": request.can_explain,
         "reason": reason,
     }
+    if request.fact_resolution and request.fact_resolution.fact_ref:
+        payload["fact_ref"] = request.fact_resolution.fact_ref
     payload.update(extra)
     return payload
 
@@ -161,7 +177,15 @@ def _result(
     value: object | None = None,
     confidence: float,
     reason: str,
+    fact_ref: str | None = None,
+    safe_default_rule_id: str | None = None,
 ) -> AnswerResolution:
+    provenance = fact_ref or (request.fact_resolution.fact_ref if request.fact_resolution else None)
+    if provenance is None and request.confirmed_fact is not None:
+        provenance = "legacy:confirmed_fact"
+    if option is not None and provenance is None and safe_default_rule_id is None:
+        raise ValueError("automatic selection requires fact or safe-default provenance")
+    failure_code = _failure_code(request, action)
     return AnswerResolution(
         relation=relation,
         action=action,
@@ -175,8 +199,33 @@ def _result(
             relation=relation,
             action=action,
             confidence=confidence,
+            **({"failure_code": failure_code} if failure_code else {}),
+            **({"fact_ref": provenance} if provenance else {}),
+            **({"safe_default_rule_id": safe_default_rule_id} if safe_default_rule_id else {}),
         ),
     )
+
+
+def _failure_code(request: AnswerRequest, action: Action) -> FailureCode | None:
+    """Return a bounded failure code for an actually unresolved required answer."""
+
+    automatic_actions = {
+        "select",
+        "select_and_record",
+        "answer_negative_and_continue",
+        "enter_value",
+    }
+    if action in automatic_actions or not request.required:
+        return None
+    risk = field_risk(
+        request.field_semantic,
+        adapter_risk=request.adapter_risk,
+        direct_impact=request.direct_impact,
+        declaration=request.declaration,
+    )
+    if action == "review" and (risk == "high" or request.declaration):
+        return "unsupported_legal_declaration"
+    return "answer_policy_unresolved"
 
 
 def _degree_level(value: object) -> str | None:
@@ -247,11 +296,11 @@ def _fact_interval(fact: object | None) -> tuple[date, date] | None:
     return _month_interval(_fact_value(fact))
 
 
-def _availability_truth(request: AnswerRequest) -> bool | None:
+def _availability_truth(request: AnswerRequest, fact: object | None) -> bool | None:
     if not any(marker in _token(request.field_semantic) for marker in ("availability", "available")):
         return None
     asked = _month_interval(request.field_semantic)
-    actual = _fact_interval(request.confirmed_fact)
+    actual = _fact_interval(fact)
     if not asked or not actual:
         return None
     return max(asked[0], actual[0]) <= min(asked[1], actual[1])
@@ -268,7 +317,7 @@ def _containing_option(options: Sequence[str], value: object) -> str | None:
     number = _numeric_value(value)
     if number is None:
         return None
-    for option in options:
+    for option in sorted(options, key=lambda item: (_token(item), _text(item))):
         cleaned = _text(option).replace(",", "")
         match = _RANGE_RE.search(cleaned)
         if match and float(match.group(1)) <= number <= float(match.group(2)):
@@ -294,7 +343,8 @@ def _containing_option(options: Sequence[str], value: object) -> str | None:
 
 def _first_option(options: Sequence[str], accepted: frozenset[str]) -> str | None:
     accepted_tokens = {_token(value) for value in accepted}
-    return next((option for option in options if _token(option) in accepted_tokens), None)
+    matches = [option for option in options if _token(option) in accepted_tokens]
+    return min(matches, key=lambda option: (_token(option), _text(option))) if matches else None
 
 
 def _option_polarity(option: object) -> bool | None:
@@ -315,26 +365,19 @@ def _option_polarity(option: object) -> bool | None:
     return None
 
 
-def _safe_low_impact_fallback(options: Sequence[str], *, fact: object | None = None) -> str | None:
-    """Return a deterministic non-material fallback when the form requires one."""
-    positive_number = (
-        isinstance(fact, (int, float))
-        and not isinstance(fact, bool)
-        and float(fact) > 0
-    )
-    negative = (
-        None
-        if positive_number
-        else next((option for option in options if _option_polarity(option) is False), None)
-    )
-    if negative:
-        return negative
-    other = _first_option(options, _OTHER)
-    if other:
-        return other
-    if positive_number:
+def _safe_default(request: AnswerRequest, options: Sequence[str]) -> tuple[str, str] | None:
+    rule = request.safe_default_rule
+    if rule is None or not rule.matches(
+        adapter=request.adapter,
+        adapter_version=request.adapter_version,
+        field_semantic=request.field_semantic,
+        context=request.context,
+    ):
         return None
-    return options[0] if options else None
+    matches = [option for option in options if _token(option) == _token(rule.value)]
+    if not matches:
+        return None
+    return min(matches, key=lambda option: (_token(option), _text(option))), rule.rule_id
 
 
 def resolve_answer(request: AnswerRequest) -> AnswerResolution:
@@ -348,13 +391,36 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
     if is_sensitive_answer_semantic(request.field_semantic):
         raise SensitiveAnswerError("sensitive credential or identity field cannot be resolved")
 
-    fact = _fact_value(request.confirmed_fact)
+    risk = field_risk(
+        request.field_semantic,
+        adapter_risk=request.adapter_risk,
+        direct_impact=request.direct_impact,
+        declaration=request.declaration,
+    )
+    typed = request.fact_resolution
+    if typed is not None:
+        fact_source = (
+            typed.value
+            if typed.production_ready
+            and sensitivity_satisfies_risk(sensitivity=typed.sensitivity, risk=risk)
+            and not (
+                risk in {"medium", "high"}
+                and field_requires_expiry(request.field_semantic)
+                and typed.expires_at is None
+            )
+            else None
+        )
+        fact = _fact_value(fact_source)
+    else:
+        fact_source = request.confirmed_fact
+        fact = _fact_value(fact_source)
+        if risk in {"medium", "high"}:
+            fact_source = None
+            fact = None
     options = tuple(option for option in request.options if _text(option))
 
     fact_known = fact is not None or (
-        isinstance(request.confirmed_fact, Mapping)
-        and request.confirmed_fact.get("start") is not None
-        and request.confirmed_fact.get("end") is not None
+        isinstance(fact_source, Mapping) and fact_source.get("start") is not None and fact_source.get("end") is not None
     )
     if not fact_known or (fact is not None and _text(fact) == ""):
         if request.required and (request.direct_impact or request.declaration):
@@ -365,15 +431,16 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
                 confidence=1.0,
                 reason="required_high_impact_fact_unknown",
             )
-        fallback = _safe_low_impact_fallback(options) if request.required else None
+        fallback = _safe_default(request, options) if request.required and risk == "low" else None
         if fallback:
             return _result(
                 request,
                 "closest_non_equivalent",
                 "select_and_record",
-                option=fallback,
+                option=fallback[0],
                 confidence=0.3,
-                reason="required_low_impact_uses_audited_safe_fallback",
+                reason="required_low_impact_uses_registered_safe_default",
+                safe_default_rule_id=fallback[1],
             )
         action: Action = "research_then_select" if request.required else "continue_unanswered"
         return _result(
@@ -384,9 +451,10 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
             reason="low_impact_fact_not_yet_confirmed",
         )
 
-    availability = _availability_truth(request)
+    availability = _availability_truth(request, fact_source)
     if availability is not None:
-        selected = next((option for option in options if _option_polarity(option) is availability), None)
+        matches = [option for option in options if _option_polarity(option) is availability]
+        selected = min(matches, key=lambda option: (_token(option), _text(option))) if matches else None
         if selected:
             relation: Relation = "exact" if availability else "truthful_negative"
             action = "select" if availability else "answer_negative_and_continue"
@@ -400,7 +468,8 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
             )
 
     if isinstance(fact, bool):
-        selected = next((option for option in options if _option_polarity(option) is fact), None)
+        matches = [option for option in options if _option_polarity(option) is fact]
+        selected = min(matches, key=lambda option: (_token(option), _text(option))) if matches else None
         if selected:
             relation = "exact" if fact else "truthful_negative"
             action = "select" if fact else "answer_negative_and_continue"
@@ -432,28 +501,35 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
         )
 
     fact_token = _token(fact)
-    exact = next((option for option in options if _text(option).casefold() == _text(fact).casefold()), None)
+    exact_matches = [option for option in options if _text(option).casefold() == _text(fact).casefold()]
+    exact = min(exact_matches, key=lambda option: (_token(option), _text(option))) if exact_matches else None
     if exact:
         return _result(request, "exact", "select", option=exact, confidence=1.0, reason="literal_option_match")
 
     alias_tokens = {_token(alias) for alias in request.aliases}
-    if isinstance(request.confirmed_fact, Mapping):
-        alias_tokens.update(_token(alias) for alias in request.confirmed_fact.get("aliases", ()))
-    alias = next((option for option in options if _token(option) == fact_token or _token(option) in alias_tokens), None)
+    if isinstance(fact_source, Mapping):
+        alias_tokens.update(_token(alias) for alias in fact_source.get("aliases", ()))
+    alias_matches = [option for option in options if _token(option) == fact_token or _token(option) in alias_tokens]
+    alias = min(alias_matches, key=lambda option: (_token(option), _text(option))) if alias_matches else None
     if alias:
         return _result(request, "alias", "select", option=alias, confidence=0.98, reason="normalized_or_known_alias")
 
     bucket = _containing_option(options, fact)
     if bucket:
         relation = "preference" if request.preference else "containing_bucket"
-        return _result(request, relation, "select", option=bucket, confidence=0.95, reason="value_is_inside_option_bucket")
+        return _result(
+            request, relation, "select", option=bucket, confidence=0.95, reason="value_is_inside_option_bucket"
+        )
 
     if _is_degree_semantic(request.field_semantic):
         level = _degree_level(fact)
         same_level = [option for option in options if _degree_level(option) == level]
         if same_level:
             generic_tokens = {level, f"{level} degree", f"{level}s degree", f"{level} s degree"}
-            generic = next((option for option in same_level if _token(option) in generic_tokens), None)
+            generic_matches = [option for option in same_level if _token(option) in generic_tokens]
+            generic = (
+                min(generic_matches, key=lambda option: (_token(option), _text(option))) if generic_matches else None
+            )
             if generic:
                 return _result(
                     request,
@@ -465,7 +541,9 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
                     reason="same_level_generic_degree_category",
                 )
             family = _degree_family(fact)
-            option = next((candidate for candidate in same_level if _degree_family(candidate) == family), same_level[0])
+            family_matches = [candidate for candidate in same_level if _degree_family(candidate) == family]
+            candidates = family_matches or same_level
+            option = min(candidates, key=lambda candidate: (_token(candidate), _text(candidate)))
             if request.declaration:
                 return _result(
                     request,
@@ -498,12 +576,12 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
             reason="unlisted_confirmed_fact_preserved_in_explanation",
         )
 
-    negative = next((option for option in options if _option_polarity(option) is False), None)
+    negative_matches = [option for option in options if _option_polarity(option) is False]
+    negative = min(negative_matches, key=lambda option: (_token(option), _text(option))) if negative_matches else None
     semantic = _token(request.field_semantic)
-    fact_is_negative = (
-        (isinstance(fact, (int, float)) and not isinstance(fact, bool) and float(fact) <= 0)
-        or _token(fact) in {_token(value) for value in _NEGATIVE}
-    )
+    fact_is_negative = (isinstance(fact, (int, float)) and not isinstance(fact, bool) and float(fact) <= 0) or _token(
+        fact
+    ) in {_token(value) for value in _NEGATIVE}
     categorical_none = negative is not None and any(
         phrase in _token(negative) for phrase in ("none of the above", "none of these")
     )
@@ -542,12 +620,11 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
             )
         return _result(
             request,
-            "closest_non_equivalent",
-            "select_and_record",
-            option=options[0],
+            "contradiction",
+            "review" if request.required else "continue_unanswered",
             value=fact,
-            confidence=0.5,
-            reason="preference_uses_nearest_available_choice",
+            confidence=0.9,
+            reason="preference_has_no_registered_truthful_mapping",
         )
 
     if not options:
@@ -564,16 +641,17 @@ def resolve_answer(request: AnswerRequest) -> AnswerResolution:
         )
 
     if request.required and not request.direct_impact and not request.declaration:
-        fallback = _safe_low_impact_fallback(options, fact=fact)
+        fallback = _safe_default(request, options) if risk == "low" else None
         if fallback:
             return _result(
                 request,
                 "closest_non_equivalent",
                 "select_and_record",
-                option=fallback,
+                option=fallback[0],
                 value=fact,
                 confidence=0.3,
-                reason="required_low_impact_uses_audited_safe_fallback",
+                reason="required_low_impact_uses_registered_safe_default",
+                safe_default_rule_id=fallback[1],
             )
 
     return _result(

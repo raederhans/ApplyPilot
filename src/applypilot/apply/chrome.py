@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from applypilot import config
+from applypilot.apply.profile_lock import ProfileLock, ProfileLockError
 from applypilot.apply.retention import (
     mark_owned_directory,
     profile_clone_ignore,
@@ -35,11 +36,23 @@ BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_CDP_PORT", "9222"))
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_ports: dict[int, int] = {}
+_profile_locks: dict[int, ProfileLock] = {}
+_profile_paths: dict[int, Path] = {}
+_launching_workers: set[int] = set()
+_allocating_cdp_workers: set[int] = set()
+_releasing_cdp_workers: set[int] = set()
 _profile_maintenance_checked: set[Path] = set()
 _chrome_lock = threading.Lock()
 _cdp_port_claims: dict[int, tuple[int, Path]] = {}
 
 SUPPORTED_BROWSER_BACKENDS = {"edge", "cloak", "auto"}
+
+
+def resolve_worker_profile_path(worker_id: int, browser_backend: str) -> Path:
+    """Purely resolve the concrete profile identity before any mutation."""
+    backend = resolve_browser_backend(browser_backend, allow_auto=False)
+    worker_root = config.CLOAK_WORKER_DIR if backend == "cloak" else config.CHROME_WORKER_DIR
+    return (worker_root / f"worker-{worker_id}").expanduser().resolve(strict=False)
 
 
 def _lock_owner_is_running(lock_path: Path) -> bool | None:
@@ -100,41 +113,79 @@ def allocate_cdp_port(worker_id: int) -> int:
     is released immediately before Chromium binds it; the lock prevents other
     ApplyPilot runs from selecting the same port during that short window.
     """
+    with _chrome_lock:
+        if (
+            worker_id in _cdp_port_claims
+            or worker_id in _allocating_cdp_workers
+            or worker_id in _releasing_cdp_workers
+            or worker_id in _launching_workers
+            or worker_id in _profile_locks
+            or worker_id in _profile_paths
+            or worker_id in _chrome_procs
+            or worker_id in _chrome_ports
+        ):
+            raise RuntimeError(f"Worker {worker_id} already has an unresolved CDP generation")
+        _allocating_cdp_workers.add(worker_id)
     lock_dir = config.APPLY_WORKER_DIR / "cdp-port-locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    _remove_stale_cdp_locks(lock_dir)
-    release_cdp_port(worker_id)
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        _remove_stale_cdp_locks(lock_dir)
 
-    for _ in range(32):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = int(probe.getsockname()[1])
-        lock_path = lock_dir / f"{port}.lock"
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            continue
-        try:
-            os.write(fd, f"pid={os.getpid()} worker={worker_id}\n".encode("ascii"))
-        finally:
-            os.close(fd)
+        for _ in range(32):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = int(probe.getsockname()[1])
+            lock_path = lock_dir / f"{port}.lock"
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            try:
+                os.write(fd, f"pid={os.getpid()} worker={worker_id}\n".encode("ascii"))
+            finally:
+                os.close(fd)
+            with _chrome_lock:
+                _cdp_port_claims[worker_id] = (port, lock_path)
+            return port
+        raise RuntimeError("Unable to reserve an isolated CDP port")
+    finally:
         with _chrome_lock:
-            _cdp_port_claims[worker_id] = (port, lock_path)
-        return port
-    raise RuntimeError("Unable to reserve an isolated CDP port")
+            _allocating_cdp_workers.discard(worker_id)
 
 
-def release_cdp_port(worker_id: int) -> None:
+def release_cdp_port(worker_id: int) -> bool:
     """Release only the CDP-port claim owned by this process and worker."""
     with _chrome_lock:
-        claim = _cdp_port_claims.pop(worker_id, None)
+        if (
+            worker_id in _launching_workers
+            or worker_id in _allocating_cdp_workers
+            or worker_id in _releasing_cdp_workers
+            or worker_id in _profile_locks
+            or worker_id in _profile_paths
+            or worker_id in _chrome_procs
+            or worker_id in _chrome_ports
+        ):
+            return False
+        claim = _cdp_port_claims.get(worker_id)
+        if claim is not None:
+            _releasing_cdp_workers.add(worker_id)
     if claim is None:
-        return
+        return True
     _port, lock_path = claim
+    unlink_succeeded = False
     try:
-        lock_path.unlink(missing_ok=True)
-    except OSError:
-        logger.debug("Unable to remove owned CDP lock %s", lock_path, exc_info=True)
+        try:
+            lock_path.unlink(missing_ok=True)
+            unlink_succeeded = True
+        except OSError:
+            logger.debug("Unable to remove owned CDP lock %s", lock_path, exc_info=True)
+            return False
+    finally:
+        with _chrome_lock:
+            if unlink_succeeded and _cdp_port_claims.get(worker_id) == claim:
+                _cdp_port_claims.pop(worker_id, None)
+            _releasing_cdp_workers.discard(worker_id)
+    return True
 
 
 def resolve_browser_backend(value: str | None = None, *, allow_auto: bool = True) -> str:
@@ -228,7 +279,11 @@ def _kill_process_tree(pid: int) -> None:
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
+def setup_worker_profile(
+    worker_id: int,
+    browser_backend: str = "edge",
+    profile_lock: ProfileLock | None = None,
+) -> Path:
     """Create an isolated Chrome profile for a worker.
 
     On first run, clones from an existing worker profile (preferred, since
@@ -244,8 +299,12 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     backend = resolve_browser_backend(browser_backend, allow_auto=False)
     worker_root = (
         config.CLOAK_WORKER_DIR if backend == "cloak" else config.CHROME_WORKER_DIR
-    )
-    profile_dir = worker_root / f"worker-{worker_id}"
+    ).expanduser().resolve(strict=False)
+    profile_dir = resolve_worker_profile_path(worker_id, backend)
+    owned_lock = profile_lock is None
+    lock = profile_lock or ProfileLock(profile_dir).acquire()
+    if lock.profile_path != profile_dir:
+        raise ProfileLockError("Profile lock does not match the requested browser profile")
 
     def mark_owned() -> None:
         mark_owned_directory(
@@ -272,78 +331,81 @@ def setup_worker_profile(worker_id: int, browser_backend: str = "edge") -> Path:
     # Preview runs must not inherit extensions, autofill data, or stale session
     # state from either the user's daily profile or a previous experiment. Only
     # the ApplyPilot-owned worker directory is ever removed here.
-    if mode == "fresh":
-        worker_root = worker_root.resolve()
-        resolved_profile = profile_dir.resolve()
-        if resolved_profile.parent != worker_root or resolved_profile == worker_root:
-            raise ValueError(f"Unsafe browser worker profile path: {resolved_profile}")
-        if resolved_profile.exists():
-            shutil.rmtree(resolved_profile)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        mark_owned()
-        logger.info("[worker-%d] Using a fresh isolated browser profile", worker_id)
-        return profile_dir
+    try:
+        if mode == "fresh":
+            resolved_profile = profile_dir.resolve()
+            if resolved_profile.parent != worker_root or resolved_profile == worker_root:
+                raise ValueError(f"Unsafe browser worker profile path: {resolved_profile}")
+            if resolved_profile.exists():
+                shutil.rmtree(resolved_profile)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            mark_owned()
+            logger.info("[worker-%d] Using a fresh isolated browser profile", worker_id)
+            return profile_dir
 
     # Persistent mode is an ApplyPilot-owned browser identity. It is created
     # empty and then reused, so a one-time interactive login can survive later
     # application runs without copying the user's daily Edge/Chrome profile.
-    if mode == "persistent":
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        mark_owned()
-        logger.info("[worker-%d] Using the persistent ApplyPilot browser profile", worker_id)
-        return profile_dir
+        if mode == "persistent":
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            mark_owned()
+            logger.info("[worker-%d] Using the persistent ApplyPilot browser profile", worker_id)
+            return profile_dir
 
-    if mode != "clone":
-        raise ValueError(
-            "APPLYPILOT_BROWSER_PROFILE_MODE must be fresh, persistent, or clone"
-        )
+        if mode != "clone":
+            raise ValueError(
+                "APPLYPILOT_BROWSER_PROFILE_MODE must be fresh, persistent, or clone"
+            )
 
-    if (profile_dir / "Default").exists():
-        mark_owned()
-        return profile_dir  # Already initialized
+        if (profile_dir / "Default").exists():
+            mark_owned()
+            return profile_dir  # Already initialized
 
     # Find a source: prefer existing worker (has session cookies), else user profile
-    source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
-    if source is None:
-        source = config.get_chrome_user_data()
-    if not source.exists():
+        source: Path | None = None
+        for wid in range(10):
+            if wid == worker_id:
+                continue
+            candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
+            if (candidate / "Default").exists():
+                source = candidate
+                break
+        if source is None:
+            source = config.get_chrome_user_data()
+        if not source.exists():
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            mark_owned()
+            logger.warning(
+                "[worker-%d] Browser profile source not found at %s; using a fresh profile",
+                worker_id,
+                source,
+            )
+            return profile_dir
+
+        logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
+                    worker_id, source.name)
         profile_dir.mkdir(parents=True, exist_ok=True)
         mark_owned()
-        logger.warning(
-            "[worker-%d] Browser profile source not found at %s; using a fresh profile",
-            worker_id,
-            source,
-        )
+
+        for item in source.iterdir():
+            if item.name in profile_clone_ignore(str(source), [item.name]):
+                continue
+            dst = profile_dir / item.name
+            try:
+                if item.is_dir():
+                    shutil.copytree(
+                        str(item), str(dst), dirs_exist_ok=True,
+                        ignore=profile_clone_ignore,
+                    )
+                else:
+                    shutil.copy2(str(item), str(dst))
+            except (PermissionError, OSError):
+                pass  # skip locked files
+
         return profile_dir
-
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    mark_owned()
-
-    for item in source.iterdir():
-        if item.name in profile_clone_ignore(str(source), [item.name]):
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=profile_clone_ignore,
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
-
-    return profile_dir
+    finally:
+        if owned_lock and lock.has_native_resource:
+            lock.release_before_spawn()
 
 
 def _cloak_fingerprint_seed(profile_dir: Path) -> int:
@@ -441,6 +503,26 @@ def _close_browser_via_cdp(port: int) -> None:
         browser.new_browser_cdp_session().send("Browser.close")
 
 
+def _resolve_actual_browser_pid(port: int) -> int:
+    """Resolve the OS PID of the browser process that actually holds the profile."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        payload = browser.new_browser_cdp_session().send("SystemInfo.getProcessInfo")
+    matches = [item for item in payload.get("processInfo", []) if item.get("type") == "browser"]
+    if len(matches) != 1:
+        raise RuntimeError("CDP did not identify exactly one browser process")
+    value = matches[0].get("osProcessId", matches[0].get("id"))
+    try:
+        pid = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("CDP browser process did not expose an OS PID") from exc
+    if pid <= 0:
+        raise RuntimeError("CDP browser process exposed an invalid OS PID")
+    return pid
+
+
 def _cdp_endpoint_reachable(port: int) -> bool:
     """Return whether the worker's browser endpoint is still serving CDP."""
     try:
@@ -535,14 +617,42 @@ def launch_chrome(worker_id: int, port: int | None = None,
         port = BASE_CDP_PORT + worker_id
 
     backend = resolve_browser_backend(browser_backend, allow_auto=False)
-    profile_dir = setup_worker_profile(worker_id, backend)
+    profile_dir = resolve_worker_profile_path(worker_id, backend)
+    profile_lock = ProfileLock(profile_dir)
+    with _chrome_lock:
+        if (
+            worker_id in _launching_workers
+            or worker_id in _profile_locks
+            or worker_id in _profile_paths
+            or worker_id in _chrome_procs
+            or worker_id in _chrome_ports
+        ):
+            raise RuntimeError(f"Worker {worker_id} already has an unresolved browser generation")
+        _launching_workers.add(worker_id)
+        _profile_locks[worker_id] = profile_lock
+        _profile_paths[worker_id] = profile_dir
+    try:
+        profile_lock.acquire()
+    finally:
+        with _chrome_lock:
+            _launching_workers.discard(worker_id)
+            if (
+                not profile_lock.has_native_resource
+                and not profile_lock.requires_recovery
+                and not profile_lock.sidecar_path.exists()
+            ):
+                _profile_locks.pop(worker_id, None)
+                _profile_paths.pop(worker_id, None)
+    proc: subprocess.Popen | None = None
+    try:
+        profile_dir = setup_worker_profile(worker_id, backend, profile_lock)
 
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
+        # Patch preferences only while physical profile ownership is held.
+        _suppress_restore_nag(profile_dir)
 
-    browser_exe = get_browser_executable(backend)
+        browser_exe = get_browser_executable(backend)
 
-    cmd = [
+        cmd = [
         browser_exe,
         "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
@@ -568,33 +678,81 @@ def launch_chrome(worker_id: int, port: int | None = None,
         # contradict the application's permission boundary.
         "--deny-permission-prompts",
         "--disable-notifications",
-    ]
-    if backend == "cloak":
-        cmd.append(f"--fingerprint={_cloak_fingerprint_seed(profile_dir)}")
-    if headless:
-        cmd.append("--headless=new")
-    if start_url:
-        cmd.append(start_url)
+        ]
+        if backend == "cloak":
+            cmd.append(f"--fingerprint={_cloak_fingerprint_seed(profile_dir)}")
+        if headless:
+            cmd.append("--headless=new")
+        if start_url:
+            cmd.append(start_url)
 
     # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if platform.system() != "Windows":
-        import os
-        kwargs["preexec_fn"] = os.setsid
+        kwargs: dict = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if platform.system() != "Windows":
+            import os
+            kwargs["preexec_fn"] = os.setsid
 
-    proc = subprocess.Popen(cmd, **kwargs)
-    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        profile_lock.record_spawn_attempt()
         _wait_for_cdp_ready(proc, port)
+        profile_lock.record_browser(_resolve_actual_browser_pid(port))
     except Exception:
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
+        if proc is None:
+            try:
+                profile_lock.release_before_spawn()
+            except ProfileLockError:
+                logger.warning("Pre-spawn profile cleanup failed", exc_info=True)
+        else:
+            with _chrome_lock:
+                _chrome_procs[worker_id] = proc
+                _chrome_ports[worker_id] = port
+            try:
+                _close_browser_via_cdp(port)
+            except Exception:
+                logger.debug("Unable to close failed browser launch via CDP", exc_info=True)
+            if proc.poll() is None:
+                _kill_process_tree(proc.pid)
+            stopped = _wait_for_browser_stopped(port, proc)
+            released = False
+            if stopped:
+                try:
+                    profile_lock.release_after_stop(
+                        profile_path=profile_dir,
+                        browser_stopped=True,
+                    )
+                    released = True
+                except ProfileLockError:
+                    logger.warning(
+                        "Failed launch stopped, but profile ownership is ambiguous",
+                        exc_info=True,
+                    )
+            if released:
+                with _chrome_lock:
+                    _chrome_procs.pop(worker_id, None)
+                    _chrome_ports.pop(worker_id, None)
+                    _profile_locks.pop(worker_id, None)
+                    _profile_paths.pop(worker_id, None)
+            else:
+                profile_lock.mark_recovery_required()
+        with _chrome_lock:
+            _launching_workers.discard(worker_id)
+            if (
+                proc is None
+                and not profile_lock.has_native_resource
+                and not profile_lock.requires_recovery
+                and not profile_lock.sidecar_path.exists()
+            ):
+                _profile_locks.pop(worker_id, None)
+                _profile_paths.pop(worker_id, None)
         raise
+    assert proc is not None
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
         _chrome_ports[worker_id] = port
+        _launching_workers.discard(worker_id)
 
     logger.info("[worker-%d] %s browser started on port %d (pid %d)",
                 worker_id, backend, port, proc.pid)
@@ -609,8 +767,10 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         process: The Popen handle returned by launch_chrome.
     """
     with _chrome_lock:
-        tracked_process = _chrome_procs.pop(worker_id, None)
-        port = _chrome_ports.pop(worker_id, None)
+        tracked_process = _chrome_procs.get(worker_id)
+        port = _chrome_ports.get(worker_id)
+        profile_lock = _profile_locks.get(worker_id)
+        locked_profile = _profile_paths.get(worker_id)
     if port is not None:
         try:
             _close_browser_via_cdp(port)
@@ -630,47 +790,80 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
             "[worker-%d] Browser stop could not be confirmed; skipping profile pruning",
             worker_id,
         )
-    for profile_root in (config.CHROME_WORKER_DIR, config.CLOAK_WORKER_DIR):
-        profile_dir = profile_root / f"worker-{worker_id}"
-        resolved_profile = profile_dir.resolve()
-        if not browser_is_stopped:
-            continue
-        with _chrome_lock:
-            if resolved_profile in _profile_maintenance_checked:
-                continue
-            _profile_maintenance_checked.add(resolved_profile)
-        marker = read_ownership_marker(profile_dir)
-        if not marker or marker.get("kind") != "browser_profile":
-            continue
+    actual_browser_stopped = False
+    if browser_is_stopped and profile_lock is not None and profile_lock.owned_by_current_thread:
         try:
-            retention_days = max(
-                1.0,
-                float(os.environ.get("APPLYPILOT_PROFILE_CACHE_RETENTION_DAYS", "7")),
-            )
-        except ValueError:
-            retention_days = 7.0
-        try:
-            maintenance = prune_owned_profile(
-                profile_dir,
-                profile_root=profile_root,
-                minimum_age_seconds=retention_days * 24 * 60 * 60,
-                execute=True,
-                browser_is_stopped=browser_is_stopped,
-            )
-            if maintenance["removed_files"]:
-                logger.info(
-                    "[worker-%d] Reclaimed %d old regenerable profile files (%d bytes)",
-                    worker_id,
-                    maintenance["removed_files"],
-                    maintenance["removed_bytes"],
-                )
-        except (OSError, PermissionError, RuntimeError, ValueError):
-            logger.debug(
-                "[worker-%d] Browser profile maintenance skipped for %s",
+            actual_browser_stopped = profile_lock.actual_browser_stopped()
+        except ProfileLockError:
+            logger.warning(
+                "[worker-%d] Actual browser process stop could not be confirmed",
                 worker_id,
-                profile_dir,
                 exc_info=True,
             )
+    if (
+        browser_is_stopped
+        and actual_browser_stopped
+        and profile_lock is not None
+        and locked_profile is not None
+        and profile_lock.owned_by_current_thread
+    ):
+        profile_dir = locked_profile
+        profile_root = profile_dir.parent
+        resolved_profile = profile_dir.resolve()
+        with _chrome_lock:
+            already_maintained = resolved_profile in _profile_maintenance_checked
+            if not already_maintained:
+                _profile_maintenance_checked.add(resolved_profile)
+        if not already_maintained:
+            marker = read_ownership_marker(profile_dir)
+            if marker and marker.get("kind") == "browser_profile":
+                try:
+                    retention_days = max(
+                        1.0,
+                        float(os.environ.get("APPLYPILOT_PROFILE_CACHE_RETENTION_DAYS", "7")),
+                    )
+                except ValueError:
+                    retention_days = 7.0
+                try:
+                    maintenance = prune_owned_profile(
+                        profile_dir,
+                        profile_root=profile_root,
+                        minimum_age_seconds=retention_days * 24 * 60 * 60,
+                        execute=True,
+                        browser_is_stopped=True,
+                    )
+                    if maintenance["removed_files"]:
+                        logger.info(
+                            "[worker-%d] Reclaimed %d old regenerable profile files (%d bytes)",
+                            worker_id,
+                            maintenance["removed_files"],
+                            maintenance["removed_bytes"],
+                        )
+                except (OSError, PermissionError, RuntimeError, ValueError):
+                    logger.debug(
+                        "[worker-%d] Browser profile maintenance skipped for %s",
+                        worker_id,
+                        profile_dir,
+                        exc_info=True,
+                    )
+        try:
+            profile_lock.release_after_stop(profile_path=profile_dir, browser_stopped=True)
+        except ProfileLockError:
+            logger.warning(
+                "[worker-%d] Profile mutex retained; owner-thread release is required",
+                worker_id,
+                exc_info=True,
+            )
+        else:
+            with _chrome_lock:
+                _chrome_procs.pop(worker_id, None)
+                _chrome_ports.pop(worker_id, None)
+                _profile_locks.pop(worker_id, None)
+                _profile_paths.pop(worker_id, None)
+    elif profile_lock is None:
+        with _chrome_lock:
+            _chrome_procs.pop(worker_id, None)
+            _chrome_ports.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
 
 
@@ -682,11 +875,30 @@ def kill_all_chrome() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         ports = dict(_chrome_ports)
-        _chrome_procs.clear()
-        _chrome_ports.clear()
+        worker_ids = set(procs) | set(ports) | set(_profile_locks) | set(_profile_paths)
 
-    for wid, proc in procs.items():
+    for wid in worker_ids:
+        proc = procs.get(wid)
         port = ports.get(wid)
+        with _chrome_lock:
+            profile_lock = _profile_locks.get(wid)
+            profile_path = _profile_paths.get(wid)
+        if (
+            proc is None
+            and profile_lock is not None
+            and profile_lock.owned_by_current_thread
+            and not profile_lock.spawn_attempted
+        ):
+            try:
+                profile_lock.release_before_spawn()
+            except ProfileLockError:
+                logger.warning("[worker-%d] Pre-spawn profile mutex retained", wid)
+            else:
+                with _chrome_lock:
+                    _profile_locks.pop(wid, None)
+                    _profile_paths.pop(wid, None)
+            release_cdp_port(wid)
+            continue
         if port is not None:
             try:
                 _close_browser_via_cdp(port)
@@ -697,8 +909,28 @@ def kill_all_chrome() -> None:
                     port,
                     exc_info=True,
                 )
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
+        stopped = _wait_for_browser_stopped(port, proc)
+        if (
+            stopped
+            and profile_lock is not None
+            and profile_path is not None
+            and profile_lock.owned_by_current_thread
+        ):
+            try:
+                profile_lock.release_after_stop(
+                    profile_path=profile_path,
+                    browser_stopped=True,
+                )
+            except ProfileLockError:
+                logger.warning("[worker-%d] Profile mutex retained", wid, exc_info=True)
+            else:
+                with _chrome_lock:
+                    _profile_locks.pop(wid, None)
+                    _profile_paths.pop(wid, None)
+                    _chrome_procs.pop(wid, None)
+                    _chrome_ports.pop(wid, None)
         release_cdp_port(wid)
 
     with _chrome_lock:
@@ -734,11 +966,30 @@ def cleanup_on_exit() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         ports = dict(_chrome_ports)
-        _chrome_procs.clear()
-        _chrome_ports.clear()
+        worker_ids = set(procs) | set(ports) | set(_profile_locks) | set(_profile_paths)
 
-    for wid, proc in procs.items():
+    for wid in worker_ids:
+        proc = procs.get(wid)
         port = ports.get(wid)
+        with _chrome_lock:
+            profile_lock = _profile_locks.get(wid)
+            profile_path = _profile_paths.get(wid)
+        if (
+            proc is None
+            and profile_lock is not None
+            and profile_lock.owned_by_current_thread
+            and not profile_lock.spawn_attempted
+        ):
+            try:
+                profile_lock.release_before_spawn()
+            except ProfileLockError:
+                logger.warning("[worker-%d] Pre-spawn profile mutex retained", wid)
+            else:
+                with _chrome_lock:
+                    _profile_locks.pop(wid, None)
+                    _profile_paths.pop(wid, None)
+            release_cdp_port(wid)
+            continue
         if port is not None:
             try:
                 _close_browser_via_cdp(port)
@@ -749,8 +1000,28 @@ def cleanup_on_exit() -> None:
                     port,
                     exc_info=True,
                 )
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
+        stopped = _wait_for_browser_stopped(port, proc)
+        if (
+            stopped
+            and profile_lock is not None
+            and profile_path is not None
+            and profile_lock.owned_by_current_thread
+        ):
+            try:
+                profile_lock.release_after_stop(
+                    profile_path=profile_path,
+                    browser_stopped=True,
+                )
+            except ProfileLockError:
+                logger.warning("[worker-%d] Profile mutex retained", wid, exc_info=True)
+            else:
+                with _chrome_lock:
+                    _profile_locks.pop(wid, None)
+                    _profile_paths.pop(wid, None)
+                    _chrome_procs.pop(wid, None)
+                    _chrome_ports.pop(wid, None)
         release_cdp_port(wid)
 
     with _chrome_lock:

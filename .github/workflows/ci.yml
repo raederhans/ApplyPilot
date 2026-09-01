@@ -68,12 +68,15 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      APPLYPILOT_DIR: ${{ runner.temp }}/applypilot-ci
       PYTHONUTF8: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Bind isolated ApplyPilot workspace
+        shell: pwsh
+        run: '"APPLYPILOT_DIR=$env:RUNNER_TEMP\applypilot-ci" >> $env:GITHUB_ENV'
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -13,6 +14,7 @@ from applypilot.apply import (
     agent_output,
     agent_runtime,
     application_actor,
+    browser_broker,
     launcher,
     page_observation,
     prompt,
@@ -23,13 +25,16 @@ from applypilot.apply.capabilities import (
     compose_runtime_capabilities,
     scope_capability_registry,
 )
-from applypilot.apply.contracts import AgentTurnResult
+from applypilot.apply.contracts import AgentTurnResult, application_actor_id
 from applypilot.apply.email_routing import MailboxMcpSpec, mailbox_prepare_duplicate_receipt
+from applypilot.apply.operator_dispatch import OperatorWaitResult
+from applypilot.apply.page_binding import PageBinding
 from applypilot.apply.run_progress import RunProgress
 from applypilot.database import (
     init_db,
     list_application_exceptions,
     list_recovery_execution_results,
+    start_application_attempt,
 )
 
 
@@ -1121,6 +1126,11 @@ def _run_worker_contract(
     receipt_process_result: dict | None = None,
     profile_overrides: dict | None = None,
     resume_authorization_calls: list[dict] | None = None,
+    semantic_repair_results: list[dict] | None = None,
+    semantic_repair_calls: list[dict] | None = None,
+    audit_hook=None,
+    reservation_calls: list[dict] | None = None,
+    lifecycle_events: list[str] | None = None,
 ):
     job = {
         "url": "https://jobs.example.test/role",
@@ -1189,6 +1199,12 @@ def _run_worker_contract(
                 else "ready_to_submit"
             )
             prepare_index += 1
+            fake_turn_id = f"fake-prepare-turn-{prepare_index}"
+            current_job["_agent_turn_result"] = {"run_id": fake_turn_id}
+            current_job["_parent_agent_run_id"] = fake_turn_id
+            current_job["_parent_agent_checkpoint_id"] = (
+                f"checkpoint:{fake_turn_id}"
+            )
             return selected_prepare, 10
         if submit_raises:
             raise RuntimeError("agent disconnected")
@@ -1231,6 +1247,10 @@ def _run_worker_contract(
             else submit_result
         )
         submit_index += 1
+        fake_turn_id = f"fake-submit-turn-{submit_index}"
+        current_job["_agent_turn_result"] = {"run_id": fake_turn_id}
+        current_job["_parent_agent_run_id"] = fake_turn_id
+        current_job["_parent_agent_checkpoint_id"] = f"checkpoint:{fake_turn_id}"
         return selected_result, 10
 
     observed = list(observer_results or [])
@@ -1340,6 +1360,11 @@ def _run_worker_contract(
             lambda supplied: restore_calls.append(dict(supplied)),
         )
     monkeypatch.setattr(launcher, "run_job", fake_run)
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_submit_scope",
+        lambda _job: nullcontext(),
+    )
 
     pending_clicks = list(causal_click_results or [])
 
@@ -1380,6 +1405,8 @@ def _run_worker_contract(
     def fake_audit(*args):
         if performance_clock is not None:
             performance_clock[0] += 0.04
+        if audit_hook is not None:
+            return audit_hook(args[2])
         if audits:
             return audits.pop(0)
         return None, {"status": "clear", "disposition": "clear"}
@@ -1389,6 +1416,36 @@ def _run_worker_contract(
         launcher,
         "_observe_linkedin_external_handoff_page",
         fake_audit,
+    )
+    pending_semantic_repairs = list(semantic_repair_results or [])
+
+    def fake_semantic_repair(
+        _port,
+        _worker_id,
+        current_job,
+        supplied_manifest,
+        supplied_audit,
+    ):
+        if semantic_repair_calls is not None:
+            semantic_repair_calls.append(
+                {
+                    "job": dict(current_job),
+                    "manifest": supplied_manifest,
+                    "audit": dict(supplied_audit),
+                }
+            )
+        if pending_semantic_repairs:
+            return pending_semantic_repairs.pop(0)
+        return {
+            "status": "not_applicable",
+            "legacy_fallback_safe": True,
+        }
+
+    monkeypatch.setattr(
+        launcher,
+        "_try_semantic_pre_submit_repair",
+        fake_semantic_repair,
+        raising=False,
     )
     def fake_linkedin_route_gate(current_job, observation, _profile, **_kwargs):
         if route_gate_calls is not None:
@@ -1428,10 +1485,23 @@ def _run_worker_contract(
         "_resolve_ats_application_binding",
         fake_resolve_ats_binding,
     )
+    def fake_reserve_manifest(_manifest, current_job, *_args, **_kwargs):
+        if reservation_calls is not None:
+            reservation_calls.append(dict(current_job))
+        current_job["_submission_gate_binding"] = {
+            "gate_id": "gate-test-1",
+            "batch_id": "batch-1",
+            "job_url": current_job["url"],
+            "attempt_id": str(
+                current_job.get("_attempt_id") or current_job["url"]
+            ),
+        }
+        return True, "reserved"
+
     monkeypatch.setattr(
         launcher,
         "_reserve_manifest_submission",
-        lambda *args, **kwargs: (True, "reserved"),
+        fake_reserve_manifest,
     )
     monkeypatch.setattr(
         launcher,
@@ -1538,6 +1608,8 @@ def _run_worker_contract(
     )
     def fake_mark_result(*args, **kwargs):
         marked.append((args, kwargs))
+        if lifecycle_events is not None:
+            lifecycle_events.append("mark_result")
         if performance_clock is not None:
             performance_clock[0] += 0.06
 
@@ -1574,6 +1646,135 @@ def _run_worker_contract(
         run_progress=run_progress,
     )
     return result, run_phases, ledger, marked
+
+
+@pytest.mark.parametrize("dispatcher_status", ["expired", "lease_lost"])
+def test_worker_operator_handoff_waits_on_live_attempt_and_never_submits(
+    monkeypatch,
+    tmp_path,
+    dispatcher_status: str,
+) -> None:
+    """A queued human-only exception is dispatched only in the pre-submit lane."""
+    control_connection = init_db(tmp_path / "operator-handoff.db")
+    job_url = "https://jobs.example.test/operator-handoff"
+    attempt_id = start_application_attempt(job_url, "worker-0", conn=control_connection)
+    actor_id = application_actor_id(attempt_id)
+    common_lease = {
+        "lease_id": "lease-operator-handoff",
+        "owner_id": actor_id,
+        "scope_id": "worker:0",
+        "attempt_id": attempt_id,
+        "runtime_id": "codex:cdp:9432",
+        "epoch": 1,
+        "issued_at": 1.0,
+        "heartbeat_at": 2.0,
+        "expires_at": 9999999999.0,
+    }
+    profile_lease = browser_broker.BrowserLease(
+        resource_kind="profile",
+        resource_id="profile-operator-handoff",
+        **common_lease,
+    )
+    page_lease = browser_broker.BrowserLease(
+        resource_kind="page",
+        resource_id=f"application:{attempt_id}",
+        **common_lease,
+    )
+    page_binding = PageBinding(
+        page_id=page_lease.resource_id,
+        page_lease_id=page_lease.lease_id,
+        page_lease_epoch=page_lease.epoch,
+        page_epoch=3,
+        profile_lease_id=profile_lease.lease_id,
+        owner_id=actor_id,
+        attempt_id=attempt_id,
+        runtime_id=page_lease.runtime_id,
+    )
+    browser_binding = browser_broker.BrowserLeaseBundle(
+        profile=profile_lease,
+        page=page_lease,
+        page_binding=page_binding,
+    ).as_dict()
+    dispatch_calls: list[dict] = []
+    heartbeat_calls: list[dict] = []
+    lifecycle_events: list[str] = []
+    reservation_calls: list[dict] = []
+
+    def fake_heartbeat(current_job, *, lease_minutes):
+        heartbeat_calls.append(
+            {"job": current_job, "lease_minutes": lease_minutes}
+        )
+        return True
+
+    def fake_wait(connection, *, exception_id, request_id, resume_owner, heartbeat,
+                  stop_wait, timeout_seconds):
+        row = connection.execute(
+            "SELECT status, submit_started FROM application_attempts "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        dispatch_calls.append(
+            {
+                "connection": connection,
+                "exception_id": exception_id,
+                "request_id": request_id,
+                "resume_owner": resume_owner,
+                "heartbeat": heartbeat,
+                "stop_wait": stop_wait,
+                "timeout_seconds": timeout_seconds,
+                "attempt_row": (
+                    row["status"],
+                    row["submit_started"],
+                ) if row is not None else None,
+            }
+        )
+        lifecycle_events.append("dispatcher_returned")
+        assert heartbeat() is True
+        assert stop_wait(0) is False
+        return OperatorWaitResult(status=dispatcher_status)
+
+    monkeypatch.setattr(launcher, "_heartbeat_operator_handoff", fake_heartbeat)
+    monkeypatch.setattr(worker_orchestration, "wait_for_requested_resume", fake_wait)
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["captcha"],
+        control_connection=control_connection,
+        lifecycle_events=lifecycle_events,
+        reservation_calls=reservation_calls,
+        job_overrides={
+            "url": job_url,
+            "application_url": f"{job_url}/apply",
+            "_attempt_id": attempt_id,
+            "_browser_lease_binding": browser_binding,
+        },
+    )
+
+    exceptions = list_application_exceptions(conn=control_connection)
+    assert len(exceptions) == 1
+    assert len(dispatch_calls) == 1
+    assert phases == ["prepare"]
+    assert reservation_calls == []
+    assert marked and marked[0][0][1] == "failed"
+    assert marked[0][1]["task_id"] == attempt_id
+    call = dispatch_calls[0]
+    assert call["connection"] is control_connection
+    assert call["exception_id"] == exceptions[0].exception_id
+    assert call["request_id"] == "fake-prepare-turn-1:human:1"
+    assert callable(call["resume_owner"])
+    assert callable(call["heartbeat"])
+    assert callable(call["stop_wait"])
+    assert call["attempt_row"] == ("in_progress", 0)
+    assert len(heartbeat_calls) == 1
+    assert heartbeat_calls[0]["lease_minutes"] == 45
+    assert heartbeat_calls[0]["job"] is call["heartbeat"].__defaults__[0]
+    assert heartbeat_calls[0]["job"]["_attempt_id"] == attempt_id
+    assert heartbeat_calls[0]["job"]["_browser_lease_binding"] == browser_binding
+    assert lifecycle_events == ["dispatcher_returned", "mark_result"]
+    assert result[0] == 0
+    assert marked[0][0][2].startswith(
+        f"manual_review_required:operator_resume_{dispatcher_status}"
+    )
 
 
 def test_worker_continues_linkedin_external_handoff_to_official_ats(
@@ -2401,6 +2602,161 @@ def test_same_application_recovery_repairs_once_then_continues(monkeypatch) -> N
     assert marked[0][0][1] == "applied"
 
 
+def test_worker_semantic_resume_repair_reaudits_without_second_agent_turn(
+    monkeypatch,
+) -> None:
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "issues": ["resume_not_uploaded"],
+        "blocking_issues": [],
+        "repairable_issues": ["resume_not_uploaded"],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+        "page_url": "https://example.wd5.myworkdayjobs.com/apply",
+    }
+    clear_report = {
+        "status": "clear",
+        "disposition": "clear",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "lossy_answer_mappings": [],
+    }
+    semantic_calls: list[dict] = []
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        audit_results=[
+            ("pre_submit_repair:resume_not_uploaded", repair_report),
+            (None, clear_report),
+        ],
+        semantic_repair_results=[{"status": "verified"}],
+        semantic_repair_calls=semantic_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert len(semantic_calls) == 1
+    assert semantic_calls[0]["audit"]["repairable_issues"] == [
+        "resume_not_uploaded"
+    ]
+
+
+def test_worker_semantic_resume_not_applicable_preserves_legacy_prepare_fallback(
+    monkeypatch,
+) -> None:
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "repairable_issues": ["resume_state_unconfirmed"],
+    }
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            ("pre_submit_repair:resume_state_unconfirmed", repair_report),
+            (None, {"status": "clear", "disposition": "clear"}),
+        ],
+        semantic_repair_results=[
+            {
+                "status": "not_applicable",
+                "legacy_fallback_safe": True,
+            }
+        ],
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+
+
+def test_worker_unattested_not_applicable_never_falls_back_to_agent(
+    monkeypatch,
+) -> None:
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            (
+                "pre_submit_repair:resume_not_uploaded",
+                {
+                    "status": "attention",
+                    "disposition": "retry_prepare",
+                    "repairable_issues": ["resume_not_uploaded"],
+                },
+            )
+        ],
+        semantic_repair_results=[{"status": "not_applicable"}],
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert "semantic_resume_repair:not_applicable" in marked[0][0][2]
+
+
+@pytest.mark.parametrize(
+    "semantic_status",
+    [
+        "parked_side_effect_unknown",
+        "parked_stale_after_effect",
+        "stale_precondition",
+    ],
+)
+def test_worker_semantic_started_or_stale_repair_never_falls_back_to_agent(
+    monkeypatch,
+    semantic_status: str,
+) -> None:
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            (
+                "pre_submit_repair:resume_not_uploaded",
+                {
+                    "status": "attention",
+                    "disposition": "retry_prepare",
+                    "repairable_issues": ["resume_not_uploaded"],
+                },
+            )
+        ],
+        semantic_repair_results=[{"status": semantic_status}],
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert semantic_status in marked[0][0][2]
+
+
+def test_worker_mixed_resume_and_field_repair_stays_with_one_legacy_writer(
+    monkeypatch,
+) -> None:
+    semantic_calls: list[dict] = []
+    repairable = ["resume_not_uploaded", "required_field_empty:Phone"]
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_results=[
+            (
+                "pre_submit_repair:resume_not_uploaded,required_field_empty:Phone",
+                {
+                    "status": "attention",
+                    "disposition": "retry_prepare",
+                    "repairable_issues": repairable,
+                },
+            ),
+            (None, {"status": "clear", "disposition": "clear"}),
+        ],
+        semantic_repair_calls=semantic_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert semantic_calls == []
+
+
 def test_configured_zero_field_repair_budget_disables_prepare_retry(monkeypatch) -> None:
     repair_report = {
         "status": "attention",
@@ -2478,7 +2834,7 @@ def test_post_submit_captcha_clearance_reobserves_without_second_submit_turn(
     assert attempts[-1]["observer"]["submit_replayed"] is False
 
 
-def test_submission_uncertain_runs_mailbox_receipt_observer_and_reconciles(
+def test_submission_uncertain_queues_receipt_reconciliation_without_agent_spawn(
     monkeypatch,
 ) -> None:
     receipt_observation = {
@@ -2506,18 +2862,23 @@ def test_submission_uncertain_runs_mailbox_receipt_observer_and_reconciles(
         },
     )
 
-    assert result == (1, 0)
-    assert phases == ["prepare", "submit", "receipt"]
-    assert [entry[0] for entry in ledger] == ["submission_uncertain", "applied"]
-    observers = marked[0][1]["evidence"]["mailbox_receipt_observers"]
-    assert observers == [
-        {
-            "provider": "gmail",
-            "turn_status": "applied",
-            "status": "applied",
-            "watermark_advanced": True,
-        }
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert [entry[0] for entry in ledger] == [
+        "submission_uncertain",
+        "submission_uncertain",
     ]
+    observers = marked[0][1]["evidence"]["mailbox_receipt_observers"]
+    assert len(observers) == 1
+    assert {
+        key: observers[0][key]
+        for key in ("provider", "turn_status", "status", "watermark_advanced")
+    } == {
+        "provider": "gmail",
+        "turn_status": "queued",
+        "status": "pending_reconciliation",
+        "watermark_advanced": False,
+    }
 
 
 def test_mailbox_source_failure_keeps_submission_uncertain(monkeypatch) -> None:
@@ -2541,7 +2902,7 @@ def test_mailbox_source_failure_keeps_submission_uncertain(monkeypatch) -> None:
     )
 
     assert result == (0, 0)
-    assert phases == ["prepare", "submit", "receipt"]
+    assert phases == ["prepare", "submit"]
     assert ledger[0][0] == "submission_uncertain"
     assert marked[0][1]["evidence"]["mailbox_receipt_observers"][0][
         "watermark_advanced"
@@ -3316,7 +3677,7 @@ def test_submit_phase_ready_marker_never_starts_a_second_submit_turn(monkeypatch
     assert marked[0][0][1] == "submission_uncertain"
 
 
-def test_worker_repairs_a_deterministic_validation_rejection_only_once(monkeypatch) -> None:
+def test_worker_parks_post_submit_validation_without_second_agent(monkeypatch) -> None:
     validation_rejection = {
         "confirmed": False,
         "receipt_visible": False,
@@ -3333,26 +3694,19 @@ def test_worker_repairs_a_deterministic_validation_rejection_only_once(monkeypat
         }],
         "current_url": "https://jobs.example.test/role/apply",
     }
-    confirmed = {
-        "confirmed": True,
-        "receipt_visible": True,
-        "applied_badge_visible": False,
-        "confirmation_text": "Your application has been submitted",
-        "current_url": "https://jobs.example.test/confirmation",
-    }
-
     result, phases, ledger, marked = _run_worker_contract(
         monkeypatch,
         submit_results=["submission_uncertain", "applied"],
-        observer_results=[validation_rejection, confirmed],
+        observer_results=[validation_rejection],
     )
 
-    assert result == (1, 0)
-    assert phases == ["prepare", "submit", "submit"]
-    assert ledger[0][0] == "applied"
+    assert result == (0, 0)
+    assert phases == ["prepare", "submit"]
+    assert all(entry[0] == "submission_uncertain" for entry in ledger)
     evidence = marked[0][1]["evidence"]
-    assert len(evidence["attempts"]) == 2
+    assert len(evidence["attempts"]) == 1
     assert evidence["attempts"][0]["disposition"] == "validation_blocked_repairable"
+    assert evidence["observer"]["agent_repair_spawned"] is False
 
 
 def test_worker_never_repairs_media_or_identity_validation(monkeypatch) -> None:

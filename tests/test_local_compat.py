@@ -608,6 +608,73 @@ def test_agent_log_slug_removes_windows_invalid_source_characters() -> None:
     assert launcher._safe_log_slug(" ") == "unknown"
 
 
+def _install_fake_profile_lock(monkeypatch, profile: Path) -> None:
+    chrome._chrome_procs.clear()
+    chrome._chrome_ports.clear()
+    chrome._profile_locks.clear()
+    chrome._profile_paths.clear()
+    chrome._launching_workers.clear()
+    chrome._allocating_cdp_workers.clear()
+    chrome._releasing_cdp_workers.clear()
+
+    class FakeLock:
+        def __init__(self, requested_profile: Path) -> None:
+            self.profile_path = Path(requested_profile)
+            self.sidecar_path = self.profile_path.parent / ".fake-sidecar"
+            self.held = False
+            self._spawn_attempted = False
+
+        def acquire(self):
+            self.held = True
+            return self
+
+        @property
+        def owned_by_current_thread(self) -> bool:
+            return self.held
+
+        @property
+        def has_native_resource(self) -> bool:
+            return self.held
+
+        @property
+        def spawn_attempted(self) -> bool:
+            return self._spawn_attempted
+
+        @property
+        def requires_recovery(self) -> bool:
+            return False
+
+        def record_browser(self, _pid: int) -> None:
+            return None
+
+        def record_spawn_attempt(self) -> None:
+            self._spawn_attempted = True
+
+        def actual_browser_stopped(self) -> bool:
+            return True
+
+        def release_before_spawn(self) -> None:
+            self.held = False
+
+        def release_after_stop(self, **_kwargs) -> None:
+            self.held = False
+
+        def mark_recovery_required(self) -> None:
+            return None
+
+    monkeypatch.setattr(chrome, "ProfileLock", FakeLock)
+    monkeypatch.setattr(chrome, "resolve_worker_profile_path", lambda *_args: profile)
+    monkeypatch.setattr(chrome, "_resolve_actual_browser_pid", lambda _port: 999)
+
+
+def _clear_fake_browser_generation(worker_id: int) -> None:
+    chrome._chrome_procs.pop(worker_id, None)
+    chrome._chrome_ports.pop(worker_id, None)
+    chrome._profile_locks.pop(worker_id, None)
+    chrome._profile_paths.pop(worker_id, None)
+    chrome._launching_workers.discard(worker_id)
+
+
 def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) -> None:
     captured = {}
 
@@ -618,6 +685,7 @@ def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) 
         def poll():
             return 0
 
+    _install_fake_profile_lock(monkeypatch, tmp_path)
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
@@ -639,6 +707,7 @@ def test_browser_launch_disables_system_extensions(monkeypatch, tmp_path: Path) 
     assert "--remote-debugging-address=127.0.0.1" in captured["command"]
     assert "--use-fake-device-for-media-stream" not in captured["command"]
     assert "--use-fake-ui-for-media-stream" not in captured["command"]
+    _clear_fake_browser_generation(0)
 
 
 def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -> None:
@@ -651,6 +720,7 @@ def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -
         def poll():
             return 0
 
+    _install_fake_profile_lock(monkeypatch, tmp_path)
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: tmp_path)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(config, "get_chrome_path", lambda: "msedge.exe")
@@ -670,6 +740,7 @@ def test_browser_launch_opens_requested_start_url(monkeypatch, tmp_path: Path) -
     )
 
     assert captured["command"][-1] == "https://www.linkedin.com/login"
+    _clear_fake_browser_generation(0)
 
 
 def test_cloak_launch_uses_separate_profile_and_stable_fingerprint(monkeypatch, tmp_path: Path) -> None:
@@ -685,6 +756,7 @@ def test_cloak_launch_uses_separate_profile_and_stable_fingerprint(monkeypatch, 
         def poll():
             return None
 
+    _install_fake_profile_lock(monkeypatch, profile)
     monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile)
     monkeypatch.setattr(chrome, "_suppress_restore_nag", lambda _profile: None)
     monkeypatch.setattr(chrome, "get_browser_executable", lambda _backend: "cloak-chrome.exe")
@@ -703,6 +775,7 @@ def test_cloak_launch_uses_separate_profile_and_stable_fingerprint(monkeypatch, 
     assert captured["command"][0] == "cloak-chrome.exe"
     assert "--fingerprint=424242" in captured["command"]
     assert f"--user-data-dir={profile}" in captured["command"]
+    _clear_fake_browser_generation(0)
 
 
 def test_cloak_fingerprint_seed_persists_per_profile(monkeypatch, tmp_path: Path) -> None:

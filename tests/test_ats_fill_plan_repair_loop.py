@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from test_apply_runtime_contract import _run_worker_contract
 
 from applypilot import database
 from applypilot.apply import launcher, page_observation, prompt
+from applypilot.apply.answer_provenance import build_host_provenance_binding
+from applypilot.apply.browser_broker import BrowserLease, BrowserLeaseBundle
+from applypilot.apply.contracts import application_actor_id
+from applypilot.apply.page_binding import PageBinding
 from applypilot.apply.specialists import ATS_FORM_SNAPSHOT_SCHEMA_VERSION
 
 
@@ -24,6 +29,39 @@ def _system_snapshot() -> dict[str, object]:
             }
         ],
         "available_fact_names": ["email"],
+    }
+
+
+def _provenance_job_overrides() -> dict[str, object]:
+    attempt_id = "attempt-provenance-repair"
+    common = {
+        "lease_id": "lease-provenance-repair",
+        "owner_id": application_actor_id(attempt_id),
+        "scope_id": "worker:0",
+        "attempt_id": attempt_id,
+        "runtime_id": "codex:cdp:9432",
+        "epoch": 1,
+        "issued_at": 1.0,
+        "heartbeat_at": 2.0,
+        "expires_at": 9999999999.0,
+    }
+    profile = BrowserLease(resource_kind="profile", resource_id="profile-1", **common)
+    page = BrowserLease(
+        resource_kind="page", resource_id=f"application:{attempt_id}", **common
+    )
+    binding = PageBinding(
+        page_id=page.resource_id,
+        page_lease_id=page.lease_id,
+        page_lease_epoch=page.epoch,
+        page_epoch=3,
+        profile_lease_id=profile.lease_id,
+        owner_id=page.owner_id,
+        attempt_id=attempt_id,
+        runtime_id=page.runtime_id,
+    )
+    return {
+        "_attempt_id": attempt_id,
+        "_browser_lease_binding": BrowserLeaseBundle(profile, page, binding).as_dict(),
     }
 
 
@@ -186,6 +224,137 @@ def test_second_retry_does_not_run_a_third_specialist_turn(monkeypatch) -> None:
     assert result == (0, 1)
     assert phases == ["prepare", "prepare"]
     assert prepared == [1]
+
+
+def test_worker_propagates_only_current_provenance_repair_before_second_clear_audit(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(database, "update_application_attempt", lambda *_a, **_k: True)
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "repairable_issues": ["answer_provenance_missing:abc"],
+    }
+    clear_report = {
+        "status": "clear",
+        "disposition": "clear",
+        "repairable_issues": [],
+    }
+    prepare_turn = 0
+    run_calls: list[dict] = []
+    audit_turn = 0
+    reservation_calls: list[dict] = []
+
+    def emit_repair(current_job: dict) -> None:
+        nonlocal prepare_turn
+        prepare_turn += 1
+        current_job["_answer_provenance_binding"] = build_host_provenance_binding(
+            current_job
+        )
+        if prepare_turn == 2:
+            current_job["_agent_observations"] = {
+                "answer_mappings": {"schema_version": "2", "mappings": []},
+                "unrelated_agent_field": "must-not-propagate",
+            }
+            current_job["_unrelated_repair_field"] = "must-not-propagate"
+
+    def audit_current(current_job: dict):
+        nonlocal audit_turn
+        audit_turn += 1
+        if audit_turn == 1:
+            assert reservation_calls == []
+            return "pre_submit_repair:answer_provenance_missing", repair_report
+        assert audit_turn == 2
+        assert reservation_calls == []
+        assert current_job["_agent_observations"] == {
+            "answer_mappings": {"schema_version": "2", "mappings": []}
+        }
+        assert current_job["_answer_provenance_binding"] == build_host_provenance_binding(
+            current_job
+        )
+        assert "_unrelated_repair_field" not in current_job
+        return None, clear_report
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_hook=audit_current,
+        job_overrides=_provenance_job_overrides(),
+        prepare_hook=emit_repair,
+        run_job_calls=run_calls,
+        reservation_calls=reservation_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert audit_turn == 2
+    assert len(reservation_calls) == 1
+    submit_job = run_calls[2]
+    assert submit_job["_agent_observations"]["answer_mappings"] == {
+        "schema_version": "2",
+        "mappings": [],
+    }
+    assert "unrelated_agent_field" not in submit_job["_agent_observations"]
+    assert "_unrelated_repair_field" not in submit_job
+
+
+@pytest.mark.parametrize("drift", ["attempt", "stale_page"])
+def test_worker_rejects_mismatched_or_stale_provenance_repair_artifacts(
+    monkeypatch, drift: str
+) -> None:
+    repair_report = {
+        "status": "attention",
+        "disposition": "retry_prepare",
+        "repairable_issues": ["answer_provenance_binding_mismatch"],
+    }
+    prepare_turn = 0
+    run_calls: list[dict] = []
+    reservation_calls: list[dict] = []
+
+    def emit_drift(current_job: dict) -> None:
+        nonlocal prepare_turn
+        prepare_turn += 1
+        current_job["_answer_provenance_binding"] = build_host_provenance_binding(
+            current_job
+        )
+        if prepare_turn != 2:
+            return
+        current_job["_agent_observations"] = {
+            "answer_mappings": {"schema_version": "2", "mappings": []}
+        }
+        if drift == "attempt":
+            current_job["_attempt_id"] = "attacker-attempt"
+        else:
+            current_job["_browser_lease_binding"]["page_binding"]["page_epoch"] = 2
+
+    queued_job = {
+        "url": "https://jobs.example.test/role",
+        "application_url": "https://jobs.example.test/role/apply",
+        "title": "Data Analyst",
+        "company_name": "Example",
+        "description": "Bounded role",
+        **_provenance_job_overrides(),
+    }
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["ready_to_submit", "ready_to_submit"],
+        audit_hook=lambda _job: (
+            "pre_submit_repair:answer_provenance_binding_mismatch",
+            repair_report,
+        ),
+        queued_jobs=[queued_job],
+        prepare_hook=emit_drift,
+        run_job_calls=run_calls,
+        reservation_calls=reservation_calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare", "prepare"]
+    assert len(run_calls) == 2
+    assert reservation_calls == []
+    assert queued_job["_browser_lease_binding"]["page_binding"]["page_epoch"] == 3
+    observations = queued_job.get("_agent_observations")
+    assert not isinstance(observations, dict) or "answer_mappings" not in observations
 
 
 def test_visible_option_labels_do_not_enter_prompt_or_mcp_context() -> None:

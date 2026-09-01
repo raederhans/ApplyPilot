@@ -202,6 +202,57 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_agent_exception_queue_open
             ON agent_exception_queue(status, queue_kind, created_at, exception_id)
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS operator_command_envelopes (
+            command_id              TEXT PRIMARY KEY,
+            exception_id            TEXT NOT NULL,
+            action                  TEXT NOT NULL,
+            run_id                  TEXT NOT NULL,
+            attempt_id              TEXT NOT NULL,
+            actor_id                TEXT NOT NULL,
+            turn_id                 TEXT NOT NULL,
+            expected_status         TEXT NOT NULL,
+            input_ref               TEXT,
+            input_sha256            TEXT,
+            recovery_budget         INTEGER NOT NULL CHECK(recovery_budget >= 0),
+            browser_authority       INTEGER NOT NULL CHECK(browser_authority = 0),
+            page_write_authority    INTEGER NOT NULL CHECK(page_write_authority = 0),
+            submit_authority        INTEGER NOT NULL CHECK(submit_authority = 0),
+            ledger_write_authority  INTEGER NOT NULL CHECK(ledger_write_authority = 0),
+            schema_version          TEXT NOT NULL,
+            created_at              TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_operator_command_exception
+            ON operator_command_envelopes(exception_id, created_at, command_id)
+    """)
+    duplicate_resume_ref = connection.execute(
+        "SELECT input_ref FROM operator_command_envelopes "
+        "WHERE action='resume' AND input_ref IS NOT NULL "
+        "GROUP BY input_ref HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if duplicate_resume_ref is not None:
+        raise ValueError("duplicate durable resume input_ref bindings require operator repair")
+    connection.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_resume_input_ref
+            ON operator_command_envelopes(input_ref)
+            WHERE action='resume' AND input_ref IS NOT NULL
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS operator_command_results (
+            result_id       TEXT PRIMARY KEY,
+            command_id      TEXT NOT NULL,
+            stage           TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            terminal_status TEXT,
+            result_ref      TEXT,
+            result_sha256   TEXT,
+            schema_version  TEXT NOT NULL,
+            occurred_at     TEXT NOT NULL,
+            UNIQUE(command_id, stage)
+        )
+    """)
     # Durable history is immutable even if a future caller accidentally issues
     # an UPDATE or DELETE directly. Human requests are intentionally mutable so
     # their resolution can be recorded without changing application state.
@@ -241,6 +292,19 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             SELECT RAISE(ABORT, 'agent_recovery_results is append-only');
         END
     """)
+    for table in ("operator_command_envelopes", "operator_command_results"):
+        connection.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_update
+            BEFORE UPDATE ON {table} BEGIN
+                SELECT RAISE(ABORT, '{table} is append-only');
+            END
+        """)
+        connection.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+            BEFORE DELETE ON {table} BEGIN
+                SELECT RAISE(ABORT, '{table} is append-only');
+            END
+        """)
     if not was_in_transaction:
         connection.commit()
 
@@ -726,11 +790,12 @@ def list_exceptions(
     status: str | None = "open",
     attempt_id: str | None = None,
     command_id: str | None = None,
+    limit: int | None = None,
 ) -> list[ApplicationException]:
     """List operator exceptions without changing job or application state."""
     ensure_schema(connection)
     clauses: list[str] = []
-    params: list[str] = []
+    params: list[object] = []
     for column, value in (
         ("status", status),
         ("attempt_id", attempt_id),
@@ -747,6 +812,11 @@ def list_exceptions(
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY created_at, exception_id"
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 500:
+            raise ValueError("exception list limit must be an integer from 1 through 500")
+        sql += " LIMIT ?"
+        params.append(limit)
     return [
         ApplicationException(
             exception_id=str(row[0]),
@@ -767,6 +837,34 @@ def list_exceptions(
     ]
 
 
+def get_exception(connection: sqlite3.Connection, exception_id: str) -> ApplicationException | None:
+    """Return one exact exception without scanning the queue."""
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT exception_id, command_id, run_id, attempt_id, actor_id, turn_id, "
+        "queue_kind, failure_category, next_action, status, context_json, created_at, "
+        "resolved_at FROM agent_exception_queue WHERE exception_id=?",
+        (exception_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return ApplicationException(
+        exception_id=str(row[0]),
+        command_id=str(row[1]),
+        run_id=str(row[2]),
+        attempt_id=str(row[3]),
+        actor_id=str(row[4]),
+        turn_id=str(row[5]),
+        queue_kind=str(row[6]),  # type: ignore[arg-type]
+        failure_category=str(row[7]),
+        next_action=str(row[8]),
+        status=str(row[9]),
+        context=json.loads(str(row[10])),
+        created_at=datetime.fromisoformat(str(row[11])),
+        resolved_at=None if row[12] is None else datetime.fromisoformat(str(row[12])),
+    )
+
+
 def resolve_exception(
     connection: sqlite3.Connection,
     exception_id: str,
@@ -784,5 +882,211 @@ def resolve_exception(
         "UPDATE agent_exception_queue SET status='resolved', resolved_at=? "
         "WHERE exception_id=? AND status='open'",
         (when.isoformat(), exception_id),
+    )
+    return cursor.rowcount == 1
+
+
+def get_human_request(connection: sqlite3.Connection, request_id: str) -> HumanRequest | None:
+    """Load one exact human request in any lifecycle state."""
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT request_id, run_id, attempt_id, request_type, prompt, context_json, status, "
+        "created_at, resolved_at FROM agent_human_requests WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return HumanRequest(
+        request_id=str(row[0]),
+        run_id=str(row[1]),
+        attempt_id=str(row[2]),
+        request_type=str(row[3]),
+        prompt=str(row[4]),
+        context=json.loads(str(row[5])),
+        status=str(row[6]),
+        created_at=datetime.fromisoformat(str(row[7])),
+        resolved_at=None if row[8] is None else datetime.fromisoformat(str(row[8])),
+    )
+
+
+def append_operator_command(connection: sqlite3.Connection, values: tuple[object, ...]) -> bool:
+    """Append an immutable operator command; exact replay is a no-op."""
+    ensure_schema(connection)
+    try:
+        connection.execute(
+            "INSERT INTO operator_command_envelopes "
+            "(command_id, exception_id, action, run_id, attempt_id, actor_id, turn_id, "
+            "expected_status, input_ref, input_sha256, recovery_budget, browser_authority, "
+            "page_write_authority, submit_authority, ledger_write_authority, schema_version, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+        return True
+    except sqlite3.IntegrityError:
+        existing = connection.execute(
+            "SELECT command_id, exception_id, action, run_id, attempt_id, actor_id, turn_id, "
+            "expected_status, input_ref, input_sha256, recovery_budget, browser_authority, "
+            "page_write_authority, submit_authority, ledger_write_authority, schema_version, "
+            "created_at FROM operator_command_envelopes WHERE command_id=?",
+            (values[0],),
+        ).fetchone()
+        if existing is not None and tuple(existing) == values:
+            return False
+        if values[2] == "resume" and values[8] is not None:
+            bound = connection.execute(
+                "SELECT command_id FROM operator_command_envelopes "
+                "WHERE action='resume' AND input_ref=?",
+                (values[8],),
+            ).fetchone()
+            if bound is not None:
+                raise ValueError("resume input_ref is already bound to another command") from None
+        raise ValueError(f"operator command collision: {values[0]}") from None
+
+
+def get_operator_command(connection: sqlite3.Connection, command_id: str) -> sqlite3.Row | tuple | None:
+    ensure_schema(connection)
+    return connection.execute(
+        "SELECT command_id, exception_id, action, run_id, attempt_id, actor_id, turn_id, "
+        "expected_status, input_ref, input_sha256, recovery_budget, browser_authority, "
+        "page_write_authority, submit_authority, ledger_write_authority, schema_version, "
+        "created_at FROM operator_command_envelopes WHERE command_id=?",
+        (command_id,),
+    ).fetchone()
+
+
+def append_operator_result(connection: sqlite3.Connection, values: tuple[object, ...]) -> bool:
+    """Append one immutable operator lifecycle result with semantic replay."""
+    ensure_schema(connection)
+    try:
+        connection.execute(
+            "INSERT INTO operator_command_results "
+            "(result_id, command_id, stage, outcome, terminal_status, result_ref, "
+            "result_sha256, schema_version, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+        return True
+    except sqlite3.IntegrityError:
+        existing = connection.execute(
+            "SELECT result_id, command_id, stage, outcome, terminal_status, result_ref, "
+            "result_sha256, schema_version, occurred_at FROM operator_command_results "
+            "WHERE command_id=? AND stage=?",
+            (values[1], values[2]),
+        ).fetchone()
+        if existing is not None and tuple(existing)[1:8] == values[1:8]:
+            return False
+        raise ValueError(f"operator result collision: {values[1]}:{values[2]}") from None
+
+
+def list_operator_result_rows(
+    connection: sqlite3.Connection, *, command_id: str | None = None, exception_id: str | None = None
+) -> list[sqlite3.Row | tuple]:
+    ensure_schema(connection)
+    clauses: list[str] = []
+    params: list[str] = []
+    sql = (
+        "SELECT r.result_id, r.command_id, r.stage, r.outcome, r.terminal_status, "
+        "r.result_ref, r.result_sha256, r.schema_version, r.occurred_at "
+        "FROM operator_command_results r JOIN operator_command_envelopes c "
+        "ON c.command_id=r.command_id"
+    )
+    if command_id is not None:
+        clauses.append("r.command_id=?")
+        params.append(command_id)
+    if exception_id is not None:
+        clauses.append("c.exception_id=?")
+        params.append(exception_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += (
+        " ORDER BY r.occurred_at, r.command_id, "
+        "CASE r.stage WHEN 'requested' THEN 0 WHEN 'started' THEN 1 ELSE 2 END, r.result_id"
+    )
+    return connection.execute(sql, tuple(params)).fetchall()
+
+
+def list_requested_resume_rows(
+    connection: sqlite3.Connection,
+    *,
+    exception_id: str,
+) -> list[sqlite3.Row | tuple]:
+    """Return requested resume envelopes for one exact exception."""
+    ensure_schema(connection)
+    return connection.execute(
+        "SELECT c.command_id,c.exception_id,c.action,c.run_id,c.attempt_id,c.actor_id,c.turn_id,"
+        "c.expected_status,c.input_ref,c.input_sha256,c.recovery_budget,c.browser_authority,"
+        "c.page_write_authority,c.submit_authority,c.ledger_write_authority,c.schema_version,"
+        "c.created_at FROM operator_command_envelopes c "
+        "JOIN operator_command_results r ON r.command_id=c.command_id "
+        "WHERE c.exception_id=? AND c.action='resume' AND r.stage='requested' "
+        "ORDER BY c.created_at,c.command_id",
+        (exception_id,),
+    ).fetchall()
+
+
+def expire_exception_cas(
+    connection: sqlite3.Connection,
+    *,
+    exception_id: str,
+    run_id: str,
+    attempt_id: str,
+    actor_id: str,
+    turn_id: str,
+    expired_at: str,
+) -> bool:
+    """Atomically expire one exact still-open exception."""
+    ensure_schema(connection)
+    cursor = connection.execute(
+        "UPDATE agent_exception_queue SET status='expired', resolved_at=? "
+        "WHERE exception_id=? AND run_id=? AND attempt_id=? AND actor_id=? AND turn_id=? "
+        "AND status='open'",
+        (expired_at, exception_id, run_id, attempt_id, actor_id, turn_id),
+    )
+    return cursor.rowcount == 1
+
+
+def expire_human_request_cas(
+    connection: sqlite3.Connection,
+    *,
+    request_id: str,
+    run_id: str,
+    attempt_id: str,
+    expired_at: str,
+) -> bool:
+    """Atomically expire one exact still-open request without reading its response."""
+    ensure_schema(connection)
+    cursor = connection.execute(
+        "UPDATE agent_human_requests SET status='expired', resolved_at=? "
+        "WHERE request_id=? AND run_id=? AND attempt_id=? AND status='open'",
+        (expired_at, request_id, run_id, attempt_id),
+    )
+    return cursor.rowcount == 1
+
+
+def resolve_exception_cas(
+    connection: sqlite3.Connection,
+    *,
+    exception_id: str,
+    run_id: str,
+    attempt_id: str,
+    actor_id: str,
+    turn_id: str,
+    expected_status: str,
+    resolved_at: str,
+) -> bool:
+    """Resolve exactly one still-current exception identity."""
+    ensure_schema(connection)
+    cursor = connection.execute(
+        "UPDATE agent_exception_queue SET status='resolved', resolved_at=? "
+        "WHERE exception_id=? AND run_id=? AND attempt_id=? AND actor_id=? AND turn_id=? "
+        "AND status=?",
+        (
+            resolved_at,
+            exception_id,
+            run_id,
+            attempt_id,
+            actor_id,
+            turn_id,
+            expected_status,
+        ),
     )
     return cursor.rowcount == 1

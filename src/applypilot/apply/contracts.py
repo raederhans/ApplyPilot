@@ -22,6 +22,90 @@ MAX_AGENT_PROPOSALS = 50
 MAX_PROPOSAL_DEPENDENCIES = 50
 MAX_TASK_DEPENDENCIES = 100
 
+FAILURE_OBSERVATION_CODES = frozenset(
+    {
+        "agent_runtime_timeout",
+        "already_applied",
+        "answer_policy_unresolved",
+        "assessment_required",
+        "browser_interaction_unavailable",
+        "browser_mcp_unavailable",
+        "browser_runtime_blocked",
+        "captcha_required",
+        "cover_letter_missing",
+        "credential_relay_missing",
+        "duplicate",
+        "expired",
+        "explicit_do_not_apply",
+        "form_resolution_incomplete",
+        "mailbox_route_unavailable",
+        "not_a_job_application",
+        "page_or_progress_failure",
+        "post_submit_observer_unavailable",
+        "provider_submission_error",
+        "required_document_missing",
+        "resume_upload_failed",
+        "security_challenge_required",
+        "sensitive_identity_material_required",
+        "submission_uncertain",
+        "truth_or_security_boundary",
+        "unknown",
+        "unsupported_legal_declaration",
+        "visual_control_unavailable",
+    }
+)
+FAILURE_OBSERVATION_SOURCES = frozenset(
+    {
+        "agent",
+        "browser_observer",
+        "policy",
+        "provider_adapter",
+        "receipt_observer",
+        "runtime",
+        "submission_observer",
+    }
+)
+FAILURE_OBSERVATION_PROVIDERS = frozenset(
+    {
+        "direct_email",
+        "generic",
+        "greenhouse",
+        "lever",
+        "linkedin",
+        "smartrecruiters",
+        "unknown",
+        "workday",
+    }
+)
+FAILURE_OBSERVATION_PHASES = frozenset(
+    {"observe", "prepare", "receipt", "submit", "verify"}
+)
+FAILURE_MISSING_CAPABILITIES = frozenset(
+    {
+        "agent_runtime_budget",
+        "answer_resolution",
+        "assessment_owner",
+        "authorized_human_security_handoff",
+        "browser_file_upload_or_site_adapter",
+        "compatible_browser_runtime",
+        "credential_relay",
+        "human_verification_relay",
+        "mailbox_route",
+        "playwright_mcp",
+        "post_submit_observer_or_receipt_reconciliation",
+        "provider_submission_diagnostics_or_adapter",
+        "site_specific_browser_interaction_or_app_handoff",
+        "site_state_or_adapter_progress",
+        "visual_control",
+    }
+)
+FAILURE_MISSING_MATERIALS = frozenset(
+    {"required_application_document", "validated_cover_letter"}
+)
+
+_FAILURE_SEMANTIC = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_FAILURE_REFERENCE = re.compile(r"^[a-z][a-z0-9_.-]{0,31}:[A-Za-z0-9._/-]{1,180}$")
+
 _FORBIDDEN_PERSISTED_KEYS = {
     "api_key",
     "authorization",
@@ -309,12 +393,80 @@ class AgentRunRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class FailureObservation:
+    """Bounded facts about one failed application turn, without recovery policy."""
+
+    code: str
+    source: str
+    provider: str
+    phase: str
+    submit_started: bool
+    field_semantic: str | None = None
+    page_epoch: int | None = None
+    evidence_refs: tuple[str, ...] = ()
+    detail_ref: str | None = None
+    missing_capability: str | None = None
+    missing_material: str | None = None
+    schema_version: str = "1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "1":
+            raise ValueError("FailureObservation schema_version must be 1")
+        for name, allowed in (
+            ("code", FAILURE_OBSERVATION_CODES),
+            ("source", FAILURE_OBSERVATION_SOURCES),
+            ("provider", FAILURE_OBSERVATION_PROVIDERS),
+            ("phase", FAILURE_OBSERVATION_PHASES),
+        ):
+            value = getattr(self, name)
+            if value not in allowed:
+                raise ValueError(f"unsupported FailureObservation {name}: {value}")
+        if not isinstance(self.submit_started, bool):
+            raise TypeError("FailureObservation submit_started must be a boolean")
+        if self.code in {
+            "post_submit_observer_unavailable",
+            "provider_submission_error",
+            "submission_uncertain",
+        } and not self.submit_started:
+            raise ValueError(
+                f"FailureObservation {self.code} requires submit_started=true"
+            )
+        if self.field_semantic is not None and not _FAILURE_SEMANTIC.fullmatch(
+            self.field_semantic
+        ):
+            raise ValueError("FailureObservation field_semantic is not a bounded semantic id")
+        if self.page_epoch is not None and (
+            isinstance(self.page_epoch, bool)
+            or not isinstance(self.page_epoch, int)
+            or self.page_epoch < 0
+        ):
+            raise ValueError("FailureObservation page_epoch must be a non-negative integer")
+        if len(self.evidence_refs) > 8:
+            raise ValueError("FailureObservation may contain at most 8 evidence refs")
+        _strings(self.evidence_refs, "FailureObservation evidence_refs")
+        for reference in (*self.evidence_refs, self.detail_ref):
+            if reference is not None and not _FAILURE_REFERENCE.fullmatch(reference):
+                raise ValueError("FailureObservation references must be bounded opaque refs")
+        if (
+            self.missing_capability is not None
+            and self.missing_capability not in FAILURE_MISSING_CAPABILITIES
+        ):
+            raise ValueError("unsupported FailureObservation missing_capability")
+        if (
+            self.missing_material is not None
+            and self.missing_material not in FAILURE_MISSING_MATERIALS
+        ):
+            raise ValueError("unsupported FailureObservation missing_material")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentTurnResult:
     run_id: str
     status: str
     summary: str
     proposals: tuple[AgentProposal, ...] = ()
     observations: Mapping[str, object] = field(default_factory=dict)
+    failure: FailureObservation | None = None
     requested_human_input: str | None = None
     completed_at: datetime = field(default_factory=utc_now)
 
@@ -327,6 +479,22 @@ class AgentTurnResult:
             raise TypeError("proposals must contain AgentProposal values")
         if len(self.proposals) > MAX_AGENT_PROPOSALS:
             raise ValueError(f"a result may contain at most {MAX_AGENT_PROPOSALS} proposals")
+        if self.failure is not None:
+            if not isinstance(self.failure, FailureObservation):
+                raise TypeError("failure must be a FailureObservation")
+            normalized_status = self.status.strip().casefold()
+            if self.failure.submit_started:
+                if normalized_status != "submission_uncertain":
+                    raise ValueError(
+                        "a submit-started failure requires submission_uncertain status"
+                    )
+            elif normalized_status not in {
+                "failed",
+                f"failed:{self.failure.code}",
+                "captcha" if self.failure.code == "captcha_required" else "failed",
+                "expired" if self.failure.code == "expired" else "failed",
+            }:
+                raise ValueError("AgentTurnResult status conflicts with FailureObservation")
         if self.requested_human_input is not None:
             _required(self.requested_human_input, "requested_human_input")
 
@@ -622,7 +790,7 @@ class ApplicationException:
             raise ValueError("run_id must remain the compatibility alias for turn_id")
         if self.queue_kind not in _EXCEPTION_QUEUE_KINDS:
             raise ValueError(f"unsupported exception queue kind: {self.queue_kind}")
-        if self.status not in {"open", "resolved"}:
+        if self.status not in {"open", "resolved", "expired"}:
             raise ValueError(f"unsupported exception status: {self.status}")
         _aware(self.created_at, "created_at")
         if self.resolved_at is not None:
@@ -800,6 +968,8 @@ class HumanRequest:
     def __post_init__(self) -> None:
         for name in ("request_id", "run_id", "attempt_id", "request_type", "prompt", "status"):
             _required(getattr(self, name), name)
+        if self.status not in {"open", "resolved", "consumed", "expired"}:
+            raise ValueError(f"unsupported human request status: {self.status}")
         _aware(self.created_at, "created_at")
         if self.resolved_at is not None:
             _aware(self.resolved_at, "resolved_at")
@@ -936,6 +1106,67 @@ def agent_proposal_from_mapping(
     )
 
 
+def failure_observation_from_mapping(value: Mapping[str, object]) -> FailureObservation:
+    """Parse the exact v1 failure-observation wire contract."""
+    allowed_keys = {
+        "code",
+        "source",
+        "provider",
+        "phase",
+        "submit_started",
+        "field_semantic",
+        "page_epoch",
+        "evidence_refs",
+        "detail_ref",
+        "missing_capability",
+        "missing_material",
+        "schema_version",
+    }
+    unknown_keys = set(value) - allowed_keys
+    if unknown_keys:
+        raise ValueError(
+            "unsupported FailureObservation fields: " + ", ".join(sorted(unknown_keys))
+        )
+    evidence_refs = value.get("evidence_refs", ())
+    if not isinstance(evidence_refs, (list, tuple)):
+        raise TypeError("FailureObservation evidence_refs must be an array")
+
+    def optional_text(key: str) -> str | None:
+        item = value.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, str):
+            raise TypeError(f"FailureObservation {key} must be a string or null")
+        return item
+
+    submit_started = value.get("submit_started")
+    if not isinstance(submit_started, bool):
+        raise TypeError("FailureObservation submit_started must be a boolean")
+    page_epoch = value.get("page_epoch")
+    if page_epoch is not None and (
+        isinstance(page_epoch, bool) or not isinstance(page_epoch, int)
+    ):
+        raise TypeError("FailureObservation page_epoch must be an integer or null")
+    return FailureObservation(
+        code=str(value.get("code") or ""),
+        source=str(value.get("source") or ""),
+        provider=str(value.get("provider") or ""),
+        phase=str(value.get("phase") or ""),
+        submit_started=submit_started,
+        field_semantic=optional_text("field_semantic"),
+        page_epoch=page_epoch,
+        evidence_refs=tuple(str(item) for item in evidence_refs),
+        detail_ref=optional_text("detail_ref"),
+        missing_capability=optional_text("missing_capability"),
+        missing_material=optional_text("missing_material"),
+        schema_version=(
+            str(value["schema_version"])
+            if "schema_version" in value
+            else "1"
+        ),
+    )
+
+
 def agent_turn_result_from_mapping(
     value: Mapping[str, object],
     *,
@@ -972,12 +1203,20 @@ def agent_turn_result_from_mapping(
     if not isinstance(observations, Mapping):
         raise TypeError("observations must be an object")
     requested = value.get("requested_human_input")
+    failure_raw = value.get("failure")
+    if failure_raw is not None and not isinstance(failure_raw, Mapping):
+        raise TypeError("failure must be an object or null")
     return AgentTurnResult(
         run_id=run_id,
         status=str(value.get("status") or ""),
         summary=str(value.get("summary") or ""),
         proposals=tuple(proposals),
         observations=dict(observations),
+        failure=(
+            failure_observation_from_mapping(failure_raw)
+            if isinstance(failure_raw, Mapping)
+            else None
+        ),
         requested_human_input=None if requested is None else str(requested),
     )
 

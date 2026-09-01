@@ -1,0 +1,334 @@
+{
+  "schema_version": "applypilot-answer-accuracy-golden/v1",
+  "cases": [
+    {
+      "case_id": "workday-degree-current-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "education",
+      "semantic": "Degree category",
+      "type": "combobox",
+      "required": true,
+      "visible_options": ["Diploma", "Bachelor", "Master"],
+      "synthetic_fact_ref": "fact:degree-workday-current",
+      "scope": "accuracy-corpus",
+      "freshness": "current",
+      "fact": {
+        "key": "degree_category",
+        "entries": [
+          {"fact_ref": "fact:degree-workday-current", "value": "Master", "sensitivity": "medium", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:degree-workday"}},
+      "safe_default": null,
+      "expected": {"fact_status": "resolved", "risk": "medium", "action": "select", "selected_option": "Master", "provenance": "fact:degree-workday-current", "failure_code": null}
+    },
+    {
+      "case_id": "smartrecruiters-experience-current-v1",
+      "provider": "smartrecruiters",
+      "adapter_version": "golden-v1",
+      "page_type": "experience",
+      "semantic": "Years of Python experience",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["0 years", "1-2 years", "5+"],
+      "synthetic_fact_ref": "fact:experience-smart-current",
+      "scope": "accuracy-corpus",
+      "freshness": "current",
+      "fact": {
+        "key": "python_experience_years",
+        "entries": [
+          {"fact_ref": "fact:experience-smart-current", "value": 6, "sensitivity": "medium", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:experience-smart"}},
+      "safe_default": null,
+      "expected": {"fact_status": "resolved", "risk": "medium", "action": "select", "selected_option": "5+", "provenance": "fact:experience-smart-current", "failure_code": null}
+    },
+    {
+      "case_id": "generic-low-current-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "profile",
+      "semantic": "Preferred working style",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Remote", "Hybrid", "On site"],
+      "synthetic_fact_ref": "fact:style-generic-current",
+      "scope": "accuracy-corpus",
+      "freshness": "current",
+      "fact": {
+        "key": "working_style",
+        "entries": [
+          {"fact_ref": "fact:style-generic-current", "value": "Hybrid", "sensitivity": "low", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": true, "adapter_risk": null, "context": {"field_ref": "field:style-generic"}},
+      "safe_default": null,
+      "expected": {"fact_status": "resolved", "risk": "low", "action": "select", "selected_option": "Hybrid", "provenance": "fact:style-generic-current", "failure_code": null}
+    },
+    {
+      "case_id": "workday-medium-missing-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "education",
+      "semantic": "Degree category",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Bachelor", "Master"],
+      "synthetic_fact_ref": "fact:degree-workday-missing",
+      "scope": "accuracy-corpus",
+      "freshness": "missing",
+      "fact": {"key": "degree_category", "entries": []},
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:degree-missing"}},
+      "safe_default": null,
+      "expected": {"fact_status": "missing", "risk": "medium", "action": "research_then_select", "selected_option": null, "provenance": "none", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "smartrecruiters-medium-expired-v1",
+      "provider": "smartrecruiters",
+      "adapter_version": "golden-v1",
+      "page_type": "experience",
+      "semantic": "Years of Python experience",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["0 years", "1-2 years", "5+"],
+      "synthetic_fact_ref": "fact:experience-smart-expired",
+      "scope": "accuracy-corpus",
+      "freshness": "expired",
+      "fact": {
+        "key": "python_experience_years",
+        "entries": [
+          {"fact_ref": "fact:experience-smart-expired", "value": 6, "sensitivity": "medium", "scope": "accuracy-corpus", "expires_at": "2026-01-01T00:00:00+00:00"}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:experience-expired"}},
+      "safe_default": null,
+      "expected": {"fact_status": "expired", "risk": "medium", "action": "research_then_select", "selected_option": null, "provenance": "none", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "generic-medium-out-of-scope-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "education",
+      "semantic": "Degree category",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Bachelor", "Master"],
+      "synthetic_fact_ref": "fact:degree-generic-other-scope",
+      "scope": "accuracy-corpus",
+      "freshness": "out_of_scope",
+      "fact": {
+        "key": "degree_category",
+        "entries": [
+          {"fact_ref": "fact:degree-generic-other-scope", "value": "Master", "sensitivity": "medium", "scope": "another-scope", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:degree-other-scope"}},
+      "safe_default": null,
+      "expected": {"fact_status": "out_of_scope", "risk": "medium", "action": "research_then_select", "selected_option": null, "provenance": "none", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "workday-medium-conflict-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "education",
+      "semantic": "Degree category",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Bachelor", "Master"],
+      "synthetic_fact_ref": "fact:degree-workday-conflict-a",
+      "scope": "accuracy-corpus",
+      "freshness": "conflict",
+      "fact": {
+        "key": "degree_category",
+        "entries": [
+          {"fact_ref": "fact:degree-workday-conflict-a", "value": "Bachelor", "sensitivity": "medium", "scope": "accuracy-corpus", "expires_at": null},
+          {"fact_ref": "fact:degree-workday-conflict-b", "value": "Master", "sensitivity": "medium", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:degree-conflict"}},
+      "safe_default": null,
+      "expected": {"fact_status": "conflict", "risk": "medium", "action": "research_then_select", "selected_option": null, "provenance": "none", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "workday-high-missing-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "eligibility",
+      "semantic": "Work authorization declaration",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Eligible", "Not eligible"],
+      "synthetic_fact_ref": "fact:eligibility-workday-missing",
+      "scope": "accuracy-corpus",
+      "freshness": "missing",
+      "fact": {"key": "eligibility_status", "entries": []},
+      "request": {"direct_impact": true, "declaration": true, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:eligibility-missing"}},
+      "safe_default": null,
+      "expected": {"fact_status": "missing", "risk": "high", "action": "review", "selected_option": null, "provenance": "none", "failure_code": "unsupported_legal_declaration"}
+    },
+    {
+      "case_id": "smartrecruiters-high-expired-v1",
+      "provider": "smartrecruiters",
+      "adapter_version": "golden-v1",
+      "page_type": "eligibility",
+      "semantic": "Work authorization declaration",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Eligible", "Not eligible"],
+      "synthetic_fact_ref": "fact:eligibility-smart-expired",
+      "scope": "accuracy-corpus",
+      "freshness": "expired",
+      "fact": {
+        "key": "eligibility_status",
+        "entries": [
+          {"fact_ref": "fact:eligibility-smart-expired", "value": "bounded-status", "sensitivity": "high", "scope": "accuracy-corpus", "expires_at": "2026-01-01T00:00:00+00:00"}
+        ]
+      },
+      "request": {"direct_impact": true, "declaration": true, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:eligibility-expired"}},
+      "safe_default": null,
+      "expected": {"fact_status": "expired", "risk": "high", "action": "review", "selected_option": null, "provenance": "none", "failure_code": "unsupported_legal_declaration"}
+    },
+    {
+      "case_id": "generic-high-out-of-scope-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "eligibility",
+      "semantic": "Work authorization declaration",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Eligible", "Not eligible"],
+      "synthetic_fact_ref": "fact:eligibility-generic-other-scope",
+      "scope": "accuracy-corpus",
+      "freshness": "out_of_scope",
+      "fact": {
+        "key": "eligibility_status",
+        "entries": [
+          {"fact_ref": "fact:eligibility-generic-other-scope", "value": "bounded-status", "sensitivity": "high", "scope": "another-scope", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": true, "declaration": true, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:eligibility-other-scope"}},
+      "safe_default": null,
+      "expected": {"fact_status": "out_of_scope", "risk": "high", "action": "review", "selected_option": null, "provenance": "none", "failure_code": "unsupported_legal_declaration"}
+    },
+    {
+      "case_id": "workday-high-conflict-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "eligibility",
+      "semantic": "Work authorization declaration",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Eligible", "Not eligible"],
+      "synthetic_fact_ref": "fact:eligibility-workday-conflict-a",
+      "scope": "accuracy-corpus",
+      "freshness": "conflict",
+      "fact": {
+        "key": "eligibility_status",
+        "entries": [
+          {"fact_ref": "fact:eligibility-workday-conflict-a", "value": "bounded-status-a", "sensitivity": "high", "scope": "accuracy-corpus", "expires_at": null},
+          {"fact_ref": "fact:eligibility-workday-conflict-b", "value": "bounded-status-b", "sensitivity": "high", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": true, "declaration": true, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:eligibility-conflict"}},
+      "safe_default": null,
+      "expected": {"fact_status": "conflict", "risk": "high", "action": "review", "selected_option": null, "provenance": "none", "failure_code": "unsupported_legal_declaration"}
+    },
+    {
+      "case_id": "workday-registered-low-default-v1",
+      "provider": "workday",
+      "adapter_version": "golden-v1",
+      "page_type": "source",
+      "semantic": "How did you hear about us?",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Referral", "Company website", "Job board"],
+      "synthetic_fact_ref": "fact:source-workday-missing",
+      "scope": "accuracy-corpus",
+      "freshness": "missing",
+      "fact": {"key": "application_source", "entries": []},
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:source-workday"}},
+      "safe_default": {"rule_id": "safe:workday-source-v1", "adapter": "workday", "adapter_version": "golden-v1", "value": "Company website"},
+      "expected": {"fact_status": "missing", "risk": "low", "action": "select_and_record", "selected_option": "Company website", "provenance": "safe_default:safe:workday-source-v1", "failure_code": null}
+    },
+    {
+      "case_id": "generic-default-mismatch-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "source",
+      "semantic": "How did you hear about us?",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Referral", "Company website", "Job board"],
+      "synthetic_fact_ref": "fact:source-generic-missing",
+      "scope": "accuracy-corpus",
+      "freshness": "missing",
+      "fact": {"key": "application_source", "entries": []},
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:source-generic"}},
+      "safe_default": {"rule_id": "safe:workday-source-mismatch-v1", "adapter": "workday", "adapter_version": "golden-v1", "value": "Company website"},
+      "expected": {"fact_status": "missing", "risk": "low", "action": "research_then_select", "selected_option": null, "provenance": "none", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "smartrecruiters-preference-no-map-v1",
+      "provider": "smartrecruiters",
+      "adapter_version": "golden-v1",
+      "page_type": "profile",
+      "semantic": "Preferred office",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["London", "Singapore"],
+      "synthetic_fact_ref": "fact:office-smart-current",
+      "scope": "accuracy-corpus",
+      "freshness": "current",
+      "fact": {
+        "key": "office_preference",
+        "entries": [
+          {"fact_ref": "fact:office-smart-current", "value": "Tokyo", "sensitivity": "low", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": true, "adapter_risk": null, "context": {"field_ref": "field:office-smart"}},
+      "safe_default": null,
+      "expected": {"fact_status": "resolved", "risk": "low", "action": "review", "selected_option": null, "provenance": "fact:office-smart-current", "failure_code": "answer_policy_unresolved"}
+    },
+    {
+      "case_id": "generic-required-custom-text-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "profile",
+      "semantic": "Professional headline",
+      "type": "custom_text",
+      "required": true,
+      "visible_options": [],
+      "synthetic_fact_ref": "fact:headline-generic-current",
+      "scope": "accuracy-corpus",
+      "freshness": "current",
+      "fact": {
+        "key": "professional_headline",
+        "entries": [
+          {"fact_ref": "fact:headline-generic-current", "value": "Applied AI learner", "sensitivity": "low", "scope": "accuracy-corpus", "expires_at": null}
+        ]
+      },
+      "request": {"direct_impact": false, "declaration": false, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:headline-generic"}},
+      "safe_default": null,
+      "expected": {"fact_status": "resolved", "risk": "low", "action": "enter_value", "selected_option": null, "provenance": "fact:headline-generic-current", "failure_code": null}
+    },
+    {
+      "case_id": "generic-unsupported-high-v1",
+      "provider": "generic",
+      "adapter_version": "golden-v1",
+      "page_type": "eligibility",
+      "semantic": "Work authorization declaration",
+      "type": "native_select",
+      "required": true,
+      "visible_options": ["Eligible", "Not eligible"],
+      "synthetic_fact_ref": "fact:eligibility-generic-unsupported",
+      "scope": "accuracy-corpus",
+      "freshness": "missing",
+      "fact": {"key": "eligibility_status", "entries": []},
+      "request": {"direct_impact": true, "declaration": true, "preference": false, "adapter_risk": null, "context": {"field_ref": "field:eligibility-unsupported"}},
+      "safe_default": null,
+      "expected": {"fact_status": "missing", "risk": "high", "action": "review", "selected_option": null, "provenance": "none", "failure_code": "unsupported_legal_declaration"}
+    }
+  ]
+}

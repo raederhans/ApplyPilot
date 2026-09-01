@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Literal
+
+from applypilot.apply.contracts import FailureObservation
 
 Recoverability = Literal[
     "retry_same_application",
@@ -267,4 +269,60 @@ def classify_failure(result: str) -> FailureDescriptor:
         "unclassified_application_failure",
         "retry_new_session",
         "inspect_bounded_failure_context_and_add_capability",
+    )
+
+
+_TYPED_REASON_BY_CODE = {
+    "agent_runtime_timeout": "agent_runtime_timeout",
+    "already_applied": "already_applied",
+    "answer_policy_unresolved": "unknown_required",
+    "assessment_required": "assessment_required",
+    "browser_interaction_unavailable": "browser_interaction_unavailable",
+    "browser_mcp_unavailable": "browser_mcp_unavailable",
+    "browser_runtime_blocked": "site_blocked",
+    "captcha_required": "captcha",
+    "cover_letter_missing": "cover_letter_missing",
+    "credential_relay_missing": "credential_relay_missing",
+    "duplicate": "duplicate",
+    "expired": "expired",
+    "explicit_do_not_apply": "explicit_do_not_apply",
+    "form_resolution_incomplete": "required_field_empty",
+    "mailbox_route_unavailable": "email_route_capability_missing",
+    "not_a_job_application": "not_a_job_application",
+    "page_or_progress_failure": "page_error",
+    "post_submit_observer_unavailable": "post_submit_observer_unavailable",
+    "provider_submission_error": "provider_submission_error",
+    "required_document_missing": "required_document_missing",
+    "resume_upload_failed": "resume_upload_failed",
+    "security_challenge_required": "security_challenge_required",
+    "sensitive_identity_material_required": "identity_material_missing",
+    "submission_uncertain": "submission_uncertain",
+    "truth_or_security_boundary": "unsafe_answer",
+    "unknown": "unknown",
+    "unsupported_legal_declaration": "unsupported_legal_declaration",
+    "visual_control_unavailable": "computer_use_handoff_unavailable",
+}
+
+
+def classify_failure_observation(observation: FailureObservation) -> FailureDescriptor:
+    """Adapt bounded failure facts to the existing recovery policy taxonomy."""
+    if not isinstance(observation, FailureObservation):
+        raise TypeError("observation must be a FailureObservation")
+    if observation.submit_started:
+        descriptor = classify_failure("submission_uncertain")
+    else:
+        reason = _TYPED_REASON_BY_CODE.get(observation.code)
+        if reason is None:
+            return FailureDescriptor(
+                "unclassified_application_failure",
+                "do_not_retry",
+                "park_unknown_typed_failure_for_bounded_diagnosis",
+            )
+        descriptor = classify_failure(reason)
+    return replace(
+        descriptor,
+        missing_capability=(
+            observation.missing_capability or descriptor.missing_capability
+        ),
+        missing_material=observation.missing_material or descriptor.missing_material,
     )

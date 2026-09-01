@@ -10,18 +10,27 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Mapping
+from contextlib import nullcontext
+from copy import deepcopy
 from types import ModuleType
 from urllib.parse import urlparse
 
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import recovery_execution as recovery_execution_mod
+from applypilot.apply.answer_provenance import build_host_provenance_binding
+from applypilot.apply.browser_broker import BrowserBrokerError, BrowserLeaseBundle
 from applypilot.apply.contracts import contract_json
 from applypilot.apply.email_routing import (
     normalize_prepared_email_application,
     normalize_sent_receipt,
     reserve_direct_email_send,
 )
+from applypilot.apply.exception_queue import exception_id_for_command
 from applypilot.apply.failure_taxonomy import classify_failure
+from applypilot.apply.operator_binding import operator_resume_binding
+from applypilot.apply.operator_dispatch import wait_for_requested_resume
+from applypilot.apply.operator_runtime import OperatorRuntime, verified_child_execution
 from applypilot.apply.run_progress import PreviewTicket, RunProgress
 
 
@@ -55,6 +64,72 @@ def _url_has_host(url: object, domain: str) -> bool:
     return host == normalized_domain or host.endswith(f".{normalized_domain}")
 
 
+def _consume_provenance_repair_artifacts(job: dict, repair_job: Mapping[str, object]) -> str | None:
+    """Copy only current-page provenance repair output back to the owning job."""
+
+    repair_observations = repair_job.get("_agent_observations")
+    answer_mappings = (
+        repair_observations.get("answer_mappings")
+        if isinstance(repair_observations, Mapping)
+        else None
+    )
+    repair_binding = repair_job.get("_answer_provenance_binding")
+    if answer_mappings is None and not isinstance(repair_binding, Mapping):
+        return None
+    if answer_mappings is not None and not isinstance(answer_mappings, Mapping):
+        return "mapping_not_object"
+    attempt_id = str(job.get("_attempt_id") or "")
+    if not attempt_id or str(repair_job.get("_attempt_id") or "") != attempt_id:
+        return "attempt_mismatch"
+    try:
+        current_bundle = BrowserLeaseBundle.from_mapping(job["_browser_lease_binding"])
+        repair_bundle = BrowserLeaseBundle.from_mapping(
+            repair_job["_browser_lease_binding"]  # type: ignore[arg-type]
+        )
+    except (BrowserBrokerError, KeyError, TypeError, ValueError):
+        return "browser_binding_invalid"
+    fixed_profile = (
+        "lease_id", "resource_kind", "resource_id", "owner_id", "scope_id",
+        "attempt_id", "runtime_id", "epoch",
+    )
+    fixed_page = fixed_profile
+    fixed_binding = (
+        "page_id", "page_lease_id", "page_lease_epoch", "profile_lease_id",
+        "owner_id", "attempt_id", "runtime_id",
+    )
+    if any(
+        getattr(current_bundle.profile, key) != getattr(repair_bundle.profile, key)
+        for key in fixed_profile
+    ) or any(
+        getattr(current_bundle.page, key) != getattr(repair_bundle.page, key)
+        for key in fixed_page
+    ) or any(
+        getattr(current_bundle.page_binding, key)
+        != getattr(repair_bundle.page_binding, key)
+        for key in fixed_binding
+    ):
+        return "browser_lease_mismatch"
+    if repair_bundle.page_binding.page_epoch < current_bundle.page_binding.page_epoch:
+        return "stale_page_epoch"
+    if not isinstance(repair_binding, Mapping):
+        return "provenance_binding_missing"
+    try:
+        recomputed = build_host_provenance_binding(repair_job)
+    except (TypeError, ValueError):
+        return "provenance_binding_invalid"
+    if dict(repair_binding) != recomputed:
+        return "provenance_binding_mismatch"
+
+    job["_browser_lease_binding"] = deepcopy(repair_job["_browser_lease_binding"])
+    job["_answer_provenance_binding"] = deepcopy(dict(repair_binding))
+    if isinstance(answer_mappings, Mapping):
+        current_observations = job.get("_agent_observations")
+        merged = dict(current_observations) if isinstance(current_observations, Mapping) else {}
+        merged["answer_mappings"] = deepcopy(dict(answer_mappings))
+        job["_agent_observations"] = merged
+    return None
+
+
 WORKER_RUNTIME_PORTS = (
     "POLL_INTERVAL", "_acquire_cloak_lane", "_acquire_submit_writer_lane",
     "_archive_worker_evidence",
@@ -76,6 +151,7 @@ WORKER_RUNTIME_PORTS = (
     "_submission_rate_status", "_submit_writer_lane", "_update_submission_ledger",
     "_has_admitted_submission_receipt",
     "_issue_manual_resume_authorization", "_consume_manual_resume_authorization",
+    "_heartbeat_operator_handoff", "_runtime_operator_resume_scope",
     "_wait_for_manual_captcha", "acquire_job", "add_event", "allocate_cdp_port",
     "capture_browser_session", "cleanup_worker", "cloak_fallback_route",
     "computer_use_handoff_allowed", "config", "datetime", "get_connection",
@@ -147,6 +223,14 @@ def _worker_loop_with_port(
     _resolve_ats_application_binding = runtime._resolve_ats_application_binding
     _run_read_only_preflight = runtime._run_read_only_preflight
     _prepare_ats_fill_plan_repair = runtime._prepare_ats_fill_plan_repair
+    _try_semantic_pre_submit_repair = getattr(
+        runtime,
+        "_try_semantic_pre_submit_repair",
+        lambda *_args, **_kwargs: {
+            "status": "not_applicable",
+            "legacy_fallback_safe": True,
+        },
+    )
     _record_ats_fill_plan_feedback = runtime._record_ats_fill_plan_feedback
     _prepare_runtime_cover_letter = runtime._prepare_runtime_cover_letter
     _admit_direct_email_receipt = runtime._admit_direct_email_receipt
@@ -155,6 +239,16 @@ def _worker_loop_with_port(
     _process_receipt_observer_result = runtime._process_receipt_observer_result
     _reserve_manifest_submission = runtime._reserve_manifest_submission
     _runtime_linkedin_route_gate = runtime._runtime_linkedin_route_gate
+    _runtime_recovery_scope = getattr(
+        runtime,
+        "_runtime_recovery_scope",
+        lambda _command: nullcontext(),
+    )
+    _runtime_submit_scope = getattr(
+        runtime,
+        "_runtime_submit_scope",
+        lambda _job: nullcontext(),
+    )
     _route_for_phase = runtime._route_for_phase
     _stop_event = runtime._stop_event
     _submission_evidence_consistent = runtime._submission_evidence_consistent
@@ -164,6 +258,8 @@ def _worker_loop_with_port(
     _has_admitted_submission_receipt = runtime._has_admitted_submission_receipt
     _issue_manual_resume_authorization = runtime._issue_manual_resume_authorization
     _consume_manual_resume_authorization = runtime._consume_manual_resume_authorization
+    _heartbeat_operator_handoff = runtime._heartbeat_operator_handoff
+    _runtime_operator_resume_scope = runtime._runtime_operator_resume_scope
     _wait_for_manual_captcha = runtime._wait_for_manual_captcha
     acquire_job = runtime.acquire_job
     add_event = runtime.add_event
@@ -197,6 +293,17 @@ def _worker_loop_with_port(
     empty_polls = 0
     profile = config.load_profile()
     submission_policy = profile.get("submission_policy", {})
+    operator_handoff_timeout_seconds = max(
+        60,
+        min(
+            int(
+                submission_policy.get("manual_intervention_timeout_seconds", 1800)
+                if isinstance(submission_policy, Mapping)
+                else 1800
+            ),
+            3600,
+        ),
+    )
 
     def configured_retry_limit(name: str) -> int:
         configured = (
@@ -802,6 +909,7 @@ def _worker_loop_with_port(
                 recovery_admission = recovery_execution_mod.admit_recovery_decision(
                     actor_decision,
                     submit_started=submission_started,
+                    operator_context=operator_resume_binding(actor_decision, job),
                 )
                 job["_application_recovery_admission"] = contract_json(
                     recovery_admission
@@ -901,7 +1009,8 @@ def _worker_loop_with_port(
                         "submit_started": False,
                     })
                     current_job["_application_actor_new_session_retries_remaining"] = 0
-                    result, stealth_duration = execute_entry_turn()
+                    with _runtime_recovery_scope(_command):
+                        result, stealth_duration = execute_entry_turn()
                     duration_ms += stealth_duration
                 except Exception as exc:
                     logger.exception("CloakBrowser fallback failed")
@@ -925,7 +1034,10 @@ def _worker_loop_with_port(
                 return {
                     "browser_runtime": active_browser_backend,
                     "fallback_applied": True,
-                    "recovery_turn_completed": True,
+                    "recovery_turn_completed": bool(
+                        current_job.get("_parent_agent_checkpoint_id")
+                        and current_job.get("_parent_agent_run_id") != _command.turn_id
+                    ),
                     "result_category": classify_failure(result).category,
                 }
 
@@ -969,17 +1081,18 @@ def _worker_loop_with_port(
                     status="retrying",
                     last_action="one bounded same-page repair",
                 )
-                result, retry_duration = run_job(
-                    current_job,
-                    port=port,
-                    worker_id=worker_id,
-                    model=model,
-                    dry_run=dry_run,
-                    agent_backend=agent_backend,
-                    manual_captcha_relay=manual_captcha_relay,
-                    resume_existing_page=True,
-                    submission_phase="prepare",
-                )
+                with _runtime_recovery_scope(_command):
+                    result, retry_duration = run_job(
+                        current_job,
+                        port=port,
+                        worker_id=worker_id,
+                        model=model,
+                        dry_run=dry_run,
+                        agent_backend=agent_backend,
+                        manual_captcha_relay=manual_captcha_relay,
+                        resume_existing_page=True,
+                        submission_phase="prepare",
+                    )
                 duration_ms += retry_duration
                 current_metrics["prepare_repair_agent_ms"] += max(
                     0, retry_duration
@@ -987,11 +1100,15 @@ def _worker_loop_with_port(
                 return {
                     "same_application_retry": True,
                     "submit_started": False,
-                    "recovery_turn_completed": True,
+                    "recovery_turn_completed": bool(
+                        current_job.get("_parent_agent_checkpoint_id")
+                        and current_job.get("_parent_agent_run_id") != _command.turn_id
+                    ),
                     "previous_category": failure.category,
                     "result_category": classify_failure(result).category,
                 }
 
+            recovery_result = None
             if recovery_command is not None:
                 if dry_run:
                     if recovery_command.command == "retry_new_session":
@@ -1047,6 +1164,75 @@ def _worker_loop_with_port(
                             "outcome": "recovery_control_persistence_failed",
                             "error_type": type(exc).__name__,
                         }
+
+            operator_exception_id = None
+            operator_request_id = None
+            operator_handoff_used = False
+            if (
+                not dry_run
+                and recovery_command is not None
+                and recovery_command.command == "enqueue_human_handoff"
+                and recovery_result is not None
+                and recovery_result.stage == "verified"
+                and recovery_result.terminal_status == "completed"
+                and set(recovery_command.payload) >= {
+                    "request_id",
+                    "checkpoint_id",
+                    "job_url",
+                    "profile_id",
+                    "browser_lease_id",
+                    "browser_lease_epoch",
+                    "page_target_id",
+                    "page_epoch",
+                }
+            ):
+                operator_exception_id = exception_id_for_command(
+                    recovery_command.command_id
+                )
+                operator_request_id = str(recovery_command.payload["request_id"])
+
+            def execute_operator_resume(
+                operator_command,
+                resume_context,
+                current_job=job,
+                current_route=active_route,
+            ):
+                """Run the sole page-owning, prepare-only child for one response."""
+                nonlocal duration_ms
+                nonlocal result
+
+                checkpoint_id = str(resume_context.get("checkpoint_ref") or "")
+                _attach_control_contract(
+                    current_job,
+                    current_route,
+                    interaction_mode=requested_interaction_mode,
+                    resume_existing_page=True,
+                )
+                with _runtime_operator_resume_scope(
+                    operator_command,
+                    checkpoint_id=checkpoint_id,
+                    resume_context=resume_context,
+                ):
+                    result, resumed_duration = run_job(
+                        current_job,
+                        port=port,
+                        worker_id=worker_id,
+                        model=model,
+                        dry_run=False,
+                        agent_backend=agent_backend,
+                        manual_captcha_relay=manual_captcha_relay,
+                        resume_existing_page=True,
+                        submission_phase="prepare",
+                    )
+                duration_ms += resumed_duration
+                child_turn_id = str(current_job.get("_parent_agent_run_id") or "")
+                return verified_child_execution(
+                    get_connection(),
+                    actor_id=operator_command.actor_id,
+                    attempt_id=operator_command.attempt_id,
+                    parent_turn_id=operator_command.run_id,
+                    child_turn_id=child_turn_id,
+                )
 
             if initial_linkedin_entry:
                 route_signal, route_observation = _observe_linkedin_external_handoff_page(
@@ -1260,7 +1446,7 @@ def _worker_loop_with_port(
                         if manual_captcha_relay and not verification_relay_used
                         else None
                     )
-                    if (
+                    manual_relay_succeeded = (
                         resume_authorization is not None
                         and _wait_for_manual_captcha(
                             port,
@@ -1275,7 +1461,26 @@ def _worker_loop_with_port(
                             resume_authorization,
                             submit_started=False,
                         )
-                    ):
+                    )
+                    if manual_relay_succeeded:
+                        if operator_exception_id and operator_request_id:
+                            try:
+                                OperatorRuntime(get_connection()).expire_resume_request(
+                                    operator_exception_id,
+                                    request_id=operator_request_id,
+                                )
+                                operator_handoff_used = True
+                            except Exception as exc:  # noqa: BLE001 - fail closed
+                                logger.warning(
+                                    "Could not expire superseded operator handoff %s: %s",
+                                    operator_exception_id,
+                                    type(exc).__name__,
+                                )
+                                result = (
+                                    "failed:manual_review_required:"
+                                    "operator_handoff_expiry_failed"
+                                )
+                                break
                         verification_relay_used = True
                         resumed_job = dict(job)
                         resumed_job["_browser_observation"] = {
@@ -1305,6 +1510,90 @@ def _worker_loop_with_port(
                         )
                         duration_ms += resumed_duration
                         continue
+                    if resume_authorization is not None:
+                        if operator_exception_id and operator_request_id:
+                            try:
+                                OperatorRuntime(get_connection()).expire_resume_request(
+                                    operator_exception_id,
+                                    request_id=operator_request_id,
+                                )
+                                operator_handoff_used = True
+                            except Exception:
+                                logger.warning(
+                                    "Manual relay ended with an unexpired operator handoff",
+                                    exc_info=True,
+                                )
+                                result = (
+                                    "failed:manual_review_required:"
+                                    "operator_handoff_expiry_failed"
+                                )
+                        break
+                    if not operator_exception_id or not operator_request_id:
+                        break
+
+                if (
+                    operator_exception_id is not None
+                    and operator_request_id is not None
+                    and not operator_handoff_used
+                ):
+                    operator_handoff_used = True
+                    add_event(
+                        f"[W{worker_id}] Waiting for one exact operator response; "
+                        "browser lease remains owned"
+                    )
+                    update_state(
+                        worker_id,
+                        status="human_wait",
+                        last_action="waiting for exact operator response",
+                    )
+                    try:
+                        handoff = wait_for_requested_resume(
+                            get_connection(),
+                            exception_id=operator_exception_id,
+                            request_id=operator_request_id,
+                            resume_owner=execute_operator_resume,
+                            heartbeat=lambda current_job=job: _heartbeat_operator_handoff(
+                                current_job,
+                                lease_minutes=application_lease_minutes,
+                            ),
+                            stop_wait=lambda seconds: _stop_event.wait(
+                                timeout=seconds
+                            ),
+                            timeout_seconds=operator_handoff_timeout_seconds,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - dispatcher fails closed
+                        logger.warning(
+                            "Operator handoff failed closed for %s: %s",
+                            operator_exception_id,
+                            type(exc).__name__,
+                        )
+                        try:
+                            OperatorRuntime(get_connection()).expire_resume_request(
+                                operator_exception_id,
+                                request_id=operator_request_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Operator handoff could not expire after dispatcher error",
+                                exc_info=True,
+                            )
+                        result = (
+                            "failed:manual_review_required:"
+                            f"operator_handoff_error:{type(exc).__name__}"
+                        )
+                        break
+                    job["_operator_handoff_result"] = {
+                        "status": handoff.status,
+                        "exception_id": operator_exception_id,
+                        "request_id": operator_request_id,
+                        "submit_authority": False,
+                    }
+                    if handoff.status == "resumed":
+                        continue
+                    result = (
+                        "failed:manual_review_required:"
+                        f"operator_resume_{handoff.status}"
+                    )
                     break
 
                 if result == "ready_to_submit" and not dry_run:
@@ -1396,6 +1685,57 @@ def _worker_loop_with_port(
                         submit_lane_state["held_at"] = None
                         _submit_writer_lane.release()
                         submit_writer_held = False
+                        resume_repair_only = bool(repairable) and all(
+                            issue in {
+                                "resume_not_uploaded",
+                                "resume_state_unconfirmed",
+                            }
+                            for issue in repairable
+                        )
+                        if resume_repair_only:
+                            try:
+                                semantic_repair = _try_semantic_pre_submit_repair(
+                                    port,
+                                    worker_id,
+                                    job,
+                                    authorization_manifest,
+                                    audit_report,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - fail closed
+                                logger.warning(
+                                    "Semantic pre-submit repair failed for %s: %s",
+                                    job.get("url"),
+                                    exc,
+                                )
+                                result = (
+                                    "failed:manual_review_required:"
+                                    f"semantic_resume_repair:{type(exc).__name__}"
+                                )
+                                break
+                            semantic_status = str(
+                                semantic_repair.get("status")
+                                if isinstance(semantic_repair, dict)
+                                else "invalid_result"
+                            )
+                            if semantic_status in {"verified", "replayed"}:
+                                add_event(
+                                    f"[W{worker_id}] Semantic resume repair: "
+                                    f"{semantic_status}"
+                                )
+                                continue
+                            safe_legacy_fallback = bool(
+                                isinstance(semantic_repair, dict)
+                                and semantic_repair.get("legacy_fallback_safe") is True
+                            )
+                            if not (
+                                semantic_status == "not_applicable"
+                                and safe_legacy_fallback
+                            ):
+                                result = (
+                                    "failed:manual_review_required:"
+                                    f"semantic_resume_repair:{semantic_status}"
+                                )
+                                break
                         specialist_repair: dict[str, object] | None = None
                         fill_snapshot = audit_report.get("ats_fill_plan_snapshot")
                         ordinary_dynamic_repair = any(
@@ -1428,6 +1768,15 @@ def _worker_loop_with_port(
                                 )
                                 break
                         repair_job = dict(job)
+                        for protected_key in (
+                            "_browser_lease_binding",
+                            "_answer_provenance_binding",
+                            "_agent_observations",
+                        ):
+                            if protected_key in repair_job:
+                                repair_job[protected_key] = deepcopy(
+                                    repair_job[protected_key]
+                                )
                         repair_job["_browser_observation"] = {
                             **audit_report,
                             "signal": audit_signal,
@@ -1473,6 +1822,15 @@ def _worker_loop_with_port(
                         orchestration_metrics["prepare_repair_agent_ms"] += max(
                             0, repair_duration
                         )
+                        provenance_repair_error = _consume_provenance_repair_artifacts(
+                            job, repair_job
+                        )
+                        if provenance_repair_error is not None:
+                            result = (
+                                "failed:manual_review_required:"
+                                f"answer_provenance_repair:{provenance_repair_error}"
+                            )
+                            break
                         if ats_fill_plan_feedback is not None:
                             accepted = repair_job.get("_ats_fill_plan_consumed")
                             binding_matches = (
@@ -1678,17 +2036,18 @@ def _worker_loop_with_port(
                         "submit_started": True,
                         "pre_submit_page_url": audit_report.get("page_url"),
                     })
-                    result, submit_duration = run_job(
-                        observed_job,
-                        port=port,
-                        worker_id=worker_id,
-                        model=model,
-                        dry_run=False,
-                        agent_backend=agent_backend,
-                        manual_captcha_relay=manual_captcha_relay,
-                        resume_existing_page=True,
-                        submission_phase="submit",
-                    )
+                    with _runtime_submit_scope(observed_job):
+                        result, submit_duration = run_job(
+                            observed_job,
+                            port=port,
+                            worker_id=worker_id,
+                            model=model,
+                            dry_run=False,
+                            agent_backend=agent_backend,
+                            manual_captcha_relay=manual_captcha_relay,
+                            resume_existing_page=True,
+                            submission_phase="submit",
+                        )
                     duration_ms += submit_duration
                     orchestration_metrics["submit_agent_ms"] += max(
                         0, submit_duration
@@ -1786,60 +2145,26 @@ def _worker_loop_with_port(
                         "disposition": disposition,
                     }]
 
-                    # One repair turn is allowed only when visible validation
-                    # errors prove the first click was rejected. An absent
-                    # receipt alone can never authorize another click.
+                    # Once a Submit-capable turn has started, visible validation
+                    # errors are parked for review.  They never authorize a
+                    # second Agent subprocess or another possible Submit.
                     if (
                         email_application is None
                         and disposition == "validation_blocked_repairable"
                     ):
-                        repair_job = dict(observed_job)
-                        repair_job.pop("_agent_submission_evidence", None)
-                        repair_job["_browser_observation"] = {
-                            "repair_mode": True,
-                            "signal": disposition,
-                            "validation_errors": observer_evidence.get(
-                                "validation_errors", []
-                            ),
-                            "submission_gate": True,
-                        }
-                        add_event(f"[W{worker_id}] Repairing supported validation errors once")
+                        observer_evidence["agent_repair_spawned"] = False
+                        observer_evidence["next_action"] = (
+                            "manual_review_without_resubmission"
+                        )
+                        add_event(
+                            f"[W{worker_id}] Post-submit validation parked; "
+                            "no second Agent turn"
+                        )
                         update_state(
                             worker_id,
-                            status="repairing",
-                            last_action="one-time validation repair",
+                            status="submission_uncertain",
+                            last_action="validation parked without resubmission",
                         )
-                        result, repair_duration = run_job(
-                            repair_job,
-                            port=port,
-                            worker_id=worker_id,
-                            model=model,
-                            dry_run=False,
-                            agent_backend=agent_backend,
-                            manual_captcha_relay=manual_captcha_relay,
-                            resume_existing_page=True,
-                            submission_phase="submit",
-                        )
-                        duration_ms += repair_duration
-                        orchestration_metrics["validation_repair_agent_ms"] += max(
-                            0, repair_duration
-                        )
-                        agent_evidence = repair_job.get("_agent_submission_evidence")
-                        observer_started = time.perf_counter()
-                        observer_evidence = _observe_post_submit_page(
-                            port, worker_id, job, attempt=2
-                        )
-                        orchestration_metrics["post_submit_observer_ms"] += (
-                            time.perf_counter() - observer_started
-                        ) * 1000
-                        disposition = _classify_post_submit_observation(
-                            observer_evidence
-                        )
-                        attempts.append({
-                            "agent": agent_evidence,
-                            "observer": observer_evidence,
-                            "disposition": disposition,
-                        })
                     elif (
                         email_application is None
                         and disposition == "verification_required"
@@ -1969,9 +2294,10 @@ def _worker_loop_with_port(
                         result = "captcha"
                     elif disposition == "validation_blocked_manual":
                         result = "failed:manual_review_required:submission_validation"
-                    elif disposition == "validation_blocked_repairable":
-                        result = "failed:submission_validation_blocked_after_repair"
-                    elif disposition == "provider_submission_error":
+                    elif disposition in {
+                        "validation_blocked_repairable",
+                        "provider_submission_error",
+                    }:
                         result = "submission_uncertain"
                     else:
                         result = "submission_uncertain"
@@ -2031,95 +2357,26 @@ def _worker_loop_with_port(
                 configured_observers = (
                     configured_observers if receipt_gate_ready else []
                 )
-                for provider, mailbox_spec in configured_observers:
-                    receipt_job = dict(job)
-                    receipt_job["_mailbox_mcp_spec"] = mailbox_spec
-                    receipt_job["_receipt_observer_context"] = (
-                        _build_receipt_observer_context(
-                            job,
-                            provider=provider,
-                            submitted_at=submitted_at,
-                        )
-                    )
-                    receipt_route = _route_for_phase(
-                        active_route,
-                        "receipt",
-                        "post_submit_receipt_reconciliation",
-                        interaction_driver="mailbox",
-                        submit_owner="none",
-                    )
-                    _attach_control_contract(
-                        receipt_job,
-                        receipt_route,
-                        interaction_mode=requested_interaction_mode,
-                        resume_existing_page=False,
+                for provider, _mailbox_spec in configured_observers:
+                    observer_context = _build_receipt_observer_context(
+                        job,
+                        provider=provider,
+                        submitted_at=submitted_at,
                     )
                     add_event(
-                        f"[W{worker_id}] Checking {provider} for an exact receipt"
+                        f"[W{worker_id}] Queued deterministic {provider} receipt reconciliation"
                     )
-                    receipt_started = time.perf_counter()
-                    try:
-                        receipt_status, receipt_duration = run_job(
-                            receipt_job,
-                            port=port,
-                            worker_id=worker_id,
-                            model=model,
-                            dry_run=False,
-                            agent_backend=agent_backend,
-                            manual_captcha_relay=False,
-                            resume_existing_page=False,
-                            submission_phase="receipt",
-                        )
-                        duration_ms += receipt_duration
-                        raw_observation = receipt_job.get("_agent_observations")
-                        receipt_observation = (
-                            raw_observation
-                            if isinstance(raw_observation, dict)
-                            else {
-                                "receipt_scan": {
-                                    "provider": provider,
-                                    "scan_succeeded": False,
-                                    "ambiguous": False,
-                                    "candidate_count": 0,
-                                }
-                            }
-                        )
-                        processed = _process_receipt_observer_result(
-                            job,
-                            provider=provider,
-                            submitted_at=submitted_at,
-                            observation=receipt_observation,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - source failure is isolated
-                        logger.warning(
-                            "Receipt observer failed for %s: %s",
-                            provider,
-                            type(exc).__name__,
-                        )
-                        receipt_status = "failed:mailbox_receipt_scan"
-                        processed = {
-                            "status": "provider_error",
-                            "provider": provider,
-                            "watermark_advanced": False,
-                            "error_type": type(exc).__name__,
-                        }
-                    orchestration_metrics["mailbox_receipt_observer_ms"] += (
-                        time.perf_counter() - receipt_started
-                    ) * 1000
                     receipt_attempts.append(
                         {
                             "provider": provider,
-                            "turn_status": receipt_status,
-                            "status": processed.get("status"),
-                            "watermark_advanced": processed.get(
-                                "watermark_advanced", False
-                            ),
+                            "turn_status": "queued",
+                            "status": "pending_reconciliation",
+                            "watermark_advanced": False,
+                            "search_after": observer_context.get("search_after"),
                         }
                     )
-                    if processed.get("status") == "applied":
-                        result = "applied"
-                        break
                 if receipt_attempts:
+                    job["_receipt_reconciliation_pending"] = receipt_attempts
                     submission_evidence = dict(submission_evidence or {})
                     submission_evidence["mailbox_receipt_observers"] = receipt_attempts
 

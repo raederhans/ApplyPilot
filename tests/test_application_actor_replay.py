@@ -324,6 +324,11 @@ def test_run_job_persists_one_v2_actor_identity_across_the_real_control_chain(
         "Popen",
         lambda _command, **kwargs: Process(env=kwargs["env"]),
     )
+    monkeypatch.setattr(
+        launcher,
+        "_process_identity_tuple",
+        lambda pid: (pid, 123_456),
+    )
     attempt_id = "attempt-run-job-v2"
     job = {
         "url": "https://example.test/jobs/durable-v2",

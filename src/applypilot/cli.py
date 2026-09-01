@@ -9,8 +9,11 @@ import os
 import sys
 import time
 import uuid
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import typer
@@ -35,7 +38,19 @@ radar_app = typer.Typer(
     help="Read-only multi-source job discovery, verification, and reporting.",
     no_args_is_help=True,
 )
+exceptions_app = typer.Typer(
+    name="exceptions",
+    help="Inspect and operate on one exact durable application exception.",
+    no_args_is_help=True,
+)
+runs_app = typer.Typer(
+    name="runs",
+    help="Inspect durable Actor runs and reconcile exact submission receipts.",
+    no_args_is_help=True,
+)
 app.add_typer(radar_app, name="radar")
+app.add_typer(exceptions_app, name="exceptions")
+app.add_typer(runs_app, name="runs")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -232,6 +247,96 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _operator_runtime(db_path: Path):
+    """Open only the explicitly named operator database, never the default workspace."""
+    from applypilot.apply.operator_runtime import OperatorRuntime
+    from applypilot.database import init_db
+
+    connection = init_db(db_path)
+    return OperatorRuntime(connection)
+
+
+def _json_safe(value: object) -> object:
+    """Project typed operator results onto stable JSON without raw answer payloads."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(asdict(value))
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _exception_view(item: Any, *, include_context: bool = False) -> dict[str, object]:
+    result: dict[str, object] = {
+        "exception_id": item.exception_id,
+        "run_id": item.run_id,
+        "attempt_id": item.attempt_id,
+        "actor_id": item.actor_id,
+        "turn_id": item.turn_id,
+        "queue_kind": item.queue_kind,
+        "failure_category": item.failure_category,
+        "next_action": item.next_action,
+        "status": item.status,
+        "created_at": item.created_at.astimezone(UTC).isoformat(),
+        "resolved_at": (
+            None if item.resolved_at is None else item.resolved_at.astimezone(UTC).isoformat()
+        ),
+    }
+    if include_context:
+        allowed = {
+            "recovery_action",
+            "recovery_command",
+            "effect_scope",
+            "policy_reason",
+            "failure_reason",
+            "terminal_status",
+            "application_ref",
+            "employer_ref",
+            "job_family_ref",
+            "jurisdiction_ref",
+            "group_scope",
+        }
+        result["context"] = {
+            key: _json_safe(value)
+            for key, value in item.context.items()
+            if key in allowed
+        }
+    return result
+
+
+def _operator_error(message: str) -> None:
+    console.print_json(data={"ok": False, "error": message})
+    raise typer.Exit(code=2)
+
+
+def _command_for_exception(
+    item: Any,
+    *,
+    command_id: str,
+    action: str,
+    input_ref: str | None = None,
+    input_sha256: str | None = None,
+):
+    from applypilot.apply.operator_commands import OperatorCommand
+
+    return OperatorCommand(
+        command_id=command_id,
+        exception_id=item.exception_id,
+        action=action,
+        run_id=item.run_id,
+        attempt_id=item.attempt_id,
+        actor_id=item.actor_id,
+        turn_id=item.turn_id,
+        input_ref=input_ref,
+        input_sha256=input_sha256,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -269,6 +374,164 @@ def radar_main(ctx: typer.Context) -> None:
             "ctx": ctx,
         },
     )
+
+
+@exceptions_app.command("list")
+def exceptions_list(
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+    status: str = typer.Option("open", "--status"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+) -> None:
+    """List bounded durable exceptions from one explicit local database."""
+    try:
+        runtime = _operator_runtime(db_path)
+        items = runtime.list_exceptions(status=status, limit=limit)
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(
+        data={
+            "ok": True,
+            "count": len(items),
+            "exceptions": [_exception_view(item) for item in items],
+        }
+    )
+
+
+@exceptions_app.command("show")
+def exceptions_show(
+    exception_id: str = typer.Argument(...),
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+) -> None:
+    """Show one exact exception without exposing a human answer or secret payload."""
+    try:
+        item = _operator_runtime(db_path).show_exception(exception_id)
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    if item is None:
+        _operator_error(f"operator exception was not found: {exception_id}")
+    console.print_json(data={"ok": True, "exception": _exception_view(item, include_context=True)})
+
+
+@exceptions_app.command("group")
+def exceptions_group(
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+) -> None:
+    """Return read-only semantic groups; group identifiers are never command targets."""
+    try:
+        groups = _operator_runtime(db_path).group_exceptions()
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "read_only": True, "groups": _json_safe(groups)})
+
+
+@exceptions_app.command("resolve")
+def exceptions_resolve(
+    exception_id: str = typer.Argument(...),
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+    command_id: str = typer.Option(..., "--command-id"),
+) -> None:
+    """Administratively dismiss one exact exception without authorizing continuation."""
+    try:
+        runtime = _operator_runtime(db_path)
+        item = runtime.show_exception(exception_id)
+        if item is None:
+            raise LookupError(f"operator exception was not found: {exception_id}")
+        command = _command_for_exception(item, command_id=command_id, action="resolve")
+        result = runtime.resolve(command)
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "result": _json_safe(result)})
+
+
+@exceptions_app.command("resume")
+def exceptions_resume(
+    exception_id: str = typer.Argument(...),
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+    command_id: str = typer.Option(..., "--command-id"),
+    request_id: str = typer.Option(..., "--request-id"),
+) -> None:
+    """Request an exact pre-submit fresh turn; an independent CLI has no owner callback."""
+    try:
+        from applypilot.apply.human_handoff import load_human_response
+
+        runtime = _operator_runtime(db_path)
+        item = runtime.show_exception(exception_id)
+        if item is None:
+            raise LookupError(f"operator exception was not found: {exception_id}")
+        response = load_human_response(runtime.connection, request_id)
+        if response is None:
+            raise LookupError(f"durable human response was not found: {request_id}")
+        command = _command_for_exception(
+            item,
+            command_id=command_id,
+            action="resume",
+            input_ref=f"human-response:{sha256(request_id.encode('utf-8')).hexdigest()}",
+            input_sha256=response.response_digest,
+        )
+        result = runtime.resume(command, request_id=request_id)
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "result": _json_safe(result)})
+
+
+@runs_app.command("inspect")
+def runs_inspect(
+    actor_id: str = typer.Argument(...),
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+) -> None:
+    """Inspect durable run/checkpoint state for one canonical actor."""
+    try:
+        inspection = _operator_runtime(db_path).inspect_run(actor_id)
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "run": _json_safe(inspection)})
+
+
+@runs_app.command("reconcile")
+def runs_reconcile(
+    attempt_id: str = typer.Argument(...),
+    db_path: Path = typer.Option(..., "--db-path", dir_okay=False),
+    command_id: str = typer.Option(..., "--command-id"),
+    evidence_file: Path = typer.Option(
+        ...,
+        "--evidence-file",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+    ),
+) -> None:
+    """Reconcile one exact receipt exception from a byte-bound compact envelope."""
+    try:
+        evidence_bytes = evidence_file.read_bytes()
+        if not evidence_bytes or len(evidence_bytes) > 64 * 1024:
+            raise ValueError("receipt evidence must contain 1 through 65536 bytes")
+        runtime = _operator_runtime(db_path)
+        candidates = tuple(
+            item
+            for item in runtime.list_exceptions(status="open", limit=500)
+            if item.attempt_id == attempt_id and item.queue_kind == "receipt_reconciliation"
+        )
+        if len(candidates) != 1:
+            raise LookupError(
+                "reconcile requires exactly one open receipt exception for the attempt"
+            )
+        digest = sha256(evidence_bytes).hexdigest()
+        evidence_ref = f"receipt-evidence:{digest}"
+        command = _command_for_exception(
+            candidates[0],
+            command_id=command_id,
+            action="reconcile",
+            input_ref=evidence_ref,
+            input_sha256=digest,
+        )
+        result = runtime.reconcile(
+            command,
+            evidence_ref=evidence_ref,
+            evidence_bytes=evidence_bytes,
+        )
+    except (json.JSONDecodeError, LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "result": _json_safe(result)})
 
 
 @app.command()

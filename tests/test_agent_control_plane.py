@@ -288,7 +288,8 @@ def test_init_db_wires_control_schema_without_changing_jobs(tmp_path) -> None:
     tables = {
         row[0]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'agent_%'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND "
+            "(name LIKE 'agent_%' OR name='browser_resource_leases')"
         )
     }
 
@@ -296,10 +297,13 @@ def test_init_db_wires_control_schema_without_changing_jobs(tmp_path) -> None:
             "agent_events",
             "agent_exception_queue",
             "agent_checkpoints",
+            "agent_control_schema_version",
             "agent_human_requests",
             "agent_human_responses",
             "agent_recovery_results",
+            "agent_runtime_turns",
             "agent_tasks",
+            "browser_resource_leases",
         }
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 

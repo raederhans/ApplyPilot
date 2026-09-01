@@ -14,6 +14,7 @@ from pathlib import Path
 from applypilot.apply.contracts import (
     MAX_AGENT_REPORT_BYTES,
     AgentTurnResult,
+    FailureObservation,
     agent_turn_result_from_mapping,
 )
 from applypilot.apply.failure_taxonomy import classify_failure
@@ -237,6 +238,13 @@ def interpret_agent_turn_result(
 ) -> tuple[str, dict | None]:
     """Adapt an open Agent result to the existing fail-closed application state."""
     status = result.status.strip().casefold()
+    failure = result.failure
+    if failure is not None:
+        return _interpret_failure_observation(
+            failure,
+            dry_run=dry_run,
+            submission_phase=submission_phase,
+        )
     if submission_phase == "receipt":
         if status == "applied" and isinstance(
             result.observations.get("confirmation_receipt"), dict
@@ -289,6 +297,34 @@ def interpret_agent_turn_result(
     )
 
 
+def _interpret_failure_observation(
+    failure: FailureObservation,
+    *,
+    dry_run: bool,
+    submission_phase: str,
+) -> tuple[str, dict | None]:
+    """Consume source-emitted failure facts without parsing agent prose."""
+    phase = submission_phase.strip().casefold()
+    if failure.submit_started:
+        return "submission_uncertain", None
+    if failure.phase != phase:
+        status = (
+            "submission_uncertain"
+            if phase == "submit" and not dry_run
+            else "failed:failure_phase_mismatch"
+        )
+        return status, None
+    if phase == "submit" and not dry_run:
+        return "submission_uncertain", None
+    if failure.code == "captcha_required":
+        return "captcha", None
+    if failure.code == "expired":
+        return "expired", None
+    if failure.code == "submission_uncertain":
+        return "submission_uncertain", None
+    return f"failed:{failure.code}", None
+
+
 def reconcile_agent_turn_outputs(
     output: str,
     structured_result: AgentTurnResult | None,
@@ -310,8 +346,16 @@ def reconcile_agent_turn_outputs(
         dry_run=dry_run,
         submission_phase=submission_phase,
     )
-    if parse_result_line(output) is None:
+    parsed_legacy = parse_result_line(output)
+    if parsed_legacy is None and "RESULT:" not in output:
         return status, evidence, "structured"
+    if parsed_legacy is None:
+        conflict = (
+            "submission_uncertain"
+            if submission_phase == "submit" and not dry_run
+            else "failed:conflicting_agent_results"
+        )
+        return conflict, None, "conflict"
 
     legacy_status, legacy_evidence = interpret_agent_output(
         output,

@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from applypilot import config
 from applypilot.apply import ats as ats_mod
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply.answer_provenance import audit_pre_submit_answer_provenance
 from applypilot.apply.identity_materials import classify_identity_requirement
 from applypilot.apply.specialists import (
     ATS_FORM_SNAPSHOT_SCHEMA_VERSION,
@@ -618,6 +619,8 @@ def _partition_pre_submit_issues(
     advisory_exact = {"education_state_unconfirmed"}
     repair_prefixes = (
         "required_field_empty:",
+        "answer_provenance_missing:",
+        "answer_provenance_binding_mismatch",
         "resume_state_unconfirmed",
         "resume_not_uploaded",
         "submit_control_missing",
@@ -1964,6 +1967,39 @@ def _adapter_observation_context(
         snapshot.get("form_fields") or (),
     )
     ats_context = ats_mod.adapter_prompt_context(form)
+    raw_fields = snapshot.get("form_fields")
+    raw_by_key = {
+        str(item.get("field_key") or ""): item
+        for item in raw_fields
+        if isinstance(item, Mapping) and str(item.get("field_key") or "")
+    } if isinstance(raw_fields, list) else {}
+    context_fields = ats_context.get("fields")
+    if isinstance(context_fields, list):
+        for context_field in context_fields:
+            if not isinstance(context_field, dict):
+                continue
+            raw_field = raw_by_key.get(str(context_field.get("field_key") or ""))
+            if not isinstance(raw_field, Mapping):
+                continue
+            options = raw_field.get("options")
+            option_values = options if isinstance(options, list) else []
+            source_count = raw_field.get("option_count")
+            if not isinstance(source_count, int) or isinstance(source_count, bool):
+                source_count = len(option_values)
+            source_truncated = raw_field.get("options_truncated") is True or source_count > len(
+                option_values
+            )
+            context_field["options_source_count"] = source_count
+            context_field["options_source_truncated"] = source_truncated
+            if not source_truncated:
+                context_field["options_full_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        option_values,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
     workday_context: dict[str, object] | None = None
     issues: list[str] = []
     if form.adapter != "workday" or not isinstance(
@@ -2141,6 +2177,7 @@ def _audit_live_pre_submit_page(
                const currentLocationFields = [];
               const selectFields = [];
               const textFields = [];
+              const provenanceFields = [];
               const protectedIdentifier = (el, text) => {
                 if (el.hasAttribute('data-applypilot-protected')) return true;
                 const descriptor = [
@@ -2173,16 +2210,46 @@ def _audit_live_pre_submit_page(
                    currentLocationValues.push(value);
                    currentLocationFields.push({text, value, required: required(el)});
                  }
-                 if (el.tagName === 'SELECT') selectFields.push({text, selected: value, required: required(el)});
-                else {
+                 if (el.tagName === 'SELECT') selectFields.push({
+                   field_key: String(el.id || el.name || `select-${selectFields.length + 1}`).slice(0, 160),
+                   text,
+                   selected: value,
+                   required: required(el),
+                   options: [...el.options].slice(0, 100).map((option) =>
+                     String(option.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+                   ),
+                   option_count: el.options.length,
+                   options_truncated: el.options.length > 100
+                 });
+                 else {
                    const sensitiveValue = protectedIdentifier(el, text);
                   textFields.push({
+                    field_key: String(el.id || el.name || `text-${textFields.length + 1}`).slice(0, 160),
+                    control: el.tagName === 'TEXTAREA' ? 'textarea' : String(el.type || 'text').toLowerCase(),
                     text,
                     value: sensitiveValue ? (value ? '[redacted-present]' : '') : value,
                     value_present: Boolean(value),
+                    required: required(el),
                     protected_identifier: sensitiveValue
                   });
                 }
+                if (value) provenanceFields.push({
+                  field_key: String(el.id || el.name || `control-${provenanceFields.length + 1}`).slice(0, 160),
+                  control: el.tagName === 'SELECT'
+                    ? 'select'
+                    : el.tagName === 'TEXTAREA' ? 'textarea' : String(el.type || 'text').toLowerCase(),
+                  text,
+                  selected: protectedIdentifier(el, text) ? '[redacted-present]' : value,
+                  required: required(el),
+                  protected_identifier: protectedIdentifier(el, text),
+                   options: el.tagName === 'SELECT'
+                    ? [...el.options].slice(0, 100).map((option) =>
+                        String(option.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+                      )
+                    : [],
+                  option_count: el.tagName === 'SELECT' ? el.options.length : 0,
+                  options_truncated: el.tagName === 'SELECT' && el.options.length > 100
+                });
               }
               const nearbyUploadText = (el) => {
                 let node = el;
@@ -2230,24 +2297,82 @@ def _audit_live_pre_submit_page(
                 if (seen.has(key)) continue;
                 seen.add(key);
                 const group = node ? [...node.querySelectorAll('input[type=radio]')] : [radio];
+                const radioOptionText = (item) => {
+                  const explicit = item.id
+                    ? deepAll('label').find((label) => label.getAttribute('for') === item.id)
+                    : null;
+                  const wrapping = item.closest('label');
+                  return String(
+                    (explicit && explicit.innerText) ||
+                    (wrapping && wrapping.innerText) ||
+                    item.getAttribute('aria-label') || item.value || ''
+                  ).replace(/\s+/g, ' ').trim().slice(0, 120);
+                };
                 const checked = group.find((item) => item.checked);
                 let selected = '';
-                if (checked) {
-                  const checkedLabel = checked.closest('label') || checked.parentElement;
-                  selected = ((checkedLabel && checkedLabel.innerText) || checked.value || '').trim();
-                }
+                if (checked) selected = radioOptionText(checked);
                 const text = labelText(radio);
                 if (required(radio) && !checked) requiredUnfilled.push(text);
                 if (
                   required(radio) && !checked &&
                   /work (authorization|authorisation)|right to work|visa|sponsorship|citizenship|legal identity|passport|national id/i.test(text)
                 ) sensitiveRequiredUnknown.push(text);
-                 radioQuestions.push({text, selected, required: required(radio)});
+                 radioQuestions.push({
+                   field_key: String(radio.name || radio.id || `radio-${radioQuestions.length + 1}`).slice(0, 160),
+                   text,
+                   selected,
+                   required: required(radio),
+                   options: group.slice(0, 100).map(radioOptionText).filter(Boolean),
+                   option_count: group.length,
+                   options_truncated: group.length > 100
+                 });
+                 if (selected) provenanceFields.push({
+                   field_key: String(radio.name || radio.id || `radio-${provenanceFields.length + 1}`).slice(0, 160),
+                   control: 'radio',
+                   text,
+                   selected,
+                   required: required(radio),
+                   protected_identifier: false,
+                   options: group.slice(0, 100).map(radioOptionText).filter(Boolean),
+                   option_count: group.length,
+                   options_truncated: group.length > 100
+                 });
               }
-              const requiredChecks = deepAll('input[type=checkbox]')
-                .filter((el) => visible(el) && required(el));
-              for (const checkbox of requiredChecks) {
-                if (!checkbox.checked) requiredUnfilled.push(labelText(checkbox));
+              const visibleChecks = deepAll('input[type=checkbox]').filter(visible);
+              for (const checkbox of visibleChecks) {
+                if (required(checkbox) && !checkbox.checked) requiredUnfilled.push(labelText(checkbox));
+                if (checkbox.checked) provenanceFields.push({
+                  field_key: String(checkbox.id || checkbox.name || `checkbox-${provenanceFields.length + 1}`).slice(0, 160),
+                  control: 'checkbox',
+                  text: labelText(checkbox),
+                  selected: 'checked',
+                  required: required(checkbox),
+                  protected_identifier: false,
+                  options: ['checked']
+                });
+              }
+              const ariaComboboxes = deepAll('[role="combobox"]')
+                .filter((el) => visible(el) && !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+              for (const combobox of ariaComboboxes) {
+                const text = labelText(combobox);
+                const selected = String(
+                  combobox.getAttribute('aria-valuetext') ||
+                  combobox.getAttribute('data-value') ||
+                  combobox.textContent || ''
+                ).replace(/\s+/g, ' ').trim().slice(0, 240);
+                if (required(combobox) && !selected) requiredUnfilled.push(text);
+                if (selected) provenanceFields.push({
+                  field_key: String(
+                    combobox.id || combobox.getAttribute('name') ||
+                    combobox.getAttribute('aria-controls') || `combobox-${provenanceFields.length + 1}`
+                  ).slice(0, 160),
+                  control: 'combobox',
+                  text,
+                  selected,
+                  required: required(combobox),
+                  protected_identifier: protectedIdentifier(combobox, text),
+                  options: []
+                });
               }
               const submitControls = deepAll(
                 'button,input[type=submit],[role="button"]'
@@ -2350,7 +2475,7 @@ def _audit_live_pre_submit_page(
                   el.placeholder || el.name || el.id || ''
                 ).replace(/\s+/g, ' ').trim().slice(0, 240);
               };
-              const structuralFields = deepAll('input,textarea,select')
+              const structuralFields = deepAll('input,textarea,select,[role="combobox"]')
                 .filter((el) => visible(el) && el.type !== 'hidden' && !el.matches(responseSelector))
                 .slice(0, 200)
                 .map((el, index) => ({
@@ -2358,17 +2483,22 @@ def _audit_live_pre_submit_page(
                   label: structuralLabel(el),
                   control: el.tagName === 'SELECT'
                     ? 'select'
-                    : el.tagName === 'TEXTAREA' ? 'textarea' : String(el.type || 'text'),
+                    : el.getAttribute('role') === 'combobox'
+                      ? 'combobox'
+                      : el.tagName === 'TEXTAREA' ? 'textarea' : String(el.type || 'text'),
                   required: required(el),
                   disabled: Boolean(el.disabled),
                   readonly: Boolean(el.readOnly),
                   autocomplete: String(el.autocomplete || '').slice(0, 120),
                   placeholder: String(el.placeholder || '').slice(0, 240),
+                  protected_identifier: protectedIdentifier(el, structuralLabel(el)),
                   options: el.tagName === 'SELECT'
                     ? [...el.options].slice(0, 100).map((option) =>
                         String(option.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120)
                       )
-                    : []
+                    : [],
+                  option_count: el.tagName === 'SELECT' ? el.options.length : 0,
+                  options_truncated: el.tagName === 'SELECT' && el.options.length > 100
                 }));
               let workdayObservation = null;
               if (/(^|\.)myworkday(?:jobs|site)\.com$/i.test(location.hostname)) {
@@ -2434,6 +2564,8 @@ def _audit_live_pre_submit_page(
                 select_fields: selectFields,
                 text_fields: textFields,
                 radio_questions: radioQuestions,
+                provenance_fields: provenanceFields.slice(0, 129),
+                provenance_field_count: provenanceFields.length,
                 file_fields: fileFields,
                 submit_control_count: submitControls.length,
                 assessment_visible: assessmentVisible,
@@ -2455,6 +2587,13 @@ def _audit_live_pre_submit_page(
             snapshot, job
         )
         issues.extend(adapter_issues)
+        provenance_audit = audit_pre_submit_answer_provenance(
+            snapshot,
+            profile,
+            job,
+            existing_issues=issues,
+        )
+        issues.extend(provenance_audit.issues)
         issues = list(dict.fromkeys(issues))
         blockers, repairable, advisories = _partition_pre_submit_issues(issues)
         lossy_mappings = _collect_lossy_answer_mappings(snapshot, profile, job)
@@ -2475,6 +2614,7 @@ def _audit_live_pre_submit_page(
             "repairable_issues": repairable,
             "advisory_issues": advisories,
             "lossy_answer_mappings": lossy_mappings,
+            "answer_provenance": provenance_audit.report,
             "advisory_only": disposition == "proceed_with_advisories",
             "submission_gate": True,
             "required_unfilled_count": len(snapshot.get("required_unfilled", [])),

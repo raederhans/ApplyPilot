@@ -251,7 +251,9 @@ def test_worker_cleanup_reclaims_old_cache_once_and_preserves_site_state(
     edge_root = tmp_path / "edge"
     cloak_root = tmp_path / "cloak"
     profile = edge_root / "worker-4"
+    cloak_profile = cloak_root / "worker-4"
     old_cache = _write(profile / "Default" / "Cache" / "old.bin", b"cache")
+    cloak_cache = _write(cloak_profile / "Default" / "Cache" / "old.bin", b"cloak")
     cookie = _write(profile / "Default" / "Network" / "Cookies", b"session")
     mark_owned_directory(
         profile,
@@ -261,6 +263,7 @@ def test_worker_cleanup_reclaims_old_cache_once_and_preserves_site_state(
     )
     two_days_ago = time.time() - 2 * 24 * 60 * 60
     os.utime(old_cache, (two_days_ago, two_days_ago))
+    os.utime(cloak_cache, (two_days_ago, two_days_ago))
     monkeypatch.setattr(chrome.config, "CHROME_WORKER_DIR", edge_root)
     monkeypatch.setattr(chrome.config, "CLOAK_WORKER_DIR", cloak_root)
     monkeypatch.setenv("APPLYPILOT_PROFILE_CACHE_RETENTION_DAYS", "1")
@@ -272,10 +275,28 @@ def test_worker_cleanup_reclaims_old_cache_once_and_preserves_site_state(
         def poll():
             return 0
 
+    class OwnedProfileLock:
+        held = True
+
+        owned_by_current_thread = True
+
+        @staticmethod
+        def actual_browser_stopped():
+            return True
+
+        def release_after_stop(self, *, profile_path, browser_stopped):
+            assert profile_path == profile.resolve()
+            assert browser_stopped is True
+            self.held = False
+
+    chrome._profile_locks[4] = OwnedProfileLock()
+    chrome._profile_paths[4] = profile.resolve()
+
     chrome.cleanup_worker(4, StoppedProcess())
 
     assert not old_cache.exists()
     assert cookie.read_bytes() == b"session"
+    assert cloak_cache.read_bytes() == b"cloak"
 
 
 def test_worker_cleanup_skips_prune_when_browser_endpoint_remains_active(

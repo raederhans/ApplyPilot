@@ -14,6 +14,12 @@ import uuid
 from pathlib import Path
 
 from applypilot.apply.contracts import (
+    FAILURE_MISSING_CAPABILITIES,
+    FAILURE_MISSING_MATERIALS,
+    FAILURE_OBSERVATION_CODES,
+    FAILURE_OBSERVATION_PHASES,
+    FAILURE_OBSERVATION_PROVIDERS,
+    FAILURE_OBSERVATION_SOURCES,
     MAX_AGENT_PROPOSALS,
     MAX_AGENT_REPORT_BYTES,
     MAX_PROPOSAL_DEPENDENCIES,
@@ -51,6 +57,48 @@ def _report_tool() -> dict[str, object]:
                 "status": {"type": "string", "minLength": 1, "maxLength": 200},
                 "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
                 "observations": {"type": "object"},
+                "failure": {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": {"const": "1"},
+                        "code": {"enum": sorted(FAILURE_OBSERVATION_CODES)},
+                        "source": {"enum": sorted(FAILURE_OBSERVATION_SOURCES)},
+                        "provider": {"enum": sorted(FAILURE_OBSERVATION_PROVIDERS)},
+                        "phase": {"enum": sorted(FAILURE_OBSERVATION_PHASES)},
+                        "submit_started": {"type": "boolean"},
+                        "field_semantic": {
+                            "type": "string",
+                            "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+                        },
+                        "page_epoch": {"type": "integer", "minimum": 0},
+                        "evidence_refs": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {
+                                "type": "string",
+                                "pattern": "^[a-z][a-z0-9_.-]{0,31}:[A-Za-z0-9._/-]{1,180}$",
+                            },
+                        },
+                        "detail_ref": {
+                            "type": "string",
+                            "pattern": "^[a-z][a-z0-9_.-]{0,31}:[A-Za-z0-9._/-]{1,180}$",
+                        },
+                        "missing_capability": {
+                            "enum": sorted(FAILURE_MISSING_CAPABILITIES)
+                        },
+                        "missing_material": {
+                            "enum": sorted(FAILURE_MISSING_MATERIALS)
+                        },
+                    },
+                    "required": [
+                        "code",
+                        "source",
+                        "provider",
+                        "phase",
+                        "submit_started",
+                    ],
+                    "additionalProperties": False,
+                },
                 "proposals": {
                     "type": "array",
                     "maxItems": MAX_AGENT_PROPOSALS,

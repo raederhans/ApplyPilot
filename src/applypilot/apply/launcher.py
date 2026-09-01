@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -37,6 +38,7 @@ from rich.live import Live
 from applypilot import config
 from applypilot.apply import agent_output as agent_output_mod
 from applypilot.apply import agent_runtime as agent_runtime_mod
+from applypilot.apply import answer_provenance as answer_provenance_mod
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import ats as ats_mod
@@ -48,12 +50,18 @@ from applypilot.apply import resume_authorization as resume_authorization_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
+from applypilot.apply.answer_policy import field_risk
+from applypilot.apply.application_facts import (
+    current_profile_facts,
+    resolve_application_fact_ref,
+)
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
 from applypilot.apply.browser_broker import (
-    BrowserBroker,
+    BrowserBrokerError,
     BrowserLeaseBundle,
     LeaseHeartbeat,
+    StalePageBinding,
 )
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
@@ -85,6 +93,7 @@ from applypilot.apply.contracts import (
     AgentTurnResult,
     ApplicationEvent,
     HumanRequest,
+    RecoveryCommand,
     ResourceClaim,
     TaskResult,
     TaskSpec,
@@ -99,6 +108,12 @@ from applypilot.apply.dashboard import (
     render_full,
     update_state,
 )
+from applypilot.apply.durable_agent_runtime import (
+    DurableAgentRuntime,
+    DurableLaunchIntent,
+    DurableRunHandle,
+)
+from applypilot.apply.durable_browser_broker import DurableBrowserBroker
 from applypilot.apply.email_routing import (
     MailboxMcpSpec,
     direct_email_send_is_reserved,
@@ -114,6 +129,8 @@ from applypilot.apply.email_routing import (
 )
 from applypilot.apply.execution_scheduler import PhaseDemand, build_execution_plan
 from applypilot.apply.failure_taxonomy import classify_failure
+from applypilot.apply.operator_commands import OperatorCommand
+from applypilot.apply.profile_lock import inspect_process_identity
 from applypilot.apply.retention import (
     archive_new_evidence,
     mark_owned_directory,
@@ -129,6 +146,30 @@ from applypilot.apply.router import (
     resolve_interaction_mode,
 )
 from applypilot.apply.run_progress import RunProgress
+from applypilot.apply.semantic_browser_ops import (
+    SEMANTIC_WRITE_POLICY,
+    SEMANTIC_WRITE_POLICY_DIGEST,
+    ResumeUploadPostcondition,
+    ResumeUploadRequest,
+    SemanticBrowserOps,
+    SemanticWriteAuthorityIssuer,
+    SemanticWriteDenied,
+    SemanticWriteUncertain,
+    resume_postcondition_digest,
+)
+from applypilot.apply.semantic_resume_runtime import (
+    DurableSemanticWriteLifecycle,
+    PlaywrightResumeUploadDriver,
+    SemanticResumeTargetError,
+    application_binding_hash,
+    bound_artifact,
+    material_binding_hash,
+    provider_for_url,
+)
+from applypilot.apply.semantic_resume_runtime import (
+    operation_id as semantic_operation_id,
+)
+from applypilot.apply.semantic_resume_upload import ADAPTER_VERSION
 from applypilot.apply.specialists import (
     prompt_safe_ats_fill_plan,
     run_durable_ats_fill_plan_specialist,
@@ -137,10 +178,263 @@ from applypilot.apply.specialists import (
 )
 from applypilot.database import get_connection
 from applypilot.runtime_settings import load_runtime_settings
+from applypilot.storage import semantic_browser_writes as semantic_write_journal
 
-_browser_broker = BrowserBroker(default_ttl_seconds=45 * 60)
+
+def _open_durable_control_connection() -> sqlite3.Connection:
+    """Open a fresh control-plane connection exclusively owned by its caller."""
+    from applypilot import database as database_mod
+
+    connection = sqlite3.connect(str(database_mod.DB_PATH), timeout=30)
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _process_identity_tuple(pid: int) -> tuple[int, int] | None:
+    identity = inspect_process_identity(pid)
+    if identity is None:
+        return None
+    return identity.pid, identity.creation_filetime
+
+
+def _launcher_process_identity() -> tuple[int, int]:
+    identity = _process_identity_tuple(os.getpid())
+    if identity is None:
+        raise RuntimeError("launcher process identity is unavailable")
+    return identity
+
+
+_runtime_recovery_local = threading.local()
+
+
+@contextmanager
+def _runtime_recovery_scope(command: RecoveryCommand):
+    """Expose one admitted recovery command only to its current worker thread."""
+    if command.command not in {"retry_same_application", "retry_new_session"}:
+        raise ValueError("runtime recovery scope only accepts agent retry commands")
+    if getattr(_runtime_recovery_local, "state", None) is not None:
+        raise RuntimeError("nested runtime recovery scope is forbidden")
+    state = {"command": command, "consumed": False}
+    _runtime_recovery_local.state = state
+    try:
+        yield
+    finally:
+        if getattr(_runtime_recovery_local, "state", None) is state:
+            del _runtime_recovery_local.state
+
+
+@contextmanager
+def _runtime_operator_resume_scope(
+    command: OperatorCommand,
+    *,
+    checkpoint_id: str,
+    resume_context: Mapping[str, object],
+):
+    """Authorize one exact operator-requested, prepare-only child turn.
+
+    The command does not grant page-write or Submit authority.  It only lets
+    the already-owning worker present the existing policy, browser lease and
+    page binding to the durable runtime for one fresh child turn.
+    """
+    human_response = resume_context.get("human_response")
+    if (
+        command.action != "resume"
+        or command.browser_authority
+        or command.page_write_authority
+        or command.submit_authority
+        or command.ledger_write_authority
+        or not str(checkpoint_id or "").strip()
+        or resume_context.get("resume_mode") != "fresh_agent_turn"
+        or resume_context.get("parent_run_id") != command.run_id
+        or resume_context.get("checkpoint_ref") != checkpoint_id
+        or not isinstance(human_response, Mapping)
+        or not str(human_response.get("request_id") or "").strip()
+        or not str(human_response.get("response_type") or "").strip()
+    ):
+        raise ValueError("operator resume scope requires a non-authoritative resume command")
+    if getattr(_runtime_recovery_local, "state", None) is not None:
+        raise RuntimeError("nested runtime continuation scope is forbidden")
+    state = {
+        "kind": "operator_resume",
+        "command": command,
+        "authorization_id": command.command_id,
+        "actor_id": command.actor_id,
+        "attempt_id": command.attempt_id,
+        "parent_turn_id": command.run_id,
+        "checkpoint_id": str(checkpoint_id),
+        "request_id": str(human_response["request_id"]),
+        "response_type": str(human_response["response_type"]),
+        "consumed": False,
+    }
+    _runtime_recovery_local.state = state
+    try:
+        yield
+    finally:
+        if getattr(_runtime_recovery_local, "state", None) is state:
+            del _runtime_recovery_local.state
+
+
+@contextmanager
+def _runtime_submit_scope(job: Mapping[str, object]):
+    """Authorize one exact prepare-checkpoint to SubmissionGate continuation."""
+    if getattr(_runtime_recovery_local, "state", None) is not None:
+        raise RuntimeError("nested runtime continuation scope is forbidden")
+    binding = job.get("_submission_gate_binding")
+    if not isinstance(binding, Mapping):
+        raise TypeError("submit continuation requires a gate binding")
+    gate_id = str(binding.get("gate_id") or "").strip()
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    parent_turn_id = str(job.get("_parent_agent_run_id") or "").strip()
+    checkpoint_id = str(job.get("_parent_agent_checkpoint_id") or "").strip()
+    job_url = str(job.get("url") or "").strip()
+    if (
+        not gate_id
+        or not attempt_id
+        or not parent_turn_id
+        or not checkpoint_id
+        or binding.get("attempt_id") != attempt_id
+        or binding.get("job_url") != job_url
+    ):
+        raise RuntimeError("submit continuation binding is incomplete or stale")
+    state = {
+        "kind": "submit",
+        "authorization_id": gate_id,
+        "actor_id": application_actor_id(attempt_id),
+        "attempt_id": attempt_id,
+        "parent_turn_id": parent_turn_id,
+        "checkpoint_id": checkpoint_id,
+        "consumed": False,
+    }
+    _runtime_recovery_local.state = state
+    try:
+        yield
+    finally:
+        if getattr(_runtime_recovery_local, "state", None) is state:
+            del _runtime_recovery_local.state
+
+
+def _active_runtime_recovery(
+    *,
+    actor_id: str,
+    attempt_id: str,
+    parent_turn_id: str,
+) -> RecoveryCommand | None:
+    command = _scoped_runtime_recovery()
+    if command is None:
+        return None
+    if (
+        command.actor_id,
+        command.attempt_id,
+        command.turn_id,
+    ) != (actor_id, attempt_id, parent_turn_id):
+        return None
+    return command
+
+
+def _scoped_runtime_recovery() -> RecoveryCommand | None:
+    state = getattr(_runtime_recovery_local, "state", None)
+    command = state.get("command") if isinstance(state, dict) else None
+    if not isinstance(command, RecoveryCommand) or bool(state.get("consumed")):
+        return None
+    return command
+
+
+def _scoped_submit_continuation() -> dict[str, object] | None:
+    state = getattr(_runtime_recovery_local, "state", None)
+    if (
+        not isinstance(state, dict)
+        or state.get("kind") != "submit"
+        or bool(state.get("consumed"))
+    ):
+        return None
+    return state
+
+
+def _scoped_operator_resume() -> dict[str, object] | None:
+    state = getattr(_runtime_recovery_local, "state", None)
+    if (
+        not isinstance(state, dict)
+        or state.get("kind") != "operator_resume"
+        or bool(state.get("consumed"))
+        or not isinstance(state.get("command"), OperatorCommand)
+    ):
+        return None
+    return state
+
+
+def _consume_runtime_recovery_authorization(
+    intent: DurableLaunchIntent,
+    parent,
+) -> bool:
+    command = _active_runtime_recovery(
+        actor_id=intent.spec.actor_id,
+        attempt_id=intent.spec.attempt_id,
+        parent_turn_id=parent.turn_id,
+    )
+    state = getattr(_runtime_recovery_local, "state", None)
+    if command is not None:
+        if (
+            command.command_id != intent.recovery_authorization_id
+            or command.submit_authority
+            or command.page_write_authority
+            or command.ledger_write_authority
+            or not isinstance(state, dict)
+            or state.get("command") is not command
+        ):
+            return False
+    else:
+        operator_resume = _scoped_operator_resume()
+        if operator_resume is not None:
+            if (
+                intent.resume_mode != "resume"
+                or intent.spec.submit_started
+                or operator_resume.get("authorization_id")
+                != intent.recovery_authorization_id
+                or operator_resume.get("actor_id") != intent.spec.actor_id
+                or operator_resume.get("attempt_id") != intent.spec.attempt_id
+                or operator_resume.get("parent_turn_id") != parent.turn_id
+                or operator_resume.get("checkpoint_id") != intent.checkpoint_id
+            ):
+                return False
+            state = operator_resume
+            state["consumed"] = True
+            return True
+        continuation = _scoped_submit_continuation()
+        if continuation is None:
+            return False
+        if (
+            intent.resume_mode != "resume"
+            or not intent.spec.submit_started
+            or continuation.get("authorization_id")
+            != intent.recovery_authorization_id
+            or continuation.get("actor_id") != intent.spec.actor_id
+            or continuation.get("attempt_id") != intent.spec.attempt_id
+            or continuation.get("parent_turn_id") != parent.turn_id
+            or continuation.get("checkpoint_id") != intent.checkpoint_id
+        ):
+            return False
+        state = continuation
+    state["consumed"] = True
+    return True
+
+
+_browser_broker = DurableBrowserBroker(
+    _open_durable_control_connection,
+    default_ttl_seconds=45 * 60,
+    process_identity_provider=lambda: _launcher_process_identity(),
+    close_connections=True,
+)
+_semantic_write_authority_issuer = SemanticWriteAuthorityIssuer()
 _agent_subprocess_runtime = agent_runtime_mod.SubprocessAgentRuntime(
     kill_process_tree=_kill_process_tree
+)
+_durable_agent_runtime = DurableAgentRuntime(
+    _agent_subprocess_runtime,
+    _open_durable_control_connection,
+    process_identity=lambda pid: _process_identity_tuple(pid),
+    resume_authorizer=_consume_runtime_recovery_authorization,
+    close_connections=True,
 )
 atexit.register(_browser_broker.close)
 atexit.register(_agent_subprocess_runtime.close)
@@ -152,6 +446,54 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         _cleanup_chrome_worker(worker_id, process)
     finally:
         _browser_broker.release_scope(f"worker:{worker_id}")
+
+
+def _heartbeat_operator_handoff(
+    job: dict,
+    *,
+    lease_minutes: int,
+) -> bool:
+    """Keep one already-owned pre-submit attempt/page alive during a bounded wait."""
+    from applypilot.database import update_application_attempt
+
+    raw_bundle = job.get("_browser_lease_binding")
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    if (
+        not isinstance(raw_bundle, Mapping)
+        or not attempt_id
+        or isinstance(lease_minutes, bool)
+        or not isinstance(lease_minutes, int)
+        or lease_minutes < 1
+    ):
+        return False
+    try:
+        previous = BrowserLeaseBundle.from_mapping(raw_bundle)
+        refreshed = _browser_broker.heartbeat(
+            previous,
+            ttl_seconds=min(3600.0, float(lease_minutes * 60)),
+        )
+    except (BrowserBrokerError, TypeError, ValueError):
+        return False
+    fixed_identity = (
+        refreshed.profile.lease_id == previous.profile.lease_id
+        and refreshed.profile.owner_id == previous.profile.owner_id
+        and refreshed.profile.attempt_id == previous.profile.attempt_id == attempt_id
+        and refreshed.page.resource_id == previous.page.resource_id
+        and refreshed.page_binding.page_id == previous.page_binding.page_id
+        and refreshed.page_binding.page_epoch == previous.page_binding.page_epoch
+    )
+    if not fixed_identity:
+        return False
+    if not update_application_attempt(
+        attempt_id,
+        phase="human_wait",
+        submit_started=False,
+        lease_minutes=lease_minutes,
+        evidence={"operator_handoff": "waiting", "submit_started": False},
+    ):
+        return False
+    job["_browser_lease_binding"] = refreshed.as_dict()
+    return True
 
 # Document the compatibility surface consumed by the extracted worker. Tests
 # and callers may still replace these ports before ``worker_loop``.
@@ -402,6 +744,566 @@ def _browser_lease_for_agent_turn(
         )
     job["_browser_lease_binding"] = bundle.as_dict()
     return bundle
+
+
+def _refresh_semantic_browser_bundle(job: dict) -> BrowserLeaseBundle:
+    """Reconstruct the current durable page epoch from an exact job-held bundle."""
+
+    raw_bundle = job.get("_browser_lease_binding")
+    if not isinstance(raw_bundle, Mapping):
+        raise SemanticWriteDenied("semantic resume repair requires a browser lease")
+    previous = BrowserLeaseBundle.from_mapping(raw_bundle)
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    actor_id = application_actor_id(attempt_id) if attempt_id else ""
+    if (
+        not attempt_id
+        or previous.page_binding.attempt_id != attempt_id
+        or previous.page_binding.owner_id != actor_id
+    ):
+        raise SemanticWriteDenied("semantic browser lease is not attempt-bound")
+    current = _browser_broker.acquire_bundle(
+        profile_id=previous.profile.resource_id,
+        page_id=previous.page.resource_id,
+        owner_id=previous.profile.owner_id,
+        scope_id=previous.profile.scope_id,
+        attempt_id=previous.profile.attempt_id,
+        runtime_id=previous.profile.runtime_id,
+        ttl_seconds=max(
+            60.0,
+            float(load_runtime_settings().application_lease_minutes * 60),
+        ),
+    )
+    job["_browser_lease_binding"] = current.as_dict()
+    return current
+
+
+def _semantic_operation_relevant(
+    record: semantic_write_journal.SemanticWriteRecord,
+    *,
+    provider: str,
+    artifact_sha256: str,
+    artifact_size: int,
+    application_hash: str,
+    material_hash: str,
+) -> bool:
+    return (
+        record.provider == provider
+        and record.artifact_sha256 == artifact_sha256
+        and record.artifact_size == artifact_size
+        and record.application_binding_hash == application_hash
+        and record.material_binding_hash == material_hash
+    )
+
+
+def _semantic_legacy_fallback_decision(
+    job: Mapping[str, object],
+    *,
+    reason_code: str,
+) -> dict[str, object]:
+    """Allow the legacy writer only when this attempt has never dispatched.
+
+    Provider, page, container, and material bindings are deliberately ignored:
+    any of them may change after a browser-side write or process interruption.
+    """
+
+    attempt_id = str(job.get("_attempt_id") or "").strip()
+    if not attempt_id:
+        return {
+            "status": "not_applicable",
+            "legacy_fallback_safe": True,
+            "reason": reason_code,
+        }
+    try:
+        connection = get_connection()
+        dispatched = [
+            record
+            for record in semantic_write_journal.list_attempt_operations(
+                connection,
+                attempt_id,
+            )
+            if record.dispatch_count > 0
+        ]
+    except Exception as exc:  # noqa: BLE001 - a missing guard must fail closed
+        logger.warning(
+            "Semantic fallback journal guard failed for %s: %s",
+            attempt_id,
+            exc,
+        )
+        return {"status": "journal_guard_unavailable"}
+    if not dispatched:
+        return {
+            "status": "not_applicable",
+            "legacy_fallback_safe": True,
+            "reason": reason_code,
+        }
+
+    previous = dispatched[-1]
+    if previous.state == "started":
+        try:
+            previous = semantic_write_journal.park_side_effect_unknown(
+                connection,
+                previous.operation_id,
+                reason_code=reason_code,
+            )
+        except semantic_write_journal.SemanticWriteTransitionError:
+            refreshed = semantic_write_journal.get_operation(
+                connection,
+                previous.operation_id,
+            )
+            if refreshed is None:
+                return {"status": "journal_guard_unavailable"}
+            previous = refreshed
+    status = (
+        "verified_state_unobserved"
+        if previous.state == "verified"
+        else previous.state
+    )
+    return {
+        "status": status,
+        "operation_id": previous.operation_id,
+        "legacy_fallback_safe": False,
+    }
+
+
+def _complete_observed_semantic_resume_effect(
+    job: dict,
+    bundle: BrowserLeaseBundle,
+    record: semantic_write_journal.SemanticWriteRecord,
+    connection: sqlite3.Connection,
+) -> dict[str, object]:
+    """Finish only the journal/CAS tail after an exact effect was observed."""
+
+    binding = bundle.page_binding
+    exact_lease = (
+        binding.page_id == record.page_id
+        and binding.page_lease_id == record.page_lease_id
+        and binding.page_lease_epoch == record.page_lease_epoch
+    )
+    if not exact_lease:
+        semantic_write_journal.park_stale_after_effect(
+            connection,
+            record.operation_id,
+            reason_code="page_lease_changed_after_effect",
+        )
+        return {"status": "parked_stale_after_effect"}
+    if binding.page_epoch == record.expected_page_epoch:
+        try:
+            bundle = _browser_broker.advance_page(
+                bundle,
+                expected_page_epoch=record.expected_page_epoch,
+            )
+        except BrowserBrokerError:
+            semantic_write_journal.park_stale_after_effect(
+                connection,
+                record.operation_id,
+                reason_code="page_epoch_cas_failed",
+            )
+            return {"status": "parked_stale_after_effect"}
+    elif binding.page_epoch != record.expected_page_epoch + 1:
+        semantic_write_journal.park_stale_after_effect(
+            connection,
+            record.operation_id,
+            reason_code="page_epoch_changed_after_effect",
+        )
+        return {"status": "parked_stale_after_effect"}
+    semantic_write_journal.mark_verified(
+        connection,
+        record.operation_id,
+        resulting_page_epoch=record.expected_page_epoch + 1,
+    )
+    job["_browser_lease_binding"] = bundle.as_dict()
+    return {
+        "status": "replayed",
+        "operation_id": record.operation_id,
+        "page_epoch": bundle.page_binding.page_epoch,
+    }
+
+
+def _try_semantic_pre_submit_repair(
+    port: int,
+    worker_id: int,
+    job: dict,
+    authorization_manifest: Mapping[str, object] | None,
+    audit_report: Mapping[str, object],
+) -> dict[str, object]:
+    """Repair one exact missing resume without granting Agent or Submit authority."""
+
+    if os.getenv("APPLYPILOT_SEMANTIC_RESUME_UPLOAD", "1").strip().casefold() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return _semantic_legacy_fallback_decision(
+            job,
+            reason_code="feature_disabled_after_dispatch",
+        )
+    repairable = audit_report.get("repairable_issues")
+    if not isinstance(repairable, list) or not repairable or any(
+        str(issue)
+        not in {
+            "resume_not_uploaded",
+            "resume_state_unconfirmed",
+        }
+        for issue in repairable
+    ):
+        return _semantic_legacy_fallback_decision(
+            job,
+            reason_code="repair_scope_changed_after_dispatch",
+        )
+    if job.get("_submission_gate_binding") or job.get("_submission_gate"):
+        return {"status": "submit_started"}
+    if not isinstance(authorization_manifest, Mapping):
+        return {"status": "authorization_manifest_required"}
+    try:
+        manifest_expires_at = datetime.fromisoformat(
+            str(authorization_manifest.get("expires_at") or "")
+        )
+    except ValueError:
+        return {"status": "authorization_manifest_invalid"}
+    if (
+        manifest_expires_at.tzinfo is None
+        or datetime.now(UTC) >= manifest_expires_at
+    ):
+        return {"status": "authorization_manifest_expired"}
+
+    from playwright.sync_api import sync_playwright
+
+    from applypilot.apply.authorization import (
+        authorize_job,
+        compute_file_binding,
+        resolve_resume_attachment,
+    )
+
+    authorization_entry = authorize_job(dict(authorization_manifest), job)
+    persisted_entry = job.get("_authorization_entry")
+    if authorization_entry is None or (
+        isinstance(persisted_entry, Mapping)
+        and dict(persisted_entry) != dict(authorization_entry)
+    ):
+        return {"status": "authorization_mismatch"}
+    try:
+        resume_path = resolve_resume_attachment(job)
+        resume_sha256, resume_size = compute_file_binding(resume_path)
+    except (OSError, RuntimeError, ValueError):
+        return {"status": "artifact_binding_invalid"}
+    if (
+        authorization_entry.get("resume_sha256") != resume_sha256
+        or authorization_entry.get("resume_size") != resume_size
+    ):
+        return {"status": "artifact_binding_changed"}
+
+    try:
+        bundle = _refresh_semantic_browser_bundle(job)
+        _browser_broker.validate_page(bundle.page_binding)
+    except Exception as exc:  # noqa: BLE001 - fail closed before page access
+        logger.warning("Semantic browser binding rejected: %s", exc)
+        return {"status": "stale_precondition"}
+
+    playwright = sync_playwright().start()
+    operation: semantic_write_journal.SemanticWriteRecord | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        pages = [page for context in browser.contexts for page in context.pages]
+        pages = _bound_application_pages(browser, pages, job)
+        if not pages:
+            return {"status": "no_bound_application_page"}
+        page, surface = page_observation_mod._select_application_page_and_frame(pages)
+        page.bring_to_front()
+        provider = provider_for_url(page.url)
+        reported_provider = provider_for_url(audit_report.get("page_url"))
+        if provider is None:
+            return _semantic_legacy_fallback_decision(
+                job,
+                reason_code="provider_changed_after_dispatch",
+            )
+        if reported_provider is not None and reported_provider != provider:
+            return {"status": "page_provider_changed"}
+
+        artifact = bound_artifact(resume_path, resume_sha256, resume_size)
+        application_hash = application_binding_hash(
+            job,
+            authorization_entry,
+            page_url=page.url,
+        )
+        material_hash = material_binding_hash(job, authorization_entry)
+        postcondition = ResumeUploadPostcondition(
+            filename=artifact.filename,
+            size_bytes=artifact.size_bytes,
+        )
+        connection = get_connection()
+        semantic_write_journal.ensure_schema(connection)
+        attempt_records = semantic_write_journal.list_attempt_operations(
+            connection,
+            bundle.page_binding.attempt_id,
+        )
+        prior = [
+            record
+            for record in attempt_records
+            if _semantic_operation_relevant(
+                record,
+                provider=provider,
+                artifact_sha256=artifact.sha256,
+                artifact_size=artifact.size_bytes,
+                application_hash=application_hash,
+                material_hash=material_hash,
+            )
+        ]
+        relevant_operation_ids = {record.operation_id for record in prior}
+        foreign_dispatched = [
+            record
+            for record in attempt_records
+            if record.dispatch_count > 0
+            and record.operation_id not in relevant_operation_ids
+        ]
+        if foreign_dispatched:
+            previous = foreign_dispatched[-1]
+            if previous.state == "started":
+                semantic_write_journal.park_side_effect_unknown(
+                    connection,
+                    previous.operation_id,
+                    reason_code="attempt_scope_changed_after_dispatch",
+                )
+                return {"status": "parked_side_effect_unknown"}
+            if previous.state == "verified":
+                return {"status": "verified_state_conflict"}
+            return {"status": "prior_operation_unresolved"}
+        for previous in reversed(prior):
+            if previous.state in {
+                "parked_side_effect_unknown",
+                "parked_stale_after_effect",
+            }:
+                return {"status": previous.state}
+            if previous.state == "effect_observed":
+                return _complete_observed_semantic_resume_effect(
+                    job,
+                    bundle,
+                    previous,
+                    connection,
+                )
+            if previous.state == "verified":
+                if (
+                    previous.resulting_page_epoch == bundle.page_binding.page_epoch
+                    and previous.page_lease_id == bundle.page_binding.page_lease_id
+                ):
+                    job["_browser_lease_binding"] = bundle.as_dict()
+                    return {
+                        "status": "replayed",
+                        "operation_id": previous.operation_id,
+                        "page_epoch": bundle.page_binding.page_epoch,
+                    }
+                return {"status": "verified_state_conflict"}
+
+        driver = PlaywrightResumeUploadDriver(surface, provider)
+        discovered = driver.discover()
+        unresolved_started = [
+            record
+            for record in prior
+            if record.state == "started" and record.dispatch_count > 0
+        ]
+        if discovered.status != "ready" or not discovered.container_key:
+            if unresolved_started:
+                previous = unresolved_started[-1]
+                semantic_write_journal.park_side_effect_unknown(
+                    connection,
+                    previous.operation_id,
+                    reason_code="target_unobservable_after_dispatch",
+                )
+                return {"status": "parked_side_effect_unknown"}
+            if any(record.dispatch_count > 0 for record in prior):
+                return {"status": "failed_no_effect"}
+            if not prior:
+                if discovered.status == "unsupported":
+                    return _semantic_legacy_fallback_decision(
+                        job,
+                        reason_code="target_unobservable_after_dispatch",
+                    )
+                return {"status": f"target_{discovered.status}"}
+            return {"status": f"target_{discovered.status}_after_start"}
+
+        request = ResumeUploadRequest(
+            actor_id=bundle.page_binding.owner_id,
+            attempt_id=bundle.page_binding.attempt_id,
+            provider=provider,
+            container_key=discovered.container_key,
+            artifact=artifact,
+            application_binding_hash=application_hash,
+            material_binding_hash=material_hash,
+            policy_digest=SEMANTIC_WRITE_POLICY_DIGEST,
+            adapter_version=ADAPTER_VERSION,
+            expected_postcondition=postcondition,
+        )
+        authority = _semantic_write_authority_issuer.issue(
+            bundle=bundle,
+            request=request,
+            submit_started=False,
+        )
+        operation_key = semantic_operation_id(authority.operation_digest)
+        claims = semantic_write_journal.SemanticWriteClaims(
+            operation_id=operation_key,
+            operation_digest=authority.operation_digest,
+            actor_id=request.actor_id,
+            attempt_id=request.attempt_id,
+            provider=provider,
+            operation_kind="upload_bound_artifact",
+            adapter_version=ADAPTER_VERSION,
+            application_binding_hash=application_hash,
+            page_id=bundle.page_binding.page_id,
+            page_lease_id=bundle.page_binding.page_lease_id,
+            page_lease_epoch=bundle.page_binding.page_lease_epoch,
+            expected_page_epoch=bundle.page_binding.page_epoch,
+            artifact_sha256=artifact.sha256,
+            artifact_size=artifact.size_bytes,
+            material_binding_hash=material_hash,
+            policy_contract_version=SEMANTIC_WRITE_POLICY,
+            policy_digest=SEMANTIC_WRITE_POLICY_DIGEST,
+            expected_postcondition_digest=resume_postcondition_digest(postcondition),
+        )
+        conflicting = [
+            record
+            for record in prior
+            if record.operation_digest != authority.operation_digest
+            and (
+                record.dispatch_count > 0
+                or record.state
+                in {
+                    "effect_observed",
+                    "verified",
+                    "parked_side_effect_unknown",
+                    "parked_stale_after_effect",
+                }
+            )
+        ]
+        if conflicting:
+            previous = conflicting[-1]
+            if previous.state == "started":
+                semantic_write_journal.park_side_effect_unknown(
+                    connection,
+                    previous.operation_id,
+                    reason_code="page_binding_changed_after_dispatch",
+                )
+                return {"status": "parked_side_effect_unknown"}
+            return {"status": "prior_operation_unresolved"}
+        operation = semantic_write_journal.begin_operation(connection, claims)
+        if operation.state in {
+            "parked_side_effect_unknown",
+            "parked_stale_after_effect",
+        }:
+            return {"status": operation.state}
+        if operation.state == "verified":
+            if (
+                operation.resulting_page_epoch == bundle.page_binding.page_epoch
+                and operation.page_lease_id == bundle.page_binding.page_lease_id
+            ):
+                job["_browser_lease_binding"] = bundle.as_dict()
+                return {
+                    "status": "replayed",
+                    "operation_id": operation.operation_id,
+                    "page_epoch": bundle.page_binding.page_epoch,
+                }
+            return {"status": "verified_state_conflict"}
+        if operation.state == "effect_observed":
+            return _complete_observed_semantic_resume_effect(
+                job,
+                bundle,
+                operation,
+                connection,
+            )
+
+        if operation.dispatch_count == 0:
+            claimed = semantic_write_journal.claim_dispatch(
+                connection,
+                operation.operation_id,
+                expected_dispatch_count=0,
+            )
+        elif operation.dispatch_count == 1:
+            if operation.state != "failed_no_effect":
+                if operation.state == "started":
+                    semantic_write_journal.park_side_effect_unknown(
+                        connection,
+                        operation.operation_id,
+                        reason_code="process_interrupted_after_dispatch",
+                    )
+                return {"status": "parked_side_effect_unknown"}
+            claimed = semantic_write_journal.claim_dispatch(
+                connection,
+                operation.operation_id,
+                expected_dispatch_count=1,
+                allow_replay=True,
+            )
+        else:
+            return {"status": "bounded_replay_exhausted"}
+        if claimed is None:
+            return {"status": "dispatch_conflict"}
+        operation = claimed
+        lifecycle = DurableSemanticWriteLifecycle(
+            connection,
+            operation_id=operation.operation_id,
+            operation_digest=operation.operation_digest,
+        )
+        semantic_ops = SemanticBrowserOps(
+            _browser_broker,
+            authority_issuer=_semantic_write_authority_issuer,
+            resume_driver=driver,
+            lifecycle=lifecycle,
+        )
+        result = semantic_ops.upload_bound_resume(bundle, authority, request)
+        job["_browser_lease_binding"] = result.bundle.as_dict()
+        return {
+            "status": "replayed" if result.replayed else "verified",
+            "operation_id": operation.operation_id,
+            "page_epoch": result.bundle.page_binding.page_epoch,
+        }
+    except StalePageBinding:
+        if connection is not None and operation is not None:
+            current = semantic_write_journal.get_operation(
+                connection, operation.operation_id
+            )
+            if current is not None and current.state == "started":
+                semantic_write_journal.mark_failed_no_effect(
+                    connection,
+                    operation.operation_id,
+                    reason_code="stale_precondition",
+                )
+        return {"status": "stale_precondition"}
+    except SemanticResumeTargetError as exc:
+        if connection is not None and operation is not None:
+            current = semantic_write_journal.get_operation(
+                connection, operation.operation_id
+            )
+            if current is not None and current.state == "started":
+                semantic_write_journal.mark_failed_no_effect(
+                    connection,
+                    operation.operation_id,
+                    reason_code="target_changed_before_write",
+                )
+        return {"status": f"target_{exc.status}"}
+    except SemanticWriteDenied:
+        if connection is not None and operation is not None:
+            current = semantic_write_journal.get_operation(
+                connection, operation.operation_id
+            )
+            if current is not None and current.state == "started":
+                semantic_write_journal.mark_failed_no_effect(
+                    connection,
+                    operation.operation_id,
+                    reason_code="authority_denied_before_write",
+                )
+        return {"status": "authority_denied"}
+    except SemanticWriteUncertain:
+        if connection is not None and operation is not None:
+            current = semantic_write_journal.get_operation(
+                connection, operation.operation_id
+            )
+            if current is not None:
+                return {"status": current.state}
+        return {"status": "parked_side_effect_unknown"}
+    except Exception as exc:
+        logger.exception("Semantic resume repair failed before verification")
+        return {"status": f"semantic_error:{type(exc).__name__}"}
+    finally:
+        playwright.stop()
 
 
 def _runtime_timeout_status(*, submission_phase: str, dry_run: bool) -> str:
@@ -737,6 +1639,54 @@ def _persist_agent_turn_completed(
     except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
         logger.warning("Could not persist Agent turn completion %s: %s", request.run_id, exc)
     return occurred_at
+
+
+def _control_contract_digest(payload: Mapping[str, object]) -> str:
+    """Hash bounded control metadata without retaining prompt or environment text."""
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _confirmed_agent_checkpoint_id(request: AgentRunRequest) -> str | None:
+    """Return the exact latest checkpoint only after its durable write is visible."""
+    from applypilot.storage import agent_control
+
+    expected = (
+        f"agent-turn:v2:{request.actor_id}:{request.turn_id}:completed:checkpoint"
+    )
+    connection = _open_durable_control_connection()
+    try:
+        checkpoint = agent_control.latest_actor_checkpoint(
+            connection,
+            request.actor_id,
+        )
+    finally:
+        connection.close()
+    if checkpoint is None:
+        return None
+    identity = (
+        checkpoint.checkpoint_id,
+        checkpoint.run_id,
+        checkpoint.attempt_id,
+        checkpoint.actor_id,
+        checkpoint.turn_id,
+        checkpoint.schema_version,
+    )
+    if identity != (
+        expected,
+        request.run_id,
+        request.attempt_id,
+        request.actor_id,
+        request.turn_id,
+        "2",
+    ):
+        return None
+    return expected
 
 
 def _bounded_control_text(value: object, *, maximum: int = 200) -> str:
@@ -3054,6 +4004,42 @@ def _available_semantic_fact_names(profile: Mapping[str, object], job: Mapping[s
     return sorted(facts)
 
 
+def _install_answer_provenance_context(job: dict) -> dict[str, object]:
+    """Install one host-owned, non-authorizing provenance binding."""
+
+    binding = answer_provenance_mod.build_host_provenance_binding(job)
+    job["_answer_provenance_binding"] = binding
+    return answer_provenance_mod.public_provenance_context(binding)
+
+
+def _host_staged_field_risk(field: Mapping[str, object]) -> str:
+    """Derive risk from host-observed field state, never caller metadata."""
+
+    label = str(field.get("label") or field.get("text") or "")
+    semantic = str(field.get("semantic") or "unknown")
+    control = str(field.get("control") or "").casefold()
+    declaration = control == "checkbox" or bool(
+        re.search(
+            r"\b(?:declare|declaration|attest|attestation|certify|certification|"
+            r"acknowledge|consent|terms and conditions)\b",
+            label,
+            re.IGNORECASE,
+        )
+    )
+    staged_adapter_risk = field.get("risk")
+    adapter_risk = (
+        staged_adapter_risk
+        if staged_adapter_risk in {"low", "medium", "high"}
+        else None
+    )
+    return field_risk(
+        f"{label} {semantic}",
+        adapter_risk=adapter_risk,
+        direct_impact=field.get("direct_impact") is True,
+        declaration=declaration,
+    )
+
+
 def _build_ats_application_context(
     job: Mapping[str, object],
     profile: Mapping[str, object],
@@ -3071,6 +4057,38 @@ def _build_ats_application_context(
         "available_fact_names": _available_semantic_fact_names(profile, job),
         "side_effect": "proposal-only",
     }
+    provenance_binding = job.get("_answer_provenance_binding")
+    if isinstance(provenance_binding, Mapping):
+        recomputed = answer_provenance_mod.build_host_provenance_binding(job)
+        if dict(provenance_binding) != recomputed:
+            raise ValueError("answer provenance binding drifted before context staging")
+        context["answer_provenance"] = answer_provenance_mod.public_provenance_context(
+            recomputed
+        )
+        context["_trusted_fact_scopes"] = list(recomputed["fact_scopes"])
+        trusted_scopes = set(recomputed["fact_scopes"])
+        available_fact_refs: list[dict[str, str]] = []
+        for fact in current_profile_facts(profile):
+            if fact.scope not in trusted_scopes:
+                continue
+            resolution = resolve_application_fact_ref(
+                current_profile_facts(profile),
+                fact_ref=fact.fact_ref,
+                scope=str(fact.scope),
+                minimum_sensitivity=fact.sensitivity,
+            )
+            if not resolution.production_ready:
+                continue
+            available_fact_refs.append(
+                {
+                    "key": fact.key[:120],
+                    "fact_ref": fact.fact_ref[:160],
+                    "sensitivity": fact.sensitivity,
+                }
+            )
+            if len(available_fact_refs) >= 200:
+                break
+        context["available_fact_refs"] = available_fact_refs
     if attempt_id:
         provider_binding = job.get("_ats_application_binding")
         context["credential_binding"] = {
@@ -3095,25 +4113,62 @@ def _build_ats_application_context(
                 for raw_field in raw_fields:
                     if not isinstance(raw_field, Mapping):
                         continue
-                    options = raw_field.get("options")
-                    option_values = options if isinstance(options, list) else []
                     safe_field = {
                         key: value
                         for key, value in raw_field.items()
                         if key not in {"options", "options_truncated"}
                     }
-                    safe_field["options_sha256"] = hashlib.sha256(
-                        json.dumps(
-                            option_values,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest()
+                    safe_field["risk"] = _host_staged_field_risk(raw_field)
+                    full_digest = raw_field.get("options_full_sha256")
+                    source_count = raw_field.get("options_source_count")
+                    source_truncated = raw_field.get("options_source_truncated")
+                    if not isinstance(full_digest, str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", full_digest
+                    ):
+                        legacy_options = raw_field.get("options")
+                        declared_count = raw_field.get("option_count")
+                        count_matches = declared_count is None or (
+                            isinstance(declared_count, int)
+                            and not isinstance(declared_count, bool)
+                            and isinstance(legacy_options, list)
+                            and declared_count == len(legacy_options)
+                        )
+                        if (
+                            isinstance(legacy_options, list)
+                            and raw_field.get("options_truncated") is False
+                            and count_matches
+                        ):
+                            full_digest = hashlib.sha256(
+                                json.dumps(
+                                    legacy_options,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest()
+                            source_count = len(legacy_options)
+                            source_truncated = False
+                        else:
+                            full_digest = None
+                            source_count = declared_count
+                            source_truncated = True
+                    safe_field["options_sha256"] = full_digest
+                    safe_field["options_source_count"] = source_count
+                    safe_field["options_source_truncated"] = source_truncated
                     safe_fields.append(safe_field)
                 safe_form["fields"] = safe_fields
             context["observed_form"] = safe_form
             context["adapter"] = str(form_context.get("adapter") or adapter)
+        provenance_observation = observation.get("answer_provenance")
+        provenance_context = context.get("answer_provenance")
+        if isinstance(provenance_observation, Mapping) and isinstance(
+            provenance_context, dict
+        ):
+            snapshot_digest = str(
+                provenance_observation.get("snapshot_digest") or ""
+            )
+            if re.fullmatch(r"[0-9a-f]{64}", snapshot_digest):
+                provenance_context["expected_snapshot_digest"] = snapshot_digest
         workday_context = observation.get("workday_state")
         if isinstance(workday_context, Mapping):
             context["workday_state"] = dict(workday_context)
@@ -3139,6 +4194,90 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'submission_uncertain', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    if submission_phase == "receipt":
+        job["_runtime_recovery_admission"] = {
+            "disposition": "receipt_only",
+            "reason_code": "DETERMINISTIC_RECEIPT_OBSERVER_REQUIRED",
+            "requires_fresh_observation": True,
+        }
+        return "submission_uncertain", 0
+    turn_id = f"agent-{uuid.uuid4()}"
+    run_id = turn_id  # Backward-compatible runtime/report identity.
+    attempt_id = str(job.get("_attempt_id") or f"preview-{turn_id}")
+    actor_id = application_actor_id(attempt_id)
+    stored_parent_turn_id = str(job.get("_parent_agent_run_id") or "").strip()
+    stored_parent_checkpoint_id = str(
+        job.get("_parent_agent_checkpoint_id") or ""
+    ).strip()
+    recovery_command = _scoped_runtime_recovery()
+    operator_resume = _scoped_operator_resume()
+    submit_continuation = _scoped_submit_continuation()
+    if recovery_command is not None:
+        if (
+            recovery_command.actor_id != actor_id
+            or recovery_command.attempt_id != attempt_id
+            or recovery_command.turn_id != stored_parent_turn_id
+            or not stored_parent_checkpoint_id
+        ):
+            raise RuntimeError("runtime recovery parent/checkpoint binding is stale")
+        runtime_parent_turn_id: str | None = recovery_command.turn_id
+        runtime_parent_checkpoint_id: str | None = stored_parent_checkpoint_id
+        runtime_authorization_id: str | None = recovery_command.command_id
+    elif operator_resume is not None:
+        if (
+            submission_phase != "prepare"
+            or operator_resume.get("actor_id") != actor_id
+            or operator_resume.get("attempt_id") != attempt_id
+            or operator_resume.get("parent_turn_id") != stored_parent_turn_id
+            or operator_resume.get("checkpoint_id") != stored_parent_checkpoint_id
+        ):
+            raise RuntimeError("operator resume parent/checkpoint binding is stale")
+        runtime_parent_turn_id = stored_parent_turn_id
+        runtime_parent_checkpoint_id = stored_parent_checkpoint_id
+        runtime_authorization_id = str(
+            operator_resume.get("authorization_id") or ""
+        )
+    elif submit_continuation is not None:
+        if (
+            submission_phase != "submit"
+            or submit_continuation.get("actor_id") != actor_id
+            or submit_continuation.get("attempt_id") != attempt_id
+            or submit_continuation.get("parent_turn_id") != stored_parent_turn_id
+            or submit_continuation.get("checkpoint_id")
+            != stored_parent_checkpoint_id
+        ):
+            raise RuntimeError("submit continuation parent/checkpoint binding is stale")
+        runtime_parent_turn_id = stored_parent_turn_id
+        runtime_parent_checkpoint_id = stored_parent_checkpoint_id
+        runtime_authorization_id = str(
+            submit_continuation.get("authorization_id") or ""
+        )
+    else:
+        # A job-carried parent is diagnostic only.  It cannot authorize a child
+        # process without the currently executing recovery command capability.
+        runtime_parent_turn_id = None
+        runtime_parent_checkpoint_id = None
+        runtime_authorization_id = None
+    restart_admission = _durable_agent_runtime.reconcile_actor(actor_id, attempt_id)
+    job["_runtime_recovery_admission"] = {
+        "disposition": restart_admission.disposition,
+        "parent_turn_id": restart_admission.parent_turn_id,
+        "reason_code": restart_admission.reason_code,
+        "requires_fresh_observation": restart_admission.requires_fresh_observation,
+    }
+    if restart_admission.disposition == "live_owner":
+        return "failed:runtime_owner_active", 0
+    if restart_admission.disposition == "blocked":
+        return "failed:runtime_recovery_blocked", 0
+    if restart_admission.disposition == "receipt_only":
+        return "submission_uncertain", 0
+    if restart_admission.disposition == "recovery_required":
+        scoped_recovery_matches = bool(
+            (recovery_command is not None or operator_resume is not None)
+            and runtime_parent_turn_id == restart_admission.parent_turn_id
+        )
+        if not scoped_recovery_matches:
+            return "failed:runtime_recovery_required", 0
     setup_started = time.perf_counter()
     setup_metrics: dict[str, int | float] = {}
     runtime_settings = load_runtime_settings()
@@ -3250,10 +4389,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     else:
         worker_dir = reset_worker_dir(worker_id)
 
-    turn_id = f"agent-{uuid.uuid4()}"
-    run_id = turn_id  # Backward-compatible runtime/report identity.
-    attempt_id = str(job.get("_attempt_id") or f"preview-{turn_id}")
-    actor_id = application_actor_id(attempt_id)
     broker_session_persistent = bool(job.get("_browser_root_runtime"))
     browser_lease_bundle = _browser_lease_for_agent_turn(
         job,
@@ -3266,6 +4401,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         dry_run=dry_run,
         resume_existing_page=resume_existing_page,
     )
+    _install_answer_provenance_context(job)
     report_path = worker_dir / "agent-turn-report.json"
     ats_context_path = worker_dir / "ats-application-context.json"
     if report_path.exists():
@@ -3300,6 +4436,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         credential_relay_authorized=credential_relay_authorized,
         identity_relay_authorized=identity_relay_authorized,
     )
+    if operator_resume is not None:
+        agent_prompt += (
+            "\n\nOPERATOR RESUME BOUNDARY:\n"
+            "An exact reference-only human response has been admitted for this "
+            "same page and checkpoint. Re-observe the current page and use only "
+            "current host-provided facts or visible state. Never infer answer "
+            "content from an opaque response reference. This is a prepare-only "
+            "turn and does not authorize Submit.\n"
+        )
     setup_metrics["prompt_build_ms"] = round(
         (time.perf_counter() - prompt_started) * 1000,
         3,
@@ -3494,15 +4639,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 if isinstance(ats_context.get("workday_state"), Mapping)
                 else {}
             ),
+            **(
+                {
+                    "operator_resume": {
+                        "request_id": str(operator_resume["request_id"]),
+                        "response_type": _bounded_control_text(
+                            operator_resume["response_type"], maximum=80
+                        ),
+                        "reference_only": True,
+                        "submit_authority": False,
+                    }
+                }
+                if operator_resume is not None
+                else {}
+            ),
         },
         available_tools=tuple(job["_available_tools"]),
         actor_id=actor_id,
         turn_id=turn_id,
-        parent_run_id=(
-            str(job["_parent_agent_run_id"])
-            if job.get("_parent_agent_run_id")
-            else None
-        ),
+        parent_run_id=runtime_parent_turn_id,
         concurrency_mode=str(job.get("_agent_concurrency_mode") or "serial_per_page"),
     )
 
@@ -3528,6 +4683,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
     stats: dict = {}
     proc = None
+    durable_handle: DurableRunHandle | None = None
     watchdog: threading.Timer | None = None
     lease_heartbeat: LeaseHeartbeat | None = None
     timed_out = threading.Event()
@@ -3630,20 +4786,51 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             env=env,
             runtime_id=browser_lease_bundle.profile.runtime_id,
             profile_id=browser_lease_bundle.profile.resource_id,
-            parent_run_id=agent_request.parent_run_id,
+            parent_run_id=runtime_parent_turn_id,
             submit_started=submission_phase == "submit" and not dry_run,
         )
-        if agent_request.parent_run_id:
-            proc = _agent_subprocess_runtime.resume(
-                agent_request.parent_run_id,
-                launch_spec,
+        raw_control_contract = job.get("_control_contract")
+        prompt_contract = (
+            dict(raw_control_contract)
+            if isinstance(raw_control_contract, Mapping)
+            else {}
+        )
+        durable_intent = DurableLaunchIntent(
+            spec=launch_spec,
+            runtime_backend=f"{agent_backend}-cli",
+            resume_mode="resume" if runtime_parent_turn_id else "root",
+            checkpoint_id=runtime_parent_checkpoint_id,
+            model=model,
+            recovery_authorization_id=(
+                runtime_authorization_id
+            ),
+            tool_surface_hash=_control_contract_digest(
+                {
+                    "schema_version": "1",
+                    "available_tools": sorted(agent_request.available_tools),
+                }
+            ),
+            prompt_contract_hash=_control_contract_digest(
+                {
+                    "schema_version": "1",
+                    "phase": submission_phase,
+                    "dry_run": dry_run,
+                    "control_contract": prompt_contract,
+                }
+            ),
+            idempotency_key=f"agent-turn:v2:{actor_id}:{turn_id}:spawn",
+        )
+        if runtime_parent_turn_id:
+            durable_handle = _durable_agent_runtime.resume(
+                durable_intent,
                 popen_factory=subprocess.Popen,
             )
         else:
-            proc = _agent_subprocess_runtime.start(
-                launch_spec,
+            durable_handle = _durable_agent_runtime.start(
+                durable_intent,
                 popen_factory=subprocess.Popen,
             )
+        proc = durable_handle.process
         process_spawned_at = time.perf_counter()
         setup_metrics["process_spawn_ms"] = round(
             (process_spawned_at - process_spawn_started) * 1000,
@@ -4116,10 +5303,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
-        if agent_process_started:
-            _agent_subprocess_runtime.close(run_id)
-            job["_parent_agent_run_id"] = run_id
+            try:
+                _kill_process_tree(proc.pid)
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning(
+                    "Could not prove Agent subprocess termination %s: %s",
+                    run_id,
+                    type(exc).__name__,
+                )
+        if agent_process_started and durable_handle is not None:
+            job.pop("_parent_agent_run_id", None)
+            job.pop("_parent_agent_checkpoint_id", None)
             final_duration_ms = turn_duration_ms or int((time.time() - start) * 1000)
             final_status = turn_application_status or (
                 "submission_uncertain"
@@ -4134,37 +5329,85 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             job["_agent_turn_result"] = contract_json(final_result)
             job["_agent_observations"] = dict(final_result.observations)
             job["_agent_turn_source"] = turn_source
-            _persist_agent_turn_completed(
-                agent_request,
-                final_result,
-                application_status=final_status,
-                duration_ms=final_duration_ms,
-                source=turn_source,
-                occurred_after=last_agent_event_at,
-                metrics={
-                    **setup_metrics,
-                    **stats,
-                    "first_output_ms": (
-                        0
-                        if first_output_at is None or process_spawned_at is None
-                        else round((first_output_at - process_spawned_at) * 1000, 3)
-                    ),
-                    "first_tool_ms": (
-                        0
-                        if first_tool_at is None or process_spawned_at is None
-                        else round((first_tool_at - process_spawned_at) * 1000, 3)
-                    ),
-                    "last_tool_ms": (
-                        0
-                        if last_tool_at is None or process_spawned_at is None
-                        else round((last_tool_at - process_spawned_at) * 1000, 3)
-                    ),
-                    "tool_call_count": tool_call_count,
-                    "unique_tool_count": len(unique_tools),
-                    "browser_tool_call_count": browser_tool_call_count,
-                    "browser_tool_success_count": browser_tool_success_count,
-                },
-            )
+            process_returncode = durable_handle.process.poll()
+            if process_returncode is not None:
+                _persist_agent_turn_completed(
+                    agent_request,
+                    final_result,
+                    application_status=final_status,
+                    duration_ms=final_duration_ms,
+                    source=turn_source,
+                    occurred_after=last_agent_event_at,
+                    metrics={
+                        **setup_metrics,
+                        **stats,
+                        "first_output_ms": (
+                            0
+                            if first_output_at is None or process_spawned_at is None
+                            else round((first_output_at - process_spawned_at) * 1000, 3)
+                        ),
+                        "first_tool_ms": (
+                            0
+                            if first_tool_at is None or process_spawned_at is None
+                            else round((first_tool_at - process_spawned_at) * 1000, 3)
+                        ),
+                        "last_tool_ms": (
+                            0
+                            if last_tool_at is None or process_spawned_at is None
+                            else round((last_tool_at - process_spawned_at) * 1000, 3)
+                        ),
+                        "tool_call_count": tool_call_count,
+                        "unique_tool_count": len(unique_tools),
+                        "browser_tool_call_count": browser_tool_call_count,
+                        "browser_tool_success_count": browser_tool_success_count,
+                    },
+                )
+                checkpoint_id = _confirmed_agent_checkpoint_id(agent_request)
+                if checkpoint_id is None:
+                    durable_status = "unknown"
+                    durable_failure = "CONTROL_CHECKPOINT_UNCONFIRMED"
+                elif final_status == "submission_uncertain":
+                    durable_status = "unknown"
+                    durable_failure = "SUBMISSION_RESULT_UNKNOWN"
+                elif timed_out.is_set():
+                    durable_status = "timed_out"
+                    durable_failure = "AGENT_RUNTIME_TIMEOUT"
+                elif process_returncode == 0:
+                    durable_status = "completed"
+                    durable_failure = None
+                else:
+                    durable_status = "failed"
+                    durable_failure = f"PROCESS_EXIT_{process_returncode}"
+                try:
+                    terminal_turn = _durable_agent_runtime.terminal(
+                        durable_handle,
+                        status=durable_status,
+                        failure_code=durable_failure,
+                        exit_code=process_returncode,
+                    )
+                except (KeyError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                    logger.warning(
+                        "Could not terminalize durable Agent turn %s: %s",
+                        run_id,
+                        type(exc).__name__,
+                    )
+                else:
+                    if checkpoint_id is not None and terminal_turn.status != "unknown":
+                        job["_parent_agent_run_id"] = run_id
+                        job["_parent_agent_checkpoint_id"] = checkpoint_id
+            else:
+                logger.error(
+                    "Agent subprocess remains live after cleanup; durable turn %s stays running",
+                    run_id,
+                )
+            try:
+                _durable_agent_runtime.close_local(run_id)
+            except (KeyError, agent_runtime_mod.SubprocessRuntimeError) as exc:
+                logger.warning(
+                    "Could not close local Agent runtime handle %s: %s",
+                    run_id,
+                    type(exc).__name__,
+                )
         if not broker_session_persistent:
             _browser_broker.release_scope(f"worker:{worker_id}")
             job.pop("_browser_lease_binding", None)

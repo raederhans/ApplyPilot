@@ -1,0 +1,220 @@
+{
+  "schema_version": "applypilot-dry-cohort-benchmark/v1",
+  "label": "replay+synthetic+dry-run_not_a_real_provider_benchmark",
+  "fixture_id": "apply-cohort-v1",
+  "description": "Local synthetic Workday and SmartRecruiters states; no live provider or default database access.",
+  "scenarios": [
+    {
+      "scenario_id": "workday-multipage-preview",
+      "provider": "workday",
+      "synthetic_state": "multipage_next_verified",
+      "dry_run": true,
+      "request": {
+        "run_id": "cohort-workday-multipage",
+        "attempt_id": "attempt-cohort-workday-multipage",
+        "agent_role": "synthetic-ats-dry-run",
+        "phase": "submit",
+        "objective": "Prepare a synthetic Workday application without submitting it",
+        "available_tools": ["browser_snapshot", "evaluate_workday_progress", "browser_fill_form"],
+        "context": {"provider": "workday", "fixture_state": "multipage_next_verified"},
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "synthetic_local_dry_run"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "previewed",
+        "receipt": false,
+        "conflict": false,
+        "tools": ["browser_snapshot", "evaluate_workday_progress", "browser_fill_form"],
+        "side_effects": ["read", "read", "write"],
+        "max_latency_ms": 500
+      },
+      "guardrails": {
+        "final_submit_attempts": 0,
+        "submit_lane_peak": 0,
+        "submit_lane_acquisitions": 0,
+        "submission_gate_attempts": 0,
+        "batch_consumptions": 0,
+        "receipt_admissions": 0,
+        "stale_writes": 0,
+        "profile_cross_talk": 0,
+        "acquisition_attempts": 1,
+        "empty_polls": 0
+      }
+    },
+    {
+      "scenario_id": "workday-required-human-boundary",
+      "provider": "workday",
+      "synthetic_state": "identity_field_manual_boundary",
+      "dry_run": true,
+      "request": {
+        "run_id": "cohort-workday-human",
+        "attempt_id": "attempt-cohort-workday-human",
+        "agent_role": "synthetic-ats-dry-run",
+        "phase": "submit",
+        "objective": "Park a synthetic Workday human-only field without submitting it",
+        "available_tools": ["browser_snapshot", "report_agent_turn"],
+        "context": {"provider": "workday", "fixture_state": "identity_field_manual_boundary"},
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "synthetic_local_dry_run"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "previewed",
+        "receipt": false,
+        "conflict": false,
+        "tools": ["browser_snapshot", "report_agent_turn"],
+        "side_effects": ["read", "read"],
+        "max_latency_ms": 500
+      },
+      "guardrails": {
+        "final_submit_attempts": 0,
+        "submit_lane_peak": 0,
+        "submit_lane_acquisitions": 0,
+        "submission_gate_attempts": 0,
+        "batch_consumptions": 0,
+        "receipt_admissions": 0,
+        "stale_writes": 0,
+        "profile_cross_talk": 0,
+        "acquisition_attempts": 1,
+        "empty_polls": 0
+      }
+    },
+    {
+      "scenario_id": "smartrecruiters-upload-preview",
+      "provider": "smartrecruiters",
+      "synthetic_state": "resume_upload_verified",
+      "dry_run": true,
+      "request": {
+        "run_id": "cohort-smart-upload",
+        "attempt_id": "attempt-cohort-smart-upload",
+        "agent_role": "synthetic-ats-dry-run",
+        "phase": "submit",
+        "objective": "Prepare a synthetic SmartRecruiters application without submitting it",
+        "available_tools": ["browser_snapshot", "browser_upload", "browser_fill_form"],
+        "context": {"provider": "smartrecruiters", "fixture_state": "resume_upload_verified"},
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "synthetic_local_dry_run"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "previewed",
+        "receipt": false,
+        "conflict": false,
+        "tools": ["browser_snapshot", "browser_upload", "browser_fill_form"],
+        "side_effects": ["read", "write", "write"],
+        "max_latency_ms": 500
+      },
+      "guardrails": {
+        "final_submit_attempts": 0,
+        "submit_lane_peak": 0,
+        "submit_lane_acquisitions": 0,
+        "submission_gate_attempts": 0,
+        "batch_consumptions": 0,
+        "receipt_admissions": 0,
+        "stale_writes": 0,
+        "profile_cross_talk": 0,
+        "acquisition_attempts": 1,
+        "empty_polls": 0
+      }
+    },
+    {
+      "scenario_id": "smartrecruiters-stale-page-parks",
+      "provider": "smartrecruiters",
+      "synthetic_state": "stale_page_epoch",
+      "dry_run": true,
+      "request": {
+        "run_id": "cohort-smart-stale",
+        "attempt_id": "attempt-cohort-smart-stale",
+        "agent_role": "synthetic-ats-dry-run",
+        "phase": "submit",
+        "objective": "Preserve a synthetic SmartRecruiters stale-page result without submitting it",
+        "available_tools": ["browser_snapshot", "report_agent_turn"],
+        "context": {"provider": "smartrecruiters", "fixture_state": "stale_page_epoch"},
+        "control_route": {
+          "interaction_driver": "playwright",
+          "browser_runtime": "edge",
+          "phase": "submit",
+          "reason_code": "synthetic_local_dry_run"
+        },
+        "interaction_mode": "playwright"
+      },
+      "expected": {
+        "status": "previewed",
+        "receipt": false,
+        "conflict": false,
+        "tools": ["browser_snapshot", "report_agent_turn"],
+        "side_effects": ["read", "read"],
+        "max_latency_ms": 500
+      },
+      "guardrails": {
+        "final_submit_attempts": 0,
+        "submit_lane_peak": 0,
+        "submit_lane_acquisitions": 0,
+        "submission_gate_attempts": 0,
+        "batch_consumptions": 0,
+        "receipt_admissions": 0,
+        "stale_writes": 0,
+        "profile_cross_talk": 0,
+        "acquisition_attempts": 1,
+        "empty_polls": 0
+      }
+    }
+  ],
+  "runtimes": {
+    "synthetic-local-replay": {
+      "cohort-workday-multipage": {
+        "latency_ms": 32,
+        "legacy_output": "RESULT:PREVIEWED\nPREVIEW_AUDIT: {\"submission_attempted\": false, \"resume_uploaded\": true, \"filled_fields\": [\"education\", \"location\"], \"manual_review_fields\": [], \"final_control_label\": \"Submit application\"}",
+        "result": {
+          "run_id": "cohort-workday-multipage",
+          "status": "previewed",
+          "summary": "Synthetic Workday page progression reached a submit-free preview",
+          "observations": {"preview_audit": {"submission_attempted": false, "resume_uploaded": true, "filled_fields": ["education", "location"], "manual_review_fields": [], "final_control_label": "Submit application"}, "tool_calls": [{"name": "browser_snapshot", "side_effect": "read"}, {"name": "evaluate_workday_progress", "side_effect": "read"}, {"name": "browser_fill_form", "side_effect": "write"}]}
+        }
+      },
+      "cohort-workday-human": {
+        "latency_ms": 25,
+        "legacy_output": "RESULT:PREVIEWED\nPREVIEW_AUDIT: {\"submission_attempted\": false, \"resume_uploaded\": true, \"filled_fields\": [\"education\"], \"manual_review_fields\": [\"identity\"], \"final_control_label\": \"Submit application\"}",
+        "result": {
+          "run_id": "cohort-workday-human",
+          "status": "previewed",
+          "summary": "Synthetic Workday human boundary was parked",
+          "observations": {"preview_audit": {"submission_attempted": false, "resume_uploaded": true, "filled_fields": ["education"], "manual_review_fields": ["identity"], "final_control_label": "Submit application"}, "tool_calls": [{"name": "browser_snapshot", "side_effect": "read"}, {"name": "report_agent_turn", "side_effect": "read"}]}
+        }
+      },
+      "cohort-smart-upload": {
+        "latency_ms": 29,
+        "legacy_output": "RESULT:PREVIEWED\nPREVIEW_AUDIT: {\"submission_attempted\": false, \"resume_uploaded\": true, \"filled_fields\": [\"resume\", \"name\"], \"manual_review_fields\": [], \"final_control_label\": \"Submit application\"}",
+        "result": {
+          "run_id": "cohort-smart-upload",
+          "status": "previewed",
+          "summary": "Synthetic SmartRecruiters upload remained submit-free",
+          "observations": {"preview_audit": {"submission_attempted": false, "resume_uploaded": true, "filled_fields": ["resume", "name"], "manual_review_fields": [], "final_control_label": "Submit application"}, "tool_calls": [{"name": "browser_snapshot", "side_effect": "read"}, {"name": "browser_upload", "side_effect": "write"}, {"name": "browser_fill_form", "side_effect": "write"}]}
+        }
+      },
+      "cohort-smart-stale": {
+        "latency_ms": 21,
+        "legacy_output": "RESULT:PREVIEWED\nPREVIEW_AUDIT: {\"submission_attempted\": false, \"resume_uploaded\": true, \"filled_fields\": [], \"manual_review_fields\": [\"stale_page_epoch\"], \"final_control_label\": \"Submit application\"}",
+        "result": {
+          "run_id": "cohort-smart-stale",
+          "status": "previewed",
+          "summary": "Synthetic SmartRecruiters stale page remained parked",
+          "observations": {"preview_audit": {"submission_attempted": false, "resume_uploaded": true, "filled_fields": [], "manual_review_fields": ["stale_page_epoch"], "final_control_label": "Submit application"}, "tool_calls": [{"name": "browser_snapshot", "side_effect": "read"}, {"name": "report_agent_turn", "side_effect": "read"}]}
+        }
+      }
+    }
+  }
+}

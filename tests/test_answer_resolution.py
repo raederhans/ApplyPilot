@@ -1,12 +1,44 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
+
 import pytest
 
 from applypilot.apply.answer_resolution import (
     AnswerRequest,
     SensitiveAnswerError,
-    resolve_answer,
 )
+from applypilot.apply.answer_resolution import (
+    resolve_answer as _resolve_answer,
+)
+from applypilot.apply.application_facts import ApplicationFact, resolve_application_fact
+
+
+def resolve_answer(request: AnswerRequest):  # type: ignore[no-untyped-def]
+    """Give legacy behavior tests explicit current-fact provenance."""
+    if request.confirmed_fact is not None:
+        fact_resolution = resolve_application_fact(
+            (
+                ApplicationFact(
+                    "profile:test-fact",
+                    "test_fact",
+                    request.confirmed_fact,
+                    source="profile.json",
+                    scope="test",
+                    confirmed_at=datetime(2026, 8, 31, tzinfo=UTC),
+                    expires_at=datetime(2027, 8, 31, tzinfo=UTC),
+                    sensitivity="high",
+                ),
+            ),
+            key="test_fact",
+            scope="test",
+        )
+        request = replace(
+            request,
+            fact_resolution=fact_resolution,
+        )
+    return _resolve_answer(request)
 
 
 def test_degree_taxonomy_prefers_broader_same_level_category() -> None:
@@ -41,7 +73,7 @@ def test_degree_taxonomy_can_use_nearest_named_category_when_auditable() -> None
     assert result.relation == "closest_non_equivalent"
     assert result.action == "select_and_record"
     assert result.selected_option == "Master of Science"
-    assert result.audit["confirmed_fact"] == "Master of Computing in Applied AI"
+    assert result.audit["fact_ref"] == "profile:test-fact"
     assert result.audit["confidence"] == result.confidence
 
 
@@ -145,9 +177,7 @@ def test_legal_declaration_rejects_nearest_non_equivalent_answer() -> None:
 
 
 def test_only_unknown_required_high_impact_fact_requires_review() -> None:
-    low_impact = resolve_answer(
-        AnswerRequest(field_semantic="Preferred team", options=("A", "B"), required=True)
-    )
+    low_impact = resolve_answer(AnswerRequest(field_semantic="Preferred team", options=("A", "B"), required=True))
     high_impact = resolve_answer(
         AnswerRequest(
             field_semantic="Citizenship declaration",
@@ -158,10 +188,26 @@ def test_only_unknown_required_high_impact_fact_requires_review() -> None:
         )
     )
 
-    assert low_impact.action == "select_and_record"
-    assert low_impact.selected_option == "A"
+    assert low_impact.action == "research_then_select"
+    assert low_impact.selected_option is None
+    assert low_impact.audit["failure_code"] == "answer_policy_unresolved"
     assert high_impact.action == "review"
     assert high_impact.relation == "contradiction"
+    assert high_impact.audit["failure_code"] == "unsupported_legal_declaration"
+
+
+def test_automatic_resolution_has_no_failure_code() -> None:
+    result = resolve_answer(
+        AnswerRequest(
+            field_semantic="Years of Python experience",
+            options=("0 years", "5+"),
+            confirmed_fact=6,
+            required=True,
+        )
+    )
+
+    assert result.action == "select"
+    assert "failure_code" not in result.audit
 
 
 @pytest.mark.parametrize(
@@ -225,9 +271,7 @@ def test_verbose_negative_availability_continues() -> None:
         (("同意（I agree）", "不同意（I disagree）"), False, "不同意（I disagree）"),
     ],
 )
-def test_chinese_boolean_labels_preserve_visible_option(
-    options: tuple[str, str], fact: bool, expected: str
-) -> None:
+def test_chinese_boolean_labels_preserve_visible_option(options: tuple[str, str], fact: bool, expected: str) -> None:
     result = resolve_answer(
         AnswerRequest(
             field_semantic="Confirmed boolean question",

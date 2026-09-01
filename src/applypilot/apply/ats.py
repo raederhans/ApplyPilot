@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+from applypilot.apply.answer_policy import FieldRisk, field_risk
+
 ATS_SCHEMA_VERSION = "1"
 MAX_FORM_FIELDS = 200
 MAX_OPTIONS_PER_FIELD = 100
@@ -140,6 +142,7 @@ class FormFieldIR:
     readonly: bool = False
     options: tuple[str, ...] = ()
     constraints: Mapping[str, object] = field(default_factory=dict)
+    risk: FieldRisk = "low"
 
     def __post_init__(self) -> None:
         if not self.field_key.strip():
@@ -186,6 +189,8 @@ class AtsAdapter(Protocol):
 
     def normalize_semantic(self, semantic: str, raw: Mapping[str, object]) -> str: ...
 
+    def risk_for(self, semantic: str, raw: Mapping[str, object]) -> FieldRisk | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class GenericAtsAdapter:
@@ -204,6 +209,10 @@ class GenericAtsAdapter:
     def normalize_semantic(self, semantic: str, raw: Mapping[str, object]) -> str:
         del raw
         return semantic
+
+    def risk_for(self, semantic: str, raw: Mapping[str, object]) -> FieldRisk | None:
+        del semantic, raw
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +367,8 @@ def build_form_ir(
         if unexpected:
             raw = {key: value for key, value in raw.items() if key.casefold() not in _VALUE_KEYS}
         semantic = adapter.normalize_semantic(_semantic(raw), raw)
+        risk_hook = getattr(adapter, "risk_for", None)
+        adapter_risk = risk_hook(semantic, raw) if callable(risk_hook) else None
         raw_options = raw.get("options")
         options = (
             tuple(_text(option, limit=120) for option in raw_options[:MAX_OPTIONS_PER_FIELD])
@@ -380,6 +391,7 @@ def build_form_ir(
                 readonly=bool(raw.get("readonly", False)),
                 options=options,
                 constraints=constraints,
+                risk=field_risk(semantic, adapter_risk=adapter_risk),
             )
         )
     return FormIR(site=_hostname(url), adapter=adapter.name, fields=tuple(built), truncated=truncated)

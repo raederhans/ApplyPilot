@@ -1,0 +1,34 @@
+[
+  {
+    "name": "false_is_a_value",
+    "scope": "job:fixture",
+    "expected": false,
+    "facts": [
+      {
+        "fact_ref": "fixture:false",
+        "key": "answer",
+        "value": false,
+        "source": "redacted-profile-fixture",
+        "scope": "job:fixture",
+        "confirmed_at": "2026-08-31T00:00:00Z",
+        "sensitivity": "medium"
+      }
+    ]
+  },
+  {
+    "name": "zero_is_a_value",
+    "scope": "job:fixture",
+    "expected": 0,
+    "facts": [
+      {
+        "fact_ref": "fixture:zero",
+        "key": "answer",
+        "value": 0,
+        "source": "redacted-profile-fixture",
+        "scope": "job:fixture",
+        "confirmed_at": "2026-08-31T00:00:00Z",
+        "sensitivity": "medium"
+      }
+    ]
+  }
+]

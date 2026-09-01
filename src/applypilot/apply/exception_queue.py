@@ -9,6 +9,7 @@ from applypilot.apply.contracts import (
     ExceptionQueueKind,
     RecoveryCommand,
 )
+from applypilot.apply.operator_binding import OPERATOR_RESUME_BINDING_KEYS
 
 
 def exception_id_for_command(command_id: str) -> str:
@@ -49,6 +50,14 @@ def exception_for_command(
         context["failure_reason"] = str(failure_reason)[:200]
     if terminal_status is not None:
         context["terminal_status"] = str(terminal_status)[:40]
+    if command.command == "enqueue_human_handoff":
+        resume_binding = {
+            key: command.payload[key]
+            for key in OPERATOR_RESUME_BINDING_KEYS
+            if key in command.payload
+        }
+        if set(resume_binding) == OPERATOR_RESUME_BINDING_KEYS:
+            context.update(resume_binding)
     return ApplicationException(
         exception_id=exception_id_for_command(command.command_id),
         command_id=command.command_id,
