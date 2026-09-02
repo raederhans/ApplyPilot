@@ -37,12 +37,12 @@ STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
       element.getClientRects().length > 0;
   };
   const nativeActive = (element) => !element.matches(':disabled');
-  const customActive = (element) => !element.matches(':disabled') &&
-    String(element.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
   const selected = (element) => element.checked === true ||
     ['true', 'mixed'].includes(
       String(element.getAttribute('aria-checked') || '').toLowerCase()
-    ) || String(element.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+    ) || ['true', 'mixed'].includes(
+      String(element.getAttribute('aria-pressed') || '').toLowerCase()
+    );
   const required = (element) => element.required === true ||
     String(element.getAttribute('aria-required') || '').toLowerCase() === 'true';
   const proxySelected = (element) => [...(element.labels || [])]
@@ -57,8 +57,9 @@ STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
   const customCandidates = [...new Set(elements.filter((element) =>
     !element.matches('input[type="checkbox"],input[type="radio"]') &&
     element.matches(
-      '[role="checkbox"],[role="radio"],[role="switch"],[aria-checked],[aria-pressed]'
-    ) && customActive(element)
+      '[role~="checkbox" i],[role~="radio" i],[role~="switch" i],'
+      + '[aria-checked],[aria-pressed]'
+    )
   ))];
   const activeCustom = customCandidates.filter((element) =>
     rendered(element) || selected(element) || required(element)
