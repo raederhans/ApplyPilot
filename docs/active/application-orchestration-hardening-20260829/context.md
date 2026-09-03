@@ -188,3 +188,10 @@ Obtain explicit commit/push authority for the frozen P6 candidate, create one `a
 - Brand evidence from the parent worktree selects CapyPilot as the user-visible name. Package, command, environment, database, and schema compatibility continues under existing ApplyPilot identifiers.
 - Windows RSS admission now measures current working set instead of the historical peak. Focused regression and cross-phase validation passed `282` tests.
 - Combined local qualification on commit `a83d8e2` passed `1721` tests in `116.40s`, full Ruff, `git diff --check`, audited release build, and clean-wheel smoke. The first full invocation produced `111` setup errors solely because the chosen `--basetemp` parent directory did not exist; after creating that isolated parent, the unchanged commit passed the complete suite. Remote exact-head CI, push, and cleanup remain pending at this checkpoint.
+
+### 2026-09-03 integration closeout
+
+- `fork/main` and local `main` advanced by ordinary fast-forward to `cc14585`; upstream `origin/main` was not modified.
+- Exact-head GitHub Actions run `33708579050` completed successfully with four real jobs: Python 3.11, 3.12, 3.13, and Windows 3.12 core tests plus clean-install smoke.
+- The Happy/P0-P4, CapyPilot-brand, and integration local branches and both isolated worktrees were removed. The merged remote `agent/application-orchestration-hardening-20260901` branch was also removed; `fork/dev` was retained because it is not merged.
+- Stash `027f5756c73174acc7d3b7603f7540740e9f9ed4` remains as a recovery snapshot. Byte comparison found 26 non-temporary paths that are not identical to final `main`, so deleting it would discard unproven WIP. The primary worktree itself is clean.

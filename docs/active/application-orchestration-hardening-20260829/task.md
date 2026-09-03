@@ -210,5 +210,5 @@ P4 accepted delivery is the concurrency evidence/governor mechanism, not a highe
 - [x] Keep loopback HTTP MCP default-off and keep production workers at 1.
 - [x] Post-audit focused suite: `282 passed in 20.39s`; scoped Ruff passed.
 - [x] Final combined CapyPilot/P0-P4 gate: `1721 passed in 116.40s`; full Ruff and `git diff --check` passed; audited release build produced wheel, sdist, bundle, and checksums; clean-wheel smoke passed install, `resume-route --help`, `CapyPilot 0.4.0`, init, doctor, and dashboard generation.
-- [ ] Ordinary push to `fork/main` and exact-head four-job CI observation.
-- [ ] Fast-forward local `main`; remove only proven-integrated branches/worktrees and recoverable temporary WIP.
+- [x] Ordinary push to `fork/main`; exact-head CI run `33708579050` scheduled four non-empty jobs and all passed on `cc14585` (Python 3.11/3.12/3.13 and Windows 3.12 clean-install smoke).
+- [x] Fast-forward local `main`; remove the two isolated worktrees, their three local integration/source branches, and the merged remote hardening branch. Preserve stash `027f5756` because 26 non-temporary paths are not byte-identical to final `main` and therefore are not safe to discard as redundant WIP.
