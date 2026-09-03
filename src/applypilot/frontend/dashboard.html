@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
-  <title>ApplyPilot Local — Opportunity Workbench</title>
+  <title>CapyPilot — Opportunity Workbench</title>
   <style>
     :root {
       --ink: #0a0c0b;
@@ -625,7 +625,7 @@
   <a class="skip-link" href="#main-content">Skip to main content</a>
   <div class="app-shell">
     <aside class="rail" aria-label="Product workflow">
-      <div class="brand"><span class="brand-mark">AP</span><span>ApplyPilot <small>Local</small></span></div>
+      <div class="brand"><span class="brand-mark">CP</span><span>CapyPilot</span></div>
       <p class="rail-label">Core workflow</p>
       <ol class="workflow" role="tablist" aria-label="Workbench stage">
         <li role="presentation"><button id="discover-tab" type="button" role="tab" aria-selected="false" aria-controls="discover-panel" data-stage="discover" tabindex="-1"><span class="step-number">01</span><span><strong>Discover</strong><span>Source truth</span></span><span class="stage-count" id="discover-stage-count">0</span></button></li>
@@ -1118,7 +1118,7 @@
         "Every shortlisted role has a current resume route, a validated PDF binding, no recorded hard gap, and a resolved cover-letter requirement.": "每个入围岗位都有当前简历路由、已验证的 PDF 绑定、无已记录硬性缺口，且求职信要求已解决。",
         "Review the recorded gaps before running any preparation command. Nothing is generated or changed from this page.": "运行准备命令前请审核已记录的缺口。本页面不会生成或更改任何内容。",
         "Unable to read the local workspace": "无法读取本地工作区",
-        "Your data was not changed. Run the read-only diagnostic; ApplyPilot will not repair or replace the database automatically.": "数据未被更改。请运行只读诊断；ApplyPilot 不会自动修复或替换数据库。",
+        "Your data was not changed. Run the read-only diagnostic; CapyPilot will not repair or replace the database automatically.": "数据未被更改。请运行只读诊断；CapyPilot 不会自动修复或替换数据库。",
         "Run diagnostic": "运行诊断",
         "No persisted resume route is available for this job version.": "此岗位版本没有已保存的简历路由。",
         "The recorded resume route belongs to an older version of this job.": "已记录的简历路由属于此岗位的旧版本。",
@@ -1933,7 +1933,7 @@
         document.getElementById("page-eyebrow").textContent = t(copy.eyebrow);
         document.getElementById("page-title").textContent = t(copy.title);
         document.getElementById("page-copy").textContent = t(copy.copy);
-        document.title = `ApplyPilot Local — ${t(copy.eyebrow)}`;
+        document.title = `CapyPilot — ${t(copy.eyebrow)}`;
         if (updateHash && location.hash !== `#${stage}`) {
           try { history.replaceState(null, "", `#${stage}`); }
           catch { location.hash = stage; }

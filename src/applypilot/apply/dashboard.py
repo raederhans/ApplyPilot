@@ -112,7 +112,7 @@ def render_dashboard() -> Table:
     Returns:
         A Rich Table object ready for display.
     """
-    table = Table(title="ApplyPilot Dashboard", expand=True, show_lines=False)
+    table = Table(title="CapyPilot Dashboard", expand=True, show_lines=False)
     table.add_column("W", style="bold", width=3, justify="center")
     table.add_column("Job", min_width=30, max_width=50, no_wrap=True)
     table.add_column("Status", width=12, justify="center")

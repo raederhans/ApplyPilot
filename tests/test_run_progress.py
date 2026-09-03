@@ -109,6 +109,7 @@ def test_performance_samples_are_bounded_thread_safe_and_decision_neutral() -> N
         {
             "submit_lane_wait_ms": index,
             "submit_lane_hold_ms": 100,
+            "submit_lane_peak": 1,
             "unknown": 999,
             "post_submit_observer_ms": -1,
         }
@@ -143,6 +144,8 @@ def test_performance_samples_are_bounded_thread_safe_and_decision_neutral() -> N
     assert performance["job_sample_count"] == 8
     assert performance["totals"]["submit_lane_wait_ms"] == 28
     assert performance["totals"]["submit_lane_hold_ms"] == 800
+    assert performance["totals"]["submit_lane_peak"] == 1
+    assert performance["maxima"]["submit_lane_peak"] == 1
     assert performance["acquisition"]["attempt_count"] == 8
     assert performance["acquisition"]["outcomes"] == {"acquired": 4, "empty": 4}
     assert performance["acquisition"]["totals"]["worker_call_ms"] == 108

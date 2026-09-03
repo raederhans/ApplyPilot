@@ -20,6 +20,7 @@ from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 from applypilot import config
 from applypilot.apply.capabilities import (
@@ -35,6 +36,89 @@ from applypilot.apply.email_routing import MailboxMcpSpec, resolve_mailbox_mcp_s
 
 logger = logging.getLogger(__name__)
 _REAL_POPEN_TYPE = subprocess.Popen
+
+
+def _current_working_set_bytes(counters: object) -> int:
+    """Return current Windows working-set bytes, never the historical peak."""
+
+    return max(0, int(getattr(counters, "WorkingSetSize", 0)))
+
+
+def process_rss_bytes(pid: int) -> int:
+    """Return best-effort resident bytes for one child process.
+
+    Telemetry must never affect runtime authority, so unsupported platforms,
+    exited processes, and access-denied handles return zero.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return 0
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            process_vm_read = 0x0010
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                process_query_limited_information | process_vm_read,
+                False,
+                pid,
+            )
+            if not handle:
+                return 0
+            try:
+                counters = ProcessMemoryCounters()
+                counters.cb = ctypes.sizeof(counters)
+                if not psapi.GetProcessMemoryInfo(
+                    handle,
+                    ctypes.byref(counters),
+                    counters.cb,
+                ):
+                    return 0
+                return _current_working_set_bytes(counters)
+            finally:
+                kernel32.CloseHandle(handle)
+
+        status = Path(f"/proc/{pid}/status")
+        if status.is_file():
+            for line in status.read_text(encoding="ascii", errors="ignore").splitlines():
+                if line.startswith("VmRSS:"):
+                    fields = line.split()
+                    return max(0, int(fields[1]) * 1024)
+    except (OSError, TypeError, ValueError):
+        return 0
+    return 0
 
 CREDENTIAL_RELAY_ENV_VARS = (
     "APPLYPILOT_ATS_CREDENTIAL_FILE",
@@ -253,6 +337,30 @@ def _toml_skill_config(paths: list[Path]) -> str:
     return f"[{entries}]"
 
 
+def _persistent_playwright_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parsed = urlparse(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("persistent Playwright MCP URL has an invalid port") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or parsed.path != "/mcp"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "persistent Playwright MCP URL must be http://127.0.0.1:<port>/mcp"
+        )
+    return f"http://127.0.0.1:{port}/mcp"
+
+
 def start_timeout_watchdog(
     proc: subprocess.Popen,
     timeout_seconds: float,
@@ -292,6 +400,7 @@ def build_agent_command(
     direct_email_send_authorized: bool = False,
     workload_class: str | None = None,
     reasoning_efforts: dict[str, str] | None = None,
+    playwright_mcp_url: str | None = None,
 ) -> tuple[list[str], Path | None]:
     """Build an isolated browser-agent command for Claude or Codex."""
     spec = resolve_playwright_mcp_spec(playwright_mcp)
@@ -384,22 +493,33 @@ def build_agent_command(
 
     final_message_path = worker_dir / "codex-final-message.txt"
     enabled_tools = playwright_tools
-    if spec.command == "npx" and platform.system() == "Windows":
-        playwright_command = os.environ.get("COMSPEC", "cmd.exe")
-        playwright_args = ["/d", "/s", "/c", "npx"]
-    elif spec.command == "npx":
-        playwright_command = shutil.which("npx")
-        if not playwright_command:
-            raise FileNotFoundError("npx was not found on PATH.")
-        playwright_args = []
+    persistent_url = _persistent_playwright_url(playwright_mcp_url)
+    playwright_connection_overrides: list[str]
+    if persistent_url is not None:
+        playwright_connection_overrides = [
+            f"mcp_servers.playwright.url={_toml_value(persistent_url)}"
+        ]
     else:
-        playwright_command = spec.command
-        playwright_args = []
-    playwright_args.extend([
-        *spec.process_args(),
-        f"--cdp-endpoint=http://localhost:{port}",
-        f"--viewport-size={config.DEFAULTS['viewport']}",
-    ])
+        if spec.command == "npx" and platform.system() == "Windows":
+            playwright_command = os.environ.get("COMSPEC", "cmd.exe")
+            playwright_args = ["/d", "/s", "/c", "npx"]
+        elif spec.command == "npx":
+            playwright_command = shutil.which("npx")
+            if not playwright_command:
+                raise FileNotFoundError("npx was not found on PATH.")
+            playwright_args = []
+        else:
+            playwright_command = spec.command
+            playwright_args = []
+        playwright_args.extend([
+            *spec.process_args(),
+            f"--cdp-endpoint=http://localhost:{port}",
+            f"--viewport-size={config.DEFAULTS['viewport']}",
+        ])
+        playwright_connection_overrides = [
+            f"mcp_servers.playwright.command={_toml_value(playwright_command)}",
+            f"mcp_servers.playwright.args={_toml_value(playwright_args)}",
+        ]
     disabled_skills = [
         Path.home() / ".codex" / "skills" / "gstack-browse",
         Path.home() / ".codex" / "skills" / "playwright",
@@ -417,14 +537,16 @@ def build_agent_command(
         "-c", "features.skill_mcp_dependency_install=false",
         "-c", 'web_search="disabled"',
         "-c", f"skills.config={_toml_skill_config(disabled_skills)}",
-        "-c", f"mcp_servers.playwright.command={_toml_value(playwright_command)}",
-        "-c", f"mcp_servers.playwright.args={_toml_value(playwright_args)}",
+    ]
+    for override in playwright_connection_overrides:
+        command.extend(["-c", override])
+    command.extend([
         "-c", "mcp_servers.playwright.required=true",
         "-c", f"mcp_servers.playwright.startup_timeout_sec={spec.startup_timeout_seconds}",
         "-c", f"mcp_servers.playwright.tool_timeout_sec={spec.tool_timeout_seconds}",
         "-c", f"mcp_servers.playwright.enabled_tools={_toml_value(enabled_tools)}",
         "-c", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
-    ]
+    ])
     if mailbox_spec.enabled:
         if mailbox_spec.command == "npx" and platform.system() == "Windows":
             mailbox_command = os.environ.get("COMSPEC", "cmd.exe")

@@ -8,19 +8,31 @@ while removing the orchestration state machine from the launcher facade.
 from __future__ import annotations
 
 import math
+import subprocess
 import threading
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
 from copy import deepcopy
+from pathlib import Path
 from types import ModuleType
 from urllib.parse import urlparse
 
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import recovery_execution as recovery_execution_mod
 from applypilot.apply.answer_provenance import build_host_provenance_binding
+from applypilot.apply.application_sessions import (
+    ApplicationSupervisor,
+    BrowserWorkerProcess,
+    EndpointUnavailable,
+    LoopbackHttpEndpointManager,
+    LoopbackHttpEndpointSpec,
+    LoopbackPortReservation,
+    PerTurnStdioEndpointManager,
+    resolve_persistent_playwright_launcher,
+)
 from applypilot.apply.browser_broker import BrowserBrokerError, BrowserLeaseBundle
-from applypilot.apply.contracts import contract_json
+from applypilot.apply.contracts import application_actor_id, contract_json
 from applypilot.apply.email_routing import (
     normalize_prepared_email_application,
     normalize_sent_receipt,
@@ -196,6 +208,8 @@ WORKER_RUNTIME_PORTS = (
     "_is_permanent_failure", "_mark_runtime_cover_not_required",
     "_click_linkedin_main_apply_causally", "_verify_linkedin_post_login_state",
     "_observe_post_submit_page", "_open_bound_application_target",
+    "_close_bound_application_targets", "_release_application_browser_authority",
+    "_kill_process_tree",
     "_observe_linkedin_external_handoff_page",
     "_resolve_ats_application_binding", "_run_read_only_preflight",
     "_prepare_ats_fill_plan_repair", "_record_ats_fill_plan_feedback",
@@ -229,6 +243,7 @@ def _validate_runtime_ports(runtime: ModuleType) -> None:
 def _worker_loop_with_port(
     runtime: ModuleType,
     port: int,
+    browser_worker: BrowserWorkerProcess,
     worker_id: int = 0,
     limit: int = 1,
     target_url: str | None = None,
@@ -277,7 +292,6 @@ def _worker_loop_with_port(
     _observe_linkedin_external_handoff_page = (
         runtime._observe_linkedin_external_handoff_page
     )
-    _open_bound_application_target = runtime._open_bound_application_target
     _resolve_ats_application_binding = runtime._resolve_ats_application_binding
     _run_read_only_preflight = runtime._run_read_only_preflight
     _prepare_ats_fill_plan_repair = runtime._prepare_ats_fill_plan_repair
@@ -323,14 +337,12 @@ def _worker_loop_with_port(
     acquire_job = runtime.acquire_job
     add_event = runtime.add_event
     capture_browser_session = runtime.capture_browser_session
-    cleanup_worker = runtime.cleanup_worker
     cloak_fallback_route = runtime.cloak_fallback_route
     computer_use_handoff_allowed = runtime.computer_use_handoff_allowed
     config = runtime.config
     datetime = runtime.datetime
     get_connection = runtime.get_connection
     initial_route = runtime.initial_route
-    launch_chrome = runtime.launch_chrome
     logger = runtime.logger
     mark_result = runtime.mark_result
     release_lock = runtime.release_lock
@@ -341,7 +353,7 @@ def _worker_loop_with_port(
     resolve_interaction_mode = runtime.resolve_interaction_mode
     restore_browser_session = runtime.restore_browser_session
     restore_preview_state = runtime.restore_preview_state
-    run_job = runtime.run_job
+    runtime_run_job = runtime.run_job
     update_state = runtime.update_state
     application_lease_minutes = runtime.load_runtime_settings().application_lease_minutes
 
@@ -385,6 +397,11 @@ def _worker_loop_with_port(
     requested_browser_backend = resolve_browser_backend(browser_backend)
     requested_interaction_mode = resolve_interaction_mode(interaction_mode)
     run_attempted_urls = attempted_urls if attempted_urls is not None else set()
+    application_supervisor: ApplicationSupervisor | None = None
+
+    def run_job(*args, **kwargs):
+        kwargs["application_supervisor"] = application_supervisor
+        return runtime_run_job(*args, **kwargs)
 
     while not _stop_event.is_set():
         if run_progress is not None:
@@ -480,6 +497,17 @@ def _worker_loop_with_port(
                 break
         initialization_complete = False
         try:
+            job.setdefault(
+                "_run_namespace_id",
+                (
+                    run_progress.run_id
+                    if run_progress is not None
+                    else f"worker-{worker_id}:{job.get('_attempt_id') or job['url']}"
+                ),
+            )
+            # Each Agent turn receives a fresh output namespace.  The runtime
+            # compatibility port returns an empty baseline without inspecting
+            # or resetting a prior run/session directory.
             job["_evidence_baseline"] = _snapshot_worker_evidence(worker_id)
             if attempted_urls_lock is None:
                 run_attempted_urls.add(str(job["url"]))
@@ -497,6 +525,7 @@ def _worker_loop_with_port(
                     run_progress.release_preview_ticket(preview_ticket)
 
         chrome_proc = None
+        application_supervisor = None
         submission_started = False
         submitted_at = None
         email_application = None
@@ -515,6 +544,7 @@ def _worker_loop_with_port(
         route_history: list[dict[str, object]] = []
         progress_submit_claimed = False
         progress_outcome: tuple[str, bool] | None = None
+        worker_generation_tainted = False
         pre_submit_audit_failure: dict[str, object] | None = None
         raw_acquisition_metrics = acquisition_attempt
         acquisition_metrics: dict[str, float | int] = {}
@@ -551,6 +581,7 @@ def _worker_loop_with_port(
             "submit_lane_wait_ms": 0.0,
             "submit_lane_hold_ms": 0.0,
             "submit_lane_acquisitions": 0.0,
+            "submit_lane_peak": 0.0,
         }
 
         def performance_snapshot(
@@ -584,6 +615,48 @@ def _worker_loop_with_port(
             attached = dict(evidence or {})
             attached["orchestration_performance"] = snapshot()
             return attached
+
+        def acquire_submit_lane(
+            *,
+            metrics=orchestration_metrics,
+            lane_state=submit_lane_state,
+        ) -> bool:
+            nonlocal submit_writer_held
+            if submit_writer_held:
+                return True
+            add_event(f"[W{worker_id}] Waiting for final submit lane")
+            lane_wait_started = time.perf_counter()
+            acquired = _acquire_submit_writer_lane(worker_id)
+            metrics["submit_lane_wait_ms"] += (
+                time.perf_counter() - lane_wait_started
+            ) * 1000
+            if not acquired:
+                return False
+            metrics["submit_lane_acquisitions"] += 1
+            metrics["submit_lane_peak"] = max(metrics["submit_lane_peak"], 1.0)
+            submit_writer_held = True
+            lane_state["held"] = True
+            lane_state["held_at"] = time.perf_counter()
+            return True
+
+        def release_submit_lane(
+            *,
+            metrics=orchestration_metrics,
+            lane_state=submit_lane_state,
+        ) -> None:
+            nonlocal submit_writer_held
+            if not submit_writer_held:
+                return
+            held_at = lane_state.get("held_at")
+            if isinstance(held_at, float):
+                metrics["submit_lane_hold_ms"] += (
+                    time.perf_counter() - held_at
+                ) * 1000
+            lane_state["held"] = False
+            lane_state["held_at"] = None
+            _submit_writer_lane.release()
+            submit_writer_held = False
+
         try:
             read_only_preflight = _run_read_only_preflight(job)
         except Exception as exc:  # noqa: BLE001 - final atomic gate remains authoritative
@@ -782,14 +855,23 @@ def _worker_loop_with_port(
             add_event(f"[W{worker_id}] Launching {active_browser_backend} browser...")
             start_url = str(job.get("application_url") or job["url"])
             initial_linkedin_entry = _url_has_host(start_url, "linkedin.com")
-            chrome_proc = launch_chrome(
-                worker_id,
-                port=port,
-                headless=headless,
-                start_url=None,
-                browser_backend=active_browser_backend,
+            attempt_id = str(
+                job.get("_attempt_id")
+                or f"worker-{worker_id}:{job.get('url') or start_url}"
             )
-            root_ids = _open_bound_application_target(port, start_url)
+            application_supervisor = ApplicationSupervisor(
+                browser_worker,
+                attempt_id=attempt_id,
+                actor_id=application_actor_id(attempt_id),
+                start_url=start_url,
+                browser_runtime=active_browser_backend,
+                headless=headless,
+                release_browser_authority=lambda current_job=job: (
+                    runtime._release_application_browser_authority(current_job)
+                ),
+            )
+            chrome_proc = application_supervisor.process
+            root_ids = set(browser_worker.active_targets)
             job["_browser_root_target_ids"] = sorted(root_ids)
             job["_browser_root_runtime"] = active_browser_backend
 
@@ -999,6 +1081,7 @@ def _worker_loop_with_port(
                 current_fallback_route=fallback_route,
                 current_route_history=route_history,
                 current_start_url=start_url,
+                current_supervisor=application_supervisor,
             ):
                 nonlocal active_browser_backend
                 nonlocal active_route
@@ -1038,21 +1121,18 @@ def _worker_loop_with_port(
                             str(current_job.get("application_url") or ""),
                         ],
                     )
-                    cleanup_worker(worker_id, chrome_proc)
-                    chrome_proc = None
-                    chrome_proc = launch_chrome(
-                        worker_id,
-                        port=port,
+                    if current_supervisor is None:
+                        raise RuntimeError("application_supervisor_unavailable")
+                    chrome_proc = current_supervisor.restart_browser(
+                        active_browser_backend,
                         headless=headless,
-                        start_url=None,
-                        browser_backend=active_browser_backend,
                     )
                     restored_cookies = restore_browser_session(
                         port,
                         edge_session,
                         current_start_url,
                     )
-                    root_ids = _open_bound_application_target(port, current_start_url)
+                    root_ids = set(browser_worker.active_targets)
                     current_job["_browser_root_target_ids"] = sorted(root_ids)
                     current_job["_browser_root_runtime"] = active_browser_backend
                     logger.info(
@@ -1203,13 +1283,11 @@ def _worker_loop_with_port(
 
                         recovery_verifier = verify_same_application_recovery
                     try:
-                        recovery_result = (
-                            recovery_execution_mod.execute_recovery_command(
-                                get_connection(),
-                                recovery_command,
-                                handler=recovery_handler,
-                                verifier=recovery_verifier,
-                            )
+                        recovery_result = recovery_execution_mod.execute_recovery_command(
+                            get_connection(),
+                            recovery_command,
+                            handler=recovery_handler,
+                            verifier=recovery_verifier,
                         )
                         job["_application_recovery_execution"] = contract_json(
                             recovery_result
@@ -1742,22 +1820,6 @@ def _worker_loop_with_port(
                     break
 
                 if result == "ready_to_submit" and not dry_run:
-                    if not submit_writer_held:
-                        add_event(f"[W{worker_id}] Waiting for final submit lane")
-                        lane_wait_started = time.perf_counter()
-                        if not _acquire_submit_writer_lane(worker_id):
-                            orchestration_metrics["submit_lane_wait_ms"] += (
-                                time.perf_counter() - lane_wait_started
-                            ) * 1000
-                            result = "deferred:operator_stop_before_submit_lane"
-                            break
-                        orchestration_metrics["submit_lane_wait_ms"] += (
-                            time.perf_counter() - lane_wait_started
-                        ) * 1000
-                        orchestration_metrics["submit_lane_acquisitions"] += 1
-                        submit_writer_held = True
-                        submit_lane_state["held"] = True
-                        submit_lane_state["held_at"] = time.perf_counter()
                     audit_started = time.perf_counter()
                     email_application = _prepared_email_application(job)
                     reported_observations = job.get("_agent_observations")
@@ -1835,15 +1897,6 @@ def _worker_loop_with_port(
                             result = f"failed:pre_submit_not_ready:{reason}"
                             break
                         field_repair_retries_remaining -= 1
-                        submit_lane_held_at = submit_lane_state.get("held_at")
-                        if isinstance(submit_lane_held_at, float):
-                            orchestration_metrics["submit_lane_hold_ms"] += (
-                                time.perf_counter() - submit_lane_held_at
-                            ) * 1000
-                        submit_lane_state["held"] = False
-                        submit_lane_state["held_at"] = None
-                        _submit_writer_lane.release()
-                        submit_writer_held = False
                         resume_repair_only = bool(repairable) and all(
                             issue in {
                                 "resume_not_uploaded",
@@ -2021,6 +2074,12 @@ def _worker_loop_with_port(
                         pre_submit_audit_failure = dict(audit_report)
                         result = f"failed:manual_review_required:{audit_signal}"
                         break
+                    # Expensive page inspection and repair stay outside the
+                    # process-global lane.  The lane begins only at the final
+                    # lease/capacity/reservation check that can admit Submit.
+                    if not acquire_submit_lane():
+                        result = "deferred:operator_stop_before_submit_lane"
+                        break
                     from applypilot.database import update_application_attempt
 
                     attempt_id = job.get("_attempt_id")
@@ -2069,6 +2128,10 @@ def _worker_loop_with_port(
                             else 0.0
                         )
                         retry_after = max(0.0, min(retry_after, 120.0))
+                        # A durable reservation was not granted, so no Submit
+                        # authority exists while waiting.  Release the lane and
+                        # reacquire only after a fresh page audit.
+                        release_submit_lane()
                         add_event(
                             f"[W{worker_id}] Atomic submit gate wait: "
                             f"{retry_after:.1f}s"
@@ -2108,6 +2171,9 @@ def _worker_loop_with_port(
                                     f"{audit_signal or 'page_changed_during_submission_gap'}"
                                 )
                                 break
+                        if not acquire_submit_lane():
+                            result = "deferred:operator_stop_before_submit_lane"
+                            break
                         lease_held = not attempt_id or update_application_attempt(
                             attempt_id,
                             phase="reservation",
@@ -2214,6 +2280,12 @@ def _worker_loop_with_port(
                     orchestration_metrics["submit_agent_ms"] += max(
                         0, submit_duration
                     )
+                    # The single-writer lane protects reservation plus the
+                    # only Submit-capable Agent turn.  Independent observation,
+                    # CAPTCHA parking, evidence archiving, and receipt
+                    # reconciliation never authorize another Submit and run
+                    # after this release.
+                    release_submit_lane()
                     agent_evidence = observed_job.get("_agent_submission_evidence")
                     if email_application is not None:
                         runtime_mailbox = observed_job.get(
@@ -2472,7 +2544,12 @@ def _worker_loop_with_port(
                         []
                         if email_application is not None
                         else _archive_worker_evidence(
-                            config.APPLY_WORKER_DIR / f"worker-{worker_id}",
+                            Path(
+                                str(
+                                    observed_job.get("_runtime_output_root")
+                                    or config.APPLY_WORKER_DIR / f"worker-{worker_id}"
+                                )
+                            ),
                             job,
                             worker_id,
                             datetime.now().astimezone().strftime("%Y%m%d_%H%M%S"),
@@ -2833,6 +2910,7 @@ def _worker_loop_with_port(
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
+            worker_generation_tainted = True
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             if dry_run:
@@ -2878,18 +2956,14 @@ def _worker_loop_with_port(
                 )
             if preview_ticket is not None and run_progress is not None:
                 run_progress.release_preview_ticket(preview_ticket)
-            if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+            if application_supervisor is not None:
+                application_supervisor.close_application(
+                    recycle_worker=worker_generation_tainted
+                )
+                application_supervisor = None
+                chrome_proc = None
             if submit_writer_held:
-                submit_lane_held_at = submit_lane_state.get("held_at")
-                if isinstance(submit_lane_held_at, float):
-                    orchestration_metrics["submit_lane_hold_ms"] += (
-                        time.perf_counter() - submit_lane_held_at
-                    ) * 1000
-                submit_lane_state["held"] = False
-                submit_lane_state["held_at"] = None
-                _submit_writer_lane.release()
-                submit_writer_held = False
+                release_submit_lane()
             if run_progress is not None:
                 try:
                     run_progress.record_performance(
@@ -2940,10 +3014,112 @@ def worker_loop(
     """Validate injected ports and own the CDP claim for the full worker run."""
     _validate_runtime_ports(runtime)
     port = runtime.allocate_cdp_port(worker_id)
+    browser_worker: BrowserWorkerProcess | None = None
+    endpoint_manager = None
     try:
+        profile = runtime.config.load_profile()
+        policy = profile.get("submission_policy", {})
+        runtime_profile = profile.get("agent_runtime", {})
+        persistent_endpoint = (
+            runtime_profile.get("persistent_playwright_mcp", {})
+            if isinstance(runtime_profile, Mapping)
+            else {}
+        )
+        persistent_endpoint_enabled = bool(
+            isinstance(persistent_endpoint, Mapping)
+            and persistent_endpoint.get("enabled") is True
+        )
+        if persistent_endpoint_enabled and agent_backend != "codex":
+            raise ValueError(
+                "persistent Playwright MCP HTTP transport currently requires Codex"
+            )
+
+        def positive_policy_integer(name: str, default: int) -> int:
+            raw = policy.get(name, default) if isinstance(policy, Mapping) else default
+            return (
+                raw
+                if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0
+                else default
+            )
+
+        rss_reader = getattr(
+            getattr(runtime, "agent_runtime_mod", None), "process_rss_bytes", None
+        )
+        if persistent_endpoint_enabled:
+            endpoint_launcher = resolve_persistent_playwright_launcher()
+            endpoint_reservation = LoopbackPortReservation.reserve(
+                runtime.config.APPLY_WORKER_DIR,
+                worker_id=worker_id,
+            )
+            try:
+                endpoint_spec = LoopbackHttpEndpointSpec(
+                    worker_id=worker_id,
+                    port=endpoint_reservation.port,
+                    cdp_port=port,
+                    launcher=endpoint_launcher,
+                )
+                raw_endpoint_timeout = persistent_endpoint.get(
+                    "startup_timeout_seconds", 60
+                )
+                endpoint_timeout = (
+                    raw_endpoint_timeout
+                    if isinstance(raw_endpoint_timeout, int)
+                    and not isinstance(raw_endpoint_timeout, bool)
+                    and raw_endpoint_timeout > 0
+                    else 60
+                )
+
+                def stop_endpoint_process(process) -> None:
+                    if process.poll() is None:
+                        runtime._kill_process_tree(process.pid)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired as exc:
+                        raise EndpointUnavailable(
+                            "persistent MCP process-tree termination timed out"
+                        ) from exc
+                    if process.poll() is None:
+                        raise EndpointUnavailable(
+                            "persistent MCP process-tree termination is unconfirmed"
+                        )
+
+                endpoint_manager = LoopbackHttpEndpointManager(
+                    endpoint_spec,
+                    endpoint_reservation,
+                    stop_process=stop_endpoint_process,
+                    startup_timeout_seconds=endpoint_timeout,
+                )
+            finally:
+                if endpoint_manager is None:
+                    endpoint_reservation.release()
+        else:
+            endpoint_manager = PerTurnStdioEndpointManager(worker_id)
+        browser_worker = BrowserWorkerProcess(
+            worker_id=worker_id,
+            port=port,
+            run_id=(
+                run_progress.run_id
+                if run_progress is not None
+                else f"worker-{worker_id}-{time.time_ns()}"
+            ),
+            namespace_root=runtime.config.APPLY_WORKER_DIR,
+            launch_browser=runtime.launch_chrome,
+            cleanup_browser=runtime.cleanup_worker,
+            open_target=runtime._open_bound_application_target,
+            close_targets=runtime._close_bound_application_targets,
+            endpoint_manager=endpoint_manager,
+            rss_reader=rss_reader if callable(rss_reader) else None,
+            max_applications=positive_policy_integer(
+                "persistent_browser_max_applications", 8
+            ),
+            max_rss_bytes=positive_policy_integer(
+                "persistent_browser_max_rss_bytes", 1_500_000_000
+            ),
+        )
         return _worker_loop_with_port(
             runtime,
             port,
+            browser_worker,
             worker_id=worker_id,
             limit=limit,
             target_url=target_url,
@@ -2961,4 +3137,10 @@ def worker_loop(
             run_progress=run_progress,
         )
     finally:
-        runtime.release_cdp_port(worker_id)
+        try:
+            if browser_worker is not None:
+                browser_worker.close()
+            elif endpoint_manager is not None:
+                endpoint_manager.shutdown()
+        finally:
+            runtime.release_cdp_port(worker_id)

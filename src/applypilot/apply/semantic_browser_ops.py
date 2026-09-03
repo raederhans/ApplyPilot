@@ -347,7 +347,7 @@ class SemanticWriteAuthorityIssuer:
 
 
 class SemanticBrowserOps:
-    """Read-only observation plus one separately authorized resume upload."""
+    """Parent-owned, exact pre-submit resume and routine-control operations."""
 
     def __init__(
         self,
@@ -453,6 +453,7 @@ class SemanticBrowserOps:
             uploaded=not replayed,
             replayed=replayed,
         )
+
 
     def apply_form_patch(self, *_args: object, **_kwargs: object) -> None:
         raise BrowserAuthorityDenied(

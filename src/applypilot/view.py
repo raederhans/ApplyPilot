@@ -467,7 +467,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             _system_state(
                 "error",
                 "Unable to read the local workspace",
-                "Your data was not changed. Run the read-only diagnostic; ApplyPilot will not repair or replace the database automatically.",
+                "Your data was not changed. Run the read-only diagnostic; CapyPilot will not repair or replace the database automatically.",
                 ("Run diagnostic", "applypilot doctor"),
                 detail=f"{type(exc).__name__}: {exc}"[:240],
             )

@@ -40,6 +40,7 @@ class RunProgress:
         success_target: int,
         preview_target: int,
         authorization_slot_cap: int,
+        run_id: str | None = None,
     ) -> None:
         for name, value in (
             ("success_target", success_target),
@@ -49,6 +50,9 @@ class RunProgress:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         self.dry_run = bool(dry_run)
+        self.run_id = str(run_id or f"apply-run-{uuid.uuid4()}").strip()
+        if not self.run_id:
+            raise ValueError("run_id is required")
         self.success_target = success_target
         self.preview_target = preview_target
         self.authorization_slot_cap = authorization_slot_cap
@@ -77,6 +81,7 @@ class RunProgress:
             "submit_lane_wait_ms",
             "submit_lane_hold_ms",
             "submit_lane_acquisitions",
+            "submit_lane_peak",
         }
     )
     _ACQUISITION_KEYS = frozenset(
@@ -94,6 +99,7 @@ class RunProgress:
         }
     )
     _PERFORMANCE_VALUE_CAP = 86_400_000.0
+    _PERFORMANCE_MAX_ONLY_KEYS = frozenset({"submit_lane_peak"})
 
     @staticmethod
     def _key(item_key: object) -> str:
@@ -219,9 +225,14 @@ class RunProgress:
         with self._lock:
             self._performance_samples += 1
             for key, value in normalized.items():
-                self._performance_totals[key] = (
-                    self._performance_totals.get(key, 0.0) + value
-                )
+                if key in self._PERFORMANCE_MAX_ONLY_KEYS:
+                    self._performance_totals[key] = max(
+                        self._performance_totals.get(key, 0.0), value
+                    )
+                else:
+                    self._performance_totals[key] = (
+                        self._performance_totals.get(key, 0.0) + value
+                    )
                 self._performance_maxima[key] = max(
                     self._performance_maxima.get(key, 0.0), value
                 )
@@ -282,6 +293,7 @@ class RunProgress:
             for outcome, _confirmed in self._terminal.values():
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
             return {
+                "run_id": self.run_id,
                 "dry_run": self.dry_run,
                 "success_target": self.success_target,
                 "preview_target": self.preview_target,

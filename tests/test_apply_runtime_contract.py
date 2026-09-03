@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -578,6 +579,60 @@ def test_codex_receives_non_required_read_only_mailbox_mcp(tmp_path) -> None:
         "mcp_servers.mailbox.enabled_tools=" in value and "send_message" in value
         for value in overrides
     )
+
+
+def test_codex_attaches_to_explicit_loopback_playwright_http_endpoint(
+    tmp_path: Path,
+) -> None:
+    endpoint_url = "http://127.0.0.1:8931/mcp"
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        tmp_path,
+        tmp_path / "unused.json",
+        resolve_codex=lambda: ["codex"],
+        playwright_mcp_url=endpoint_url,
+    )
+    overrides = {
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c"
+    }
+
+    assert f'mcp_servers.playwright.url="{endpoint_url}"' in overrides
+    assert not any(value.startswith("mcp_servers.playwright.command=") for value in overrides)
+    assert not any(value.startswith("mcp_servers.playwright.args=") for value in overrides)
+    assert "mcp_servers.playwright.required=true" in overrides
+    assert "mcp_servers.playwright.startup_timeout_sec=60" in overrides
+    assert "mcp_servers.playwright.tool_timeout_sec=90" in overrides
+    assert any(value.startswith("mcp_servers.playwright.enabled_tools=") for value in overrides)
+    assert 'mcp_servers.playwright.default_tools_approval_mode="approve"' in overrides
+
+
+@pytest.mark.parametrize(
+    "endpoint_url",
+    (
+        "https://127.0.0.1:8931/mcp",
+        "http://localhost:8931/mcp",
+        "http://127.0.0.1:8931/other",
+        "http://127.0.0.1:8931/mcp?generation=old",
+    ),
+)
+def test_codex_rejects_noncanonical_persistent_playwright_url(
+    tmp_path: Path,
+    endpoint_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="must be http://127.0.0.1"):
+        agent_runtime.build_agent_command(
+            "codex",
+            "model",
+            9432,
+            tmp_path,
+            tmp_path / "unused.json",
+            resolve_codex=lambda: ["codex"],
+            playwright_mcp_url=endpoint_url,
+        )
 
 
 def test_mailbox_send_tool_requires_explicit_standing_authorization(tmp_path) -> None:
@@ -1413,6 +1468,11 @@ def _run_worker_contract(
         launcher,
         "_open_bound_application_target",
         lambda _port, _url: {"application-root"},
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_close_bound_application_targets",
+        lambda _port, _targets: None,
     )
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
@@ -2811,7 +2871,7 @@ def test_worker_performance_metrics_are_attempt_bound_and_run_aggregated(
     ] == 2
 
 
-def test_final_attempt_performance_includes_every_submit_lane_hold_segment(
+def test_submit_lane_excludes_audit_repair_and_independent_observer(
     monkeypatch,
 ) -> None:
     clock = [0.0]
@@ -2840,12 +2900,14 @@ def test_final_attempt_performance_includes_every_submit_lane_hold_segment(
         "orchestration_performance"
     ]["metrics"]
     final_metrics = final_records[0]["metrics"]
-    assert final_metrics["submit_lane_acquisitions"] == 2
-    assert final_metrics["submit_lane_wait_ms"] == pytest.approx(20.0)
-    assert final_metrics["submit_lane_hold_ms"] == pytest.approx(220.0)
-    assert final_metrics["submit_lane_hold_ms"] - persisted_before_release[
+    assert final_metrics["submit_lane_acquisitions"] == 1
+    assert final_metrics["submit_lane_peak"] == 1
+    assert final_metrics["submit_lane_wait_ms"] == pytest.approx(10.0)
+    assert final_metrics["submit_lane_hold_ms"] == pytest.approx(30.0)
+    assert final_metrics["post_submit_observer_ms"] == pytest.approx(50.0)
+    assert final_metrics["submit_lane_hold_ms"] == persisted_before_release[
         "submit_lane_hold_ms"
-    ] == pytest.approx(60.0)
+    ]
 
 
 def test_lossy_degree_and_work_status_mappings_are_audited_without_blocking() -> None:
@@ -3544,6 +3606,11 @@ def test_dry_run_timeout_restores_pre_preview_state(monkeypatch) -> None:
         launcher,
         "_open_bound_application_target",
         lambda _port, _url: {"application-root"},
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_close_bound_application_targets",
+        lambda _port, _targets: None,
     )
     monkeypatch.setattr(launcher, "allocate_cdp_port", lambda _worker_id: 9432)
     monkeypatch.setattr(launcher, "release_cdp_port", lambda _worker_id: None)

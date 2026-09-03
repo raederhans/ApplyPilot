@@ -231,7 +231,7 @@ def prune_owned_profile(
     resolved = _contained_path(profile_dir, profile_root)
     marker = read_ownership_marker(resolved)
     if not marker or marker.get("kind") != "browser_profile":
-        raise PermissionError(f"Browser profile is not explicitly ApplyPilot-owned: {resolved}")
+        raise PermissionError(f"Browser profile is not explicitly CapyPilot-owned: {resolved}")
     if execute and not browser_is_stopped:
         raise RuntimeError("Refusing profile cleanup while browser stop is not confirmed")
     cutoff = (time.time() if now is None else float(now)) - max(

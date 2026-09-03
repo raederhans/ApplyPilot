@@ -1,0 +1,31 @@
+{
+  "schema_version": "applypilot-full-stack-fixture/v1",
+  "fixture_id": "applypilot-p4-matched-24-v1",
+  "claim_boundary": "deterministic local Workday and SmartRecruiters fixtures only; no provider, network, Submit, gate, reservation, mailbox, or receipt authority",
+  "tasks": [
+    {"task_id": "wd-routine-01", "provider": "workday", "scenario": "routine"},
+    {"task_id": "sr-routine-01", "provider": "smartrecruiters", "scenario": "routine"},
+    {"task_id": "wd-stale-01", "provider": "workday", "scenario": "stale"},
+    {"task_id": "sr-stale-01", "provider": "smartrecruiters", "scenario": "stale"},
+    {"task_id": "wd-human-01", "provider": "workday", "scenario": "human_only"},
+    {"task_id": "sr-human-01", "provider": "smartrecruiters", "scenario": "human_only"},
+    {"task_id": "wd-crash-01", "provider": "workday", "scenario": "crash_recovery"},
+    {"task_id": "sr-crash-01", "provider": "smartrecruiters", "scenario": "crash_recovery"},
+    {"task_id": "wd-routine-02", "provider": "workday", "scenario": "routine"},
+    {"task_id": "sr-routine-02", "provider": "smartrecruiters", "scenario": "routine"},
+    {"task_id": "wd-stale-02", "provider": "workday", "scenario": "stale"},
+    {"task_id": "sr-stale-02", "provider": "smartrecruiters", "scenario": "stale"},
+    {"task_id": "wd-human-02", "provider": "workday", "scenario": "human_only"},
+    {"task_id": "sr-human-02", "provider": "smartrecruiters", "scenario": "human_only"},
+    {"task_id": "wd-crash-02", "provider": "workday", "scenario": "crash_recovery"},
+    {"task_id": "sr-crash-02", "provider": "smartrecruiters", "scenario": "crash_recovery"},
+    {"task_id": "wd-routine-03", "provider": "workday", "scenario": "routine"},
+    {"task_id": "sr-routine-03", "provider": "smartrecruiters", "scenario": "routine"},
+    {"task_id": "wd-stale-03", "provider": "workday", "scenario": "stale"},
+    {"task_id": "sr-stale-03", "provider": "smartrecruiters", "scenario": "stale"},
+    {"task_id": "wd-human-03", "provider": "workday", "scenario": "human_only"},
+    {"task_id": "sr-human-03", "provider": "smartrecruiters", "scenario": "human_only"},
+    {"task_id": "wd-crash-03", "provider": "workday", "scenario": "crash_recovery"},
+    {"task_id": "sr-crash-03", "provider": "smartrecruiters", "scenario": "crash_recovery"}
+  ]
+}

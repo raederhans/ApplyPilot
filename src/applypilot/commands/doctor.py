@@ -154,7 +154,7 @@ def run_doctor(runtime: ModuleType) -> None:
         results.append((
             "External CAPTCHA solver",
             "[yellow]inactive[/yellow]",
-            "CAPSOLVER_API_KEY is present but ApplyPilot does not call solvers or inject tokens",
+            "CAPSOLVER_API_KEY is present but CapyPilot does not call solvers or inject tokens",
         ))
     else:
         results.append((
@@ -165,7 +165,7 @@ def run_doctor(runtime: ModuleType) -> None:
 
     # --- Render results ---
     console.print()
-    console.print("[bold]ApplyPilot Local Doctor[/bold]\n")
+    console.print("[bold]CapyPilot Doctor[/bold]\n")
 
     col_w = max(len(r[0]) for r in results) + 2
     for check, status, note in results:

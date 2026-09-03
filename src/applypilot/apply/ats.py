@@ -23,6 +23,21 @@ MAX_PROMPT_OPTIONS_PER_FIELD = 20
 MAX_PROMPT_OPTION_LENGTH = 80
 MAX_TEXT_LENGTH = 240
 
+_ROUTINE_SEMANTIC_CONTROL_KINDS = frozenset(
+    {
+        "text",
+        "textarea",
+        "native_select",
+        "custom_combobox",
+        "radio",
+        "checkbox",
+        "switch",
+        "date",
+        "resume_file",
+        "navigation",
+    }
+)
+
 _SPACE_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
 _VALUE_KEYS = frozenset(
@@ -191,6 +206,8 @@ class AtsAdapter(Protocol):
 
     def risk_for(self, semantic: str, raw: Mapping[str, object]) -> FieldRisk | None: ...
 
+    def semantic_control_kinds(self) -> frozenset[str]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class GenericAtsAdapter:
@@ -213,6 +230,11 @@ class GenericAtsAdapter:
     def risk_for(self, semantic: str, raw: Mapping[str, object]) -> FieldRisk | None:
         del semantic, raw
         return None
+
+    def semantic_control_kinds(self) -> frozenset[str]:
+        """Generic pages have no production semantic-write admission."""
+
+        return frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +297,9 @@ class SmartRecruitersAtsAdapter(GenericAtsAdapter):
             "Upload the validated resume through the required Resume container and verify its file list before continuing.",
         )
 
+    def semantic_control_kinds(self) -> frozenset[str]:
+        return _ROUTINE_SEMANTIC_CONTROL_KINDS
+
 
 @dataclass(frozen=True, slots=True)
 class WorkdayAtsAdapter(GenericAtsAdapter):
@@ -293,6 +318,9 @@ class WorkdayAtsAdapter(GenericAtsAdapter):
             "Treat each Workday page as an explicit state and verify structural progress after Next.",
             "After final Submit, do not switch runtimes and require visible receipt evidence.",
         )
+
+    def semantic_control_kinds(self) -> frozenset[str]:
+        return _ROUTINE_SEMANTIC_CONTROL_KINDS
 
 
 class AtsAdapterRegistry:

@@ -137,7 +137,7 @@ def _setup_resume() -> None:
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell CapyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
 
     profile: dict = {}
 
@@ -263,7 +263,7 @@ def _setup_searches() -> None:
 
     # Build YAML content
     lines = [
-        "# ApplyPilot search configuration",
+        "# CapyPilot search configuration",
         "# Edit this file to refine your job search queries.",
         "",
         "defaults:",
@@ -309,7 +309,7 @@ def _setup_ai_features() -> None:
         default="gemini",
     )
 
-    env_lines = ["# ApplyPilot configuration", ""]
+    env_lines = ["# CapyPilot configuration", ""]
 
     if provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
@@ -340,12 +340,12 @@ def _setup_auto_apply() -> None:
     """Configure autonomous job application (Codex is the default agent)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
-        "ApplyPilot can autonomously fill and submit job applications\n"
+        "CapyPilot can autonomously fill and submit job applications\n"
         "using Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
-        console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
+        console.print("[dim]You can apply manually using the tailored resumes CapyPilot generates.[/dim]")
         return
 
     # Check for the default Codex CLI
@@ -373,7 +373,7 @@ def run_wizard() -> None:
     console.print()
     console.print(
         Panel.fit(
-            "[bold green]ApplyPilot Setup Wizard[/bold green]\n\n"
+            "[bold green]CapyPilot Setup Wizard[/bold green]\n\n"
             "This will create your configuration at:\n"
             f"  [cyan]{APP_DIR}[/cyan]\n\n"
             "You can re-run this anytime with [bold]applypilot init[/bold].",

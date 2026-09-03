@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from applypilot.apply.agent_runtime import (
     SubprocessAgentRuntime,
     SubprocessLaunchSpec,
     SubprocessRuntimeAdapter,
+    process_rss_bytes,
 )
 
 
@@ -42,6 +44,15 @@ def _spec(
         parent_run_id=parent_run_id,
         submit_started=submit_started,
     )
+
+
+def test_process_rss_is_best_effort_and_never_raises() -> None:
+    assert process_rss_bytes(-1) == 0
+    observed = process_rss_bytes(os.getpid())
+    if platform.system() in {"Windows", "Linux"}:
+        assert observed > 0
+    else:
+        assert observed >= 0
 
 
 def test_real_subprocess_adapter_start_resume_health_and_close(tmp_path: Path) -> None:

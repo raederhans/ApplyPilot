@@ -66,7 +66,7 @@ def _reject_live_or_default_root(path: Path | str, *, name: str) -> Path:
         or item.is_relative_to(resolved)
         for item in forbidden
     ):
-        raise ValueError(f"{name} must be an isolated temporary root, not the default ApplyPilot data path")
+        raise ValueError(f"{name} must be an isolated temporary root, not the default CapyPilot data path")
     return resolved
 
 

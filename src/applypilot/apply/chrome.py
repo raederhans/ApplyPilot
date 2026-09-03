@@ -362,7 +362,7 @@ def setup_worker_profile(
         if mode == "persistent":
             profile_dir.mkdir(parents=True, exist_ok=True)
             mark_owned()
-            logger.info("[worker-%d] Using the persistent ApplyPilot browser profile", worker_id)
+            logger.info("[worker-%d] Using the persistent CapyPilot browser profile", worker_id)
             return profile_dir
 
         if mode != "clone":

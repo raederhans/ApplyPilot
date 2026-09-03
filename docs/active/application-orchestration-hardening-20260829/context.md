@@ -127,3 +127,63 @@ Success condition: target checks pass, live workers terminate cleanly, no cross-
 ## Next step
 
 Obtain explicit commit/push authority for the frozen P6 candidate, create one `agent/**` branch without altering `main`, push once, and verify that the resulting GitHub Actions run targets the exact pushed SHA, creates exactly the four expected checks, and passes all of them. Do not resume GSK, use the fallback job, run a live provider browser, or change worker capacity until that remote P6 gate passes.
+
+## 2026-09-02 Happy Pilot wave handoff
+
+- Source conversation: user-provided ChatGPT task `capypilot改造`, read-only. Its P0-P4 roadmap is treated as an architectural hypothesis and acceptance proposal; repository code and tests remain authoritative.
+- Isolated integration worktree: `C:\Users\raede\.codex\worktrees\happy-pilot-p0-p4-20260902\ApplyPilot`.
+- Branch/base: `agent/happy-pilot-p0-p4-20260902` from `fork/main` at `577c6f7de339ba1be4dfe7f18bd4c94fea3c7f22`.
+- Protected parent: `C:\Users\raede\Desktop\简历\applypilot-local\source`, branch `main` at `12d20b6ad4dc57f10e85974e8240d3c203944d43`, with 45 modified and 95 untracked paths observed before worktree creation. It is not an integration target.
+- Execution topology: P0 may write in the isolated worktree; P1-P4 are initially read-only. Phase promotion is serial. `/root` alone updates records, integrates, starts long tests, and decides whether commit/push authority is needed.
+- Shared-resource prohibition: no live `APPLYPILOT_DIR`, browser profile, CDP endpoint, mailbox, ATS provider, receipt, or Submit action. Tests must use isolated temporary roots and offline/local fixtures.
+- Immediate next step: supervise the P0 implementation task while collecting P1-P4 gap analyses, accept or reject P0 on focused evidence, then grant P1 write authority only if P0 is accepted.
+
+### P0 acceptance and P1 promotion
+
+- P0 owner task: `Happy Pilot P0 基线与指标` (`01a06243-d880-7761-ba30-99a6387b822f`).
+- Accepted implementation: unique run/session/profile/output namespaces; no reuse/deletion of another turn's worker output; submit lane narrowed to final capacity/reservation and one Submit-capable turn; MCP-ready/direct-child RSS/token telemetry; user-visible Happy Pilot branding with `applypilot` package/CLI/distribution/environment compatibility retained.
+- Accepted tests: isolated P0 composition `664 passed in 32.32s`, all touched Python/tests scoped Ruff green, `git diff --check` green. No live browser/profile/provider/mailbox/Submit/receipt or remote action.
+- Known P0 measurement limits: `mcp_ready_ms` is an observed upper bound at first MCP call; RSS is direct child only. P1/P4 must not relabel either as full endpoint handshake or process-tree memory evidence.
+- P1 gap task `01a06243-dcf9-7591-8cca-8e39bf879d0b` is now the sole code writer. P2-P4 remain read-only until serial promotion.
+
+### P1 functional acceptance and P2 promotion
+
+- P1 implemented long-lived worker browser ownership with per-application actor/attempt/session/page/output isolation, `ApplicationSupervisor`, `ContextBundle`, generation-bound restart, and a default-off loopback Streamable HTTP MCP seam.
+- HTTP readiness is fail-closed on exact recorded child process-tree ownership, endpoint generation, listener liveness, and loopback URL shape. Codex receives URL-only MCP configuration when explicitly enabled; default production behavior remains per-turn stdio.
+- Accepted tests: focused lifecycle/HTTP/worker composition `69 passed, 318 deselected`; isolated full P0/P1 composition `1688 passed in 192.98s`; scoped Ruff and `git diff --check` green.
+- Unverified boundaries: no `npx` download, real `@playwright/mcp@0.0.79` server, real CDP attach, Codex end-to-end MCP handshake, provider, default database, Submit, receipt, or matched 1/2-worker cohort. The HTTP seam stays disabled and the worker cap stays unchanged.
+- P2 task `01a06243-e25c-7b32-915d-9e3946d9df06` is now the sole code writer. P3-P4 remain read-only until serial promotion.
+
+### P2 functional acceptance and P3 promotion
+
+- P2 added a P1-bound semantic capability seam: `FormSurface`/`ControlDescriptor`, full page lease/epoch and root-target binding, frame/open-shadow traversal, closed-shadow/cross-origin/ambiguity/stateful fail-closed inspection, HMAC TTL single-use authority, and stable postcondition verification before CAS.
+- Workday and SmartRecruiters admit only supported routine controls. Generic providers, final Submit, arbitrary file paths, ledger/reservation/receipt, and generic page-write authority receive no new capability. The existing resume upload acceptance chain is preserved.
+- Accepted tests: focused P1/P2/Broker/ATS/stateful composition `188 passed in 37.21s`; isolated full suite `1699 passed in 113.65s`; final root-target binding regression `12 passed in 8.23s`; scoped Ruff and diff check green.
+- Unverified boundary: the ordinary `run_job` path is not globally cut over, and no real ATS/default browser profile/database/mailbox/CDP/Submit/receipt action ran. P2 is accepted as a frozen functional seam, not a production rollout.
+- P3 task `01a06243-e78a-7b72-b016-380405c82abe` is now the sole code writer. P4 remains read-only until serial promotion.
+
+### P3 acceptance and P4 promotion
+
+- P3 added durable `ApplicationEpisode`/`JobEvidenceBundle` aggregation and typed command/result contracts while retaining existing `agent_events` as the only command/event authority. Evidence stores source references/hashes/fact metadata rather than raw application answers.
+- Atomic command admission, revision CAS, strict ordering, and `effect_unknown` parking prevent an admitted-but-unrecorded side effect from being blindly repeated after a crash. One same-application/provider/lease P2 descriptor diff replan is consumed durably before replacement execution.
+- A real non-submit worker recovery seam consumes the P3 contract when P1 bindings exist. Missing/conflicting material facts prohibit automated browser actions but still permit human handoff, parking, and receipt checking.
+- Accepted tests: P3 focused `8 passed`; P3/recovery composition `10 passed`; corrected isolated full suite `1708 passed in 119.40s`; scoped Ruff and diff check green. The first full run exposed two human-handoff regressions (`1706 passed, 2 failed`); the corrected full run, not the partial run, is the acceptance evidence.
+- P4 task `01a06243-ed3e-75d0-b960-4ee9306d13ab` is now the sole code writer. Production worker count remains unchanged until P4 evidence admits a higher cap.
+
+### P4 completion without concurrency promotion
+
+- The original P4 task was revoked after a long interval without visible progress. It later disclosed three unverified draft files and stopped. Replacement task `Happy Pilot P4 并发门禁接管` (`01a062ae-4363-7713-a131-16062224c60b`) reviewed and completed that work as sole writer.
+- P4 now provides a matched full-stack local no-submit cohort, per-job evidence, fail-closed admission manifest, clamp/downshift-only `PerformanceGovernor`, and a read-only `runs cohort` operator surface. Existing exception/resume/reconcile commands still revalidate their original server-side authority.
+- Final cohort: 24 jobs, 2 warmup plus 10 measured blocks, 720 measured job samples. Throughput `4.915/6.512/6.858 jobs/s`; 2-worker speedup lower bound `1.307x` and p95 ratio `1.270x`; 4-worker lower bound `1.367x` and p95 ratio `2.058x`. Both worker counts fail performance admission.
+- All non-performance gates passed: zero SQLite busy; 4-worker lock p95/max `14.02/109.61 ms`; submit wait p95/max `0.007/0.023 ms`; hold p95 `1.021 ms`; RSS within limits; identical quality digest; all jobs complete; duplicate Submit, cross-talk, admitted stale write, repeated admitted action, Submit, SubmissionGate, reservation, receipt, and receipt drift all zero.
+- One profiled optimization changed the benchmark worker from repeated SQLite connection open/close to per-worker thread-local reuse while retaining transaction/CAS/WAL/busy-timeout semantics. Its short before/after showed no gain, so no threshold or behavior was relaxed and no further tuning was attempted.
+- Accepted validation: P4 focused `7 passed`; P1-P4/Broker/operator composition `70 passed`; isolated full suite `1715 passed in 111.91s`; scoped Ruff, new-file format, diff check, runner parsing, and report CLI read all green.
+- Final verdict: P0-P4 local functional/mechanism work is complete, but P1 real MCP/CDP transport, P2 global run-path cutover, remote CI, live ATS canaries, and any higher production worker count remain unverified/not promoted. No commit, push, merge, deploy, or production configuration change occurred.
+
+### 2026-09-03 integration authority correction
+
+- Integration review rejected two proposed production authority expansions. `ApplicationEpisode` is no longer wired around the established recovery executor, and semantic control HMAC authority is no longer exposed through production `SemanticBrowserOps`.
+- The only production recovery effect lifecycle remains `recovery_execution`; the only production browser/write and submit authorities remain the established durable broker/write journal, `SubmissionGate`, reservation, single submit writer, independent observer, and receipt reconciliation chain.
+- P4 may directly exercise semantic controls only inside its isolated, zero-submit benchmark. The HTTP MCP seam is still default-off, and performance evidence still rejects worker counts 2 and 4.
+- Brand evidence from the parent worktree selects CapyPilot as the user-visible name. Package, command, environment, database, and schema compatibility continues under existing ApplyPilot identifiers.
+- Windows RSS admission now measures current working set instead of the historical peak. Focused regression and cross-phase validation passed `282` tests; final combined release/remote evidence remains pending at this checkpoint.

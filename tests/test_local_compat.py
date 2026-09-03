@@ -4020,6 +4020,11 @@ def test_worker_treats_browser_observation_as_hard_submission_gate(monkeypatch) 
         "_open_bound_application_target",
         lambda _port, _url: {"application-root"},
     )
+    monkeypatch.setattr(
+        launcher,
+        "_close_bound_application_targets",
+        lambda _port, _targets: None,
+    )
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(launcher, "run_job", fake_run_job)
     monkeypatch.setattr(

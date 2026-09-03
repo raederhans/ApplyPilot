@@ -55,6 +55,7 @@ from applypilot.apply.application_facts import (
     current_profile_facts,
     resolve_application_fact_ref,
 )
+from applypilot.apply.application_sessions import ApplicationSupervisor
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
 from applypilot.apply.browser_broker import (
@@ -147,6 +148,7 @@ from applypilot.apply.router import (
     resolve_interaction_mode,
 )
 from applypilot.apply.run_progress import RunProgress
+from applypilot.apply.runtime_namespace import RuntimeNamespace
 from applypilot.apply.semantic_browser_ops import (
     SEMANTIC_WRITE_POLICY,
     SEMANTIC_WRITE_POLICY_DIGEST,
@@ -505,6 +507,22 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         _cleanup_chrome_worker(worker_id, process)
     finally:
         _browser_broker.release_scope(f"worker:{worker_id}")
+
+
+def _release_application_browser_authority(job: dict) -> None:
+    """Release only the exact application bundle currently carried by ``job``."""
+    raw_bundle = job.get("_browser_lease_binding")
+    if not isinstance(raw_bundle, Mapping):
+        return
+    bundle = BrowserLeaseBundle.from_mapping(raw_bundle)
+    _browser_broker.release_scope(
+        bundle.profile.scope_id,
+        owner_id=bundle.profile.owner_id,
+        attempt_id=bundle.profile.attempt_id,
+        runtime_id=bundle.profile.runtime_id,
+        expected_bundles=(bundle,),
+    )
+    job.pop("_browser_lease_binding", None)
 
 
 def _heartbeat_operator_handoff(
@@ -1464,6 +1482,7 @@ def _build_agent_command(
     direct_email_send_authorized: bool = False,
     workload_class: str | None = None,
     reasoning_efforts: dict[str, str] | None = None,
+    playwright_mcp_url: str | None = None,
 ) -> tuple[list[str], Path | None]:
     return agent_runtime_mod.build_agent_command(
         backend,
@@ -1483,6 +1502,7 @@ def _build_agent_command(
         direct_email_send_authorized=direct_email_send_authorized,
         workload_class=workload_class,
         reasoning_efforts=reasoning_efforts,
+        playwright_mcp_url=playwright_mcp_url,
     )
 
 
@@ -2218,6 +2238,27 @@ def worker_loop(
         run_progress=run_progress,
     )
 
+
+def run_p4_no_submit_worker(**kwargs):
+    """Run the isolated P4 worker through the production launcher boundary.
+
+    The implementation is imported lazily so ordinary application runs do not
+    acquire benchmark or Playwright dependencies. The isolated worker has no
+    Submit, SubmissionGate, reservation, mailbox, or receipt imports.
+    """
+
+    from applypilot.apply.p4_no_submit_worker import run_p4_no_submit_worker as run
+
+    return run(**kwargs)
+
+
+def initialize_p4_no_submit_database(db_path: Path) -> None:
+    """Initialize one explicitly supplied P4 benchmark database."""
+
+    from applypilot.apply.p4_no_submit_worker import initialize_p4_no_submit_database
+
+    initialize_p4_no_submit_database(db_path)
+
 logger = logging.getLogger(__name__)
 
 # Blocked sites loaded from config/sites.yaml
@@ -2243,6 +2284,26 @@ def _open_bound_application_target(port: int, start_url: str) -> set[str]:
             raise RuntimeError("Browser did not expose the new application target id")
         page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
         return {target_id}
+
+
+def _close_bound_application_targets(port: int, target_ids: set[str]) -> None:
+    """Close only live CDP targets named by one application supervisor."""
+    expected = {str(target_id).strip() for target_id in target_ids if str(target_id).strip()}
+    if not expected:
+        return
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        session = browser.new_browser_cdp_session()
+        observed = {
+            str(info.get("targetId") or "")
+            for info in session.send("Target.getTargets").get("targetInfos", [])
+        }
+        for target_id in sorted(expected.intersection(observed)):
+            result = session.send("Target.closeTarget", {"targetId": target_id})
+            if result.get("success") is not True:
+                raise RuntimeError(f"CDP target cleanup was not confirmed: {target_id}")
 
 
 def _default_ats_binding_transport(url: str) -> dict[str, object]:
@@ -2774,8 +2835,13 @@ _evidence_retention_checked = False
 
 
 def _snapshot_worker_evidence(worker_id: int) -> dict[str, tuple[int, int]]:
-    worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
-    return snapshot_files(worker_dir, _WORKER_EVIDENCE_NAMES)
+    """Return the baseline for a fresh turn-local output namespace.
+
+    ``worker_id`` remains in the compatibility port, but transient output is
+    no longer read from the legacy shared ``worker-N`` directory.
+    """
+    del worker_id
+    return {}
 
 
 def _record_evidence_retention(
@@ -4352,7 +4418,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             agent_backend: str = "codex",
             manual_captcha_relay: bool = False,
             resume_existing_page: bool = False,
-            submission_phase: str = "submit") -> tuple[str, int]:
+            submission_phase: str = "submit",
+            application_supervisor: ApplicationSupervisor | None = None) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
@@ -4369,7 +4436,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         return "submission_uncertain", 0
     turn_id = f"agent-{uuid.uuid4()}"
     run_id = turn_id  # Backward-compatible runtime/report identity.
-    attempt_id = str(job.get("_attempt_id") or f"preview-{turn_id}")
+    attempt_id = str(
+        job.get("_attempt_id")
+        or (
+            application_supervisor.attempt_id
+            if application_supervisor is not None
+            else f"preview-{turn_id}"
+        )
+    )
     actor_id = application_actor_id(attempt_id)
     stored_parent_turn_id = str(job.get("_parent_agent_run_id") or "").strip()
     stored_parent_checkpoint_id = str(
@@ -4584,12 +4658,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    if resume_existing_page:
-        worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
-        worker_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        worker_dir = reset_worker_dir(worker_id)
-
     broker_session_persistent = bool(job.get("_browser_root_runtime"))
     browser_lease_bundle = _browser_lease_for_agent_turn(
         job,
@@ -4602,13 +4670,38 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         dry_run=dry_run,
         resume_existing_page=resume_existing_page,
     )
+    if application_supervisor is not None:
+        application_supervisor.bind_browser_authority(browser_lease_bundle)
+        if submission_phase == "submit" and not dry_run:
+            application_supervisor.mark_submit_started()
+    runtime_namespace = RuntimeNamespace(
+        root=config.APPLY_WORKER_DIR,
+        run_id=str(job.get("_run_namespace_id") or f"direct-run-{uuid.uuid4()}"),
+        session_id=turn_id,
+        profile_id=browser_lease_bundle.profile.resource_id,
+    )
+    worker_dir = runtime_namespace.output_root
+    try:
+        worker_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise RuntimeError("runtime output namespace already exists") from exc
+    job["_run_namespace_id"] = runtime_namespace.run_id
+    job["_runtime_output_root"] = str(worker_dir)
+    job["_runtime_namespace"] = runtime_namespace.as_dict()
+    application_context = (
+        application_supervisor.context_bundle(
+            namespace=runtime_namespace,
+            phase=submission_phase,
+            runtime_backend=f"{agent_backend}-cli",
+        )
+        if application_supervisor is not None
+        else None
+    )
+    if application_context is not None:
+        job["_application_context_bundle"] = application_context.as_dict()
     _install_answer_provenance_context(job)
-    report_path = worker_dir / "agent-turn-report.json"
-    ats_context_path = worker_dir / "ats-application-context.json"
-    if report_path.exists():
-        report_path.unlink()
-    if ats_context_path.exists():
-        ats_context_path.unlink()
+    report_path = runtime_namespace.path("agent-turn-report.json")
+    ats_context_path = runtime_namespace.path("ats-application-context.json")
 
     workspace_root = config.APP_DIR.parent
     secure_fill_script = workspace_root / "fill-ats-credentials.ps1"
@@ -4669,7 +4762,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         "capabilities": list(browser_lease_bundle.page.capabilities),
         "authority": "observation_only",
     }
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_config_path = runtime_namespace.path("mcp-config.json")
     mcp_config_path.write_text(
         json.dumps(
             _make_mcp_config(
@@ -4699,6 +4792,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         runtime_metadata=runtime_metadata,
         mailbox_mcp=mailbox_mcp,
         direct_email_send_authorized=direct_email_send_authorized,
+        playwright_mcp_url=(
+            application_context.endpoint.address
+            if application_context is not None
+            and application_context.endpoint.transport == "streamable-http"
+            and application_context.endpoint.reusable
+            else None
+        ),
         workload_class=(
             "submit_repair"
             if submission_phase == "submit" and "repair" in runtime_state
@@ -4719,6 +4819,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         3,
     )
     runtime_metadata["performance"] = dict(setup_metrics)
+    runtime_metadata["namespace"] = runtime_namespace.as_dict()
+    if application_context is not None:
+        runtime_metadata["application_context"] = application_context.as_dict()
+        runtime_metadata["persistent_worker"] = (
+            application_supervisor.browser_worker.metrics()
+        )
     if final_message_path and final_message_path.exists():
         final_message_path.unlink()
 
@@ -4732,6 +4838,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env[REPORT_PATH_ENV] = str(report_path)
     env[RUN_ID_ENV] = run_id
     env[ATS_CONTEXT_PATH_ENV] = str(ats_context_path)
+    env["APPLYPILOT_RUN_NAMESPACE_ID"] = runtime_namespace.run_id
+    env["APPLYPILOT_SESSION_NAMESPACE_ID"] = runtime_namespace.session_id
+    env["APPLYPILOT_PROFILE_NAMESPACE_ID"] = runtime_namespace.profile_id
+    env["APPLYPILOT_OUTPUT_NAMESPACE"] = str(runtime_namespace.output_root)
     for key in (
         "APPLYPILOT_ATS_CREDENTIAL_FILE",
         "APPLYPILOT_IDENTITY_CREDENTIAL_FILE",
@@ -4807,6 +4917,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         ),
         context={
             "worker_id": worker_id,
+            "runtime_namespace": runtime_namespace.as_dict(),
+            **(
+                {"application_context": application_context.as_dict()}
+                if application_context is not None
+                else {}
+            ),
             "browser_backend": str(job.get("_browser_backend") or "unknown"),
             "resume_existing_page": resume_existing_page,
             "dry_run": dry_run,
@@ -4867,7 +4983,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('company_name', '')}")
 
-    worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
+    worker_log = runtime_namespace.path("agent-runtime.log")
     ts_header = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     log_header = (
         f"\n{'=' * 60}\n"
@@ -4907,7 +5023,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     process_spawned_at: float | None = None
     first_output_at: float | None = None
     first_tool_at: float | None = None
+    first_mcp_ready_at: float | None = None
     last_tool_at: float | None = None
+    rss_peak_bytes = 0
+    last_rss_sample_at: float | None = None
     tool_call_count = 0
     tool_call_sequence = 0
     seen_tool_calls: set[str] = set()
@@ -5098,6 +5217,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
         proc = durable_handle.process
         process_spawned_at = time.perf_counter()
+        rss_peak_bytes = agent_runtime_mod.process_rss_bytes(proc.pid)
+        last_rss_sample_at = process_spawned_at
         setup_metrics["process_spawn_ms"] = round(
             (process_spawned_at - process_spawn_started) * 1000,
             3,
@@ -5127,6 +5248,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 line = line.strip()
                 if not line:
                     continue
+                rss_sample_at = time.perf_counter()
+                if (
+                    last_rss_sample_at is None
+                    or rss_sample_at - last_rss_sample_at >= 0.25
+                ):
+                    rss_peak_bytes = max(
+                        rss_peak_bytes,
+                        agent_runtime_mod.process_rss_bytes(proc.pid),
+                    )
+                    last_rss_sample_at = rss_sample_at
                 if first_output_at is None:
                     first_output_at = time.perf_counter()
                 try:
@@ -5143,6 +5274,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 now_tool = time.perf_counter()
                                 if first_tool_at is None:
                                     first_tool_at = now_tool
+                                if (
+                                    first_mcp_ready_at is None
+                                    and str(raw_name).startswith("mcp__")
+                                ):
+                                    first_mcp_ready_at = now_tool
                                 last_tool_at = now_tool
                                 tool_key = record_tool_call(
                                     block.get("id"), str(raw_name)
@@ -5252,6 +5388,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             now_tool = time.perf_counter()
                             if first_tool_at is None:
                                 first_tool_at = now_tool
+                            if first_mcp_ready_at is None and item_type == "mcp_tool_call":
+                                first_mcp_ready_at = now_tool
                             last_tool_at = now_tool
                             tool_key = record_tool_call(
                                 item.get("id"), f"{server}:{tool}"
@@ -5383,7 +5521,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             job.get("site") or job.get("source_site") or "unknown",
             20,
         )
-        job_log = config.LOG_DIR / f"agent_{ts}_w{worker_id}_{site_slug}.txt"
+        job_log = runtime_namespace.path(f"agent-result-{site_slug}.txt")
         job_log.write_text(
             "Agent output redacted; authoritative status is stored in the application ledger.\n",
             encoding="utf-8",
@@ -5677,6 +5815,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     metrics={
                         **setup_metrics,
                         **stats,
+                        "total_tokens": sum(
+                            max(0, int(value))
+                            for value in (
+                                stats.get("input_tokens", 0),
+                                stats.get("output_tokens", 0),
+                            )
+                            if isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                        ),
+                        "process_rss_peak_bytes": max(0, rss_peak_bytes),
                         "first_output_ms": (
                             0
                             if first_output_at is None or process_spawned_at is None
@@ -5687,6 +5835,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if first_tool_at is None or process_spawned_at is None
                             else round((first_tool_at - process_spawned_at) * 1000, 3)
                         ),
+                        "mcp_ready_ms": (
+                            0
+                            if first_mcp_ready_at is None or process_spawned_at is None
+                            else round(
+                                (first_mcp_ready_at - process_spawned_at) * 1000,
+                                3,
+                            )
+                        ),
+                        "mcp_ready_observed": int(first_mcp_ready_at is not None),
                         "last_tool_ms": (
                             0
                             if last_tool_at is None or process_spawned_at is None

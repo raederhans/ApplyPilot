@@ -1,4 +1,4 @@
-"""ApplyPilot CLI — the main entry point."""
+"""CapyPilot CLI — the main entry point (``applypilot`` compatible)."""
 
 from __future__ import annotations
 
@@ -243,7 +243,7 @@ def _assert_discovery_storage_path(path: Path, root: Path, label: str) -> None:
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"[bold]ApplyPilot Local[/bold] {__version__}")
+        console.print(f"[bold]CapyPilot[/bold] {__version__}")
         raise typer.Exit()
 
 
@@ -359,7 +359,7 @@ def main(
         is_eager=True,
     ),
 ) -> None:
-    """ApplyPilot Local — evidence-driven discovery, preparation, and application."""
+    """CapyPilot — evidence-driven discovery, preparation, and application."""
     if workspace is not None:
         os.environ["APPLYPILOT_DIR"] = str(workspace)
     _assert_discovery_only_command(ctx.invoked_subcommand, {"sync-linkedin-applied", "radar"})
@@ -485,6 +485,28 @@ def runs_inspect(
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
     console.print_json(data={"ok": True, "run": _json_safe(inspection)})
+
+
+@runs_app.command("cohort")
+def runs_cohort(
+    report_path: Path = typer.Option(
+        ...,
+        "--report-path",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Inspect read-only cohort, admission, and governor evidence."""
+
+    try:
+        from applypilot.apply.performance_governor import inspect_cohort_report
+
+        evidence = inspect_cohort_report(report_path)
+    except (json.JSONDecodeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _operator_error(str(exc))
+    console.print_json(data={"ok": True, "evidence": evidence})
 
 
 @runs_app.command("reconcile")
@@ -1364,7 +1386,7 @@ def browser_session(
         console.print(f"[red]Browser backend unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from None
 
-    console.print("\n[bold blue]Opening persistent ApplyPilot browser session[/bold blue]")
+    console.print("\n[bold blue]Opening persistent CapyPilot browser session[/bold blue]")
     console.print(f"  Worker:  {worker}")
     console.print(f"  Backend: {effective_browser_backend}")
     console.print(f"  URL:     {url}")
@@ -1406,7 +1428,7 @@ def status() -> None:
         profile=app_config.load_profile(),
     )
 
-    console.print("\n[bold]ApplyPilot Pipeline Status[/bold]\n")
+    console.print("\n[bold]CapyPilot Pipeline Status[/bold]\n")
 
     # Summary table
     summary = Table(title="Pipeline Overview", show_header=True, header_style="bold cyan")
@@ -1552,7 +1574,7 @@ def rekey_email_job_command(
     reference: str = typer.Option(
         ...,
         "--reference",
-        help="Stable lowercase role/date slug used only for ApplyPilot tracking.",
+        help="Stable lowercase role/date slug used only for CapyPilot tracking.",
     ),
     title: str = typer.Option(..., "--title", help="Verified job title."),
     company: str = typer.Option(..., "--company", help="Verified employer name."),

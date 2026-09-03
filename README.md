@@ -1,8 +1,8 @@
-# ApplyPilot Local
+# CapyPilot
 
 **Local-first, evidence-driven job application workspace.**
 
-ApplyPilot Local helps a job seeker discover verifiable openings, score fit,
+CapyPilot helps a job seeker discover verifiable openings, score fit,
 reuse validated resume variants, prepare application materials, assist with
 browser-based forms under explicit authorization, and reconcile submission
 receipts. Candidate data, credentials, generated documents, and runtime logs
@@ -11,7 +11,8 @@ stay on the user's machine by default.
 This repository is an independent continuation of the inactive upstream
 [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot). The
 Python import package and CLI remain `applypilot` for compatibility; the
-distribution and product identity are `ApplyPilot Local`.
+public product identity is `CapyPilot`. The Python package,
+`applypilot` CLI, and `APPLYPILOT_*` environment variables remain compatible.
 
 ## Product principles
 
@@ -80,7 +81,7 @@ applypilot --version
 ```
 
 For a repeatable import from files you already maintain, provide all three
-inputs together. ApplyPilot validates them, refuses to replace existing files
+inputs together. CapyPilot validates them, refuses to replace existing files
 unless `--force` is explicit, and does not collect API keys or browser
 credentials:
 
@@ -149,7 +150,7 @@ second final-submit attempt. Use `--interaction-mode playwright` to disable
 that handoff request.
 
 CloakBrowser uses its own `cloak-workers/` profiles and never clones the daily
-Edge profile. ApplyPilot disables CloakBrowser auto-updates and pins the
+Edge profile. CapyPilot disables CloakBrowser auto-updates and pins the
 keyless binary unless `APPLYPILOT_CLOAK_VERSION` or a separately managed
 `CLOAKBROWSER_LICENSE_KEY` selects another admitted build. The upstream binary
 license prohibits automated account creation and redistribution; those flows
@@ -220,7 +221,7 @@ requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository conventions and
 
 ## License and provenance
 
-ApplyPilot Local remains licensed under
+CapyPilot remains licensed under
 [GNU AGPL-3.0-only](LICENSE). The original ApplyPilot authors retain their
 copyright in the upstream work; fork modifications are distributed under the
 same license. See [NOTICE.md](NOTICE.md) for provenance and the network-source
@@ -228,5 +229,5 @@ obligation that matters if this code is later offered as an interactive
 service.
 
 This repository is not affiliated with applypilot.app, useapplypilot.com, or
-other products using a similar name. “ApplyPilot Local” identifies this
+other products using a similar name. “CapyPilot” identifies this
 independent fork and its local-first operating model.

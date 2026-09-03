@@ -1095,6 +1095,11 @@ def test_codex_final_message_is_the_only_legacy_output_for_preview_contract(
         return Process(env=kwargs["env"], final_message_path=final_path)
 
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        launcher.agent_runtime_mod,
+        "process_rss_bytes",
+        lambda _pid: 12_345,
+    )
     monkeypatch.setattr(launcher, "_process_identity_tuple", lambda pid: (pid, 123_456))
     job = {
         "url": "https://example.test/jobs/preview",
@@ -1205,7 +1210,10 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
                     "type": "item.completed",
                     "item": {"type": "agent_message", "text": "RESULT:READY_TO_SUBMIT"},
                 },
-                {"type": "turn.completed", "usage": {}},
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 11, "output_tokens": 7},
+                },
             ]
             self.stdout = io.StringIO("\n".join(json.dumps(item) for item in messages))
 
@@ -1232,6 +1240,11 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
         return Process(env=kwargs["env"])
 
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        launcher.agent_runtime_mod,
+        "process_rss_bytes",
+        lambda _pid: 12_345,
+    )
     monkeypatch.setattr(
         launcher,
         "_process_identity_tuple",
@@ -1275,6 +1288,13 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     completed_payload = json.loads(events[-1][1])
     assert completed_payload["metrics"]["browser_tool_call_count"] == 1
     assert completed_payload["metrics"]["browser_tool_success_count"] == 1
+    assert completed_payload["metrics"]["mcp_ready_observed"] == 1
+    assert completed_payload["metrics"]["mcp_ready_ms"] >= 0
+    assert completed_payload["metrics"]["process_spawn_ms"] >= 0
+    assert completed_payload["metrics"]["process_rss_peak_bytes"] == 12_345
+    assert completed_payload["metrics"]["input_tokens"] == 11
+    assert completed_payload["metrics"]["output_tokens"] == 7
+    assert completed_payload["metrics"]["total_tokens"] == 18
     assert completed_payload["actor_decision"] == {
         "run_id": completed_payload["actor_decision"]["run_id"],
         "attempt_id": "attempt-1",
@@ -1293,7 +1313,12 @@ def test_run_job_records_structured_turn_events_without_changing_status_contract
     assert captured_ats_context["side_effect"] == "proposal-only"
     assert captured_env["PRIVATE_TOKEN"] == "secret-value"
     assert "secret-value" not in " ".join(captured_command)
-    assert "secret-value" not in (app_dir / ".mcp-apply-0.json").read_text(encoding="utf-8")
+    output_root = Path(job["_runtime_output_root"])
+    assert output_root.is_relative_to(config.APPLY_WORKER_DIR)
+    assert job["_runtime_namespace"]["run_id"] == job["_run_namespace_id"]
+    assert "secret-value" not in (output_root / "mcp-config.json").read_text(
+        encoding="utf-8"
+    )
     assert job["_agent_proposal_results"]
     assert {
         outcome["value"] for outcome in job["_agent_proposal_results"].values()

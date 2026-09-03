@@ -51,7 +51,7 @@ def run_radar_queries(runtime: ModuleType, values: dict[str, object]) -> None:
         table.add_row(item["track"], item["subtrack"], item["window"], item["url"])
     console.print(table)
     console.print(
-        "[dim]URLs are for visible, candidate-operated review. ApplyPilot does not crawl LinkedIn.[/dim]"
+        "[dim]URLs are for visible, candidate-operated review. CapyPilot does not crawl LinkedIn.[/dim]"
     )
 
 

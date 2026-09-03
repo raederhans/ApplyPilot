@@ -581,7 +581,7 @@ def run_pipeline(
     mode = "streaming" if stream else "sequential"
     console.print()
     console.print(Panel.fit(
-        f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
+        f"[bold]CapyPilot Pipeline[/bold] ({mode})",
         border_style="blue",
     ))
     console.print(f"  Min score:  {min_score}")
