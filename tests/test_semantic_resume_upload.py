@@ -440,6 +440,7 @@ def test_artifact_metadata_mismatch_is_zero_write(
     assert element.set_calls == 0
 
 
+@pytest.mark.browser
 def test_real_playwright_page_set_content_upload(tmp_path: Path) -> None:
     sync_api = pytest.importorskip("playwright.sync_api")
     path = tmp_path / "browser-resume.pdf"

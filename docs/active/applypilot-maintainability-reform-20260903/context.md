@@ -64,3 +64,9 @@ Phase II must correct the local tier ownership before relying on remote timing: 
 - Main provider/observation/runtime/safety selection: `487 passed in 28.73s`.
 - Supplementary semantic-browser/admission/stateful-control/repair selection: `104 passed in 18.57s`.
 - Changed-file Ruff and compile checks passed. No real Chromium, live ATS, Submit, email, remote CI, full 1,720-test run, build, release, commit, push, or deployment was performed.
+
+## 2026-09-03 — integration CI ownership correction
+
+- The first integrated commit was `2a09332480bf8832b665b22f980a25d5a851fbd9` on `fork/main`. CI run `33713251268` proved that the compatibility lanes and the originally marked Chromium tier were healthy, but the Linux core lane still collected 23 real-Chromium cases from five mixed test files. Fourteen failed because the core job intentionally did not install Chromium; nine would otherwise skip when the executable was absent. This was a marker-ownership defect, not product-runtime evidence.
+- The correction marks individual browser-using tests in `test_control_descriptors.py`, `test_full_stack_no_submit_benchmark.py`, `test_semantic_resume_runtime.py`, `test_semantic_resume_upload.py`, and `test_stateful_control_coverage.py`. Pure logic tests in those files remain in core. The existing whole-file marker in `test_runtime_cohort_chromium.py` remains unchanged.
+- Corrected collection is `1728` total: core `1668`, compatibility `19`, browser `30`, and Windows `30`. The full browser selection passed locally (`30 passed in 48.56s`); the pre-correction core superset had passed locally (`1691 passed`) and the Windows selection passed (`30 passed`). A new remote run is still required for Linux core, build/wheel, and dependent Windows clean-install evidence.

@@ -318,6 +318,7 @@ def _route_fixture(page, provider: str) -> str:
     return root_url
 
 
+@pytest.mark.browser
 @pytest.mark.parametrize("provider", ["workday", "smartrecruiters"])
 def test_real_chromium_supported_provider_controls_use_p1_epoch_bound_gateway(
     tmp_path: Path,
@@ -395,6 +396,7 @@ def test_real_chromium_supported_provider_controls_use_p1_epoch_bound_gateway(
         browser.close()
 
 
+@pytest.mark.browser
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
@@ -440,6 +442,7 @@ def test_real_chromium_surface_fail_closed_boundaries(
         browser.close()
 
 
+@pytest.mark.browser
 def test_real_chromium_closed_shadow_root_fails_closed(tmp_path: Path) -> None:
     sync_api = pytest.importorskip("playwright.sync_api")
     with sync_api.sync_playwright() as playwright:

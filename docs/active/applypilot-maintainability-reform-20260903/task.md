@@ -48,3 +48,11 @@
 - Main selection: `487 passed in 28.73s`; supplementary semantic-browser/admission/stateful-control/repair selection: `104 passed in 18.57s`.
 - Unmigrated: pre-submit answer/policy/audit remains in the facade; browser lease install/refresh/repair/heartbeat/release remains a single job-mapping fact with multiple mutation sites; browser-injected LinkedIn JavaScript retains its local hostname predicate because it executes outside Python registry scope.
 - No full 1,720-test execution, real Chromium, live ATS, Submit, mailbox action, remote CI, build, release, commit, push, or deployment was performed.
+
+## Integration follow-up — locally qualified
+
+- [x] Push the combined reform commit `2a09332480bf8832b665b22f980a25d5a851fbd9` to `fork/main` after Ruff, compile, `1691` core tests, and `30` Windows tests passed locally.
+- [x] Diagnose CI run `33713251268`: Python 3.11/3.13 compatibility and the original Chromium tier passed, but core exposed 23 real-Chromium cases that were not owned by the browser marker; Windows correctly remained blocked by the failed upstream gate.
+- [x] Mark only the real Chromium test functions in the five mixed-responsibility files, leaving their pure contract tests in core.
+- [x] Validate the corrected partition: `1728` total, `1668` core, `19` compatibility, `30` browser, and `30` Windows selections; the complete browser tier passed locally (`30 passed`).
+- The follow-up commit requires a fresh remote CI run before the integration owner may report the remote gate as passing.

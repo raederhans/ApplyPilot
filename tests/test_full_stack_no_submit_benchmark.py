@@ -75,6 +75,7 @@ def test_fixture_is_exact_matched_workday_smartrecruiters_cohort() -> None:
     }
 
 
+@pytest.mark.browser
 def test_launcher_worker_crosses_p1_p2_p3_without_submit_authority(tmp_path: Path) -> None:
     root = tmp_path / "isolated"
     root.mkdir()

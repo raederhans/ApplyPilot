@@ -281,6 +281,7 @@ def test_postcondition_and_operation_ids_are_path_free(tmp_path: Path) -> None:
         operation_id("not-a-digest")
 
 
+@pytest.mark.browser
 @pytest.mark.parametrize(
     ("provider", "html", "optional_selector"),
     [

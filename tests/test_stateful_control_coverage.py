@@ -38,6 +38,7 @@ def test_stateful_control_coverage_contract_requires_complete_classification() -
     ) == "stateful_control_unclassified"
 
 
+@pytest.mark.browser
 @pytest.mark.parametrize(
     ("body", "expected_unclassified", "expected_selected"),
     [
@@ -151,6 +152,7 @@ def test_real_local_chromium_classifies_custom_and_hidden_stateful_controls(
     assert coverage["proof_complete"] is (expected_unclassified == 0)
 
 
+@pytest.mark.browser
 def test_custom_aria_disabled_state_cannot_escape_through_hidden_payload() -> None:
     from playwright.sync_api import sync_playwright
 
@@ -183,6 +185,7 @@ def test_custom_aria_disabled_state_cannot_escape_through_hidden_payload() -> No
     assert coverage["proof_complete"] is False
 
 
+@pytest.mark.browser
 def test_html_disabled_native_controls_remain_excluded_from_coverage() -> None:
     from playwright.sync_api import sync_playwright
 
@@ -213,6 +216,7 @@ def test_html_disabled_native_controls_remain_excluded_from_coverage() -> None:
     assert coverage["proof_complete"] is True
 
 
+@pytest.mark.browser
 def test_native_aria_disabled_cannot_escape_successful_control_coverage() -> None:
     from playwright.sync_api import sync_playwright
 
