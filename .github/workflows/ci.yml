@@ -16,14 +16,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Python ${{ matrix.python-version }}
+  core:
+    name: Core Python 3.12
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install core and development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Verify optional job-board dependency chain
+        run: |
+          python -m pip install -e ".[jobboards]"
+          python -c "from jobspy import scrape_jobs; assert callable(scrape_jobs)"
+
+      - name: Lint
+        run: ruff check src
+
+      - name: Test core tier
+        run: python -m pytest -q -m "not browser and not windows"
+
+      - name: Build distribution
+        run: python scripts/build_release.py
+
+      - name: Verify wheel metadata and CLI
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/python/*.whl
+          python -m pip check
+          applypilot --version
+
+  compatibility:
+    name: Compatibility Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.13"]
 
     steps:
       - name: Checkout
@@ -39,36 +78,38 @@ jobs:
       - name: Install core and development dependencies
         run: python -m pip install -e ".[dev]"
 
+      - name: Test compatibility subset
+        run: python -m pytest -q -m "compatibility and not browser and not windows"
+
+  browser-chromium:
+    name: Browser Chromium 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install core and development dependencies
+        run: python -m pip install -e ".[dev]"
+
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Verify optional job-board dependency chain
-        if: matrix.python-version == '3.12'
-        run: |
-          python -m pip install -e ".[jobboards]"
-          python -c "from jobspy import scrape_jobs; assert callable(scrape_jobs)"
-
-      - name: Lint
-        if: matrix.python-version == '3.12'
-        run: ruff check src
-
-      - name: Test
-        run: python -m pytest -q
-
-      - name: Build distribution
-        if: matrix.python-version == '3.12'
-        run: python scripts/build_release.py
-
-      - name: Verify wheel metadata and CLI
-        if: matrix.python-version == '3.12'
-        run: |
-          python -m pip install --force-reinstall --no-deps dist/python/*.whl
-          python -m pip check
-          applypilot --version
+      - name: Test browser tier
+        run: python -m pytest -q -m browser
 
   windows-install-smoke:
-    name: Windows 3.12 core tests and clean install smoke
+    name: Windows 3.12 tests and clean install smoke
     runs-on: windows-latest
+    needs: [core, compatibility, browser-chromium]
     timeout-minutes: 30
     env:
       PYTHONUTF8: "1"
@@ -91,11 +132,8 @@ jobs:
       - name: Install core and development dependencies
         run: python -m pip install -e ".[dev]"
 
-      - name: Install Playwright Chromium
-        run: python -m playwright install chromium
-
-      - name: Test core suite
-        run: python -m pytest -q
+      - name: Test Windows tier
+        run: python -m pytest -q -m windows
 
       - name: Build release artifacts
         run: python scripts/build_release.py

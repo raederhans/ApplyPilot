@@ -42,8 +42,11 @@ from applypilot.apply import answer_provenance as answer_provenance_mod
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import ats as ats_mod
+from applypilot.apply import linkedin_page_observation as linkedin_page_observation_mod
 from applypilot.apply import orchestration as orchestration_mod
 from applypilot.apply import page_observation as page_observation_mod
+from applypilot.apply import page_surfaces as page_surfaces_mod
+from applypilot.apply import post_submit_observation as post_submit_observation_mod
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import receipt_observer as receipt_observer_mod
 from applypilot.apply import resume_authorization as resume_authorization_mod
@@ -76,15 +79,15 @@ from applypilot.apply.capabilities import (
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     _kill_process_tree,
-    allocate_cdp_port,  # noqa: F401 - injected worker port
-    capture_browser_session,  # noqa: F401 - injected worker port
+    allocate_cdp_port,
+    capture_browser_session,
     cleanup_on_exit,
     kill_all_chrome,
-    launch_chrome,  # noqa: F401 - injected worker port
-    release_cdp_port,  # noqa: F401 - injected worker port
+    launch_chrome,
+    release_cdp_port,
     reset_worker_dir,
     resolve_browser_backend,
-    restore_browser_session,  # noqa: F401 - injected worker port
+    restore_browser_session,
 )
 from applypilot.apply.chrome import (
     cleanup_worker as _cleanup_chrome_worker,
@@ -142,8 +145,8 @@ from applypilot.apply.retention import (
 from applypilot.apply.router import (
     ControlRoute,
     cloak_fallback_route,
-    computer_use_handoff_allowed,  # noqa: F401 - injected worker port
-    initial_route,  # noqa: F401 - injected worker port
+    computer_use_handoff_allowed,
+    initial_route,
     prompt_control_contract,
     resolve_interaction_mode,
 )
@@ -572,9 +575,97 @@ def _heartbeat_operator_handoff(
     job["_browser_lease_binding"] = refreshed.as_dict()
     return True
 
-# Document the compatibility surface consumed by the extracted worker. Tests
-# and callers may still replace these ports before ``worker_loop``.
-_WORKER_RUNTIME_EXPORTS = worker_orchestration_mod.WORKER_RUNTIME_PORTS
+def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
+    """Compose typed worker ports from the current launcher compatibility surface."""
+
+    return worker_orchestration_mod.WorkerRuntimePorts(
+        host=worker_orchestration_mod.WorkerHostPorts(
+            poll_interval=POLL_INTERVAL,
+            stop_event=_stop_event,
+            config=config,
+            logger=logger,
+            datetime=datetime,
+            load_runtime_settings=load_runtime_settings,
+            kill_process_tree=_kill_process_tree,
+            process_rss_bytes=agent_runtime_mod.process_rss_bytes,
+        ),
+        browser=worker_orchestration_mod.WorkerBrowserPorts(
+            acquire_cloak_lane=_acquire_cloak_lane,
+            cloak_lane=_cloak_lane,
+            allocate_cdp_port=allocate_cdp_port,
+            release_cdp_port=release_cdp_port,
+            launch_chrome=launch_chrome,
+            cleanup_worker=cleanup_worker,
+            open_bound_application_target=_open_bound_application_target,
+            close_bound_application_targets=_close_bound_application_targets,
+            release_application_browser_authority=_release_application_browser_authority,
+            capture_browser_session=capture_browser_session,
+            restore_browser_session=restore_browser_session,
+            cloak_fallback_route=cloak_fallback_route,
+            computer_use_handoff_allowed=computer_use_handoff_allowed,
+            initial_route=initial_route,
+            resolve_browser_backend=resolve_browser_backend,
+            resolve_interaction_mode=resolve_interaction_mode,
+        ),
+        jobs=worker_orchestration_mod.WorkerJobPorts(
+            acquire_job=acquire_job,
+            add_event=add_event,
+            get_connection=get_connection,
+            mark_result=mark_result,
+            mark_runtime_cover_not_required=_mark_runtime_cover_not_required,
+            record_application_attempt_performance=record_application_attempt_performance,
+            release_lock=release_lock,
+            restore_preview_state=restore_preview_state,
+            update_state=update_state,
+        ),
+        application=worker_orchestration_mod.WorkerApplicationPorts(
+            archive_worker_evidence=_archive_worker_evidence,
+            snapshot_worker_evidence=_snapshot_worker_evidence,
+            attach_control_contract=_attach_control_contract,
+            format_failure_error=_format_failure_error,
+            is_permanent_failure=_is_permanent_failure,
+            resolve_ats_application_binding=_resolve_ats_application_binding,
+            run_read_only_preflight=_run_read_only_preflight,
+            prepare_ats_fill_plan_repair=_prepare_ats_fill_plan_repair,
+            try_semantic_pre_submit_repair=_try_semantic_pre_submit_repair,
+            record_ats_fill_plan_feedback=_record_ats_fill_plan_feedback,
+            prepare_runtime_cover_letter=_prepare_runtime_cover_letter,
+            runtime_linkedin_route_gate=_runtime_linkedin_route_gate,
+            route_for_phase=_route_for_phase,
+            run_job=run_job,
+        ),
+        observation=worker_orchestration_mod.WorkerPageObservationPorts(
+            audit_live_pre_submit_page=_audit_live_pre_submit_page,
+            classify_post_submit_observation=_classify_post_submit_observation,
+            click_linkedin_main_apply_causally=_click_linkedin_main_apply_causally,
+            verify_linkedin_post_login_state=_verify_linkedin_post_login_state,
+            observe_post_submit_page=_observe_post_submit_page,
+            observe_linkedin_external_handoff_page=_observe_linkedin_external_handoff_page,
+        ),
+        submission=worker_orchestration_mod.WorkerSubmissionPorts(
+            acquire_submit_writer_lane=_acquire_submit_writer_lane,
+            admit_direct_email_receipt=_admit_direct_email_receipt,
+            configured_receipt_observers=_configured_receipt_observers,
+            build_receipt_observer_context=_build_receipt_observer_context,
+            process_receipt_observer_result=_process_receipt_observer_result,
+            reserve_manifest_submission=_reserve_manifest_submission,
+            submission_evidence_consistent=_submission_evidence_consistent,
+            submission_rate_status=_submission_rate_status,
+            submit_writer_lane=_submit_writer_lane,
+            update_submission_ledger=_update_submission_ledger,
+            has_admitted_submission_receipt=_has_admitted_submission_receipt,
+        ),
+        operator=worker_orchestration_mod.WorkerOperatorPorts(
+            issue_manual_resume_authorization=_issue_manual_resume_authorization,
+            consume_manual_resume_authorization=_consume_manual_resume_authorization,
+            heartbeat_operator_handoff=_heartbeat_operator_handoff,
+            runtime_operator_resume_scope=_runtime_operator_resume_scope,
+            runtime_audit_verification_scope=_runtime_audit_verification_scope,
+            runtime_recovery_scope=_runtime_recovery_scope,
+            runtime_submit_scope=_runtime_submit_scope,
+            wait_for_manual_captcha=_wait_for_manual_captcha,
+        ),
+    )
 
 _format_failure_error = agent_output_mod.format_failure_error
 _interpret_agent_output = agent_output_mod.interpret_agent_output
@@ -592,13 +683,13 @@ _reconcile_agent_turn_outputs_with_diagnostics = (
 _application_fact_value = page_observation_mod._application_fact_value
 _audit_live_pre_submit_page = page_observation_mod._audit_live_pre_submit_page
 _observe_linkedin_external_handoff_page = (
-    page_observation_mod._observe_linkedin_external_handoff_page
+    linkedin_page_observation_mod.observe_linkedin_external_handoff_page
 )
 _click_linkedin_main_apply_causally = (
-    page_observation_mod._click_linkedin_main_apply_causally
+    linkedin_page_observation_mod.click_linkedin_main_apply_causally
 )
 _verify_linkedin_post_login_state = (
-    page_observation_mod._verify_linkedin_post_login_state
+    linkedin_page_observation_mod.verify_linkedin_post_login_state
 )
 
 
@@ -711,15 +802,19 @@ def _record_ats_fill_plan_feedback(
             idempotency_key=f"{task_id}:{event}",
         )
     )
-_bound_application_pages = page_observation_mod._bound_application_pages
+_bound_application_pages = page_surfaces_mod.bound_application_pages
 _captcha_response_present = page_observation_mod._captcha_response_present
-_classify_post_submit_observation = page_observation_mod._classify_post_submit_observation
+_classify_post_submit_observation = (
+    post_submit_observation_mod.classify_post_submit_observation
+)
 _expected_screening_answer = page_observation_mod._expected_screening_answer
-_observe_post_submit_page = page_observation_mod._observe_post_submit_page
+_observe_post_submit_page = post_submit_observation_mod.observe_post_submit_page
 _selected_matches_boolean = page_observation_mod._selected_matches_boolean
-_select_application_frame = page_observation_mod._select_application_frame
-_select_application_page = page_observation_mod._select_application_page
-_submission_evidence_consistent = page_observation_mod._submission_evidence_consistent
+_select_application_frame = page_surfaces_mod.select_application_frame
+_select_application_page = page_surfaces_mod.select_application_page
+_submission_evidence_consistent = (
+    post_submit_observation_mod.submission_evidence_consistent
+)
 _validate_pre_submit_snapshot = page_observation_mod._validate_pre_submit_snapshot
 _verification_clear_state_stable = page_observation_mod._verification_clear_state_stable
 _visible_captcha_overlay = page_observation_mod._visible_captcha_overlay
@@ -1089,7 +1184,7 @@ def _try_semantic_pre_submit_repair(
         pages = _bound_application_pages(browser, pages, job)
         if not pages:
             return {"status": "no_bound_application_page"}
-        page, surface = page_observation_mod._select_application_page_and_frame(pages)
+        page, surface = page_surfaces_mod.select_application_page_and_frame(pages)
         page.bring_to_front()
         provider = provider_for_url(page.url)
         reported_provider = provider_for_url(audit_report.get("page_url"))
@@ -2219,8 +2314,7 @@ def worker_loop(
     attempted_urls_lock: threading.Lock | None = None,
     run_progress: RunProgress | None = None,
 ) -> tuple[int, int]:
-    return worker_orchestration_mod.worker_loop(
-        sys.modules[__name__],
+    options = worker_orchestration_mod.WorkerRunOptions(
         worker_id=worker_id,
         limit=limit,
         target_url=target_url,
@@ -2236,6 +2330,10 @@ def worker_loop(
         attempted_urls=attempted_urls,
         attempted_urls_lock=attempted_urls_lock,
         run_progress=run_progress,
+    )
+    return worker_orchestration_mod.worker_loop(
+        _worker_runtime_ports(),
+        options,
     )
 
 
@@ -3131,7 +3229,7 @@ def _linkedin_causal_attestation_matches(
         return None
     if private.get("version") != 1 or observed.get("version") != 1:
         return None
-    source_job_id = page_observation_mod._linkedin_job_id(
+    source_job_id = linkedin_page_observation_mod.linkedin_job_id(
         job.get("url") or job.get("application_url")
     )
     if not source_job_id or private.get("source_job_id") != source_job_id:

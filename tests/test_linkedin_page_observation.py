@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from applypilot.apply import page_observation
+from applypilot.apply import linkedin_page_observation
 
 _ENCODED_JOB = (
     "https%3A%2F%2Fwww.linkedin.com%2Fjobs%2Fview%2F4455274411%2F"
@@ -17,13 +17,13 @@ _DOUBLE_ENCODED_JOB = (
 
 
 def test_linkedin_job_id_requires_full_path_identity() -> None:
-    assert page_observation._linkedin_job_id(
+    assert linkedin_page_observation.linkedin_job_id(
         "https://www.linkedin.com/jobs/view/1234/"
     ) == "1234"
-    assert page_observation._linkedin_page_matches_job_id(
+    assert linkedin_page_observation.linkedin_page_matches_job_id(
         "https://www.linkedin.com/jobs/view/12345/", "1234"
     ) is False
-    assert page_observation._linkedin_job_id(
+    assert linkedin_page_observation.linkedin_job_id(
         "https://www.linkedin.com/jobs/view/data-analyst-123456789"
     ) == "123456789"
 
@@ -49,7 +49,7 @@ def test_linkedin_job_id_requires_full_path_identity() -> None:
 def test_linkedin_authwall_extracts_one_exact_redirect_job_id(
     url: str, expected: str
 ) -> None:
-    assert page_observation._linkedin_authwall_redirect_job_id(url) == expected
+    assert linkedin_page_observation.linkedin_authwall_redirect_job_id(url) == expected
 
 
 @pytest.mark.parametrize(
@@ -67,7 +67,7 @@ def test_linkedin_authwall_extracts_one_exact_redirect_job_id(
     ],
 )
 def test_linkedin_authwall_rejects_unbound_or_ambiguous_redirects(url: str) -> None:
-    assert page_observation._linkedin_authwall_redirect_job_id(url) == ""
+    assert linkedin_page_observation.linkedin_authwall_redirect_job_id(url) == ""
 
 
 def test_linkedin_causal_entry_admits_only_direct_bound_authwall(
@@ -107,17 +107,17 @@ def test_linkedin_causal_entry_admits_only_direct_bound_authwall(
 
     monkeypatch.setattr("playwright.sync_api.sync_playwright", Playwright)
     monkeypatch.setattr(
-        page_observation, "_bound_application_pages", lambda *_args: [page]
+        linkedin_page_observation, "bound_application_pages", lambda *_args: [page]
     )
-    monkeypatch.setattr(page_observation, "_page_target_id", lambda _page: "root")
+    monkeypatch.setattr(linkedin_page_observation, "page_target_id", lambda _page: "root")
     monkeypatch.setattr(
-        page_observation,
-        "_target_infos",
+        linkedin_page_observation,
+        "target_infos",
         lambda _session: {"root": {"targetId": "root", "url": page.url}},
     )
     monkeypatch.setattr(
-        page_observation,
-        "_wait_for_linkedin_main_apply_control",
+        linkedin_page_observation,
+        "wait_for_linkedin_main_apply_control",
         lambda _page: pytest.fail("authwall admission must not click Apply"),
     )
     job = {
@@ -126,7 +126,7 @@ def test_linkedin_causal_entry_admits_only_direct_bound_authwall(
         "_browser_root_target_ids": ["root"],
     }
 
-    signal, observation = page_observation._click_linkedin_main_apply_causally(
+    signal, observation = linkedin_page_observation.click_linkedin_main_apply_causally(
         9432, 0, job
     )
 
@@ -172,16 +172,16 @@ def test_linkedin_causal_entry_rejects_authwall_outside_direct_root(
 
     monkeypatch.setattr("playwright.sync_api.sync_playwright", Playwright)
     monkeypatch.setattr(
-        page_observation, "_bound_application_pages", lambda *_args: [page]
+        linkedin_page_observation, "bound_application_pages", lambda *_args: [page]
     )
-    monkeypatch.setattr(page_observation, "_page_target_id", lambda _page: "child")
+    monkeypatch.setattr(linkedin_page_observation, "page_target_id", lambda _page: "child")
     job = {
         "url": "https://www.linkedin.com/jobs/view/4455274411/",
         "application_url": "https://www.linkedin.com/jobs/view/4455274411/",
         "_browser_root_target_ids": ["root"],
     }
 
-    signal, observation = page_observation._click_linkedin_main_apply_causally(
+    signal, observation = linkedin_page_observation.click_linkedin_main_apply_causally(
         9432, 0, job
     )
 
@@ -203,7 +203,7 @@ def test_causal_apply_rejects_preexisting_or_unbound_external_target() -> None:
         },
     }
 
-    assert page_observation._classify_linkedin_causal_target(
+    assert linkedin_page_observation.classify_linkedin_causal_target(
         before, after, source_target_id="root"
     ) == (None, "linkedin_apply_click:no_causal_external_target")
 
@@ -219,7 +219,7 @@ def test_target_snapshot_only_corroborates_same_target_navigation() -> None:
         }
     }
 
-    attested, reason = page_observation._classify_linkedin_causal_target(
+    attested, reason = linkedin_page_observation.classify_linkedin_causal_target(
         before, after, source_target_id="root"
     )
 
@@ -241,7 +241,7 @@ def test_target_snapshot_only_corroborates_popup_with_source_opener() -> None:
         },
     }
 
-    attested, reason = page_observation._classify_linkedin_causal_target(
+    attested, reason = linkedin_page_observation.classify_linkedin_causal_target(
         before, after, source_target_id="root"
     )
 
@@ -258,7 +258,7 @@ def test_linkedin_external_page_identity_is_bounded() -> None:
                 "primary_headings": ["H" * 500 for _ in range(20)],
             }
 
-    identity = page_observation._linkedin_external_page_identity(Page())
+    identity = linkedin_page_observation.linkedin_external_page_identity(Page())
 
     assert identity["version"] == 1
     assert len(identity["page_title"]) == 300
@@ -275,7 +275,7 @@ def test_linkedin_causal_click_waits_for_delayed_public_top_card() -> None:
             self.calls.append((script, timeout))
 
     page = Page()
-    page_observation._wait_for_linkedin_main_apply_control(page)
+    linkedin_page_observation.wait_for_linkedin_main_apply_control(page)
 
     assert len(page.calls) == 1
     script, timeout = page.calls[0]
@@ -299,7 +299,7 @@ def test_linkedin_public_apply_handle_uses_only_top_card_cta() -> None:
             assert "apply\\b" in script
             return Handle()
 
-    result = page_observation._linkedin_main_apply_handle(Page())
+    result = linkedin_page_observation.linkedin_main_apply_handle(Page())
 
     assert result is not None
 
@@ -316,7 +316,7 @@ def test_linkedin_public_apply_handle_accepts_explicit_chinese_cta() -> None:
             assert "topCard.querySelectorAll" in script
             return Handle()
 
-    assert page_observation._linkedin_main_apply_handle(Page()) is not None
+    assert linkedin_page_observation.linkedin_main_apply_handle(Page()) is not None
 
 
 def test_linkedin_app_promo_dismissal_is_exact_and_pre_application() -> None:
@@ -345,7 +345,7 @@ def test_linkedin_app_promo_dismissal_is_exact_and_pre_application() -> None:
             assert "cta-modal" in script
             calls.append(("wait", timeout))
 
-    assert page_observation._dismiss_linkedin_app_promo(Page()) is True
+    assert linkedin_page_observation.dismiss_linkedin_app_promo(Page()) is True
     assert calls == [("click", 5_000), ("wait", 5_000)]
 
 
@@ -380,11 +380,11 @@ def test_linkedin_causal_entry_rejects_job_drift_after_app_promo(
     apply_clicks: list[str] = []
     monkeypatch.setattr("playwright.sync_api.sync_playwright", Playwright)
     monkeypatch.setattr(
-        page_observation, "_bound_application_pages", lambda *_args: [page]
+        linkedin_page_observation, "bound_application_pages", lambda *_args: [page]
     )
-    monkeypatch.setattr(page_observation, "_page_target_id", lambda _page: "root")
+    monkeypatch.setattr(linkedin_page_observation, "page_target_id", lambda _page: "root")
     monkeypatch.setattr(
-        page_observation, "_wait_for_linkedin_main_apply_control", lambda _page: None
+        linkedin_page_observation, "wait_for_linkedin_main_apply_control", lambda _page: None
     )
 
     def dismiss_and_drift(_page) -> bool:
@@ -392,16 +392,16 @@ def test_linkedin_causal_entry_rejects_job_drift_after_app_promo(
         return True
 
     monkeypatch.setattr(
-        page_observation, "_dismiss_linkedin_app_promo", dismiss_and_drift
+        linkedin_page_observation, "dismiss_linkedin_app_promo", dismiss_and_drift
     )
     monkeypatch.setattr(
-        page_observation,
-        "_linkedin_click_page_state",
+        linkedin_page_observation,
+        "linkedin_click_page_state",
         lambda _page: pytest.fail("job drift must stop before login inspection"),
     )
     monkeypatch.setattr(
-        page_observation,
-        "_linkedin_main_apply_handle",
+        linkedin_page_observation,
+        "linkedin_main_apply_handle",
         lambda _page: apply_clicks.append("apply"),
     )
     job = {
@@ -410,7 +410,7 @@ def test_linkedin_causal_entry_rejects_job_drift_after_app_promo(
         "_browser_root_target_ids": ["root"],
     }
 
-    signal, observation = page_observation._click_linkedin_main_apply_causally(
+    signal, observation = linkedin_page_observation.click_linkedin_main_apply_causally(
         9432, 0, job
     )
 
@@ -428,7 +428,7 @@ def test_snapshot_without_click_epoch_event_is_not_authoritative() -> None:
         "final_url": "https://jobs.example/role",
     }
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         corroborated,
         source_target_id="root",
         navigation_events=[],
@@ -453,7 +453,7 @@ def test_same_tab_event_preserves_bounded_redirect_lineage() -> None:
         "https://jobs.example/final",
     ]
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         corroborated,
         source_target_id="root",
         navigation_events=["https://jobs.example/final"],
@@ -484,7 +484,7 @@ def test_popup_event_and_same_tab_event_are_ambiguous() -> None:
         "lineage_complete": True,
     }
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         corroborated,
         source_target_id="root",
         navigation_events=["https://jobs.example/final"],
@@ -507,7 +507,7 @@ def test_valid_popup_plus_lost_popup_fails_closed() -> None:
         "lineage_complete": True,
     }
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         None,
         source_target_id="root",
         navigation_events=[],
@@ -530,7 +530,7 @@ def test_single_classified_popup_event_is_admitted() -> None:
         "lineage_complete": True,
     }
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         None,
         source_target_id="root",
         navigation_events=[],
@@ -551,7 +551,7 @@ def test_valid_same_tab_plus_lost_popup_fails_closed() -> None:
         "final_url": "https://jobs.example/final",
     }
 
-    admitted, reason = page_observation._admit_linkedin_causal_events(
+    admitted, reason = linkedin_page_observation.admit_linkedin_causal_events(
         corroborated,
         source_target_id="root",
         navigation_events=["https://jobs.example/final"],
@@ -565,7 +565,7 @@ def test_valid_same_tab_plus_lost_popup_fails_closed() -> None:
 
 
 def test_native_surface_cannot_mask_lost_popup() -> None:
-    signal, disposition = page_observation._resolve_linkedin_click_epoch(
+    signal, disposition = linkedin_page_observation.resolve_linkedin_click_epoch(
         None,
         "linkedin_apply_click:target_lost_or_unclassified",
         source_job_page_matches=True,
@@ -578,7 +578,7 @@ def test_native_surface_cannot_mask_lost_popup() -> None:
 
 
 def test_login_surface_cannot_mask_lost_popup() -> None:
-    signal, disposition = page_observation._resolve_linkedin_click_epoch(
+    signal, disposition = linkedin_page_observation.resolve_linkedin_click_epoch(
         None,
         "linkedin_apply_click:target_lost_or_unclassified",
         source_job_page_matches=True,
@@ -591,7 +591,7 @@ def test_login_surface_cannot_mask_lost_popup() -> None:
 
 
 def test_external_popup_and_native_surface_are_ambiguous() -> None:
-    signal, disposition = page_observation._resolve_linkedin_click_epoch(
+    signal, disposition = linkedin_page_observation.resolve_linkedin_click_epoch(
         {"target_id": "popup", "mode": "new_popup_from_source"},
         "linkedin_apply_click:causal_external_target",
         source_job_page_matches=True,
@@ -604,7 +604,7 @@ def test_external_popup_and_native_surface_are_ambiguous() -> None:
 
 
 def test_external_popup_and_login_surface_are_ambiguous() -> None:
-    signal, disposition = page_observation._resolve_linkedin_click_epoch(
+    signal, disposition = linkedin_page_observation.resolve_linkedin_click_epoch(
         {"target_id": "popup", "mode": "new_popup_from_source"},
         "linkedin_apply_click:causal_external_target",
         source_job_page_matches=True,

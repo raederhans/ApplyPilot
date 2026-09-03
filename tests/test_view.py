@@ -59,6 +59,7 @@ def test_dashboard_uses_capypilot_brand_assets_and_accessible_warm_tokens() -> N
     assert 'src="assets/capypilot/capypilot-mascot-companion.png" alt="" aria-hidden="true"' in html
     assert 'document.title = `CapyPilot — ${t(copy.eyebrow)}`;' in html
     assert "ApplyPilot Local —" not in html
+    assert "Happy Pilot" not in html
 
     for token in (
         "--canvas: #f7f2e8;",

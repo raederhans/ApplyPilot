@@ -31,6 +31,7 @@ from applypilot.apply.control_descriptors import (
     FormInspection,
     provider_for_url,
 )
+from applypilot.apply.provider_registry import provider_supports
 from applypilot.storage import agent_control
 
 EpisodeState = Literal[
@@ -58,7 +59,6 @@ MAX_REPLANS = 1
 MAX_FORM_DIFF = 24
 _REF = re.compile(r"[^\s\x00-\x1f]{1,300}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_SUPPORTED_PROVIDERS = frozenset({"workday", "smartrecruiters"})
 _MATERIAL_FACT_MARKERS = (
     "identity",
     "legal",
@@ -326,7 +326,7 @@ class ApplicationCommand:
         if not _SHA256.fullmatch(self.evidence_digest):
             raise ValueError("application command evidence digest is invalid")
         if self.kind == "browser_control":
-            if self.provider not in _SUPPORTED_PROVIDERS:
+            if not provider_supports(self.provider, "application_episode"):
                 raise ValueError("browser command provider is unsupported")
             if self.expected_page_epoch is None or self.expected_page_epoch < 0:
                 raise ValueError("browser command requires an expected page epoch")
@@ -727,7 +727,7 @@ def build_job_evidence_bundle(
     conflicts: list[str] = []
     if not source_refs:
         unavailable.append("job_source_missing")
-    if provider not in _SUPPORTED_PROVIDERS:
+    if not provider_supports(provider, "application_episode"):
         unavailable.append("provider_evidence_unavailable")
 
     raw_binding = job.get("_answer_provenance_binding")
@@ -1227,7 +1227,10 @@ def bounded_form_replan(
         return ReplanDecision(False, "replan_budget_exhausted", diff)
     if command.kind != "browser_control" or command.effect != "browser":
         return ReplanDecision(False, "replan_requires_browser_command", diff)
-    if episode.provider not in _SUPPORTED_PROVIDERS or after.provider != episode.provider:
+    if (
+        not provider_supports(episode.provider, "application_episode")
+        or after.provider != episode.provider
+    ):
         return ReplanDecision(False, "replan_provider_unsupported_or_changed", diff)
     if (
         after.context.actor_id != episode.actor_id

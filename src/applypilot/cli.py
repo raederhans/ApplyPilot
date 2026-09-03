@@ -207,6 +207,30 @@ def _build_standing_authorization_manifest(
     )
 
 
+class _CliApplyCommandRuntime:
+    """Typed command adapter assembled from the current CLI monkeypatch surface."""
+
+    @property
+    def console(self) -> Console:
+        return console
+
+    @property
+    def environment(self):
+        return os.environ
+
+    def bootstrap(self) -> None:
+        _bootstrap()
+
+    def standing_auto_authorization_enabled(self, profile: dict) -> bool:
+        return _standing_auto_authorization_enabled(profile)
+
+    def build_standing_authorization_manifest(self, connection, **kwargs) -> dict:
+        return _build_standing_authorization_manifest(connection, **kwargs)
+
+    def exit_exception(self, code: int) -> BaseException:
+        return typer.Exit(code=code)
+
+
 def _radar_bootstrap() -> None:
     """Initialize only discovery storage and the shared database."""
     from applypilot.config import ensure_radar_dirs
@@ -1314,8 +1338,8 @@ def apply(
     ),
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
-    return _command_module("apply").run_apply(
-        sys.modules[__name__],
+    command = _command_module("apply")
+    options = command.ApplyCommandOptions(
         limit=limit,
         workers=workers,
         min_score=min_score,
@@ -1337,6 +1361,7 @@ def apply(
         reset_failed=reset_failed,
         reset_failed_url=reset_failed_url,
     )
+    return command.run_apply(_CliApplyCommandRuntime(), options)
 
 
 @app.command("browser-session")

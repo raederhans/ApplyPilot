@@ -8,6 +8,8 @@ from applypilot.commands.apply import (
 )
 from applypilot.runtime_settings import load_runtime_settings
 
+pytestmark = pytest.mark.compatibility
+
 
 def test_runtime_settings_preserve_established_defaults() -> None:
     settings = load_runtime_settings({})

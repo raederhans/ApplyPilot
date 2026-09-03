@@ -7,10 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from typer.testing import CliRunner
 
 import install
+from applypilot import cli
 from scripts.build_release import audit_wheel
 from scripts.smoke_release import display_command
+
+pytestmark = pytest.mark.compatibility
 
 
 def test_bundle_source_requires_matching_checksum(tmp_path: Path) -> None:
@@ -38,12 +42,16 @@ def test_jobboard_extra_supports_package_paths_and_vcs() -> None:
 
 def test_public_brand_metadata_preserves_compatibility_identifiers() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+    version = CliRunner().invoke(cli.app, ["--version"])
 
+    assert version.exit_code == 0
+    assert "CapyPilot" in version.stdout
     assert metadata["description"].startswith("CapyPilot:")
     assert metadata["authors"] == [{"name": "Pickle-Pixel and CapyPilot contributors"}]
     assert metadata["name"] == "applypilot-local"
     assert metadata["scripts"] == {"applypilot": "applypilot.cli:app"}
     assert metadata["urls"]["Repository"] == "https://github.com/raederhans/ApplyPilot"
+    assert cli.app.info.name == "applypilot"
 
 
 def test_capypilot_dashboard_assets_are_included_in_build_artifacts() -> None:

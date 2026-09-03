@@ -11,11 +11,11 @@ import math
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from applypilot.apply import application_actor as application_actor_mod
@@ -47,6 +47,160 @@ from applypilot.apply.run_progress import PreviewTicket, RunProgress
 from applypilot.apply.stateful_control_coverage import (
     stateful_control_coverage_error as _stateful_control_coverage_error,
 )
+
+
+class WorkerConfigPort(Protocol):
+    APPLY_WORKER_DIR: Path
+
+    def load_profile(self) -> dict: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerHostPorts:
+    """Process, configuration, and clock services for one worker."""
+
+    poll_interval: float
+    stop_event: threading.Event
+    config: WorkerConfigPort
+    logger: Any
+    datetime: Any
+    load_runtime_settings: Callable[..., Any]
+    kill_process_tree: Callable[..., Any]
+    process_rss_bytes: Callable[..., Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerBrowserPorts:
+    """Browser ownership, routing, and session lifecycle services."""
+
+    acquire_cloak_lane: Callable[..., Any]
+    cloak_lane: Any
+    allocate_cdp_port: Callable[..., int]
+    release_cdp_port: Callable[..., Any]
+    launch_chrome: Callable[..., Any]
+    cleanup_worker: Callable[..., Any]
+    open_bound_application_target: Callable[..., Any]
+    close_bound_application_targets: Callable[..., Any]
+    release_application_browser_authority: Callable[..., Any]
+    capture_browser_session: Callable[..., Any]
+    restore_browser_session: Callable[..., Any]
+    cloak_fallback_route: Callable[..., Any]
+    computer_use_handoff_allowed: Callable[..., Any]
+    initial_route: Callable[..., Any]
+    resolve_browser_backend: Callable[..., Any]
+    resolve_interaction_mode: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerJobPorts:
+    """Job acquisition and durable lifecycle services."""
+
+    acquire_job: Callable[..., Any]
+    add_event: Callable[..., Any]
+    get_connection: Callable[..., Any]
+    mark_result: Callable[..., Any]
+    mark_runtime_cover_not_required: Callable[..., Any]
+    record_application_attempt_performance: Callable[..., Any]
+    release_lock: Callable[..., Any]
+    restore_preview_state: Callable[..., Any]
+    update_state: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerApplicationPorts:
+    """Application-agent execution and preparation services."""
+
+    archive_worker_evidence: Callable[..., Any]
+    snapshot_worker_evidence: Callable[..., Any]
+    attach_control_contract: Callable[..., Any]
+    format_failure_error: Callable[..., Any]
+    is_permanent_failure: Callable[..., Any]
+    resolve_ats_application_binding: Callable[..., Any]
+    run_read_only_preflight: Callable[..., Any]
+    prepare_ats_fill_plan_repair: Callable[..., Any]
+    try_semantic_pre_submit_repair: Callable[..., Any]
+    record_ats_fill_plan_feedback: Callable[..., Any]
+    prepare_runtime_cover_letter: Callable[..., Any]
+    runtime_linkedin_route_gate: Callable[..., Any]
+    route_for_phase: Callable[..., Any]
+    run_job: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPageObservationPorts:
+    """Pre-submit, LinkedIn handoff, and post-submit observation services."""
+
+    audit_live_pre_submit_page: Callable[..., Any]
+    classify_post_submit_observation: Callable[..., Any]
+    click_linkedin_main_apply_causally: Callable[..., Any]
+    verify_linkedin_post_login_state: Callable[..., Any]
+    observe_post_submit_page: Callable[..., Any]
+    observe_linkedin_external_handoff_page: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerSubmissionPorts:
+    """Submission authority, ledger, and receipt services."""
+
+    acquire_submit_writer_lane: Callable[..., Any]
+    admit_direct_email_receipt: Callable[..., Any]
+    configured_receipt_observers: Callable[..., Any]
+    build_receipt_observer_context: Callable[..., Any]
+    process_receipt_observer_result: Callable[..., Any]
+    reserve_manifest_submission: Callable[..., Any]
+    submission_evidence_consistent: Callable[..., Any]
+    submission_rate_status: Callable[..., Any]
+    submit_writer_lane: Any
+    update_submission_ledger: Callable[..., Any]
+    has_admitted_submission_receipt: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerOperatorPorts:
+    """Human-review and bounded resume authorization services."""
+
+    issue_manual_resume_authorization: Callable[..., Any]
+    consume_manual_resume_authorization: Callable[..., Any]
+    heartbeat_operator_handoff: Callable[..., Any]
+    runtime_operator_resume_scope: Callable[..., Any]
+    runtime_audit_verification_scope: Callable[..., Any]
+    runtime_recovery_scope: Callable[..., Any]
+    runtime_submit_scope: Callable[..., Any]
+    wait_for_manual_captcha: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimePorts:
+    """Responsibility-grouped runtime boundary consumed by the worker core."""
+
+    host: WorkerHostPorts
+    browser: WorkerBrowserPorts
+    jobs: WorkerJobPorts
+    application: WorkerApplicationPorts
+    observation: WorkerPageObservationPorts
+    submission: WorkerSubmissionPorts
+    operator: WorkerOperatorPorts
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRunOptions:
+    """Immutable configuration for one worker run."""
+
+    worker_id: int = 0
+    limit: int = 1
+    target_url: str | None = None
+    min_score: int = 6
+    headless: bool = False
+    model: str = "sonnet"
+    dry_run: bool = False
+    agent_backend: str = "codex"
+    manual_captcha_relay: bool = False
+    browser_backend: str = "edge"
+    interaction_mode: str = "auto"
+    authorization_manifest: dict | None = None
+    attempted_urls: set[str] | None = None
+    attempted_urls_lock: threading.Lock | None = None
+    run_progress: RunProgress | None = None
 
 
 def _prepared_email_application(job: dict) -> dict | None:
@@ -199,66 +353,11 @@ def _enforce_stateful_control_coverage(
     return audit_signal or f"pre_submit_audit:{error}", normalized
 
 
-WORKER_RUNTIME_PORTS = (
-    "POLL_INTERVAL", "_acquire_cloak_lane", "_acquire_submit_writer_lane",
-    "_archive_worker_evidence",
-    "_snapshot_worker_evidence",
-    "_attach_control_contract", "_audit_live_pre_submit_page",
-    "_classify_post_submit_observation", "_cloak_lane", "_format_failure_error",
-    "_is_permanent_failure", "_mark_runtime_cover_not_required",
-    "_click_linkedin_main_apply_causally", "_verify_linkedin_post_login_state",
-    "_observe_post_submit_page", "_open_bound_application_target",
-    "_close_bound_application_targets", "_release_application_browser_authority",
-    "_kill_process_tree",
-    "_observe_linkedin_external_handoff_page",
-    "_resolve_ats_application_binding", "_run_read_only_preflight",
-    "_prepare_ats_fill_plan_repair", "_record_ats_fill_plan_feedback",
-    "_prepare_runtime_cover_letter", "_reserve_manifest_submission",
-    "_runtime_linkedin_route_gate",
-    "_admit_direct_email_receipt",
-    "_configured_receipt_observers", "_build_receipt_observer_context",
-    "_process_receipt_observer_result",
-    "_route_for_phase", "_stop_event", "_submission_evidence_consistent",
-    "_submission_rate_status", "_submit_writer_lane", "_update_submission_ledger",
-    "_has_admitted_submission_receipt",
-    "_issue_manual_resume_authorization", "_consume_manual_resume_authorization",
-    "_heartbeat_operator_handoff", "_runtime_operator_resume_scope",
-    "_runtime_audit_verification_scope",
-    "_wait_for_manual_captcha", "acquire_job", "add_event", "allocate_cdp_port",
-    "capture_browser_session", "cleanup_worker", "cloak_fallback_route",
-    "computer_use_handoff_allowed", "config", "datetime", "get_connection",
-    "initial_route", "launch_chrome", "load_runtime_settings", "logger",
-    "mark_result", "release_cdp_port", "release_lock", "resolve_browser_backend",
-    "resolve_interaction_mode", "restore_browser_session", "restore_preview_state",
-    "record_application_attempt_performance", "run_job", "update_state",
-)
-
-
-def _validate_runtime_ports(runtime: ModuleType) -> None:
-    missing = [name for name in WORKER_RUNTIME_PORTS if not hasattr(runtime, name)]
-    if missing:
-        raise TypeError(f"worker runtime is missing required ports: {', '.join(missing)}")
-
-
 def _worker_loop_with_port(
-    runtime: ModuleType,
+    runtime: WorkerRuntimePorts,
     port: int,
     browser_worker: BrowserWorkerProcess,
-    worker_id: int = 0,
-    limit: int = 1,
-    target_url: str | None = None,
-    min_score: int = 6,
-    headless: bool = False,
-    model: str = "sonnet",
-    dry_run: bool = False,
-    agent_backend: str = "codex",
-    manual_captcha_relay: bool = False,
-    browser_backend: str = "edge",
-    interaction_mode: str = "auto",
-    authorization_manifest: dict | None = None,
-    attempted_urls: set[str] | None = None,
-    attempted_urls_lock: threading.Lock | None = None,
-    run_progress: RunProgress | None = None,
+    options: WorkerRunOptions,
 ) -> tuple[int, int]:
     """Run jobs until the confirmed-success target is reached or the queue is empty.
 
@@ -274,88 +373,95 @@ def _worker_loop_with_port(
     Returns:
         Tuple of (applied_count, failed_count).
     """
-    POLL_INTERVAL = runtime.POLL_INTERVAL
-    _acquire_cloak_lane = runtime._acquire_cloak_lane
-    _acquire_submit_writer_lane = runtime._acquire_submit_writer_lane
-    _archive_worker_evidence = runtime._archive_worker_evidence
-    _snapshot_worker_evidence = runtime._snapshot_worker_evidence
-    _attach_control_contract = runtime._attach_control_contract
-    _audit_live_pre_submit_page = runtime._audit_live_pre_submit_page
-    _classify_post_submit_observation = runtime._classify_post_submit_observation
-    _cloak_lane = runtime._cloak_lane
-    _format_failure_error = runtime._format_failure_error
-    _is_permanent_failure = runtime._is_permanent_failure
-    _mark_runtime_cover_not_required = runtime._mark_runtime_cover_not_required
-    _click_linkedin_main_apply_causally = runtime._click_linkedin_main_apply_causally
-    _verify_linkedin_post_login_state = runtime._verify_linkedin_post_login_state
-    _observe_post_submit_page = runtime._observe_post_submit_page
+    host = runtime.host
+    browser = runtime.browser
+    jobs = runtime.jobs
+    application = runtime.application
+    observation = runtime.observation
+    submission = runtime.submission
+    operator = runtime.operator
+    worker_id = options.worker_id
+    limit = options.limit
+    target_url = options.target_url
+    min_score = options.min_score
+    headless = options.headless
+    model = options.model
+    dry_run = options.dry_run
+    agent_backend = options.agent_backend
+    manual_captcha_relay = options.manual_captcha_relay
+    browser_backend = options.browser_backend
+    interaction_mode = options.interaction_mode
+    authorization_manifest = options.authorization_manifest
+    attempted_urls = options.attempted_urls
+    attempted_urls_lock = options.attempted_urls_lock
+    run_progress = options.run_progress
+    POLL_INTERVAL = host.poll_interval
+    _acquire_cloak_lane = browser.acquire_cloak_lane
+    _acquire_submit_writer_lane = submission.acquire_submit_writer_lane
+    _archive_worker_evidence = application.archive_worker_evidence
+    _snapshot_worker_evidence = application.snapshot_worker_evidence
+    _attach_control_contract = application.attach_control_contract
+    _audit_live_pre_submit_page = observation.audit_live_pre_submit_page
+    _classify_post_submit_observation = observation.classify_post_submit_observation
+    _cloak_lane = browser.cloak_lane
+    _format_failure_error = application.format_failure_error
+    _is_permanent_failure = application.is_permanent_failure
+    _mark_runtime_cover_not_required = jobs.mark_runtime_cover_not_required
+    _click_linkedin_main_apply_causally = observation.click_linkedin_main_apply_causally
+    _verify_linkedin_post_login_state = observation.verify_linkedin_post_login_state
+    _observe_post_submit_page = observation.observe_post_submit_page
     _observe_linkedin_external_handoff_page = (
-        runtime._observe_linkedin_external_handoff_page
+        observation.observe_linkedin_external_handoff_page
     )
-    _resolve_ats_application_binding = runtime._resolve_ats_application_binding
-    _run_read_only_preflight = runtime._run_read_only_preflight
-    _prepare_ats_fill_plan_repair = runtime._prepare_ats_fill_plan_repair
-    _try_semantic_pre_submit_repair = getattr(
-        runtime,
-        "_try_semantic_pre_submit_repair",
-        lambda *_args, **_kwargs: {
-            "status": "not_applicable",
-            "legacy_fallback_safe": True,
-        },
-    )
-    _record_ats_fill_plan_feedback = runtime._record_ats_fill_plan_feedback
-    _prepare_runtime_cover_letter = runtime._prepare_runtime_cover_letter
-    _admit_direct_email_receipt = runtime._admit_direct_email_receipt
-    _configured_receipt_observers = runtime._configured_receipt_observers
-    _build_receipt_observer_context = runtime._build_receipt_observer_context
-    _process_receipt_observer_result = runtime._process_receipt_observer_result
-    _reserve_manifest_submission = runtime._reserve_manifest_submission
-    _runtime_linkedin_route_gate = runtime._runtime_linkedin_route_gate
-    _runtime_recovery_scope = getattr(
-        runtime,
-        "_runtime_recovery_scope",
-        lambda _command: nullcontext(),
-    )
-    _runtime_submit_scope = getattr(
-        runtime,
-        "_runtime_submit_scope",
-        lambda _job: nullcontext(),
-    )
-    _route_for_phase = runtime._route_for_phase
-    _stop_event = runtime._stop_event
-    _submission_evidence_consistent = runtime._submission_evidence_consistent
-    _submission_rate_status = runtime._submission_rate_status
-    _submit_writer_lane = runtime._submit_writer_lane
-    _update_submission_ledger = runtime._update_submission_ledger
-    _has_admitted_submission_receipt = runtime._has_admitted_submission_receipt
-    _issue_manual_resume_authorization = runtime._issue_manual_resume_authorization
-    _consume_manual_resume_authorization = runtime._consume_manual_resume_authorization
-    _heartbeat_operator_handoff = runtime._heartbeat_operator_handoff
-    _runtime_operator_resume_scope = runtime._runtime_operator_resume_scope
-    _runtime_audit_verification_scope = runtime._runtime_audit_verification_scope
-    _wait_for_manual_captcha = runtime._wait_for_manual_captcha
-    acquire_job = runtime.acquire_job
-    add_event = runtime.add_event
-    capture_browser_session = runtime.capture_browser_session
-    cloak_fallback_route = runtime.cloak_fallback_route
-    computer_use_handoff_allowed = runtime.computer_use_handoff_allowed
-    config = runtime.config
-    datetime = runtime.datetime
-    get_connection = runtime.get_connection
-    initial_route = runtime.initial_route
-    logger = runtime.logger
-    mark_result = runtime.mark_result
-    release_lock = runtime.release_lock
+    _resolve_ats_application_binding = application.resolve_ats_application_binding
+    _run_read_only_preflight = application.run_read_only_preflight
+    _prepare_ats_fill_plan_repair = application.prepare_ats_fill_plan_repair
+    _try_semantic_pre_submit_repair = application.try_semantic_pre_submit_repair
+    _record_ats_fill_plan_feedback = application.record_ats_fill_plan_feedback
+    _prepare_runtime_cover_letter = application.prepare_runtime_cover_letter
+    _admit_direct_email_receipt = submission.admit_direct_email_receipt
+    _configured_receipt_observers = submission.configured_receipt_observers
+    _build_receipt_observer_context = submission.build_receipt_observer_context
+    _process_receipt_observer_result = submission.process_receipt_observer_result
+    _reserve_manifest_submission = submission.reserve_manifest_submission
+    _runtime_linkedin_route_gate = application.runtime_linkedin_route_gate
+    _runtime_recovery_scope = operator.runtime_recovery_scope
+    _runtime_submit_scope = operator.runtime_submit_scope
+    _route_for_phase = application.route_for_phase
+    _stop_event = host.stop_event
+    _submission_evidence_consistent = submission.submission_evidence_consistent
+    _submission_rate_status = submission.submission_rate_status
+    _submit_writer_lane = submission.submit_writer_lane
+    _update_submission_ledger = submission.update_submission_ledger
+    _has_admitted_submission_receipt = submission.has_admitted_submission_receipt
+    _issue_manual_resume_authorization = operator.issue_manual_resume_authorization
+    _consume_manual_resume_authorization = operator.consume_manual_resume_authorization
+    _heartbeat_operator_handoff = operator.heartbeat_operator_handoff
+    _runtime_operator_resume_scope = operator.runtime_operator_resume_scope
+    _runtime_audit_verification_scope = operator.runtime_audit_verification_scope
+    _wait_for_manual_captcha = operator.wait_for_manual_captcha
+    acquire_job = jobs.acquire_job
+    add_event = jobs.add_event
+    capture_browser_session = browser.capture_browser_session
+    cloak_fallback_route = browser.cloak_fallback_route
+    computer_use_handoff_allowed = browser.computer_use_handoff_allowed
+    config = host.config
+    datetime = host.datetime
+    get_connection = jobs.get_connection
+    initial_route = browser.initial_route
+    logger = host.logger
+    mark_result = jobs.mark_result
+    release_lock = jobs.release_lock
     record_application_attempt_performance = (
-        runtime.record_application_attempt_performance
+        jobs.record_application_attempt_performance
     )
-    resolve_browser_backend = runtime.resolve_browser_backend
-    resolve_interaction_mode = runtime.resolve_interaction_mode
-    restore_browser_session = runtime.restore_browser_session
-    restore_preview_state = runtime.restore_preview_state
-    runtime_run_job = runtime.run_job
-    update_state = runtime.update_state
-    application_lease_minutes = runtime.load_runtime_settings().application_lease_minutes
+    resolve_browser_backend = browser.resolve_browser_backend
+    resolve_interaction_mode = browser.resolve_interaction_mode
+    restore_browser_session = browser.restore_browser_session
+    restore_preview_state = jobs.restore_preview_state
+    runtime_run_job = application.run_job
+    update_state = jobs.update_state
+    application_lease_minutes = host.load_runtime_settings().application_lease_minutes
 
     applied = 0
     failed = 0
@@ -867,7 +973,7 @@ def _worker_loop_with_port(
                 browser_runtime=active_browser_backend,
                 headless=headless,
                 release_browser_authority=lambda current_job=job: (
-                    runtime._release_application_browser_authority(current_job)
+                    browser.release_application_browser_authority(current_job)
                 ),
             )
             chrome_proc = application_supervisor.process
@@ -2994,30 +3100,22 @@ def _worker_loop_with_port(
 
 
 def worker_loop(
-    runtime: ModuleType,
-    worker_id: int = 0,
-    limit: int = 1,
-    target_url: str | None = None,
-    min_score: int = 6,
-    headless: bool = False,
-    model: str = "sonnet",
-    dry_run: bool = False,
-    agent_backend: str = "codex",
-    manual_captcha_relay: bool = False,
-    browser_backend: str = "edge",
-    interaction_mode: str = "auto",
-    authorization_manifest: dict | None = None,
-    attempted_urls: set[str] | None = None,
-    attempted_urls_lock: threading.Lock | None = None,
-    run_progress: RunProgress | None = None,
+    runtime: WorkerRuntimePorts,
+    options: WorkerRunOptions,
 ) -> tuple[int, int]:
-    """Validate injected ports and own the CDP claim for the full worker run."""
-    _validate_runtime_ports(runtime)
-    port = runtime.allocate_cdp_port(worker_id)
+    """Own the CDP claim and execute one typed worker run."""
+    if not isinstance(runtime, WorkerRuntimePorts):
+        raise TypeError("worker runtime must be a grouped WorkerRuntimePorts instance")
+    if not isinstance(options, WorkerRunOptions):
+        raise TypeError("worker options must be a WorkerRunOptions instance")
+    host = runtime.host
+    browser = runtime.browser
+    worker_id = options.worker_id
+    port = browser.allocate_cdp_port(worker_id)
     browser_worker: BrowserWorkerProcess | None = None
     endpoint_manager = None
     try:
-        profile = runtime.config.load_profile()
+        profile = host.config.load_profile()
         policy = profile.get("submission_policy", {})
         runtime_profile = profile.get("agent_runtime", {})
         persistent_endpoint = (
@@ -3029,7 +3127,7 @@ def worker_loop(
             isinstance(persistent_endpoint, Mapping)
             and persistent_endpoint.get("enabled") is True
         )
-        if persistent_endpoint_enabled and agent_backend != "codex":
+        if persistent_endpoint_enabled and options.agent_backend != "codex":
             raise ValueError(
                 "persistent Playwright MCP HTTP transport currently requires Codex"
             )
@@ -3042,13 +3140,11 @@ def worker_loop(
                 else default
             )
 
-        rss_reader = getattr(
-            getattr(runtime, "agent_runtime_mod", None), "process_rss_bytes", None
-        )
+        rss_reader = host.process_rss_bytes
         if persistent_endpoint_enabled:
             endpoint_launcher = resolve_persistent_playwright_launcher()
             endpoint_reservation = LoopbackPortReservation.reserve(
-                runtime.config.APPLY_WORKER_DIR,
+                host.config.APPLY_WORKER_DIR,
                 worker_id=worker_id,
             )
             try:
@@ -3071,7 +3167,7 @@ def worker_loop(
 
                 def stop_endpoint_process(process) -> None:
                     if process.poll() is None:
-                        runtime._kill_process_tree(process.pid)
+                        host.kill_process_tree(process.pid)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired as exc:
@@ -3098,15 +3194,15 @@ def worker_loop(
             worker_id=worker_id,
             port=port,
             run_id=(
-                run_progress.run_id
-                if run_progress is not None
+                options.run_progress.run_id
+                if options.run_progress is not None
                 else f"worker-{worker_id}-{time.time_ns()}"
             ),
-            namespace_root=runtime.config.APPLY_WORKER_DIR,
-            launch_browser=runtime.launch_chrome,
-            cleanup_browser=runtime.cleanup_worker,
-            open_target=runtime._open_bound_application_target,
-            close_targets=runtime._close_bound_application_targets,
+            namespace_root=host.config.APPLY_WORKER_DIR,
+            launch_browser=browser.launch_chrome,
+            cleanup_browser=browser.cleanup_worker,
+            open_target=browser.open_bound_application_target,
+            close_targets=browser.close_bound_application_targets,
             endpoint_manager=endpoint_manager,
             rss_reader=rss_reader if callable(rss_reader) else None,
             max_applications=positive_policy_integer(
@@ -3120,21 +3216,7 @@ def worker_loop(
             runtime,
             port,
             browser_worker,
-            worker_id=worker_id,
-            limit=limit,
-            target_url=target_url,
-            min_score=min_score,
-            headless=headless,
-            model=model,
-            dry_run=dry_run,
-            agent_backend=agent_backend,
-            manual_captcha_relay=manual_captcha_relay,
-            browser_backend=browser_backend,
-            interaction_mode=interaction_mode,
-            authorization_manifest=authorization_manifest,
-            attempted_urls=attempted_urls,
-            attempted_urls_lock=attempted_urls_lock,
-            run_progress=run_progress,
+            options,
         )
     finally:
         try:
@@ -3143,4 +3225,4 @@ def worker_loop(
             elif endpoint_manager is not None:
                 endpoint_manager.shutdown()
         finally:
-            runtime.release_cdp_port(worker_id)
+            browser.release_cdp_port(worker_id)

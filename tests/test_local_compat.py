@@ -419,8 +419,11 @@ def test_worker_releases_cdp_claim_when_profile_loading_fails(monkeypatch) -> No
 
 
 def test_worker_runtime_port_validation_reports_missing_contract() -> None:
-    with pytest.raises(TypeError, match="missing required ports"):
-        worker_orchestration.worker_loop(SimpleNamespace())
+    with pytest.raises(TypeError, match="grouped WorkerRuntimePorts"):
+        worker_orchestration.worker_loop(
+            SimpleNamespace(),
+            worker_orchestration.WorkerRunOptions(),
+        )
 
 
 def test_dead_cdp_lock_is_removed_only_after_liveness_check(monkeypatch, tmp_path: Path) -> None:
@@ -1393,7 +1396,7 @@ def test_login_policy_stops_when_google_reuse_is_not_authorized() -> None:
 def test_screening_uses_configured_mobility() -> None:
     screening = prompt._build_screening_section(_application_profile())
 
-    assert "willing to relocate within Singapore: Yes" in screening
+    assert "willing to relocate locally: Yes" in screening
     assert "willing to relocate to another country: No" in screening
     assert "maximum 25%" in screening
     assert "cannot relocate" not in screening
@@ -2694,7 +2697,7 @@ def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
     assert "take a fresh snapshot after typing each autocomplete value" in built
     assert "latest snapshot's exact option ref" in built
     assert "the invalid state is gone, the listbox is closed, and the selected value remains" in built
-    assert "Do not use a manual-entry fallback when an exact Singapore option is visible" in built
+    assert "Do not use a manual-entry fallback when an exact confirmed option is visible" in built
     assert "Personal information City only" in built
     assert "Cannot find your city? Click here to fill in manually" in built
     assert "no selectable exact city/country option" in built
@@ -2814,7 +2817,7 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "If a CAPTCHA is found, solve it before continuing" not in built
     assert "CAPTCHA SOLVE" not in built
     assert 'Treat "Full name"' in built
-    assert "Current location/city/country fields use Singapore" in built
+    assert "Current location/city/country fields use the confirmed profile value: Singapore, Singapore" in built
     assert "2026-11-10" in built
     assert "2026-10-15" not in built
     assert "full-time credit-bearing availability begins January 2027" not in built
@@ -3375,6 +3378,17 @@ def test_email_route_prepare_prompt_makes_mailbox_the_primary_workflow(
     monkeypatch, tmp_path: Path
 ) -> None:
     profile = _application_profile()
+    profile["personal"].update({"city": "Kuala Lumpur", "country": "Malaysia"})
+    profile["availability"].update(
+        {
+            "earliest_start_date": "2030-01-15",
+            "generic_application_availability_date": "2030-01-15",
+            "credit_bearing_internship_start": "2030-01-15",
+            "internship_end_date": "2030-09-30",
+            "credit_bearing_internship_hours_per_week": "37.5 hours/week",
+        }
+    )
+    profile["work_authorization"]["require_sponsorship"] = "Yes for post-graduation only"
     resume_txt = tmp_path / "tailored.txt"
     resume_txt.write_text("Verified resume", encoding="utf-8")
     resume_txt.with_suffix(".pdf").write_bytes(b"%PDF-test")
@@ -3408,6 +3422,15 @@ def test_email_route_prepare_prompt_makes_mailbox_the_primary_workflow(
     assert "== MAILBOX-ONLY CONTROL ==" in built
     assert "REQUIRED BROWSER CONTROL" not in built
     assert "browser_mcp_unavailable" not in built
+    assert "Kuala Lumpur, Malaysia" in built
+    assert "2030-01-15" in built
+    assert "2030-09-30" in built
+    assert "37.5 hours/week" in built
+    assert "Yes for post-graduation only" in built
+    assert "Singapore" not in built
+    assert "November 2026" not in built
+    assert "16-hour" not in built
+    assert "August start" not in built
 
 
 def test_email_route_submit_keeps_send_capability_gate() -> None:

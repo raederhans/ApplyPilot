@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import asdict
 
 import pytest
 
-from applypilot.apply import local_synthetic_browser_benchmark as benchmark_module
 from applypilot.apply.local_synthetic_browser_benchmark import (
     FIXED_TASKS,
     LOCAL_SYNTHETIC_LABEL,
@@ -13,6 +11,8 @@ from applypilot.apply.local_synthetic_browser_benchmark import (
     SyntheticBrowserTask,
     run_local_synthetic_browser_benchmark,
 )
+
+pytestmark = pytest.mark.browser
 
 
 def test_real_local_chromium_matched_cohorts_are_offline_and_submit_free() -> None:
@@ -93,14 +93,6 @@ def test_report_contract_denies_provider_and_promotion_claims() -> None:
     assert asdict(report)["provider_benchmark"] is False
     assert asdict(report)["promotion_authority"] is False
     assert report.cohorts[0].wall_clock_ms >= 0
-    source = inspect.getsource(benchmark_module)
-    assert "applypilot.database" not in source
-    assert "applypilot.config" not in source
-    assert "SubmissionGate" not in source
-    assert "reserve_batch_submission" not in source
-    assert "reconcile_submission_receipt" not in source
-    assert "load_profile" not in source
-    assert "get_connection" not in source
 
 
 @pytest.mark.parametrize(

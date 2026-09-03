@@ -11,6 +11,8 @@ from typing import Literal, Protocol, runtime_checkable
 
 from playwright.sync_api import Error as PlaywrightError
 
+from applypilot.apply.provider_registry import provider_supports
+
 Provider = Literal["workday", "smartrecruiters"]
 ObservationStatus = Literal["ready", "unsupported", "manual"]
 UploadStatus = Literal["uploaded", "unsupported", "manual", "failed"]
@@ -288,7 +290,7 @@ def observe_resume_upload(
     """Select exactly one safe Resume/CV file input without mutating the page."""
 
     normalized_provider = provider.strip().lower()
-    if normalized_provider not in {"workday", "smartrecruiters"}:
+    if not provider_supports(normalized_provider, "semantic_upload"):
         return ResumeUploadObservation(
             status="unsupported",
             provider=normalized_provider,

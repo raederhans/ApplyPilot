@@ -19,8 +19,8 @@ from typing import Literal, Protocol
 
 from applypilot.apply.browser_broker import BrowserAuthorityDenied, BrowserLeaseBundle
 from applypilot.apply.page_binding import PageBinding
+from applypilot.apply.provider_registry import provider_supports
 
-_ALLOWED_PROVIDERS = frozenset({"workday", "smartrecruiters"})
 SEMANTIC_WRITE_POLICY = "semantic-browser-write/v1"
 SEMANTIC_WRITE_POLICY_DIGEST = hashlib.sha256(
     SEMANTIC_WRITE_POLICY.encode("ascii")
@@ -124,7 +124,7 @@ class ResumeUploadRequest:
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} is required")
-        if self.provider not in _ALLOWED_PROVIDERS:
+        if not provider_supports(self.provider, "semantic_upload"):
             raise ValueError("provider is not eligible for semantic resume upload")
         for value, name in (
             (self.application_binding_hash, "application_binding_hash"),
@@ -482,7 +482,7 @@ def _validate_bundle_request(
         bundle.page_binding.attempt_id,
     ) != (request.attempt_id,) * 3:
         raise SemanticWriteDenied("attempt does not own the exact browser lease bundle")
-    if request.provider not in _ALLOWED_PROVIDERS:
+    if not provider_supports(request.provider, "semantic_upload"):
         raise SemanticWriteDenied("provider is not eligible for semantic resume upload")
 
 

@@ -34,35 +34,64 @@ def test_job_level_env_does_not_use_runner_context() -> None:
 def test_ci_exposes_all_required_checks() -> None:
     jobs = _load_workflow(CI_WORKFLOW)["jobs"]
     assert isinstance(jobs, dict)
-    assert set(jobs) == {"verify", "windows-install-smoke"}
+    assert set(jobs) == {
+        "core",
+        "compatibility",
+        "browser-chromium",
+        "windows-install-smoke",
+    }
 
-    verify = jobs["verify"]
+    core = jobs["core"]
+    compatibility = jobs["compatibility"]
+    browser = jobs["browser-chromium"]
     windows = jobs["windows-install-smoke"]
-    assert isinstance(verify, dict) and isinstance(windows, dict)
-    versions = verify["strategy"]["matrix"]["python-version"]
-    check_names = {verify["name"].replace("${{ matrix.python-version }}", version) for version in versions}
+    assert all(
+        isinstance(job, dict)
+        for job in (core, compatibility, browser, windows)
+    )
+    versions = compatibility["strategy"]["matrix"]["python-version"]
+    check_names = {core["name"]}
+    check_names.update(
+        compatibility["name"].replace("${{ matrix.python-version }}", version)
+        for version in versions
+    )
+    check_names.add(browser["name"])
     check_names.add(windows["name"])
 
     assert check_names == {
-        "Python 3.11",
-        "Python 3.12",
-        "Python 3.13",
-        "Windows 3.12 core tests and clean install smoke",
+        "Core Python 3.12",
+        "Compatibility Python 3.11",
+        "Compatibility Python 3.13",
+        "Browser Chromium 3.12",
+        "Windows 3.12 tests and clean install smoke",
     }
 
-    verify_steps = verify["steps"]
-    assert isinstance(verify_steps, list)
-    chromium_step = next(
-        step for step in verify_steps if step.get("name") == "Install Playwright Chromium"
+    core_steps = core["steps"]
+    assert isinstance(core_steps, list)
+    core_test = next(step for step in core_steps if step.get("name") == "Test core tier")
+    assert core_test["run"] == 'python -m pytest -q -m "not browser and not windows"'
+
+    compatibility_steps = compatibility["steps"]
+    assert isinstance(compatibility_steps, list)
+    compatibility_test = next(
+        step for step in compatibility_steps
+        if step.get("name") == "Test compatibility subset"
     )
+    assert compatibility_test["run"] == (
+        'python -m pytest -q -m "compatibility and not browser and not windows"'
+    )
+    browser_steps = browser["steps"]
+    assert isinstance(browser_steps, list)
+    chromium_step = next(step for step in browser_steps if step.get("name") == "Install Playwright Chromium")
     assert chromium_step["run"] == "python -m playwright install --with-deps chromium"
 
     windows_steps = windows["steps"]
     assert isinstance(windows_steps, list)
-    windows_chromium_step = next(
-        step for step in windows_steps if step.get("name") == "Install Playwright Chromium"
+    windows_test = next(
+        step for step in windows_steps if step.get("name") == "Test Windows tier"
     )
-    assert windows_chromium_step["run"] == "python -m playwright install chromium"
+    assert windows_test["run"] == "python -m pytest -q -m windows"
+    assert windows["needs"] == ["core", "compatibility", "browser-chromium"]
 
     bind_step = next(step for step in windows["steps"] if step.get("name") == "Bind isolated ApplyPilot workspace")
     assert bind_step["shell"] == "pwsh"

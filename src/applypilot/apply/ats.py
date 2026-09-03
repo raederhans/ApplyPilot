@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from applypilot.apply.answer_policy import FieldRisk, field_risk
+from applypilot.apply.provider_registry import provider_matches_host
 
 ATS_SCHEMA_VERSION = "1"
 MAX_FORM_FIELDS = 200
@@ -243,7 +244,7 @@ class GreenhouseAtsAdapter(GenericAtsAdapter):
 
     def matches(self, *, hostname: str, path: str) -> bool:
         del path
-        return hostname in {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+        return provider_matches_host(self.name, hostname, "detection")
 
     def guidance(self) -> tuple[str, ...]:
         return (
@@ -258,7 +259,7 @@ class LeverAtsAdapter(GenericAtsAdapter):
 
     def matches(self, *, hostname: str, path: str) -> bool:
         del path
-        return hostname in {"jobs.lever.co", "jobs.eu.lever.co"}
+        return provider_matches_host(self.name, hostname, "detection")
 
     def guidance(self) -> tuple[str, ...]:
         return (
@@ -273,7 +274,7 @@ class AshbyAtsAdapter(GenericAtsAdapter):
 
     def matches(self, *, hostname: str, path: str) -> bool:
         del path
-        return hostname == "jobs.ashbyhq.com"
+        return provider_matches_host(self.name, hostname, "detection")
 
     def guidance(self) -> tuple[str, ...]:
         return (
@@ -288,7 +289,7 @@ class SmartRecruitersAtsAdapter(GenericAtsAdapter):
 
     def matches(self, *, hostname: str, path: str) -> bool:
         del path
-        return hostname == "jobs.smartrecruiters.com"
+        return provider_matches_host(self.name, hostname, "detection")
 
     def guidance(self) -> tuple[str, ...]:
         return (
@@ -307,10 +308,7 @@ class WorkdayAtsAdapter(GenericAtsAdapter):
 
     def matches(self, *, hostname: str, path: str) -> bool:
         del path
-        return any(
-            hostname == suffix or hostname.endswith(f".{suffix}")
-            for suffix in ("myworkdayjobs.com", "myworkdaysite.com")
-        )
+        return provider_matches_host(self.name, hostname, "detection")
 
     def guidance(self) -> tuple[str, ...]:
         return (

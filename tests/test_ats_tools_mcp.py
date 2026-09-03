@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from applypilot import config
 from applypilot.apply import ats_tools_mcp, launcher, prompt
 
 
@@ -573,13 +574,46 @@ def test_launcher_context_exposes_fact_names_not_values_or_query_tokens() -> Non
     assert "Playwright remains the sole page writer" in section
 
 
-def test_prompt_requires_tool_produced_v2_mapping_and_forbids_hand_built_hashes() -> None:
-    source = Path(prompt.__file__).read_text(encoding="utf-8")
+def test_prompt_requires_tool_produced_v2_mapping_and_forbids_hand_built_hashes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    resume = tmp_path / "resume.txt"
+    resume.write_text("Verified resume", encoding="utf-8")
+    resume.with_suffix(".pdf").write_bytes(b"%PDF-test")
+    monkeypatch.setattr(
+        config,
+        "load_profile",
+        lambda: {
+            "personal": {
+                "full_name": "Candidate Example",
+                "email": "candidate@example.test",
+                "phone": "+1 555 0100",
+            },
+            "work_authorization": {},
+            "compensation": {"salary_expectation": "Negotiable"},
+        },
+    )
+    monkeypatch.setattr(config, "load_search_config", dict)
+    monkeypatch.setattr(config, "APPLY_WORKER_DIR", tmp_path / "workers")
 
-    assert "build_answer_mapping" in source
-    assert "Never invent or hand-calculate a field hash" in source
-    assert "Do not emit a legacy/list-shaped mapping" in source
-    assert "field without a current typed fact or host exact checker" in source
+    rendered = prompt.build_prompt(
+        {
+            "url": "https://jobs.example.test/role",
+            "title": "Analyst",
+            "company_name": "Example",
+            "tailored_resume_path": str(resume),
+            "tailor_status": "machine_validated",
+            "cover_letter_status": "not_required",
+            "_agent_reporting_enabled": True,
+        },
+        "Verified resume",
+        dry_run=True,
+    )
+
+    assert "build_answer_mapping" in rendered
+    assert "Never invent or hand-calculate a field hash" in rendered
+    assert "Do not emit a legacy/list-shaped mapping" in rendered
+    assert "field without a current typed fact or host exact checker" in rendered
 
 
 def test_fill_plan_discards_values_and_only_uses_launcher_fact_names(

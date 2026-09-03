@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlparse
 
+from applypilot.apply.provider_registry import provider_for_url as registry_provider_for_url
 from applypilot.apply.semantic_browser_ops import (
     BoundResumeArtifact,
     ResumeUploadObservation,
@@ -30,10 +31,6 @@ from applypilot.apply.semantic_resume_upload import (
 )
 from applypilot.storage import semantic_browser_writes as write_journal
 
-_SUPPORTED_PROVIDER_HOSTS = {
-    "workday": ("myworkdayjobs.com", "myworkdaysite.com"),
-    "smartrecruiters": ("smartrecruiters.com",),
-}
 _REASON_CHARACTER_RE = re.compile(r"[^a-z0-9_.:-]+")
 
 
@@ -181,17 +178,7 @@ class DurableSemanticWriteLifecycle:
 def provider_for_url(value: object) -> str | None:
     """Return a supported exact ATS provider from an HTTPS page URL."""
 
-    try:
-        parsed = urlparse(str(value or "").strip())
-    except ValueError:
-        return None
-    host = (parsed.hostname or "").casefold().rstrip(".")
-    if parsed.scheme.casefold() != "https" or not host:
-        return None
-    for provider, domains in _SUPPORTED_PROVIDER_HOSTS.items():
-        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
-            return provider
-    return None
+    return registry_provider_for_url(value, "semantic_upload")
 
 
 def application_binding_hash(

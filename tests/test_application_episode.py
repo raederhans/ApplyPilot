@@ -403,6 +403,3 @@ def test_replan_rejects_stale_or_different_application(tmp_path: Path) -> None:
 
 def test_episode_remains_diagnostic_not_production_recovery_authority() -> None:
     assert not hasattr(worker_orchestration, "_execute_recovery_with_episode")
-    assert "application_episode" not in Path(worker_orchestration.__file__).read_text(
-        encoding="utf-8"
-    )

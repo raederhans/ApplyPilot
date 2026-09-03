@@ -28,6 +28,8 @@ from applypilot.apply.profile_lock import (
     sidecar_path_for_profile,
 )
 
+pytestmark = pytest.mark.windows
+
 
 class FakeKernel:
     def __init__(self, wait_result: int = WAIT_OBJECT_0) -> None:

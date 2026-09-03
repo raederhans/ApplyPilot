@@ -21,23 +21,7 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
 from playwright.sync_api import Frame, Locator, Page, sync_playwright
 
 from applypilot import config
-
-KNOWN_ATS_HOSTS = {
-    "ashbyhq.com",
-    "bamboohr.com",
-    "greenhouse.io",
-    "greenhouse.com",
-    "icims.com",
-    "jobvite.com",
-    "lever.co",
-    "myworkdayjobs.com",
-    "oraclecloud.com",
-    "smartrecruiters.com",
-    "successfactors.com",
-    "workable.com",
-    "workday.com",
-    "workdayjobs.com",
-}
+from applypilot.apply.provider_registry import host_supports_credential_relay
 
 BLOCKED_IDENTITY_HOSTS = {
     "accounts.google.com",
@@ -118,7 +102,7 @@ def host_is_known_ats(host: str) -> bool:
         return False
     if any(_host_matches(normalized, blocked) for blocked in BLOCKED_IDENTITY_HOSTS):
         return False
-    return any(_host_matches(normalized, candidate) for candidate in KNOWN_ATS_HOSTS)
+    return host_supports_credential_relay(normalized)
 
 
 def _select_candidate(candidates: list[dict[str, object]]) -> dict[str, object]:

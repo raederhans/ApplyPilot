@@ -3,8 +3,67 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from typing import Any, Protocol
+
+
+class CommandConsole(Protocol):
+    """Small output port used by command bodies."""
+
+    def print(self, *objects: object, **kwargs: object) -> None: ...
+
+
+class ApplyCommandRuntime(Protocol):
+    """CLI-owned services needed to execute one apply command."""
+
+    @property
+    def console(self) -> CommandConsole: ...
+
+    @property
+    def environment(self) -> Mapping[str, str]: ...
+
+    def bootstrap(self) -> None: ...
+
+    def standing_auto_authorization_enabled(self, profile: dict) -> bool: ...
+
+    def build_standing_authorization_manifest(
+        self,
+        connection: Any,
+        *,
+        profile: dict,
+        target_url: str | None,
+        requested_limit: int,
+        min_score: int,
+    ) -> dict: ...
+
+    def exit_exception(self, code: int) -> BaseException: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyCommandOptions:
+    """Immutable projection of Typer's ``apply`` options."""
+
+    limit: int | None = None
+    workers: int = 1
+    min_score: int = 6
+    model: str | None = None
+    agent_backend: str | None = None
+    browser_backend: str | None = None
+    interaction_mode: str | None = None
+    continuous: bool = False
+    dry_run: bool = False
+    manual_captcha_relay: bool = False
+    headless: bool = False
+    url: str | None = None
+    authorization_file: Path | None = None
+    final_authorization_file: Path | None = None
+    gen: bool = False
+    mark_applied: str | None = None
+    mark_failed: str | None = None
+    fail_reason: str | None = None
+    reset_failed: bool = False
+    reset_failed_url: str | None = None
 
 
 def _select_runnable_browser_backend(
@@ -102,38 +161,34 @@ def _manual_captcha_relay_enabled(
 
 
 def run_apply(
-    runtime: ModuleType,
-    *,
-    limit: int | None,
-    workers: int,
-    min_score: int,
-    model: str | None,
-    agent_backend: str | None,
-    browser_backend: str | None,
-    interaction_mode: str | None,
-    continuous: bool,
-    dry_run: bool,
-    manual_captcha_relay: bool,
-    headless: bool,
-    url: str | None,
-    authorization_file: Path | None,
-    final_authorization_file: Path | None,
-    gen: bool,
-    mark_applied: str | None,
-    mark_failed: str | None,
-    fail_reason: str | None,
-    reset_failed: bool,
-    reset_failed_url: str | None,
+    runtime: ApplyCommandRuntime,
+    options: ApplyCommandOptions,
 ) -> None:
     """Prepare one application, or submit under workspace policy/one-off authorization."""
-    _bootstrap = runtime._bootstrap
-    _build_standing_authorization_manifest = runtime._build_standing_authorization_manifest
-    _standing_auto_authorization_enabled = runtime._standing_auto_authorization_enabled
+    limit = options.limit
+    workers = options.workers
+    min_score = options.min_score
+    model = options.model
+    agent_backend = options.agent_backend
+    browser_backend = options.browser_backend
+    interaction_mode = options.interaction_mode
+    continuous = options.continuous
+    dry_run = options.dry_run
+    manual_captcha_relay = options.manual_captcha_relay
+    headless = options.headless
+    url = options.url
+    authorization_file = options.authorization_file
+    final_authorization_file = options.final_authorization_file
+    gen = options.gen
+    mark_applied = options.mark_applied
+    mark_failed = options.mark_failed
+    fail_reason = options.fail_reason
+    reset_failed = options.reset_failed
+    reset_failed_url = options.reset_failed_url
     console = runtime.console
-    os = runtime.os
-    typer = runtime.typer
+    environment = runtime.environment
 
-    _bootstrap()
+    runtime.bootstrap()
 
     from applypilot.apply.submission_admission import summarize_worker_allocation
     from applypilot.config import PROFILE_PATH as _profile_path
@@ -153,7 +208,7 @@ def run_apply(
             updated_url = mark_job(mark_applied, "applied")
         except (LookupError, ValueError) as exc:
             console.print(f"[red]Could not mark job as applied:[/red] {exc}")
-            raise typer.Exit(code=1) from None
+            raise runtime.exit_exception(1) from None
         console.print(f"[green]Marked as applied:[/green] {updated_url}")
         return
 
@@ -163,7 +218,7 @@ def run_apply(
             updated_url = mark_job(mark_failed, "failed", reason=fail_reason)
         except (LookupError, ValueError) as exc:
             console.print(f"[red]Could not mark job as failed:[/red] {exc}")
-            raise typer.Exit(code=1) from None
+            raise runtime.exit_exception(1) from None
         console.print(
             f"[yellow]Marked as failed:[/yellow] {updated_url} "
             f"({fail_reason or 'manual'})"
@@ -176,15 +231,15 @@ def run_apply(
             count = do_reset(reset_failed_url)
         except (LookupError, ValueError) as exc:
             console.print(f"[red]Could not reset failed job:[/red] {exc}")
-            raise typer.Exit(code=1) from None
+            raise runtime.exit_exception(1) from None
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 
     if dry_run and continuous:
         console.print("[red]Continuous dry-run is not supported; use a finite --limit.[/red]")
-        raise typer.Exit(code=1)
+        raise runtime.exit_exception(1)
     profile = load_profile(_profile_path)
-    standing_auto_authorize = _standing_auto_authorization_enabled(profile)
+    standing_auto_authorize = runtime.standing_auto_authorization_enabled(profile)
     submission_policy = profile.get("submission_policy", {})
     manual_captcha_relay = _manual_captcha_relay_enabled(
         manual_captcha_relay,
@@ -205,7 +260,7 @@ def run_apply(
         console.print(
             "[red]Manual CAPTCHA relay requires bounded visible submission mode.[/red]"
         )
-        raise typer.Exit(code=1)
+        raise runtime.exit_exception(1)
     final_batch_authorization_required = bool(
         isinstance(submission_policy, dict)
         and submission_policy.get("batch_final_authorization_required", False)
@@ -215,7 +270,7 @@ def run_apply(
         console.print(
             "[red]--final-authorization-file requires its bound --authorization-file.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
     if (
         not dry_run
         and final_batch_authorization_required
@@ -226,13 +281,13 @@ def run_apply(
             "[red]This workspace requires one final batch authorization before any browser submission. "
             "Run finalize-batch after the user approves the complete prepared batch, then pass both files.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
 
     if not dry_run and authorization_file is None and not url and not standing_auto_authorize:
         console.print(
             "[red]Submission without a manifest requires one exact --url.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
     if not dry_run and authorization_file is None:
         submission_policy = profile.get("submission_policy", {})
         manifest_required = bool(
@@ -246,13 +301,13 @@ def run_apply(
             console.print(
                 "[red]Profile policy requires --authorization-file for every submission.[/red]"
             )
-            raise typer.Exit(code=2)
+            raise runtime.exit_exception(2)
     requested_limit = limit if limit is not None else (0 if continuous else 1)
     if not dry_run and continuous and authorization_file is None:
         console.print(
             "[red]Continuous submission requires --authorization-file.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
     if (
         not dry_run
         and requested_limit > 1
@@ -262,25 +317,25 @@ def run_apply(
         console.print(
             "[red]Batch submission requires --authorization-file or standing auto-authorization.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
     if (
         not dry_run
         and url
         and authorization_file is None
-        and os.environ.get("APPLYPILOT_AUTO_SUBMIT") != "1"
+        and environment.get("APPLYPILOT_AUTO_SUBMIT") != "1"
         and not standing_auto_authorize
     ):
         console.print(
             "[red]Single-URL submission requires APPLYPILOT_AUTO_SUBMIT=1 or "
             "--authorization-file.[/red]"
         )
-        raise typer.Exit(code=2)
+        raise runtime.exit_exception(2)
     # --- Full apply mode ---
 
-    backend = resolve_apply_backend(agent_backend, os.environ)
+    backend = resolve_apply_backend(agent_backend, environment)
     if backend not in {"codex", "claude"}:
         console.print("[red]--agent-backend must be codex or claude.[/red]")
-        raise typer.Exit(code=1)
+        raise runtime.exit_exception(1)
     from applypilot.apply.chrome import get_browser_executable, resolve_browser_backend
     from applypilot.apply.router import resolve_interaction_mode
 
@@ -289,8 +344,8 @@ def run_apply(
         effective_interaction_mode = resolve_interaction_mode(interaction_mode)
     except ValueError as exc:
         console.print(f"[red]{exc}.[/red]")
-        raise typer.Exit(code=1) from None
-    effective_model = resolve_apply_model(backend, model, os.environ)
+        raise runtime.exit_exception(1) from None
+    effective_model = resolve_apply_model(backend, model, environment)
 
     # Check 1: the selected browser-agent CLI and a visible browser are required.
     import shutil
@@ -316,7 +371,7 @@ def run_apply(
         if not has_browser:
             missing.append(browser_error or effective_browser_backend)
         console.print(f"[red]Browser apply is missing: {', '.join(missing)}.[/red]")
-        raise typer.Exit(code=1)
+        raise runtime.exit_exception(1)
     if unavailable_browsers:
         unavailable = "; ".join(
             f"{backend}: {reason}"
@@ -333,7 +388,7 @@ def run_apply(
             "[red]Profile not found.[/red]\n"
             "Run [bold]applypilot init[/bold] to create your profile first."
         )
-        raise typer.Exit(code=1)
+        raise runtime.exit_exception(1)
 
     # Check 3: Submission needs an approved cover letter. A fill-only preview
     # can proceed with a validated resume and leave an optional letter blank.
@@ -353,18 +408,18 @@ def run_apply(
                     "[red]No submission-ready materials.[/red]\n"
                     "Prepare a validated resume and resolve any material hard requirements first."
                 )
-            raise typer.Exit(code=1)
+            raise runtime.exit_exception(1)
 
     if gen:
         from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
-            raise typer.Exit(code=1)
+            raise runtime.exit_exception(1)
         prompt_file = gen_prompt(target, min_score=min_score, model=effective_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
-            raise typer.Exit(code=1)
+            raise runtime.exit_exception(1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         if backend == "claude":
@@ -401,10 +456,10 @@ def run_apply(
                 authorization_manifest = load_manifest(authorization_file)
         except (OSError, TypeError, ValueError) as exc:
             console.print(f"[red]Invalid authorization manifest:[/red] {exc}")
-            raise typer.Exit(code=2) from None
+            raise runtime.exit_exception(2) from None
     elif not dry_run and standing_auto_authorize:
         try:
-            authorization_manifest = _build_standing_authorization_manifest(
+            authorization_manifest = runtime.build_standing_authorization_manifest(
                 get_connection(),
                 profile=profile,
                 target_url=url,
@@ -413,7 +468,7 @@ def run_apply(
             )
         except (TypeError, ValueError) as exc:
             console.print(f"[red]Standing auto-authorization could not bind a ready job:[/red] {exc}")
-            raise typer.Exit(code=2) from None
+            raise runtime.exit_exception(2) from None
         console.print(
             "[green]Standing authorization bound "
             f"{len(authorization_manifest['jobs'])} exact ready candidate(s) for up to "
@@ -453,7 +508,7 @@ def run_apply(
             console.print(
                 "[red]No preview-admitted candidates remain; refusing to start browser workers.[/red]"
             )
-            raise typer.Exit(code=1)
+            raise runtime.exit_exception(1)
     else:
         worker_allocation = summarize_worker_allocation(
             get_connection(),
@@ -466,7 +521,7 @@ def run_apply(
             console.print(
                 "[red]No executable authorized candidates remain; refusing to start browser workers.[/red]"
             )
-            raise typer.Exit(code=2)
+            raise runtime.exit_exception(2)
 
     worker_summary_lines, workers = _worker_summary_lines(
         worker_allocation,

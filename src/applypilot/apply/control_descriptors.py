@@ -26,6 +26,7 @@ from applypilot.apply.browser_broker import (
     StalePageBinding,
 )
 from applypilot.apply.page_binding import PageBinding
+from applypilot.apply.provider_registry import provider_for_url as registry_provider_for_url
 
 Provider = Literal["workday", "smartrecruiters"]
 ControlKind = Literal[
@@ -54,10 +55,6 @@ SEMANTIC_CONTROL_POLICY = "semantic-control-write/v1"
 MAX_CONTROLS = 200
 MAX_OPTIONS = 100
 
-_PROVIDER_HOSTS: dict[str, tuple[str, ...]] = {
-    "workday": ("myworkdayjobs.com", "myworkdaysite.com"),
-    "smartrecruiters": ("smartrecruiters.com",),
-}
 _SUPPORTED_KINDS = frozenset(
     {
         "text",
@@ -90,17 +87,8 @@ class SemanticControlUncertain(RuntimeError):
 def provider_for_url(value: object) -> Provider | None:
     """Resolve only exact HTTPS Workday and SmartRecruiters provider hosts."""
 
-    try:
-        parsed = urlparse(str(value or "").strip())
-    except ValueError:
-        return None
-    host = (parsed.hostname or "").casefold().rstrip(".")
-    if parsed.scheme.casefold() != "https" or not host:
-        return None
-    for provider, domains in _PROVIDER_HOSTS.items():
-        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
-            return provider  # type: ignore[return-value]
-    return None
+    resolved = registry_provider_for_url(value, "control_write")
+    return resolved if resolved in {"workday", "smartrecruiters"} else None  # type: ignore[return-value]
 
 
 @dataclass(frozen=True, slots=True)

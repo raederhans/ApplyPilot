@@ -11,6 +11,8 @@ from applypilot.optional_dependencies import (
     require_module,
 )
 
+pytestmark = pytest.mark.compatibility
+
 
 def test_optional_dependency_error_names_installable_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_import(_module_name: str):

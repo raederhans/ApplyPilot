@@ -150,8 +150,8 @@ def _setup(
         lambda _browser, pages, _job: pages,
     )
     monkeypatch.setattr(
-        launcher.page_observation_mod,
-        "_select_application_page_and_frame",
+        launcher.page_surfaces_mod,
+        "select_application_page_and_frame",
         lambda _pages: (page, surface),
     )
     monkeypatch.setattr(

@@ -7,7 +7,6 @@ personal data is loaded from the user's profile -- nothing is hardcoded.
 
 import json
 import logging
-import os
 import shutil
 from collections.abc import Iterable
 from datetime import datetime
@@ -193,6 +192,33 @@ def _build_profile_summary(profile: dict) -> str:
     lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
 
     return "\n".join(lines)
+
+
+def _confirmed_location_label(profile: dict) -> str:
+    """Return only the candidate location facts currently present in the profile."""
+    personal = profile.get("personal", {})
+    return ", ".join(
+        str(personal.get(key) or "").strip()
+        for key in ("city", "province_state", "country")
+        if str(personal.get(key) or "").strip()
+    )
+
+
+def _build_candidate_fact_boundary(profile: dict) -> str:
+    """Keep direct-email instructions bound to current profile and typed policies."""
+    availability = profile.get("availability", {})
+    work_auth = profile.get("work_authorization", {})
+    return (
+        "Use only confirmed candidate facts from the current profile and typed policy branches. "
+        "For availability, use the current confirmed start, end, schedule, and exact-period rule; "
+        "never revive retired facts from older artifacts. For work authorization or sponsorship, "
+        "use only the role-specific branch that matches the live question. "
+        "Do not expose message bodies, OAuth data, mailbox content, attachment paths, or file digests in the report. "
+        f"Current availability reference: start={availability.get('credit_bearing_internship_start', availability.get('earliest_start_date', 'Manual review'))}; "
+        f"end={availability.get('internship_end_date', 'Manual review')}; "
+        f"schedule={availability.get('credit_bearing_internship_hours_per_week', 'Manual review')}. "
+        f"Current work-authorization reference: {work_auth.get('require_sponsorship', 'Manual review')}."
+    )
 
 
 def _build_location_check(profile: dict, search_config: dict) -> str:
@@ -442,7 +468,7 @@ def _build_screening_section(profile: dict) -> str:
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}; willing to relocate within Singapore: {mobility.get('willing_to_relocate_within_singapore', 'manual review')}; willing to relocate to another country: {mobility.get('willing_to_relocate_to_another_country', 'manual review')}
+  - Location/relocation: lives in {city}; willing to relocate locally: {mobility.get('willing_to_relocate_within_singapore', 'manual review')}; willing to relocate to another country: {mobility.get('willing_to_relocate_to_another_country', 'manual review')}
   - Travel: {mobility.get('willing_to_travel', 'manual review')}, maximum {mobility.get('maximum_travel_percentage', 'manual review')}%
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
@@ -1019,219 +1045,8 @@ def _build_portal_handoff_rule(job: dict) -> str:
 
 
 def _build_captcha_section() -> str:
-    """Compatibility wrapper for the current click-and-observe guidance.
-
-    The legacy solver text remains below temporarily so older local diffs are
-    not destructively rewritten, but it is unreachable and no longer emitted.
-    """
+    """Compatibility wrapper for the current fail-closed CAPTCHA guidance."""
     return _build_captcha_check_section()
-
-    # Legacy, unreachable text retained for a later dedicated cleanup.
-    config.load_env()
-    capsolver_configured = bool(os.environ.get("CAPSOLVER_API_KEY", ""))
-    # This literal is an instruction marker, never the secret. It keeps the
-    # legacy browser snippets non-secret while directing the runtime agent to
-    # obtain the credential from the process environment.
-    capsolver_key = "READ_FROM_CAPSOLVER_API_KEY_ENV_WITHOUT_ECHOING"
-    key_instruction = (
-        "Read CAPSOLVER_API_KEY from the process environment at execution time. "
-        "Never print, echo, persist, or include its value in tool output."
-        if capsolver_configured
-        else "CAPSOLVER_API_KEY is not configured. Use the manual fallback."
-    )
-
-    return f"""== CAPTCHA ==
-You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-Credential handling: {key_instruction}
-API base: https://api.capsolver.com
-
-CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
-1. Run CAPTCHA DETECT to get the type and sitekey
-2. Run CAPTCHA SOLVE (createTask -> poll -> inject) with the CapSolver API
-3. ONLY go to MANUAL FALLBACK if CapSolver returns errorId > 0
-Do NOT skip the API call based on what the CAPTCHA looks like. CapSolver solves CAPTCHAs server-side -- it does NOT need to see or interact with images, puzzles, or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are solved via API token, not visually. ALWAYS try the API first.
-
---- CAPTCHA DETECT ---
-Run this browser_evaluate after every navigation, Apply/Submit/Login click, or when a page feels stuck.
-IMPORTANT: Detection order matters. hCaptcha elements also have data-sitekey, so check hCaptcha BEFORE reCAPTCHA.
-
-browser_evaluate function: () => {{{{
-  const r = {{}};
-  const url = window.location.href;
-  // 1. hCaptcha (check FIRST -- hCaptcha uses data-sitekey too)
-  const hc = document.querySelector('.h-captcha, [data-hcaptcha-sitekey]');
-  if (hc) {{{{
-    r.type = 'hcaptcha'; r.sitekey = hc.dataset.sitekey || hc.dataset.hcaptchaSitekey;
-  }}}}
-  if (!r.type && document.querySelector('script[src*="hcaptcha.com"], iframe[src*="hcaptcha.com"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'hcaptcha'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 2. Cloudflare Turnstile
-  if (!r.type) {{{{
-    const cf = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]');
-    if (cf) {{{{
-      r.type = 'turnstile'; r.sitekey = cf.dataset.sitekey || cf.dataset.turnstileSitekey;
-      if (cf.dataset.action) r.action = cf.dataset.action;
-      if (cf.dataset.cdata) r.cdata = cf.dataset.cdata;
-    }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="challenges.cloudflare.com"]')) {{{{
-    r.type = 'turnstile_script_only'; r.note = 'Wait 3s and re-detect.';
-  }}}}
-  // 3. reCAPTCHA v3 (invisible, loaded via render= param)
-  if (!r.type) {{{{
-    const s = document.querySelector('script[src*="recaptcha"][src*="render="]');
-    if (s) {{{{
-      const m = s.src.match(/render=([^&]+)/);
-      if (m && m[1] !== 'explicit') {{{{ r.type = 'recaptchav3'; r.sitekey = m[1]; }}}}
-    }}}}
-  }}}}
-  // 4. reCAPTCHA v2 (checkbox or invisible)
-  if (!r.type) {{{{
-    const rc = document.querySelector('.g-recaptcha');
-    if (rc) {{{{ r.type = 'recaptchav2'; r.sitekey = rc.dataset.sitekey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="recaptcha"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'recaptchav2'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 5. FunCaptcha (Arkose Labs)
-  if (!r.type) {{{{
-    const fc = document.querySelector('#FunCaptcha, [data-pkey], .funcaptcha');
-    if (fc) {{{{ r.type = 'funcaptcha'; r.sitekey = fc.dataset.pkey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) {{{{
-    const el = document.querySelector('[data-pkey]');
-    if (el) {{{{ r.type = 'funcaptcha'; r.sitekey = el.dataset.pkey; }}}}
-  }}}}
-  if (r.type) {{{{ r.url = url; return r; }}}}
-  return null;
-}}}}
-
-Result actions:
-- null -> no CAPTCHA. Continue normally.
-- "turnstile_script_only" -> browser_wait_for time: 3, re-run detect.
-- Any other type -> proceed to CAPTCHA SOLVE below.
-
---- CAPTCHA SOLVE ---
-Three steps: createTask -> poll -> inject. Do each as a separate browser_evaluate call.
-
-STEP 1 -- CREATE TASK (copy this exactly, fill in the 3 placeholders):
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/createTask', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      task: {{{{
-        type: 'TASK_TYPE',
-        websiteURL: 'PAGE_URL',
-        websiteKey: 'SITE_KEY'
-      }}}}
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-TASK_TYPE values (use EXACTLY these strings):
-  hcaptcha     -> HCaptchaTaskProxyLess
-  recaptchav2  -> ReCaptchaV2TaskProxyLess
-  recaptchav3  -> ReCaptchaV3TaskProxyLess
-  turnstile    -> AntiTurnstileTaskProxyLess
-  funcaptcha   -> FunCaptchaTaskProxyLess
-
-PAGE_URL = the url from detect result. SITE_KEY = the sitekey from detect result.
-For recaptchav3: add "pageAction": "submit" to the task object (or the actual action found in page scripts).
-For turnstile: add "metadata": {{"action": "...", "cdata": "..."}} if those were in detect result.
-
-Response: {{"errorId": 0, "taskId": "abc123"}} on success.
-If errorId > 0 -> CAPTCHA SOLVE failed. Go to MANUAL FALLBACK.
-
-STEP 2 -- POLL (replace TASK_ID with the taskId from step 1):
-Loop: browser_wait_for time: 3, then run:
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/getTaskResult', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      taskId: 'TASK_ID'
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-- status "processing" -> wait 3s, poll again. Max 10 polls (30s).
-- status "ready" -> extract token:
-    reCAPTCHA: solution.gRecaptchaResponse
-    hCaptcha:  solution.gRecaptchaResponse
-    Turnstile: solution.token
-- errorId > 0 or 30s timeout -> MANUAL FALLBACK.
-
-STEP 3 -- INJECT TOKEN (replace THE_TOKEN with actual token string):
-
-For reCAPTCHA v2/v3:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{{{ el.value = token; el.style.display = 'block'; }}}});
-  if (window.___grecaptcha_cfg) {{{{
-    const clients = window.___grecaptcha_cfg.clients;
-    for (const key in clients) {{{{
-      const walk = (obj, d) => {{{{
-        if (d > 4 || !obj) return;
-        for (const k in obj) {{{{
-          if (typeof obj[k] === 'function' && k.length < 3) try {{{{ obj[k](token); }}}} catch(e) {{{{}}}}
-          else if (typeof obj[k] === 'object') walk(obj[k], d+1);
-        }}}}
-      }}}};
-      walk(clients[key], 0);
-    }}}}
-  }}}}
-  return 'injected';
-}}}}
-
-For hCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
-  if (ta) ta.value = token;
-  document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(f => f.setAttribute('data-hcaptcha-response', token));
-  const cb = document.querySelector('[data-hcaptcha-widget-id]');
-  if (cb && window.hcaptcha) try {{{{ window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-For Turnstile:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
-  if (inp) inp.value = token;
-  if (window.turnstile) try {{{{ const w = document.querySelector('.cf-turnstile'); if (w) window.turnstile.getResponse(w); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-For FunCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('#FunCaptcha-Token, input[name="fc-token"]');
-  if (inp) inp.value = token;
-  if (window.ArkoseEnforcement) try {{{{ window.ArkoseEnforcement.setConfig({{{{data: {{{{blob: token}}}}}}}}) }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-After injecting: browser_wait_for time: 2, then snapshot.
-- Widget gone or green check -> success. Click Submit if needed.
-- No change -> click Submit/Verify/Continue button (some sites need it).
-- Still stuck -> token may have expired (~2 min lifetime). Re-run from STEP 1.
-
---- MANUAL FALLBACK ---
-You should ONLY be here if CapSolver createTask returned errorId > 0. If you haven't tried CapSolver yet, GO BACK and try it first.
-If CapSolver genuinely failed (errorId > 0):
-1. Audio challenge: Look for "audio" or "accessibility" button -> click it for an easier challenge.
-2. Text/logic puzzles: Solve them yourself. Think step by step. Common tricks: "All but 9 die" = 9 left. "3 sisters and 4 brothers, how many siblings?" = 7.
-3. Simple text captchas ("What is 3+7?", "Type the word") -> solve them.
-4. All else fails -> Output RESULT:CAPTCHA."""
 
 
 def _build_captcha_check_section() -> str:
@@ -1610,6 +1425,8 @@ RESULT:FAILED:mailbox_receipt_scan"""
 
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
+    confirmed_location = _confirmed_location_label(profile)
+    candidate_fact_boundary = _build_candidate_fact_boundary(profile)
     location_check = _build_location_check(profile, search_config)
     availability_section = _build_availability_section(profile)
     work_authorization_section = _build_work_authorization_section(profile)
@@ -1864,7 +1681,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)"""
             "Open the ordinary application form without submitting it. If the role accepts applications only by "
             "email, follow EMAIL-ONLY APPLICATION ROUTE and prepare the verified plan without sending."
         )
-        final_steps = """10. BEFORE any submission action, snapshot and review EVERY field. Verify legal name, email, phone, Singapore location, current company, work authorization, availability answers, required screening responses, and the uploaded resume. Resolve ordinary required unknowns through the profile, reference registry, resolver tool, and closest non-contradictory option. Stop only if the resume remains missing, an assessment/CAPTCHA is present, or a required direct-impact identity/legal/credential answer would be false. Otherwise fix supported errors and save a screenshot named pre-submit-review.png.
+        final_steps = """10. BEFORE any submission action, snapshot and review EVERY field. Verify legal name, email, phone, current profile location, current company, work authorization, availability answers, required screening responses, and the uploaded resume. Resolve ordinary required unknowns through the profile, reference registry, resolver tool, and closest non-contradictory option. Stop only if the resume remains missing, an assessment/CAPTCHA is present, or a required direct-impact identity/legal/credential answer would be false. Otherwise fix supported errors and save a screenshot named pre-submit-review.png.
 11. STOP before clicking Submit/Apply/Send/Finish/Complete application or any equivalent final control. Do not press Enter while that control is focused.
 12. Output RESULT:READY_TO_SUBMIT when the completed form is visible at the final review point. The launcher will capture an advisory browser observation before a separate submission phase."""
         result_codes = f"""RESULT:READY_TO_SUBMIT -- form completed and waiting for an advisory browser observation
@@ -1905,7 +1722,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)"""
             )
             login_steps = authorized_login_steps
             if submission_phase == "prepare":
-                final_steps = """10. Snapshot and review EVERY field. Verify legal name, email, phone, Singapore location, current company, availability answers, required screening responses, and the uploaded resume. Fix supported errors, then save pre-submit-review.png.
+                final_steps = """10. Snapshot and review EVERY field. Verify legal name, email, phone, current profile location, current company, availability answers, required screening responses, and the uploaded resume. Fix supported errors, then save pre-submit-review.png.
 11. STOP before clicking the final submission control. Do not press Enter while it is focused.
 12. Output RESULT:READY_TO_SUBMIT when the form is complete and ready for the launcher's advisory observation."""
                 result_codes = f"""RESULT:READY_TO_SUBMIT -- form completed and waiting for advisory observation
@@ -2065,7 +1882,7 @@ Approved Cover Letter PDF: {cl_upload_path or 'N/A'}
 {field_review_steps}
 {final_steps}
 
-Use only confirmed facts. The candidate is available full-time from November 2026 through June 2027; never state or imply a 16-hour weekly limit or an August start. Do not claim sponsorship is required. Do not expose message bodies, OAuth data, mailbox content, attachment paths, or file digests in the report.
+{candidate_fact_boundary}
 
 == RESULT CODES ==
 {result_codes}
@@ -2133,7 +1950,7 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         "after typing each autocomplete value, and use only the latest snapshot's exact option "
         "ref. After selecting the option, take another fresh snapshot and verify that the "
         "invalid state is gone, the listbox is closed, and the selected value remains before "
-        "starting the next field. Do not use a manual-entry fallback when an exact Singapore "
+        "starting the next field. Do not use a manual-entry fallback when an exact confirmed "
         "option is visible. For Personal information City only, first try the exact city/country "
         "option. If a fresh snapshot proves there is no selectable exact city/country option, "
         "the provider-owned `Cannot find your city? Click here to fill in manually` control is "
@@ -2188,7 +2005,7 @@ Use RESULT:FAILED:browser_mcp_unavailable only when the attached Playwright MCP 
 
 == FIELD IDENTITY RULES ==
 - Full name and all first/given/last/family/surname fields use the legal identity from APPLICANT PROFILE. Preferred/display name is used only when the label explicitly asks for it.
-- Current location/city/country fields use Singapore. Use the full street address only when the form actually asks for address fields.
+- Current location/city/country fields use the confirmed profile value: {confirmed_location or 'Manual review'}. Use the full street address only when the form actually asks for address fields.
 - Current company and current title use the Current Employment record, not a resume-parser guess.
 - For a full-time internship tied to a stated start month, answer Yes only if the exact full-time availability in the current profile meets that month. Dates and duration are generally negotiable fit signals, not automatic rejection gates; answer required questions truthfully and continue unless a hard legal condition is unmet.
 
