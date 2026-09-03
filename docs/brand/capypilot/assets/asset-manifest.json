@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "generatedOn": "2026-09-02",
+  "brand": "CapyPilot",
+  "assets": [
+    {
+      "path": "selected-dashboard-1440x1024.png",
+      "size": [1440, 1024],
+      "mode": "RGB",
+      "status": "approved-direction-reference",
+      "use": "P1 visual target; not runtime UI"
+    },
+    {
+      "path": "capypilot-mark-compact-master.png",
+      "size": [1254, 1254],
+      "mode": "RGBA",
+      "status": "approved-raster-master",
+      "use": "compact mark, sidebar, mobile and favicon source",
+      "alphaInspected": true,
+      "safeAreaInspected": true
+    },
+    {
+      "path": "capypilot-app-icon-master.png",
+      "size": [1254, 1254],
+      "mode": "RGB",
+      "status": "approved-raster-master",
+      "use": "application icon source"
+    },
+    {
+      "path": "app-icon-192.png",
+      "size": [192, 192],
+      "mode": "RGB",
+      "status": "approved-export",
+      "use": "web app icon"
+    },
+    {
+      "path": "app-icon-512.png",
+      "size": [512, 512],
+      "mode": "RGB",
+      "status": "approved-export",
+      "use": "high-resolution web app icon"
+    },
+    {
+      "path": "favicon.ico",
+      "size": [64, 64],
+      "mode": "RGBA",
+      "status": "approved-export",
+      "use": "multi-size favicon: 16, 32, 48 and 64 px"
+    },
+    {
+      "path": "favicon-16.png",
+      "size": [16, 16],
+      "mode": "RGBA",
+      "status": "approved-export",
+      "use": "16 px favicon"
+    },
+    {
+      "path": "favicon-32.png",
+      "size": [32, 32],
+      "mode": "RGBA",
+      "status": "approved-export",
+      "use": "32 px favicon"
+    },
+    {
+      "path": "favicon-48.png",
+      "size": [48, 48],
+      "mode": "RGBA",
+      "status": "approved-export",
+      "use": "48 px favicon"
+    },
+    {
+      "path": "capypilot-lockup-light.png",
+      "size": [2076, 758],
+      "mode": "RGBA",
+      "status": "approved-raster-master",
+      "use": "horizontal lockup on warm light surfaces",
+      "alphaInspected": true,
+      "exactTextInspected": "CapyPilot"
+    },
+    {
+      "path": "capypilot-lockup-dark.png",
+      "size": [1774, 887],
+      "mode": "RGB",
+      "status": "approved-dark-adaptation-preview",
+      "use": "reference for placement on #2B241F; not a transparent runtime lockup"
+    },
+    {
+      "path": "capypilot-lockup-monochrome.png",
+      "size": [2076, 758],
+      "mode": "RGBA",
+      "status": "approved-derived-export",
+      "use": "one-color deep-cocoa lockup on light surfaces",
+      "alphaInspected": true
+    },
+    {
+      "path": "capypilot-lockup-monochrome-inverse.png",
+      "size": [2076, 758],
+      "mode": "RGBA",
+      "status": "approved-derived-export",
+      "use": "one-color warm-ivory lockup on dark surfaces",
+      "alphaInspected": true
+    },
+    {
+      "path": "capypilot-mascot-companion.png",
+      "size": [1254, 1254],
+      "mode": "RGBA",
+      "status": "approved-raster-reference",
+      "use": "desktop header, help or restrained empty state",
+      "alphaInspected": true
+    },
+    {
+      "path": "qa-small-size-preview.png",
+      "size": [384, 192],
+      "mode": "RGB",
+      "status": "qa-only",
+      "use": "16, 24, 32 and 48 px mark inspection on light and dark surfaces"
+    }
+  ],
+  "productionNotes": {
+    "generation": "Built-in ImageGen created the selected direction and raster masters. Mechanical LANCZOS exports created exact runtime sizes. Monochrome variants preserve the approved lockup alpha.",
+    "inspection": "All listed assets were opened or included in a visual QA sheet. Dimensions, modes and alpha bounds were inspected programmatically.",
+    "excluded": "Image generations that baked a checkerboard instead of true alpha were rejected and were not copied into this directory.",
+    "vector": "No SVG master is supplied in P0. Any future vector redraw must match the approved raster mark and pass small-size review before replacing it."
+  }
+}

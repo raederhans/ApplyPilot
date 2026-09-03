@@ -30,6 +30,18 @@ from applypilot.frontend.contracts import (
 
 console = Console()
 DATA_PLACEHOLDER = "__APPLYPILOT_DASHBOARD_DATA__"
+DASHBOARD_ASSET_DIRECTORY = Path("assets") / "capypilot"
+DASHBOARD_ASSET_NAMES = (
+    "capypilot-lockup-light.png",
+    "capypilot-mark-compact-master.png",
+    "capypilot-mascot-companion.png",
+    "favicon.ico",
+    "favicon-16.png",
+    "favicon-32.png",
+    "favicon-48.png",
+    "app-icon-192.png",
+    "app-icon-512.png",
+)
 ACTIVE_APPLICATION_SQL = (
     "(apply_status IS NULL OR apply_status NOT IN ('applied', 'submission_uncertain')) "
     "AND COALESCE(apply_retry_blocked, 0) = 0"
@@ -456,6 +468,18 @@ def render_dashboard(data: dict[str, Any]) -> str:
     return template.replace(DATA_PLACEHOLDER, payload)
 
 
+def _publish_dashboard_assets(output: Path) -> None:
+    """Publish approved package assets beside a generated Dashboard."""
+    source = resource_files("applypilot.frontend").joinpath("assets", "capypilot")
+    target = output.parent / DASHBOARD_ASSET_DIRECTORY
+    target.mkdir(parents=True, exist_ok=True)
+    for name in DASHBOARD_ASSET_NAMES:
+        asset = source.joinpath(name)
+        if not asset.is_file():
+            raise RuntimeError(f"Packaged Dashboard asset is missing: {name}")
+        (target / name).write_bytes(asset.read_bytes())
+
+
 def generate_dashboard(output_path: str | None = None) -> str:
     """Generate the local HTML workbench and return its absolute path."""
     out = Path(output_path) if output_path else APP_DIR / "dashboard.html"
@@ -474,6 +498,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         )
     html = render_dashboard(data)
     out.parent.mkdir(parents=True, exist_ok=True)
+    _publish_dashboard_assets(out)
     out.write_text(html, encoding="utf-8")
 
     abs_path = str(out.resolve())

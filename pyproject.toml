@@ -1,11 +1,11 @@
 [project]
 name = "applypilot-local"
 version = "0.4.0"
-description = "Local-first, evidence-driven job application workspace"
+description = "CapyPilot: a local-first, evidence-driven job application workspace"
 readme = "README.md"
 license = "AGPL-3.0-only"
 requires-python = ">=3.11"
-authors = [{name = "Pickle-Pixel and ApplyPilot Local contributors"}]
+authors = [{name = "Pickle-Pixel and CapyPilot contributors"}]
 maintainers = [{name = "raederhans"}]
 keywords = [
     "job-search",
@@ -89,6 +89,7 @@ packages = ["src/applypilot"]
 artifacts = [
     "src/applypilot/config/*.yaml",
     "src/applypilot/frontend/*.html",
+    "src/applypilot/frontend/assets/capypilot/*",
 ]
 
 [tool.pytest.ini_options]

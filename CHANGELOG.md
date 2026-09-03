@@ -1,8 +1,15 @@
 # Changelog
 
-All notable changes to ApplyPilot will be documented in this file.
+All notable changes to CapyPilot will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- Renamed the public product identity to **CapyPilot** while retaining the
+  `applypilot-local` distribution, `applypilot` package and CLI,
+  `APPLYPILOT_*` environment variables, local storage identifiers, and
+  repository URLs for compatibility.
 
 ### Fixed
 

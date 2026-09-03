@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "brand": {
+    "displayName": "CapyPilot",
+    "direction": "quiet-copilot-warm-light",
+    "selectedOn": "2026-09-02"
+  },
+  "technicalIdentifiers": {
+    "immutable": [
+      "applypilot",
+      "applypilot-local",
+      "APPLYPILOT_*",
+      "src/applypilot",
+      "applypilot.db"
+    ],
+    "rule": "Rename user-visible product copy only. Do not globally replace technical identifiers."
+  },
+  "color": {
+    "canvas": "#F7F2E8",
+    "surfaceRaised": "#FFFCF6",
+    "surfaceSand": "#EEE4D3",
+    "textPrimary": "#2B241F",
+    "textMuted": "#6F635A",
+    "borderSubtle": "#D8CEC0",
+    "brandPrimary": "#A95F3D",
+    "brandSecondary": "#5C3A2A",
+    "brandIllustrationTaupe": "#B88962",
+    "success": "#2F7A55",
+    "warning": "#965F12",
+    "error": "#B4473E",
+    "link": "#2E68A0",
+    "focus": "#2E68A0",
+    "successSurface": "#E6F1EA",
+    "warningSurface": "#F7ECD5",
+    "errorSurface": "#F7E3E0",
+    "infoSurface": "#E6EEF7"
+  },
+  "typography": {
+    "sans": "Source Sans 3, Noto Sans SC, Microsoft YaHei, PingFang SC, system-ui, sans-serif",
+    "mono": "JetBrains Mono, Consolas, SFMono-Regular, monospace",
+    "runtimeRule": "Bundle fonts locally if used; otherwise fall back to installed system fonts. Do not add runtime font CDN requests."
+  },
+  "mascot": {
+    "desktopMaxWidthPx": 210,
+    "desktopMaxViewportFraction": 0.12,
+    "mobileDecorativeMaxWidthPx": 96,
+    "allowedRoles": [
+      "brand identification",
+      "quiet empty-state support",
+      "missing-evidence guidance",
+      "help and onboarding"
+    ],
+    "forbiddenRoles": [
+      "celebrating authorization",
+      "celebrating submission",
+      "masking an error or uncertain receipt",
+      "implying guaranteed interview or offer"
+    ]
+  },
+  "accessibility": {
+    "minimumBodyContrast": 4.5,
+    "minimumLargeTextContrast": 3.0,
+    "minimumInteractiveTargetPx": 44,
+    "reducedMotion": true,
+    "colorAloneDoesNotConveyState": true
+  }
+}
+

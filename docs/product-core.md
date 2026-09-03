@@ -1,6 +1,6 @@
-# ApplyPilot Local product core
+# CapyPilot product core
 
-ApplyPilot Local is a private job-search operations workspace. Its product
+CapyPilot is a private job-search operations workspace. Its product
 promise is not “submit more forms”; it is “move each opportunity forward with
 truthful materials, explicit authority, and durable evidence.”
 

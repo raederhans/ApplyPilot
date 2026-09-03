@@ -1,102 +1,94 @@
 # CapyPilot
 
-**Local-first, evidence-driven job application workspace.**
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-CapyPilot helps a job seeker discover verifiable openings, score fit,
-reuse validated resume variants, prepare application materials, assist with
-browser-based forms under explicit authorization, and reconcile submission
-receipts. Candidate data, credentials, generated documents, and runtime logs
-stay on the user's machine by default.
+**A local-first, evidence-driven workspace for running a careful job search.**
 
-This repository is an independent continuation of the inactive upstream
-[Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot). The
-Python import package and CLI remain `applypilot` for compatibility; the
-public product identity is `CapyPilot`. The Python package,
-`applypilot` CLI, and `APPLYPILOT_*` environment variables remain compatible.
+CapyPilot helps one job seeker discover verifiable openings, compare fit,
+prepare truthful materials, complete supported application forms under explicit
+authorization, and confirm what was actually submitted. Profiles, resumes,
+credentials, browser sessions, receipts, and runtime logs stay on the user's
+machine by default.
 
-## Product principles
+CapyPilot is built for supervised execution, not blind bulk submission. A
+clicked **Submit** button is not counted as success; only decisive evidence
+matched to the exact job can create a durable submitted record.
 
-- **Evidence before status:** a clicked Submit control is not treated as a
-  successful application. Only decisive, identity-matched confirmation can
-  create a durable submitted record.
-- **Local-first privacy:** profiles, resumes, databases, credentials, browser
-  evidence, and generated artifacts are ignored by Git and remain local.
-- **Human authority:** unsupported answers, CAPTCHA, assessments, identity or
-  financial documents, account recovery, and security changes stop for review.
-- **Source truth:** official jobs stay separate from social or community leads
-  until a fresh authoritative listing verifies them.
-- **Reusable work:** validated resume artifacts can be reused only when the
-  job fingerprint and evidence coverage still match.
+## Current status
 
-## Capabilities
+- **Beta, local-first, and CLI-first.** The product runs on the user's machine;
+  there is no hosted CapyPilot service, account system, or cloud sync.
+- **Useful end to end today.** The current code supports official-source
+  discovery and manual imports, fit scoring, validated resume reuse, truthful
+  tailoring, cover-letter and PDF preparation, authorized browser assistance,
+  application history, and receipt reconciliation.
+- **The browser dashboard is read-only.** It presents the same four stages—
+  Discover, Decide, Prepare, and Verify—without mutating the database or
+  executing commands.
+- **Human review remains part of the product.** Unsupported material answers,
+  CAPTCHA or MFA, assessments, identity or financial documents, account
+  recovery, security changes, and uncertain submission outcomes stop for
+  review.
+- **The CapyPilot identity is unreleased.** The latest public release is v0.4.0
+  under the former **ApplyPilot Local** name. The current repository contains
+  the CapyPilot brand migration and keeps existing technical identifiers for
+  compatibility.
 
-| Surface | What it provides |
-| --- | --- |
-| Official radar | Structured company/ATS discovery with complete, partial, blocked, and skipped source states |
-| Job-board discovery | Optional JobSpy integration for Indeed, LinkedIn, Glassdoor, ZipRecruiter, and Google Jobs |
-| Fit and materials | LLM-assisted scoring, truthful resume tailoring, cover letters, PDF validation |
-| Resume library | Content-addressed artifacts, subtype routing, validation state, and hard-gap review |
-| Application runtime | Explicit authorization manifests, readiness decisions, isolated browser workers, manual takeover |
-| Receipt reconciliation | Exact job/company/title matching, decisive confirmation evidence, idempotent status updates |
-| Opportunity workbench | Local browser UI for eligible roles, fit evidence, source quality, and verified form links |
-| Local status | SQLite-backed application history, unanswered questions, source observations, and terminal dashboards |
+## Product workflow
 
-## Installation
+| Stage | What CapyPilot does | What it does not assume |
+| --- | --- | --- |
+| Discover | Collects official openings, optional board results, and manual leads with source state | A lead is not automatically a verified job |
+| Decide | Checks eligibility, enriches descriptions, scores fit, and records readiness | A high score is not authorization to apply |
+| Prepare | Routes validated resumes, identifies evidence gaps, tailors content, and validates PDFs | Missing facts are not invented |
+| Verify | Separates authorization, browser observations, platform state, and durable receipts | A preview or final click is not proof of acceptance |
 
-Python 3.11 or 3.12 is recommended for the complete workflow; the core and
-official radar also run on Python 3.13. The quickest released installation is
-an isolated command-line app managed by `pipx`:
+The safe application path is:
 
-```bash
-pipx install applypilot-local
+```text
+prepare -> audit -> authorize -> submit -> observe -> reconcile receipt
 ```
 
-Until the first tagged PyPI release, install the current repository directly:
+If acceptance cannot be proved, the application remains
+`submission_uncertain` and is not submitted again automatically.
+
+## Install
+
+Python 3.11 or 3.12 is recommended for the full workflow. Core commands and
+the official-source radar also support Python 3.13.
+
+There is currently no `applypilot-local` release on PyPI. Install from the
+[latest GitHub release](https://github.com/raederhans/ApplyPilot/releases) or
+directly from the repository:
 
 ```bash
 pipx install "git+https://github.com/raederhans/ApplyPilot.git"
 ```
 
-An extracted GitHub release bundle or source checkout also includes a guided,
-cross-platform installer. It bootstraps `pipx`, verifies a bundled wheel when
-present, and never copies local profiles, credentials, resumes, or databases:
+A release bundle or source checkout also provides a guided installer:
 
 ```bash
 python install.py
 ```
 
-The broad third-party job-board connector is intentionally optional because
-its upstream package currently pins an older NumPy line:
+Third-party job-board discovery is optional and currently intended for Python
+3.11–3.12:
 
 ```bash
-python install.py --with-jobboards  # Python 3.11-3.12
+python install.py --with-jobboards
 ```
 
-Then initialize and verify the local workspace:
+## Quick start
+
+Initialize the local workspace and check available capabilities:
 
 ```bash
 applypilot init
 applypilot doctor
-applypilot --version
+applypilot dashboard
 ```
 
-For a repeatable import from files you already maintain, provide all three
-inputs together. CapyPilot validates them, refuses to replace existing files
-unless `--force` is explicit, and does not collect API keys or browser
-credentials:
-
-```bash
-applypilot init --resume resume.txt --profile profile.json --searches searches.yaml
-applypilot dashboard --no-open
-```
-
-`applypilot doctor` reports optional capabilities separately; a missing
-JobSpy installation does not prevent the official-company radar, resume
-library, status tools, or manually imported jobs from working.
-
-## Common workflows
-
-### Discover and prepare
+Discover and prepare opportunities:
 
 ```bash
 applypilot radar collect
@@ -104,15 +96,7 @@ applypilot radar report --hours 24
 applypilot run discover enrich score tailor cover pdf
 ```
 
-### Reuse validated resumes
-
-```bash
-applypilot resume-library-sync
-applypilot resume-library-status
-applypilot resume-route --url <verified-job-url>
-```
-
-### Review and apply
+Review one exact job before any submission:
 
 ```bash
 applypilot review-readiness
@@ -122,87 +106,37 @@ applypilot apply --authorization-file <batch-manifest.json>
 applypilot reconcile-receipts --file <receipt.json>
 ```
 
-The default browser backend is the installed Edge/Chrome runtime. An optional,
-isolated CloakBrowser backend is available for authorized sites that reject a
-normal Playwright/CDP session because of automation fingerprinting:
+Validated resume variants can be inspected and routed independently:
 
 ```bash
-python -m pip install -e ".[stealth]"
-applypilot apply --dry-run --url <verified-job-url> --browser-backend cloak
-applypilot apply --dry-run --url <verified-job-url> --browser-backend auto
+applypilot resume-library-sync
+applypilot resume-library-status
+applypilot resume-route --url <verified-job-url>
 ```
 
-`auto` starts with Edge and makes at most one CloakBrowser retry only for an
-explicit bot/WAF block. It never retries a CAPTCHA, assessment, selector
-failure, authentication failure, or any operation after submission begins.
-CloakBrowser is a browser runtime, not a second form-filling agent: Playwright
-remains the structured interaction driver on both Edge and Cloak. Independent
-Edge workers may run in parallel; workers that actually need Cloak share one
-serialized fallback lane unless the configured license explicitly permits
-concurrency.
+Run `applypilot --help` for the complete command list. Optional browser
+backends, interaction modes, provider behavior, and operating details belong
+in the command help and product documentation rather than this overview.
 
-`--interaction-mode auto` also teaches the isolated Playwright agent when to
-request a bounded Windows Computer Use handoff for a genuinely visual-only or
-native control. Computer Use is not injected into the isolated CLI process, so
-the request fails closed for an outer agent to handle with a fresh observation;
-it is never used for file pickers, CAPTCHA/MFA, permissions, assessments, or a
-second final-submit attempt. Use `--interaction-mode playwright` to disable
-that handoff request.
+## Compatibility and local data
 
-CloakBrowser uses its own `cloak-workers/` profiles and never clones the daily
-Edge profile. CapyPilot disables CloakBrowser auto-updates and pins the
-keyless binary unless `APPLYPILOT_CLOAK_VERSION` or a separately managed
-`CLOAKBROWSER_LICENSE_KEY` selects another admitted build. The upstream binary
-license prohibits automated account creation and redistribution; those flows
-must continue with the ordinary/manual path.
+The public product name is **CapyPilot**, while these technical identifiers
+remain unchanged during the migration:
 
-Dry-run and preview states are not submission receipts. The application
-runtime deliberately keeps uncertain outcomes as `submission_uncertain` until
-reconciliation proves the exact application was accepted.
+- distribution: `applypilot-local`
+- Python package and CLI: `applypilot`
+- environment variables: `APPLYPILOT_*`
+- default workspace: `~/.applypilot/`
+- database schema, storage keys, entry points, and repository URL
 
-## Architecture
+Do not commit or share the local workspace. It may contain profile data,
+resumes, generated documents, SQLite databases, API keys, browser profiles,
+screenshots, receipts, logs, or verification codes. CapyPilot does not endorse
+CAPTCHA bypass, hidden submission, identity-document automation, or account
+recovery automation. See [SECURITY.md](SECURITY.md) before reporting a
+vulnerability.
 
-```text
-official ATS / optional boards / manual imports
-                    |
-                    v
-        discovery observations + jobs
-                    |
-                    v
-        SQLite identity and state contracts
-          |            |             |
-          v            v             v
-      fit scoring  resume library  status history
-          \            |             /
-           \           v            /
-            readiness + authorization
-                       |
-                       v
-              isolated browser worker
-                       |
-                       v
-              receipt reconciliation
-```
-
-The architecture keeps discovery, preparation, authorization, browser
-execution, and receipt admission as separate boundaries. A producer cannot
-declare its own output successful merely because it completed without an
-exception.
-
-## Local data and security
-
-The default workspace is `~/.applypilot/`. Do not commit or share:
-
-- `profile.json`, resumes, generated PDFs, cover letters, or SQLite databases;
-- `.env`, API keys, credential records, browser profiles, or verification codes;
-- application screenshots, receipts, logs, worker attachments, or
-  `chrome-workers/` / `cloak-workers/` browser profiles.
-
-Credentials are read only at execution time. The project does not endorse
-CAPTCHA bypass, identity-document automation, account recovery, or hidden
-submission. Review [SECURITY.md](SECURITY.md) before reporting a vulnerability.
-
-## Development
+## Development and documentation
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -211,23 +145,14 @@ pytest -q
 python scripts/build_release.py
 ```
 
-The release builder audits archive contents and metadata, creates wheel and
-source distributions under `dist/python/`, produces a verified install bundle,
-and writes SHA-256 checksums. On Windows, `--no-isolation` is available when an
-antivirus aggressively scans temporary PEP 517 build environments. CI runs
-lint, the complete test suite, and these package checks on pushes and pull
-requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository conventions and
-[docs/product-core.md](docs/product-core.md) for the product and frontend boundary.
+- [Product and frontend boundaries](docs/product-core.md)
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [License and provenance](NOTICE.md)
 
-## License and provenance
-
-CapyPilot remains licensed under
-[GNU AGPL-3.0-only](LICENSE). The original ApplyPilot authors retain their
-copyright in the upstream work; fork modifications are distributed under the
-same license. See [NOTICE.md](NOTICE.md) for provenance and the network-source
-obligation that matters if this code is later offered as an interactive
-service.
-
-This repository is not affiliated with applypilot.app, useapplypilot.com, or
-other products using a similar name. “CapyPilot” identifies this
-independent fork and its local-first operating model.
+CapyPilot is licensed under [GNU AGPL-3.0-only](LICENSE). It is an independent
+continuation of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot);
+the original authors retain copyright in the upstream work. This repository is
+not affiliated with applypilot.app, useapplypilot.com, or similarly named
+products.

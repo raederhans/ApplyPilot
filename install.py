@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install ApplyPilot Local as an isolated command-line application.
+"""Install CapyPilot as an isolated command-line application.
 
 The installer works in three contexts, in this order:
 
@@ -49,7 +49,7 @@ def resolve_source(root: Path) -> str:
     packages = root / "packages"
     wheels = sorted(packages.glob("applypilot_local-*.whl")) if packages.is_dir() else []
     if len(wheels) > 1:
-        raise RuntimeError("Release bundle contains more than one ApplyPilot Local wheel")
+        raise RuntimeError("Release bundle contains more than one CapyPilot wheel")
     if wheels:
         wheel = wheels[0]
         expected = _expected_bundle_hash(root, wheel)
@@ -89,7 +89,7 @@ def install(
 ) -> None:
     if sys.version_info < MIN_PYTHON:
         required = ".".join(map(str, MIN_PYTHON))
-        raise RuntimeError(f"ApplyPilot Local requires Python {required} or newer")
+        raise RuntimeError(f"CapyPilot requires Python {required} or newer")
     if include_jobboards and sys.version_info >= (3, 13):
         raise RuntimeError("The optional job-board connector currently requires Python 3.11 or 3.12")
 
@@ -110,7 +110,7 @@ def install(
         _run([*pipx, "ensurepath"], dry_run=dry_run)
 
     if not dry_run:
-        print("\nApplyPilot Local is installed.")
+        print("\nCapyPilot is installed.")
         print("Open a new terminal, then run: applypilot init")
         print("Verify the installation with: applypilot doctor")
 

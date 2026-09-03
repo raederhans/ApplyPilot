@@ -1,6 +1,6 @@
-# Contributing to ApplyPilot Local
+# Contributing to CapyPilot
 
-Thank you for your interest in contributing to ApplyPilot Local. This guide covers everything you need to get started.
+Thank you for your interest in contributing to CapyPilot. This guide covers everything you need to get started.
 
 ## Development Setup
 
@@ -18,7 +18,7 @@ pip install -e ".[dev]"
 playwright install chromium
 ```
 
-This installs ApplyPilot in editable mode with all development dependencies (pytest, ruff, etc.) and downloads the Chromium browser binary for Playwright.
+This installs CapyPilot in editable mode with all development dependencies (pytest, ruff, etc.) and downloads the Chromium browser binary for Playwright.
 
 ### Verify Installation
 
@@ -94,7 +94,7 @@ pytest tests/ --cov=src/applypilot --cov-report=term-missing
 
 ## Linting and Code Style
 
-ApplyPilot uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting.
+CapyPilot uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting.
 
 ```bash
 # Check for issues
@@ -144,4 +144,4 @@ ApplyPilot/
 
 ## License
 
-By contributing to ApplyPilot, you agree that your contributions will be licensed under the [GNU Affero General Public License v3.0](LICENSE).
+By contributing to CapyPilot, you agree that your contributions will be licensed under the [GNU Affero General Public License v3.0](LICENSE).
