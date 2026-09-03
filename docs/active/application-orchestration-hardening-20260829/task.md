@@ -209,6 +209,6 @@ P4 accepted delivery is the concurrency evidence/governor mechanism, not a highe
 - [x] Use current Windows working set for application-boundary recycle decisions and cover current-below-limit/peak-above-limit behavior.
 - [x] Keep loopback HTTP MCP default-off and keep production workers at 1.
 - [x] Post-audit focused suite: `282 passed in 20.39s`; scoped Ruff passed.
-- [ ] Final combined CapyPilot/P0-P4 full suite and release build.
+- [x] Final combined CapyPilot/P0-P4 gate: `1721 passed in 116.40s`; full Ruff and `git diff --check` passed; audited release build produced wheel, sdist, bundle, and checksums; clean-wheel smoke passed install, `resume-route --help`, `CapyPilot 0.4.0`, init, doctor, and dashboard generation.
 - [ ] Ordinary push to `fork/main` and exact-head four-job CI observation.
 - [ ] Fast-forward local `main`; remove only proven-integrated branches/worktrees and recoverable temporary WIP.
