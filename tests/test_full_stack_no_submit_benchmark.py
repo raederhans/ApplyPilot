@@ -15,6 +15,7 @@ from applypilot.apply.full_stack_no_submit_benchmark import (
     load_fixture,
     run_full_stack_no_submit_benchmark,
 )
+from applypilot.apply.p4_no_submit_worker import ATTRIBUTION_SCHEMA_VERSION
 from applypilot.apply.performance_governor import (
     DEFAULT_THRESHOLDS,
     REPORT_SCHEMA_VERSION,
@@ -114,6 +115,15 @@ def test_launcher_worker_crosses_p1_p2_p3_without_submit_authority(tmp_path: Pat
         "receipt_identity_drift",
     }
     assert all(item[field] == 0 for item in results for field in forbidden)
+    for item in results:
+        attribution = item["performance_attribution"]
+        assert attribution["schema_version"] == ATTRIBUTION_SCHEMA_VERSION
+        assert attribution["missing_required_spans"] == []
+        assert 0 <= attribution["attribution_coverage_ratio"] <= 1
+        assert (attribution["attributed_wall_clock_ms"] + attribution["unattributed_wall_clock_ms"]) == pytest.approx(
+            item["latency_ms"], abs=0.01
+        )
+        assert "codex_spawn_ms" in attribution["unavailable_spans"]
 
 
 def test_admission_requires_every_two_and_four_worker_gate() -> None:

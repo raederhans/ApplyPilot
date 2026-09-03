@@ -55,4 +55,4 @@
 - [x] Diagnose CI run `33713251268`: Python 3.11/3.13 compatibility and the original Chromium tier passed, but core exposed 23 real-Chromium cases that were not owned by the browser marker; Windows correctly remained blocked by the failed upstream gate.
 - [x] Mark only the real Chromium test functions in the five mixed-responsibility files, leaving their pure contract tests in core.
 - [x] Validate the corrected partition: `1728` total, `1668` core, `19` compatibility, `30` browser, and `30` Windows selections; the complete browser tier passed locally (`30 passed`).
-- The follow-up commit requires a fresh remote CI run before the integration owner may report the remote gate as passing.
+- [x] Fresh remote CI run `33713631836` passed for exact follow-up HEAD `70dd7e5d8c67ec0869c8500fb9d8d54fc7c0b9af`, including core, compatibility, Chromium, build/wheel, and dependent Windows clean-install gates.

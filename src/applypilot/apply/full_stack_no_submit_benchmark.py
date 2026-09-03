@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from applypilot.apply import agent_runtime
+from applypilot.apply.p4_no_submit_worker import ATTRIBUTION_SCHEMA_VERSION
 from applypilot.apply.performance_governor import (
     DEFAULT_THRESHOLDS,
     REPORT_SCHEMA_VERSION,
@@ -45,6 +46,7 @@ class CohortMetricCollector:
         self._lock = threading.Lock()
         self.sqlite_waits_ms: list[float] = []
         self.sqlite_busy_errors = 0
+        self.worker_spans_ms: dict[int, dict[str, float]] = {}
 
     def record_sqlite_wait(self, wait_ms: float) -> None:
         with self._lock:
@@ -54,11 +56,25 @@ class CohortMetricCollector:
         with self._lock:
             self.sqlite_busy_errors += 1
 
+    def record_worker_span(self, worker_id: int, name: str, duration_ms: float) -> None:
+        value = float(duration_ms)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("worker span duration must be finite and non-negative")
+        if name not in {"playwright_start_ms", "browser_launch_ms", "browser_close_ms"}:
+            raise ValueError(f"unknown worker attribution span: {name}")
+        with self._lock:
+            spans = self.worker_spans_ms.setdefault(int(worker_id), {})
+            spans[name] = spans.get(name, 0.0) + value
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
                 "sqlite_lock_wait_ms": list(self.sqlite_waits_ms),
                 "sqlite_busy_errors": self.sqlite_busy_errors,
+                "worker_lifecycle_spans_ms": {
+                    str(worker_id): {name: round(value, 3) for name, value in sorted(spans.items())}
+                    for worker_id, spans in sorted(self.worker_spans_ms.items())
+                },
             }
 
 
@@ -289,6 +305,39 @@ def _quality_projection(results: Sequence[Mapping[str, object]]) -> list[dict[st
     ]
 
 
+def _attribution_summary(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    phase_values: dict[str, list[float]] = {}
+    coverage: list[float] = []
+    unavailable: set[str] = set()
+    complete = 0
+    for result in results:
+        raw = result.get("performance_attribution")
+        if not isinstance(raw, Mapping) or raw.get("schema_version") != ATTRIBUTION_SCHEMA_VERSION:
+            coverage.append(0.0)
+            continue
+        raw_spans = raw.get("spans_ms")
+        if isinstance(raw_spans, Mapping):
+            for name, value in raw_spans.items():
+                phase_values.setdefault(str(name), []).append(float(value))
+        coverage.append(float(raw.get("attribution_coverage_ratio") or 0.0))
+        raw_unavailable = raw.get("unavailable_spans")
+        if isinstance(raw_unavailable, Sequence) and not isinstance(raw_unavailable, (str, bytes)):
+            unavailable.update(str(item) for item in raw_unavailable)
+        complete += int(raw.get("attribution_complete") is True)
+    task_count = len(results)
+    return {
+        "schema_version": ATTRIBUTION_SCHEMA_VERSION,
+        "task_count": task_count,
+        "complete_tasks": complete,
+        "all_tasks_complete": task_count > 0 and complete == task_count,
+        "coverage_ratio_min": round(min(coverage, default=0.0), 6),
+        "coverage_ratio_p50": round(_percentile(coverage, 0.50), 6),
+        "phase_p50_ms": {name: round(_percentile(values, 0.50), 3) for name, values in sorted(phase_values.items())},
+        "phase_p95_ms": {name: round(_percentile(values, 0.95), 3) for name, values in sorted(phase_values.items())},
+        "unavailable_spans": sorted(unavailable),
+    }
+
+
 def _cohort(
     tasks: Sequence[Mapping[str, object]],
     *,
@@ -395,6 +444,7 @@ def _aggregate(reports: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "receipt_calls",
         "receipt_identity_drift",
     )
+    attribution = _attribution_summary(results)
     return {
         "blocks": len(reports),
         "throughput_by_block": [float(item["throughput_jobs_per_second"]) for item in reports],
@@ -418,6 +468,9 @@ def _aggregate(reports: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "completed_jobs": len(results),
         "side_effects": {field: sum(int(item[field]) for item in results) for field in side_effect_fields},
         "all_replays_verified": all(bool(item["replay_verified"]) for item in results),
+        "performance_attribution": attribution,
+        "attribution_complete": bool(attribution["all_tasks_complete"]),
+        "worker_lifecycle_samples": [item.get("worker_lifecycle_spans_ms", {}) for item in reports],
     }
 
 
