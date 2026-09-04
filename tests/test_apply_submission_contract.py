@@ -1173,6 +1173,46 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
     }
 
 
+def test_terminal_attempt_performance_accepts_audited_direct_email_attribution(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "direct-email-attribution.db")
+    target_url = "https://acme.myworkdayjobs.com/job/123"
+    attempt_id = start_application_attempt(target_url, "worker-1", conn=conn)
+    attribution_job = {"application_url": target_url}
+    bind_attempt_route(
+        attribution_job,
+        provider="direct_email",
+        target_url=target_url,
+        worker_application_index=1,
+        worker_id="worker-1",
+    )
+    safe_record_job_span(attribution_job, "agent.turn", 120)
+    attribution = attribution_snapshot(attribution_job)
+    assert attribution is not None
+    route = safe_route_binding_snapshot(attribution_job)
+    assert route is not None
+    assert route["provider"] == "direct_email"
+    assert finalize_application_attempt(
+        attempt_id,
+        "applied",
+        evidence={"orchestration_performance": {"attribution_route": route}},
+        conn=conn,
+    )
+
+    assert record_application_attempt_performance(
+        attempt_id,
+        {"version": 1, "metrics": {}, "acquisition": {}, "attribution": attribution},
+        conn=conn,
+    )
+    stored = conn.execute(
+        "SELECT evidence_json FROM application_attempts WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    evidence = json.loads(stored["evidence_json"])
+    assert evidence["orchestration_performance"]["attribution"] == attribution
+
+
 def test_prune_history_is_preview_first_and_preserves_uncertainty(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "prune.db")
     old = (NOW - timedelta(days=200)).isoformat()

@@ -1689,7 +1689,9 @@ def _worker_loop_with_port(
                     audit_signal, audit_report = _enforce_stateful_control_coverage(
                         audit_signal, audit_report
                     )
-                    bind_attribution_target(audit_report.get("page_url") or admitted_target_url)
+                    bind_attribution_target(
+                        audit_report.get("page_url") or admitted_target_url
+                    )
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
                     performance_attribution_mod.safe_record_job_span(
@@ -2014,7 +2016,21 @@ def _worker_loop_with_port(
                                 "disposition": "block",
                                 "blocking_issues": ["page_drift"],
                             }
-                    bind_attribution_target(audit_report.get("page_url") or admitted_target_url)
+                    if email_application is not None:
+                        # The normalized plan proves the mailbox channel and the
+                        # admitted posting/application target remains the durable
+                        # attribution target for this terminal attempt.
+                        performance_attribution_mod.safe_bind_attempt_route(
+                            job,
+                            provider="direct_email",
+                            target_url=admitted_target_url,
+                            worker_application_index=worker_application_index,
+                            worker_id=f"worker-{worker_id}",
+                        )
+                    else:
+                        bind_attribution_target(
+                            audit_report.get("page_url") or admitted_target_url
+                        )
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
                     performance_attribution_mod.safe_record_job_span(

@@ -2837,6 +2837,9 @@ def test_worker_uses_reserved_mailbox_submit_route_for_email_application(
     assert _ledger[0][1]["agent"]["channel"] == "direct_email"
     assert _ledger[0][1]["observer"]["confirmed"] is True
     assert _marked[0][0][1] == "applied"
+    assert _marked[0][1]["evidence"]["orchestration_performance"][
+        "attribution_route"
+    ]["provider"] == "direct_email"
 
 
 def test_worker_never_falls_back_to_browser_audit_for_rejected_email_plan(
@@ -2860,6 +2863,9 @@ def test_worker_never_falls_back_to_browser_audit_for_rejected_email_plan(
     assert phases == ["prepare"]
     assert marked[0][0][1] == "failed"
     assert "email_plan_unverified" in marked[0][0][2]
+    assert "attribution_route" not in marked[0][1]["evidence"][
+        "orchestration_performance"
+    ]
 
 
 def test_direct_email_submission_evidence_requires_send_and_sent_copy() -> None:

@@ -153,6 +153,25 @@ def test_unbound_or_invalid_attribution_is_unavailable_not_zero_filled() -> None
         attribution_mod.trace_for_job(job).record("agent.turn", math.nan)
 
 
+def test_direct_email_binding_preserves_confirmed_channel_for_ats_target() -> None:
+    job: dict[str, object] = {}
+
+    attribution_mod.bind_attempt_route(
+        job,
+        provider="direct_email",
+        target_url="https://acme.myworkdayjobs.com/job/123",
+        worker_application_index=3,
+        worker_id="worker-1",
+    )
+
+    assert attribution_mod.safe_route_binding_snapshot(job) == {
+        "provider": "direct_email",
+        "domain": "acme.myworkdayjobs.com",
+        "worker_application_index": 3,
+        "worker_id": "worker-1",
+    }
+
+
 def test_attempt_route_mismatch_is_rejected_even_when_shape_is_valid() -> None:
     job = _bound_job()
     attribution_mod.safe_record_job_span(job, "agent.turn", 1)

@@ -112,8 +112,10 @@ def bind_attempt_route(
     parsed = urlparse(raw_target)
     hostname = _safe_hostname(parsed.hostname or "")
     detected_provider = provider_for_url(raw_target, "detection")
+    # A confirmed direct-email plan describes the submission channel, which can
+    # legitimately differ from the ATS that hosts the posting target.
     candidate_provider = (
-        "direct_email" if declared_provider == "direct_email" and detected_provider is None else detected_provider
+        "direct_email" if declared_provider == "direct_email" else detected_provider
     )
     if candidate_provider not in _PROVIDERS or hostname is None:
         return
