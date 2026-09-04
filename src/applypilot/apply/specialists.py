@@ -915,6 +915,8 @@ def run_durable_ats_fill_plan_specialist(
     claimed = task_journal.claim(connection, task_id, owner_id, lease_seconds=10)
     if claimed is None:
         raise RuntimeError("ATS fill-plan task is already claimed")
+    lease_token = claimed.lease_token
+    assert lease_token is not None
     _append_feedback_event(
         connection,
         event_id=f"{task_id}:emitted",
@@ -959,7 +961,7 @@ def run_durable_ats_fill_plan_specialist(
         task_journal.complete(
             connection,
             task_id,
-            owner_id,
+            lease_token,
             TaskResult(
                 task_id=task_id,
                 status="completed",
@@ -972,7 +974,7 @@ def run_durable_ats_fill_plan_specialist(
         task_journal.fail(
             connection,
             task_id,
-            owner_id,
+            lease_token,
             TaskResult(
                 task_id=task_id,
                 status="timed_out",
@@ -993,7 +995,7 @@ def run_durable_ats_fill_plan_specialist(
         task_journal.fail(
             connection,
             task_id,
-            owner_id,
+            lease_token,
             TaskResult(
                 task_id=task_id,
                 status="failed",
@@ -1336,6 +1338,8 @@ def run_durable_material_specialist(
     claimed = task_journal.claim(connection, task_id, owner_id, lease_seconds=120)
     if claimed is None:
         raise RuntimeError("material specialist task is already claimed")
+    lease_token = claimed.lease_token
+    assert lease_token is not None
     _append_feedback_event(
         connection,
         event_id=f"{task_id}:emitted",
@@ -1362,12 +1366,12 @@ def run_durable_material_specialist(
             output={"material_readiness": result},
             authority_scope=_MATERIAL_SPECIALIST_SPEC.authority_scope,
         )
-        task_journal.complete(connection, task_id, owner_id, durable_result)
+        task_journal.complete(connection, task_id, lease_token, durable_result)
     except Exception as exc:
         task_journal.fail(
             connection,
             task_id,
-            owner_id,
+            lease_token,
             TaskResult(
                 task_id=task_id,
                 status="failed",

@@ -71,3 +71,25 @@ finding in the bounded P2 scope.
 Next: migrate the existing `agent_tasks` journal additively and introduce the
 single-owner background runtime with lease-epoch CAS, bounded workers, persistent
 heartbeat/progress/cancellation/retry, result events, and non-read replay denial.
+
+P3 completed locally. The existing `agent_tasks` table now migrates additively
+with heartbeat, bounded progress, cancellation, retry scheduling, worker/result
+references, dead-letter reason, and lease epoch. All production mutations use
+epoch-fenced tokens; cancellation wins over completion/retry; expired read tasks
+may be reclaimed, while non-read/effectful work is never automatically replayed.
+
+The staged background runtime provides one worker thread, a connection factory,
+lease reaping, retry scheduling, cancellation dispatch, result events, bounded
+coalescing, and lifecycle-safe shutdown. Provider classification, application
+facts, and work-authorization preflight now use the unique durable path
+`register -> worker -> heartbeat/result -> replay`; the previous direct execution
+path is removed.
+
+P3 verification: `333 passed in 12.18s` for the focused journal, background
+runtime, specialist, orchestration, and runtime-contract union; target Ruff and
+`git diff --check` passed. Independent final review returned PASS with no material
+finding.
+
+Next: introduce a canonical ToolBroker declaration/admission surface shared by
+CLI, internal MCP hosts, and App Server wiring; stage deferred namespaces and
+experimental dynamic tools without granting browser-write or submit authority.

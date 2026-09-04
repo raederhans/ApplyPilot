@@ -401,6 +401,66 @@ def test_preflight_advisory_reaches_the_actual_agent_prompt_reader(
     assert "submission authority" in rendered
 
 
+def test_preflight_context_specialists_use_durable_single_worker_and_replay(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from applypilot.apply import specialists
+
+    path = tmp_path / "preflight-background.db"
+    monkeypatch.setattr(launcher, "get_connection", lambda: sqlite3.connect(path))
+    monkeypatch.setattr(
+        launcher.config,
+        "load_profile",
+        lambda: {
+            "agent_runtime": {
+                "orchestration": {
+                    "material_specialist_mode": "off",
+                    "production_specialist_modes": {
+                        "provider-classifier-v1": "advisory",
+                        "application-facts-v1": "shadow",
+                        "work-authorization-v1": "shadow",
+                    },
+                }
+            },
+            "work_authorization": {"requires_sponsorship": False},
+        },
+    )
+    calls: dict[str, int] = {}
+    original = specialists.run_context_specialist
+
+    def counted(name, snapshot, *, mode="shadow"):
+        calls[name] = calls.get(name, 0) + 1
+        return original(name, snapshot, mode=mode)
+
+    monkeypatch.setattr(specialists, "run_context_specialist", counted)
+    job = {
+        "url": "https://boards.greenhouse.io/acme/jobs/123",
+        "title": "Engineer",
+    }
+
+    first = launcher._run_read_only_preflight(job)
+    second = launcher._run_read_only_preflight(job)
+
+    assert calls == {
+        "provider-classifier-v1": 1,
+        "application-facts-v1": 1,
+        "work-authorization-v1": 1,
+    }
+    assert first["specialist_advisories"] == second["specialist_advisories"]
+    assert first["specialist_advisories"][0]["result"]["provider"] == "greenhouse"
+    connection = sqlite3.connect(path)
+    rows = connection.execute(
+        "SELECT task_id,spec_json,status,heartbeat_at,result_ref FROM agent_tasks "
+        "WHERE task_id LIKE 'preflight-context:%' ORDER BY task_id"
+    ).fetchall()
+    assert len(rows) == 3
+    assert all(row[2] == "completed" and row[3] and row[4] for row in rows)
+    provider_task_id = next(row[0] for row in rows if "provider-classifier-v1" in row[1])
+    assert [
+        event["event_type"] for event in task_journal.list_events(connection, provider_task_id)
+    ] == ["claimed", "progress", "progress", "result"]
+
+
 @pytest.mark.parametrize(
     "specialist_id",
     [

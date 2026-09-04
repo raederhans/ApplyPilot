@@ -69,6 +69,10 @@ from applypilot.apply.application_facts import (
 from applypilot.apply.application_sessions import ApplicationSupervisor, ContextBundle
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
+from applypilot.apply.background_runtime import (
+    BackgroundWorkerPool,
+    production_specialist_runners,
+)
 from applypilot.apply.browser_authority import BrowserAuthorityHandle
 from applypilot.apply.browser_broker import (
     BrowserBrokerError,
@@ -205,7 +209,6 @@ from applypilot.apply.specialists import (
     normalize_specialist_mode,
     production_specialist_spec,
     prompt_safe_ats_fill_plan,
-    run_context_specialist,
     run_durable_ats_fill_plan_specialist,
     run_durable_material_specialist,
     run_system_specialist,
@@ -213,6 +216,7 @@ from applypilot.apply.specialists import (
 from applypilot.database import get_connection
 from applypilot.runtime_settings import load_runtime_settings
 from applypilot.storage import semantic_browser_writes as semantic_write_journal
+from applypilot.storage import task_journal
 
 
 def _durable_control_database_path() -> Path:
@@ -3281,6 +3285,13 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
                 partial_allowed=False,
             )
         )
+    background_pool = BackgroundWorkerPool(
+        lambda: get_connection(),
+        production_specialist_runners(),
+        worker_id="preflight-context-read-1",
+        max_workers=1,
+        coalesce_wait_seconds=2.0,
+    )
     if provider == "smartrecruiters":
         tasks.extend(
             (
@@ -3388,21 +3399,73 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
                     failure_category="specialist_timeout",
                     retryable=True,
                 )
-            specialist_run = run_context_specialist(
-                specialist_id,
-                context_snapshots[specialist_id],
-                mode=context_modes[specialist_id],
+            snapshot = context_snapshots[specialist_id]
+            specialist_mode = context_modes[specialist_id]
+            durable_identity = hashlib.sha256(
+                json.dumps(
+                    {
+                        "kind": specialist_id,
+                        "mode": specialist_mode,
+                        "snapshot": snapshot,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            durable_task_id = f"preflight-context:{specialist_id}:{durable_identity[:24]}"
+            durable_spec = TaskSpec(
+                task_id=durable_task_id,
+                kind=specialist_id,
+                objective="Produce bounded durable read-only preflight context.",
+                inputs={"snapshot": snapshot, "mode": specialist_mode},
+                effect_class="read",
+                authority_scope=production_specialist_spec(specialist_id).authority_scope,
+                retry_budget=0,
+                retry_categories=production_specialist_spec(specialist_id).retry_categories,
+                cancellation_mode="cooperative",
+                partial_allowed=False,
+                idempotency_key=durable_task_id,
             )
-            if specialist_run is None:
-                return TaskResult(task_id=task.task_id, status="completed")
+            connection = get_connection()
+            try:
+                task_journal.register(connection, durable_spec)
+            finally:
+                close = getattr(connection, "close", None)
+                if callable(close):
+                    close()
+            worker_outcome = background_pool.run_task(durable_task_id)
+            connection = get_connection()
+            try:
+                durable_entry = task_journal.load(connection, durable_task_id)
+            finally:
+                close = getattr(connection, "close", None)
+                if callable(close):
+                    close()
+            if (
+                worker_outcome is None
+                or durable_entry is None
+                or durable_entry.status != "completed"
+                or not isinstance(durable_entry.result, Mapping)
+            ):
+                return TaskResult(
+                    task_id=task.task_id,
+                    status=(
+                        "failed" if durable_entry is None else durable_entry.status
+                    ),
+                    failure_category="background_specialist_unavailable",
+                )
+            durable_output = durable_entry.result.get("output")
+            if not isinstance(durable_output, Mapping):
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="failed",
+                    failure_category="background_specialist_result_invalid",
+                )
             return TaskResult(
                 task_id=task.task_id,
                 status="completed",
-                output={
-                    "result": specialist_run.result,
-                    "enforced": specialist_run.enforced,
-                    "mode": specialist_run.mode,
-                },
+                output=dict(durable_output),
                 authority_scope=production_specialist_spec(
                     specialist_id
                 ).authority_scope,
@@ -3462,17 +3525,20 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
                 "metrics": dict(task_result.metrics),
             }
 
-    outcome = orchestration_mod.execute_task_graph(
-        tasks,
-        runner,
-        reducer,
-        max_workers=len(tasks),
-        resource_capacities={
-            "local-read": 1,
-            "database-read": 1,
-            "network-read": 1,
-        },
-    )
+    try:
+        outcome = orchestration_mod.execute_task_graph(
+            tasks,
+            runner,
+            reducer,
+            max_workers=len(tasks),
+            resource_capacities={
+                "local-read": 1,
+                "database-read": 1,
+                "network-read": 1,
+            },
+        )
+    finally:
+        background_pool.shutdown()
     result: dict[str, object] = {
         "provider": provider,
         "task_statuses": outcome.reduced_state.get("task_statuses", {}),

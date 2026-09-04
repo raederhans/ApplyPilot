@@ -141,3 +141,227 @@ def test_load_spec_returns_durable_system_inputs(tmp_path) -> None:
     loaded = task_journal.load_spec(connection, "task-snapshot")
 
     assert loaded["inputs"] == spec.inputs
+
+
+def test_additive_migration_is_idempotent_for_legacy_database() -> None:
+    connection = _connection()
+    connection.execute("""
+        CREATE TABLE agent_tasks (
+            task_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+            spec_digest TEXT NOT NULL, spec_json TEXT NOT NULL,
+            effect_class TEXT NOT NULL, status TEXT NOT NULL, owner_id TEXT,
+            lease_expires_at TEXT, result_json TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+    """)
+
+    task_journal.ensure_schema(connection)
+    task_journal.ensure_schema(connection)
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_tasks)")}
+    assert {
+        "heartbeat_at",
+        "progress_json",
+        "cancel_requested",
+        "retry_at",
+        "worker_id",
+        "result_ref",
+        "dead_letter_reason",
+        "lease_epoch",
+    } <= columns
+
+
+def test_lease_epoch_fences_old_owner_after_reap_and_reclaim() -> None:
+    connection = _connection()
+    current = datetime(2026, 9, 4, tzinfo=UTC)
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    first = task_journal.claim(connection, "read", "same-worker", lease_seconds=1, now=current)
+    assert first is not None and first.lease_token is not None
+    assert task_journal.reap_expired(
+        connection, now=current + timedelta(seconds=2)
+    ) == (1, 0)
+    second = task_journal.claim(
+        connection, "read", "same-worker", lease_seconds=30, now=current + timedelta(seconds=2)
+    )
+    assert second is not None and second.lease_token is not None
+    assert second.lease_epoch == first.lease_epoch + 1
+
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.heartbeat(connection, first.lease_token, progress={"stage": "late"})
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.complete(
+            connection,
+            "read",
+            first.lease_token,
+            TaskResult(task_id="read", status="completed"),
+        )
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.fail(
+            connection,
+            "read",
+            first.lease_token,
+            TaskResult(task_id="read", status="failed"),
+        )
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.acknowledge_cancel(connection, first.lease_token)
+    result = TaskResult(task_id="read", status="completed")
+    assert task_journal.complete(connection, "read", second.lease_token, result).status == "completed"
+    assert task_journal.complete(connection, "read", second.lease_token, result).status == "completed"
+    assert [
+        event["event_type"] for event in task_journal.list_events(connection, "read")
+    ].count("result") == 1
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.complete(connection, "read", first.lease_token, result)
+
+
+def test_owner_only_compatibility_cannot_mutate_a_reclaimed_task() -> None:
+    connection = _connection()
+    current = datetime(2026, 9, 4, tzinfo=UTC)
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    assert task_journal.claim(connection, "read", "same", lease_seconds=1, now=current)
+    task_journal.reap_expired(connection, now=current + timedelta(seconds=2))
+    second = task_journal.claim(
+        connection, "read", "same", lease_seconds=30, now=current + timedelta(seconds=2)
+    )
+    assert second is not None
+
+    with pytest.raises(RuntimeError, match="first claim"):
+        task_journal.complete(
+            connection,
+            "read",
+            "same",
+            TaskResult(task_id="read", status="completed"),
+        )
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.complete(
+            connection,
+            "read",
+            "same",
+            TaskResult(task_id="read", status="completed"),
+            lease_epoch=1,
+        )
+
+
+def test_heartbeat_cancel_and_result_events_share_durable_state() -> None:
+    connection = _connection()
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    claimed = task_journal.claim(connection, "read", "worker")
+    assert claimed is not None and claimed.lease_token is not None
+    token = claimed.lease_token
+
+    updated = task_journal.heartbeat(connection, token, progress={"stage": "half"})
+    assert updated.progress == {"stage": "half"}
+    assert updated.heartbeat_at is not None
+    assert task_journal.request_cancel(connection, "read").cancel_requested is True
+    assert task_journal.cancellation_requested(connection, token) is True
+    assert task_journal.acknowledge_cancel(connection, token).status == "cancelled"
+
+    assert [event["event_type"] for event in task_journal.list_events(connection, "read")] == [
+        "claimed",
+        "progress",
+        "cancel_requested",
+        "result",
+    ]
+
+
+def test_progress_rejects_unbounded_or_payload_shaped_content() -> None:
+    connection = _connection()
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    claimed = task_journal.claim(connection, "read", "worker")
+    assert claimed is not None and claimed.lease_token is not None
+
+    with pytest.raises(ValueError, match="non-sensitive"):
+        task_journal.heartbeat(
+            connection,
+            claimed.lease_token,
+            progress={"candidate_email": "private@example.test"},
+        )
+
+
+def test_reaper_never_replays_expired_effectful_work() -> None:
+    connection = _connection()
+    current = datetime(2026, 9, 4, tzinfo=UTC)
+    task_journal.register(
+        connection, TaskSpec("submit", "submit", "Submit", effect_class="submit")
+    )
+    assert task_journal.claim(connection, "submit", "worker", lease_seconds=1, now=current)
+
+    assert task_journal.reap_expired(
+        connection, now=current + timedelta(seconds=2)
+    ) == (0, 1)
+    entry = task_journal.load(connection, "submit")
+    assert entry is not None and entry.status == "dead_letter"
+    assert entry.dead_letter_reason == "expired_non_read_lease_requires_manual_review"
+
+
+def test_cancel_request_blocks_complete_fail_and_retry_until_ack() -> None:
+    connection = _connection()
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    claimed = task_journal.claim(connection, "read", "worker")
+    assert claimed is not None and claimed.lease_token is not None
+    token = claimed.lease_token
+    task_journal.request_cancel(connection, "read")
+
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.complete(
+            connection,
+            "read",
+            token,
+            TaskResult(task_id="read", status="completed"),
+        )
+    with pytest.raises(RuntimeError, match="stale"):
+        task_journal.fail(
+            connection,
+            "read",
+            token,
+            TaskResult(task_id="read", status="failed"),
+        )
+    with pytest.raises(RuntimeError, match="stale|replayable"):
+        task_journal.schedule_retry(
+            connection,
+            token,
+            retry_at=datetime.now(UTC) + timedelta(seconds=1),
+            failure_category="transient",
+        )
+    assert task_journal.acknowledge_cancel(connection, token).status == "cancelled"
+
+
+def test_claim_next_skips_expired_non_read_so_pending_read_is_not_starved() -> None:
+    connection = _connection()
+    current = datetime(2026, 9, 4, tzinfo=UTC)
+    task_journal.register(
+        connection, TaskSpec("unsafe", "submit", "Submit", effect_class="submit")
+    )
+    task_journal.register(connection, TaskSpec("read", "audit", "Read"))
+    assert task_journal.claim(connection, "unsafe", "old", lease_seconds=1, now=current)
+
+    claimed = task_journal.claim_next(
+        connection, "reader", lease_seconds=30, now=current + timedelta(seconds=2)
+    )
+    assert claimed is not None and claimed.task_id == "read"
+
+
+def test_retry_beyond_durable_deadline_becomes_timed_out() -> None:
+    connection = _connection()
+    current = datetime(2026, 9, 4, tzinfo=UTC)
+    task_journal.register(
+        connection,
+        TaskSpec(
+            "read",
+            "audit",
+            "Read",
+            deadline_at=current + timedelta(seconds=4),
+        ),
+    )
+    claimed = task_journal.claim(connection, "read", "worker", now=current)
+    assert claimed is not None and claimed.lease_token is not None
+
+    result = task_journal.schedule_retry(
+        connection,
+        claimed.lease_token,
+        retry_at=current + timedelta(seconds=5),
+        failure_category="transient",
+        now=current,
+    )
+    assert result.status == "timed_out"
+    assert result.result["failure_category"] == "retry_exceeds_deadline"
