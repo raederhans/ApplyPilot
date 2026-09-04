@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -23,6 +25,45 @@ def test_register_is_idempotent_and_rejects_digest_drift() -> None:
         task_journal.register(
             conn,
             TaskSpec("task-1", "audit", "Changed objective", idempotency_key="same"),
+        )
+
+
+def test_new_optional_task_controls_preserve_legacy_canonical_digest() -> None:
+    spec = TaskSpec("legacy", "audit", "Read facts", idempotency_key="same")
+    legacy = {
+        "task_id": "legacy",
+        "kind": "audit",
+        "objective": "Read facts",
+        "inputs": {},
+        "depends_on": [],
+        "required_results": [],
+        "effect_class": "read",
+        "resource_claims": [],
+        "retry_budget": 0,
+        "deadline_at": None,
+        "idempotency_key": "same",
+        "priority": 0,
+        "counts_toward_target": False,
+        "resume_cursor": {},
+    }
+    encoded = json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()
+
+    assert task_journal.spec_digest(spec) == hashlib.sha256(encoded).hexdigest()
+
+
+def test_pending_legacy_task_does_not_accept_new_control_scope() -> None:
+    connection = _connection()
+    task_journal.register(connection, TaskSpec("pending", "audit", "Read facts"))
+
+    with pytest.raises(ValueError, match="different task spec"):
+        task_journal.register(
+            connection,
+            TaskSpec(
+                "pending",
+                "audit",
+                "Read facts",
+                authority_scope=("read:bounded_snapshot",),
+            ),
         )
 
 

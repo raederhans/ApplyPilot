@@ -382,6 +382,65 @@ def _enforce_stateful_control_coverage(
     return audit_signal or f"pre_submit_audit:{error}", normalized
 
 
+def _inject_preflight_specialist_context(
+    job: dict[str, Any], preflight: Mapping[str, Any]
+) -> None:
+    """Attach only reducer-consumed advisory/required reads to Agent context."""
+    raw = preflight.get("specialist_advisories")
+    if not isinstance(raw, list):
+        return
+    admitted: list[dict[str, object]] = []
+    for index, item in enumerate(raw[:8]):
+        if not isinstance(item, Mapping):
+            continue
+        result = item.get("result")
+        if not isinstance(result, Mapping):
+            continue
+        facts = result.get("facts")
+        admitted.append(
+            {
+                "proposal_id": f"preflight:{index}",
+                "kind": str(item.get("kind") or "read-only-specialist")[:100],
+                "status": "completed",
+                "summary": str(
+                    result.get("summary") or result.get("state") or ""
+                )[:500],
+                "facts": dict(facts) if isinstance(facts, Mapping) else {},
+            }
+        )
+    if admitted:
+        existing = job.get("_agent_specialist_context")
+        prior = list(existing) if isinstance(existing, list) else []
+        job["_agent_specialist_context"] = (prior + admitted)[:8]
+
+
+def _preflight_failure_modes(
+    profile: Mapping[str, Any], job: Mapping[str, Any]
+) -> tuple[str, bool, list[str]]:
+    runtime = profile.get("agent_runtime", {})
+    orchestration = runtime.get("orchestration", {}) if isinstance(runtime, Mapping) else {}
+    orchestration = orchestration if isinstance(orchestration, Mapping) else {}
+    material_mode = str(
+        job.get("_material_specialist_mode")
+        or orchestration.get("material_specialist_mode", "shadow")
+    ).casefold().strip()
+    if material_mode == "enforce":
+        material_mode = "required"
+    material_block = material_mode not in {"off", "shadow", "advisory"}
+    configured = orchestration.get("production_specialist_modes", {})
+    configured = configured if isinstance(configured, Mapping) else {}
+    required: list[str] = []
+    for specialist_id in (
+        "provider-classifier-v1",
+        "application-facts-v1",
+        "work-authorization-v1",
+    ):
+        specialist_mode = str(configured.get(specialist_id, "shadow")).casefold().strip()
+        if specialist_mode in {"required", "enforce"}:
+            required.append(specialist_id)
+    return material_mode, material_block, required
+
+
 def _worker_loop_with_port(
     runtime: WorkerRuntimePorts,
     port: int,
@@ -812,26 +871,16 @@ def _worker_loop_with_port(
                 job.get("url"),
                 exc,
             )
-            runtime_profile = profile.get("agent_runtime", {})
-            orchestration_profile = (
-                runtime_profile.get("orchestration", {})
-                if isinstance(runtime_profile, dict)
-                else {}
+            material_mode, fail_closed_mode, required_specialists = (
+                _preflight_failure_modes(profile, job)
             )
-            configured_material_mode = (
-                orchestration_profile.get("material_specialist_mode", "shadow")
-                if isinstance(orchestration_profile, dict)
-                else "shadow"
-            )
-            material_mode = str(
-                job.get("_material_specialist_mode") or configured_material_mode
-            ).casefold().strip()
-            fail_closed_mode = material_mode not in {"off", "shadow"}
             read_only_preflight = {
                 "task_statuses": {},
                 "error_type": type(exc).__name__,
                 "material_specialist_mode": material_mode,
                 "material_enforced_block": fail_closed_mode,
+                "specialist_required_block": bool(required_specialists),
+                "required_specialist_failures": required_specialists,
                 "material_readiness": {
                     "state": "blocked",
                     "ready": False,
@@ -840,6 +889,7 @@ def _worker_loop_with_port(
                 },
             }
         job["_read_only_preflight"] = read_only_preflight
+        _inject_preflight_specialist_context(job, read_only_preflight)
         duplicate_snapshot = read_only_preflight.get("duplicate")
         if (
             isinstance(duplicate_snapshot, dict)
@@ -867,6 +917,39 @@ def _worker_loop_with_port(
                 worker_id,
                 status="skipped",
                 last_action="exact duplicate receipt/status",
+                jobs_done=jobs_done,
+            )
+            continue
+        if read_only_preflight.get("specialist_required_block"):
+            failed_specialists = read_only_preflight.get(
+                "required_specialist_failures", []
+            )
+            reason = "required_specialist_preflight_blocked"
+            if isinstance(failed_specialists, list) and failed_specialists:
+                reason += ":" + ",".join(sorted(map(str, failed_specialists)))
+            if dry_run:
+                restore_preview_state(job)
+            else:
+                mark_result(
+                    job["url"],
+                    "failed",
+                    reason,
+                    permanent=False,
+                    task_id=job.get("_attempt_id"),
+                    evidence={"required_specialists": failed_specialists},
+                )
+            if run_progress is not None:
+                run_progress.record_terminal(job["url"], "failed")
+            if preview_ticket is not None:
+                run_progress.release_preview_ticket(preview_ticket)
+                preview_ticket = None
+            failed += 1
+            jobs_done += 1
+            add_event(f"[W{worker_id}] Required specialist blocked launch: {reason}")
+            update_state(
+                worker_id,
+                status="failed",
+                last_action=reason,
                 jobs_done=jobs_done,
             )
             continue

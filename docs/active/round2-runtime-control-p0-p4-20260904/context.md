@@ -47,3 +47,27 @@ Next: extend the existing production specialist allowlist into a staged
 cancellation, deadline, retry, and deterministic conflict reduction. No specialist
 receives browser-write, submit, mailbox-send, ledger-write, or ApplicationActor
 authority.
+
+P2 completed locally. The specialist contract now supports
+`off -> shadow -> advisory -> required` with `enforce` as a compatibility alias.
+Provider classification, application facts, and work authorization are admitted
+as bounded preflight reads; material readiness remains the durable deterministic
+read; field semantic and page-failure specialists are allowlisted but explicitly
+skipped outside their real prepare/observe phases. Advisory output reaches the
+Agent's bounded specialist context, while required failure blocks before browser
+launch. Legacy replay compatibility is restricted to completed read-only tasks
+whose core spec is unchanged.
+
+P2 intentionally does not claim the background runtime controls owned by P3:
+cross-process heartbeat, retry scheduling, cancellation dispatch, lease reaping,
+and conflict coalescing remain unopened. Execution budget metadata remains
+truthful where a hard termination boundary does not yet exist.
+
+P2 verification: `321 passed in 10.02s` for the focused specialist,
+orchestration, legacy-journal, and runtime-contract union; target Ruff and
+`git diff --check` passed. Independent final review returned PASS with no material
+finding in the bounded P2 scope.
+
+Next: migrate the existing `agent_tasks` journal additively and introduce the
+single-owner background runtime with lease-epoch CAS, bounded workers, persistent
+heartbeat/progress/cancellation/retry, result events, and non-read replay denial.

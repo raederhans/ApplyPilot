@@ -17,6 +17,14 @@ from datetime import UTC, datetime, timedelta
 from applypilot.apply.contracts import TaskResult, TaskSpec, contract_json, ensure_persistable
 
 _TERMINAL = {"completed", "failed", "blocked", "cancelled", "timed_out"}
+_P2_OPTIONAL_SPEC_FIELDS = {
+    "authority_scope",
+    "retry_categories",
+    "deadline_at",
+    "cancellation_mode",
+    "partial_allowed",
+    "conflict_keys",
+}
 
 
 def _now() -> datetime:
@@ -193,10 +201,33 @@ def register(
                 f"{_SELECT} WHERE task_id=? OR idempotency_key=?",
                 (spec.task_id, key),
             ).fetchone())
+            legacy_completed_read_match = False
+            if (
+                existing is not None
+                and existing.task_id == spec.task_id
+                and existing.idempotency_key == key
+                and existing.status == "completed"
+                and existing.effect_class == "read"
+                and spec.effect_class == "read"
+            ):
+                row = connection.execute(
+                    "SELECT spec_json FROM agent_tasks WHERE task_id=?",
+                    (existing.task_id,),
+                ).fetchone()
+                legacy = json.loads(str(row[0])) if row is not None else None
+                current = contract_json(spec)
+                if isinstance(legacy, dict):
+                    for field in _P2_OPTIONAL_SPEC_FIELDS:
+                        if field not in legacy:
+                            current.pop(field, None)
+                    legacy_completed_read_match = legacy == current
             if (
                 existing is None
                 or existing.task_id != spec.task_id
-                or existing.spec_digest != digest
+                or (
+                    existing.spec_digest != digest
+                    and not legacy_completed_read_match
+                )
             ):
                 raise ValueError(
                     "task idempotency key was reused for a different task spec"

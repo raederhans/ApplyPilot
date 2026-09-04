@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,9 +20,15 @@ from applypilot.apply.contracts import (
     AgentProposal,
     AgentRunRequest,
     AgentTurnResult,
+    TaskResult,
+    TaskSpec,
     agent_turn_result_from_mapping,
 )
-from applypilot.apply.orchestration import execute_proposal_waves, plan_proposal_waves
+from applypilot.apply.orchestration import (
+    execute_proposal_waves,
+    execute_task_graph,
+    plan_proposal_waves,
+)
 
 
 def test_agent_event_clock_advances_when_wall_clock_collides(monkeypatch) -> None:
@@ -105,6 +112,95 @@ def test_independent_specialists_can_execute_in_parallel() -> None:
     )
 
     assert results == {"research": "research", "form-map": "form-map"}
+
+
+def test_production_task_context_reports_bounded_progress_and_gates_retry() -> None:
+    heartbeats: list[dict[str, object]] = []
+    checkpoints: list[dict[str, object]] = []
+    task = TaskSpec(
+        task_id="facts",
+        kind="specialist",
+        objective="Read facts",
+        authority_scope=("read:bounded_snapshot",),
+        retry_budget=2,
+        retry_categories=("transient",),
+    )
+
+    def runner(current: TaskSpec, context) -> TaskResult:
+        context.heartbeat({"stage": "read"})
+        context.checkpoint({"cursor": "fact:1"})
+        return TaskResult(
+            task_id=current.task_id,
+            status="failed",
+            failure_category="permanent",
+            retryable=True,
+        )
+
+    outcome = execute_task_graph(
+        [task],
+        runner,
+        lambda *_args: None,
+        heartbeat=lambda _task, payload: heartbeats.append(dict(payload)),
+        checkpoint=lambda _task, payload: checkpoints.append(dict(payload)),
+    )
+
+    assert outcome.attempts == {"facts": 1}
+    assert heartbeats == [{"stage": "read"}]
+    assert checkpoints == [{"cursor": "fact:1"}]
+
+
+def test_declared_conflicts_are_reduced_serially_and_partial_fails_closed() -> None:
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    tasks = [
+        TaskSpec(
+            task_id=task_id,
+            kind="specialist",
+            objective="Read one catalog entry",
+            conflict_keys=("facts:work-authorization",),
+            partial_allowed=False,
+        )
+        for task_id in ("first", "second")
+    ]
+
+    def runner(task: TaskSpec, _context) -> TaskResult:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return TaskResult(task_id=task.task_id, status="completed", partial=True)
+
+    outcome = execute_task_graph(tasks, runner, lambda *_args: None, max_workers=2)
+
+    assert peak == 1
+    assert {result.failure_category for result in outcome.results.values()} == {
+        "partial_result_not_allowed"
+    }
+
+
+def test_specialist_result_cannot_escalate_its_declared_authority() -> None:
+    task = TaskSpec(
+        task_id="authority",
+        kind="specialist",
+        objective="Read one snapshot",
+        authority_scope=("read:bounded_snapshot",),
+    )
+    outcome = execute_task_graph(
+        [task],
+        lambda current, _context: TaskResult(
+            task_id=current.task_id,
+            status="completed",
+            authority_scope=("browser:write",),
+        ),
+        lambda *_args: None,
+    )
+
+    assert outcome.results["authority"].failure_category == "undeclared_authority"
+    assert outcome.results["authority"].succeeded is False
 
 
 def test_proposal_execution_is_serial_until_a_parallel_budget_is_explicit() -> None:

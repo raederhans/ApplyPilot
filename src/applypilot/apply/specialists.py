@@ -21,9 +21,15 @@ from applypilot.apply.ats import (
     ATS_SCHEMA_VERSION,
     adapter_prompt_context,
     build_form_ir,
+    detect_ats_site,
     propose_fill_plan,
 )
-from applypilot.apply.contracts import ApplicationEvent, TaskResult, TaskSpec
+from applypilot.apply.contracts import (
+    ApplicationEvent,
+    TaskResult,
+    TaskSpec,
+    ensure_persistable,
+)
 from applypilot.apply.material_readiness import (
     evaluate_material_readiness,
     material_snapshot_identity,
@@ -35,6 +41,20 @@ Specialist = Callable[[Mapping[str, object]], dict[str, object]]
 ATS_FORM_SNAPSHOT_SCHEMA_VERSION = "ats-form-snapshot-v1"
 ATS_FILL_PLAN_INPUT_SCHEMA_VERSION = "ats-fill-plan-input-v1"
 ATS_FILL_PLAN_OUTPUT_SCHEMA_VERSION = "ats-fill-plan-output-v1"
+SPECIALIST_MODES = frozenset({"off", "shadow", "advisory", "required"})
+READ_ONLY_SPECIALIST_AUTHORITY = (
+    "read:bounded_snapshot",
+    "write:control_heartbeat",
+    "write:control_checkpoint",
+    "emit:advisory_context",
+)
+def normalize_specialist_mode(mode: str) -> str:
+    normalized = mode.casefold().strip()
+    if normalized == "enforce":
+        normalized = "required"
+    if normalized not in SPECIALIST_MODES:
+        raise ValueError("specialist mode must be off, shadow, advisory, or required")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +74,20 @@ class ProductionSpecialistSpec:
     output_schema_version: str
     execution_budget_seconds: int
     max_output_bytes: int
+    authority_scope: tuple[str, ...]
+    read_only: bool
+    capabilities: tuple[str, ...]
+    retry_categories: tuple[str, ...]
     metadata: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if self.effect_class != "read" or not self.read_only:
+            raise ValueError("production specialists must be read-only")
+        if self.capabilities:
+            raise ValueError("production specialists may not receive runtime capabilities")
+        if not set(self.authority_scope) <= set(READ_ONLY_SPECIALIST_AUTHORITY):
+            raise ValueError("production specialist authority exceeds the read-only boundary")
+        ensure_persistable(self.metadata, path="$.specialist_metadata")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +106,37 @@ class AtsFillPlanOutputLimitError(RuntimeError):
         self.stderr_prefix = stderr_prefix
 
 
+class SpecialistDeadlineExceeded(RuntimeError):
+    pass
+
+
+class SpecialistCancelled(RuntimeError):
+    pass
+
+
+def _run_deterministic_read_specialist(
+    runner: Specialist,
+    snapshot: Mapping[str, object],
+    *,
+    timeout_seconds: float,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Run a deterministic read synchronously with cooperative boundary checks."""
+    frozen = ensure_persistable(snapshot, path="$.specialist_input")
+    assert isinstance(frozen, dict)
+    if cancelled is not None and cancelled():
+        raise SpecialistCancelled("specialist execution cancelled")
+    started = time.monotonic()
+    value = runner(frozen)
+    if cancelled is not None and cancelled():
+        raise SpecialistCancelled("specialist execution cancelled")
+    if time.monotonic() - started >= max(timeout_seconds, 0.001):
+        raise SpecialistDeadlineExceeded("specialist execution deadline exceeded")
+    if not isinstance(value, dict):
+        raise TypeError("specialist result must be an object")
+    return value
+
+
 _PRODUCTION_SPECIALIST_SPECS = {
     "ats-fill-plan-v1": ProductionSpecialistSpec(
         specialist_id="ats-fill-plan-v1",
@@ -82,6 +146,10 @@ _PRODUCTION_SPECIALIST_SPECS = {
         output_schema_version=ATS_FILL_PLAN_OUTPUT_SCHEMA_VERSION,
         execution_budget_seconds=5,
         max_output_bytes=16 * 1024,
+        authority_scope=READ_ONLY_SPECIALIST_AUTHORITY,
+        read_only=True,
+        capabilities=(),
+        retry_categories=("specialist_timeout", "specialist_transient"),
         metadata={
             "execution_budget_seconds": 5,
             "execution_budget_enforced": False,
@@ -89,6 +157,32 @@ _PRODUCTION_SPECIALIST_SPECS = {
         },
     ),
 }
+
+for _specialist_id, _phase in (
+    ("field-semantic-v1", "prepare"),
+    ("provider-classifier-v1", "preflight"),
+    ("application-facts-v1", "preflight"),
+    ("work-authorization-v1", "preflight"),
+    ("page-failure-v1", "observe"),
+):
+    _PRODUCTION_SPECIALIST_SPECS[_specialist_id] = ProductionSpecialistSpec(
+        specialist_id=_specialist_id,
+        phases=(_phase,),
+        effect_class="read",
+        input_schema_version=f"{_specialist_id}-input",
+        output_schema_version=f"{_specialist_id}-output",
+        execution_budget_seconds=2,
+        max_output_bytes=4096,
+        authority_scope=READ_ONLY_SPECIALIST_AUTHORITY,
+        read_only=True,
+        capabilities=(),
+        retry_categories=("specialist_timeout", "specialist_transient"),
+        metadata={
+            "deterministic": True,
+            "proposal_only": True,
+            "execution_budget_enforced": False,
+        },
+    )
 
 
 def production_specialist_spec(name: str) -> ProductionSpecialistSpec:
@@ -452,6 +546,8 @@ def dispatch_production_specialist(
     this boundary.
     """
     spec = production_specialist_spec(kind)
+    if spec.effect_class != "read" or not spec.read_only:
+        raise PermissionError("production specialist is not admitted as read-only")
     if phase not in spec.phases:
         raise ValueError(f"specialist phase is not allowed: {phase}")
     if not isinstance(payload, Mapping):
@@ -759,7 +855,12 @@ def run_durable_ats_fill_plan_specialist(
             "snapshot_catalog": {snapshot_ref: frozen},
         },
         effect_class="read",
+        authority_scope=production_specialist_spec("ats-fill-plan-v1").authority_scope,
         retry_budget=0,
+        retry_categories=production_specialist_spec("ats-fill-plan-v1").retry_categories,
+        cancellation_mode="killable_subprocess",
+        partial_allowed=False,
+        conflict_keys=(f"ats-snapshot:{snapshot_digest}",),
         idempotency_key=proposal_id,
     )
     entry = task_journal.register(
@@ -863,6 +964,7 @@ def run_durable_ats_fill_plan_specialist(
                 task_id=task_id,
                 status="completed",
                 output={"ats_fill_plan": result},
+                authority_scope=specialist_spec.authority_scope,
             ),
         )
         outcome_status = "completed"
@@ -946,6 +1048,124 @@ _PRODUCTION_SPECIALISTS: dict[str, Specialist] = {
     "material-readiness-v1": evaluate_material_readiness,
 }
 
+_MATERIAL_SPECIALIST_SPEC = ProductionSpecialistSpec(
+    specialist_id="material-readiness-v1",
+    phases=("preflight",),
+    effect_class="read",
+    input_schema_version="material-snapshot-v1",
+    output_schema_version="material-readiness-v1",
+    execution_budget_seconds=5,
+    max_output_bytes=16 * 1024,
+    authority_scope=READ_ONLY_SPECIALIST_AUTHORITY,
+    read_only=True,
+    capabilities=(),
+    retry_categories=("specialist_timeout", "specialist_transient"),
+    metadata={
+        "deterministic": True,
+        "prepare_only": True,
+        "execution_budget_enforced": False,
+    },
+)
+_PRODUCTION_SPECIALIST_SPECS["material-readiness-v1"] = _MATERIAL_SPECIALIST_SPEC
+
+
+def run_context_specialist(
+    name: str,
+    snapshot: Mapping[str, object],
+    *,
+    mode: str = "shadow",
+) -> SpecialistRun | None:
+    """Run one bounded deterministic context specialist without effect authority."""
+    normalized = normalize_specialist_mode(mode)
+    if normalized == "off":
+        return None
+    spec = production_specialist_spec(name)
+    if name in {"ats-fill-plan-v1", "material-readiness-v1"}:
+        raise ValueError("specialist requires its dedicated validated dispatcher")
+    copied = ensure_persistable(snapshot, path="$.specialist_input")
+    assert isinstance(copied, dict)
+    result: dict[str, object]
+    if name == "provider-classifier-v1":
+        url = str(copied.get("application_url") or copied.get("url") or "")[:2048]
+        provider = detect_ats_site(url) if url else "unknown"
+        result = {
+            "state": "ready" if url else "insufficient",
+            "ready": bool(url),
+            "provider": provider,
+            "summary": f"provider={provider}" if url else "provider unavailable: URL missing",
+        }
+    elif name == "application-facts-v1":
+        facts = {
+            key: copied[key]
+            for key in ("title", "company", "location", "employment_type")
+            if isinstance(copied.get(key), (str, bool, int, float))
+        }
+        result = {
+            "state": "ready" if facts else "insufficient",
+            "ready": bool(facts),
+            "facts": facts,
+            "summary": f"{len(facts)} bounded application facts",
+        }
+    elif name == "work-authorization-v1":
+        facts = {
+            key: copied[key]
+            for key in (
+                "legally_authorized_to_work",
+                "requires_sponsorship",
+                "require_sponsorship",
+                "visa_status",
+            )
+            if isinstance(copied.get(key), (str, bool))
+        }
+        result = {
+            "state": "ready" if facts else "insufficient",
+            "ready": bool(facts),
+            "facts": facts,
+            "summary": (
+                "bounded work-authorization facts available"
+                if facts
+                else "work-authorization facts unavailable"
+            ),
+        }
+    elif name == "field-semantic-v1":
+        semantics = copied.get("field_semantics")
+        semantics = semantics if isinstance(semantics, Mapping) else {}
+        bounded = {
+            str(key)[:100]: str(value)[:100]
+            for key, value in list(semantics.items())[:100]
+            if str(key) and str(value)
+        }
+        result = {
+            "state": "ready" if bounded else "insufficient",
+            "ready": bool(bounded),
+            "facts": bounded,
+            "summary": f"{len(bounded)} field semantics",
+        }
+    elif name == "page-failure-v1":
+        code = str(copied.get("failure_code") or copied.get("failure_category") or "")[:100]
+        result = {
+            "state": "ready" if code else "insufficient",
+            "ready": bool(code),
+            "facts": {"failure_code": code} if code else {},
+            "summary": f"page failure={code}" if code else "page failure unavailable",
+        }
+    else:  # pragma: no cover - registry/spec lookup is the closed admission gate
+        raise ValueError(f"specialist is not allowlisted: {name}")
+    ensure_persistable(result, path="$.specialist_output")
+    if len(_canonical_json_bytes(result)) > spec.max_output_bytes:
+        raise ValueError("specialist output exceeds the configured byte limit")
+    enforced = normalized == "required" and not bool(result["ready"])
+    telemetry = (
+        {"event_type": "agent.proposal.emitted", "specialist_id": name},
+        {
+            "event_type": "agent.proposal.executed",
+            "specialist_id": name,
+            "status": "completed",
+        },
+        {"event_type": "agent.proposal.consumed", "specialist_id": name},
+    )
+    return SpecialistRun(name, normalized, result, enforced, telemetry)
+
 
 def production_specialist(name: str) -> Specialist:
     try:
@@ -959,14 +1179,27 @@ def run_system_specialist(
     job: Mapping[str, object],
     *,
     mode: str = "shadow",
+    timeout_seconds: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> SpecialistRun | None:
-    normalized = mode.casefold().strip()
+    normalized = normalize_specialist_mode(mode)
     if normalized == "off":
         return None
-    if normalized not in {"shadow", "enforce"}:
-        raise ValueError("specialist mode must be off, shadow, or enforce")
-    result = production_specialist(name)(job)
-    changed = normalized == "enforce" and not bool(result.get("ready"))
+    if _MATERIAL_SPECIALIST_SPEC.effect_class != "read":
+        raise PermissionError("material specialist is not admitted as read-only")
+    ensure_persistable(job, path="$.specialist_input")
+    result = _run_deterministic_read_specialist(
+        production_specialist(name),
+        job,
+        timeout_seconds=(
+            _MATERIAL_SPECIALIST_SPEC.execution_budget_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        ),
+        cancelled=cancelled,
+    )
+    ensure_persistable(result, path="$.specialist_output")
+    changed = normalized == "required" and not bool(result.get("ready"))
     telemetry = (
         {"event_type": "agent.proposal.emitted", "specialist_id": name},
         {"event_type": "agent.proposal.executed", "specialist_id": name, "status": "completed"},
@@ -1014,13 +1247,14 @@ def run_durable_material_specialist(
     mode: str,
     attempt_id: str,
     workflow_id: str,
+    cancelled: Callable[[], bool] | None = None,
+    timeout_seconds: float | None = None,
 ) -> SpecialistRun | None:
     """Journal, execute, replay, and persist feedback for material readiness."""
-    normalized = mode.casefold().strip()
+    normalized = normalize_specialist_mode(mode)
     if normalized == "off":
         return None
-    if normalized not in {"shadow", "enforce"}:
-        raise ValueError("specialist mode must be off, shadow, or enforce")
+    ensure_persistable(job, path="$.specialist_input")
     identity = material_snapshot_identity(job)
     version = "material-readiness-v1"
     fingerprint = identity["job_fingerprint"]
@@ -1037,6 +1271,11 @@ def run_durable_material_specialist(
             "material_snapshot_digest": snapshot,
         },
         effect_class="read",
+        authority_scope=_MATERIAL_SPECIALIST_SPEC.authority_scope,
+        retry_categories=_MATERIAL_SPECIALIST_SPEC.retry_categories,
+        cancellation_mode="cooperative",
+        partial_allowed=False,
+        conflict_keys=(f"material-snapshot:{snapshot}",),
         idempotency_key=proposal_id,
     )
     entry = task_journal.register(
@@ -1052,7 +1291,7 @@ def run_durable_material_specialist(
         result = output.get("material_readiness") if isinstance(output, Mapping) else None
         if not isinstance(result, dict):
             raise RuntimeError("completed material task has no durable result")
-        changed = normalized == "enforce" and result.get("state") != "ready"
+        changed = normalized == "required" and result.get("state") != "ready"
         replay_key = uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"{attempt_id}:{normalized}",
@@ -1106,11 +1345,22 @@ def run_durable_material_specialist(
         payload={**base_payload, "replay": False, "before_decision": "unchecked"},
     )
     try:
-        result = production_specialist(version)(job)
+        result = _run_deterministic_read_specialist(
+            production_specialist(version),
+            job,
+            timeout_seconds=(
+                _MATERIAL_SPECIALIST_SPEC.execution_budget_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            cancelled=cancelled,
+        )
+        ensure_persistable(result, path="$.specialist_output")
         durable_result = TaskResult(
             task_id=task_id,
             status="completed",
             output={"material_readiness": result},
+            authority_scope=_MATERIAL_SPECIALIST_SPEC.authority_scope,
         )
         task_journal.complete(connection, task_id, owner_id, durable_result)
     except Exception as exc:
@@ -1126,7 +1376,7 @@ def run_durable_material_specialist(
             ),
         )
         raise
-    changed = normalized == "enforce" and result.get("state") != "ready"
+    changed = normalized == "required" and result.get("state") != "ready"
     feedback = (
         ("executed", "agent.proposal.executed", {"status": "completed", "replay": False}),
         ("consumed", "agent.proposal.consumed", {"state": result.get("state"), "replay": False}),

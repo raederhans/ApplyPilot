@@ -11,11 +11,16 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Collection, Iterable, Mapping, MutableMapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TypeVar
 
-from applypilot.apply.contracts import AgentProposal, TaskResult, TaskSpec
+from applypilot.apply.contracts import (
+    AgentProposal,
+    TaskResult,
+    TaskSpec,
+    ensure_persistable,
+)
 
 T = TypeVar("T")
 
@@ -29,6 +34,12 @@ class TaskExecutionContext:
     attempt: int
     dependency_results: Mapping[str, TaskResult]
     reduced_state: Mapping[str, object]
+    _heartbeat: Callable[[Mapping[str, object]], None] = field(
+        default=lambda _payload: None, repr=False, compare=False
+    )
+    _checkpoint: Callable[[Mapping[str, object]], None] = field(
+        default=lambda _payload: None, repr=False, compare=False
+    )
 
     def cancelled(self) -> bool:
         if any(event.is_set() for event in self.cancel_events):
@@ -39,6 +50,18 @@ class TaskExecutionContext:
         if self.deadline_at is None:
             return None
         return max(0.0, (self.deadline_at - datetime.now(UTC)).total_seconds())
+
+    def heartbeat(self, payload: Mapping[str, object] | None = None) -> None:
+        """Report bounded control progress without granting product-write authority."""
+        copied = ensure_persistable(payload or {}, path="$.heartbeat")
+        assert isinstance(copied, dict)
+        self._heartbeat(copied)
+
+    def checkpoint(self, payload: Mapping[str, object]) -> None:
+        """Publish a resumable control checkpoint, never browser or submit state."""
+        copied = ensure_persistable(payload, path="$.checkpoint")
+        assert isinstance(copied, dict)
+        self._checkpoint(copied)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +94,8 @@ def execute_task_graph(
     initial_state: Mapping[str, object] | None = None,
     cancel_event: threading.Event | None = None,
     target_successes: int | None = None,
+    heartbeat: Callable[[TaskSpec, Mapping[str, object]], None] | None = None,
+    checkpoint: Callable[[TaskSpec, Mapping[str, object]], None] | None = None,
 ) -> CoordinatorOutcome:
     """Run a recoverable task DAG with dependencies and capacity claims.
 
@@ -129,14 +154,18 @@ def execute_task_graph(
     external_stop = cancel_event or threading.Event()
 
     def resources_available(task: TaskSpec) -> bool:
-        return all(
+        resources_free = all(
             in_use.get(claim.key, 0) + claim.units <= capacities.get(claim.key, 1)
             for claim in task.resource_claims
         )
+        conflicts_free = all(in_use.get(f"conflict:{key}", 0) == 0 for key in task.conflict_keys)
+        return resources_free and conflicts_free
 
     def reserve(task: TaskSpec) -> None:
         for claim in task.resource_claims:
             in_use[claim.key] = in_use.get(claim.key, 0) + claim.units
+        for key in task.conflict_keys:
+            in_use[f"conflict:{key}"] = 1
 
     def release(task: TaskSpec) -> None:
         for claim in task.resource_claims:
@@ -145,12 +174,46 @@ def execute_task_graph(
                 in_use[claim.key] = remaining
             else:
                 in_use.pop(claim.key, None)
+        for key in task.conflict_keys:
+            in_use.pop(f"conflict:{key}", None)
 
     def consume(task: TaskSpec, result: TaskResult) -> None:
         nonlocal target_count
         if result.task_id != task.task_id:
             raise ValueError(
                 f"runner returned result for {result.task_id}, expected {task.task_id}"
+            )
+        unexpected_conflicts = set(result.conflict_keys) - set(task.conflict_keys)
+        if unexpected_conflicts:
+            result = TaskResult(
+                task_id=task.task_id,
+                status="blocked",
+                output={"conflict_keys": sorted(unexpected_conflicts)},
+                failure_category="undeclared_conflict",
+                retryable=False,
+                conflict_keys=tuple(sorted(unexpected_conflicts)),
+                resume_cursor=task.resume_cursor,
+            )
+        unexpected_authority = set(result.authority_scope) - set(task.authority_scope)
+        if unexpected_authority:
+            result = TaskResult(
+                task_id=task.task_id,
+                status="blocked",
+                output={"authority_scope": sorted(unexpected_authority)},
+                failure_category="undeclared_authority",
+                retryable=False,
+                resume_cursor=task.resume_cursor,
+            )
+        if result.partial and not task.partial_allowed:
+            result = TaskResult(
+                task_id=task.task_id,
+                status="blocked",
+                output={"partial_status": result.status},
+                failure_category="partial_result_not_allowed",
+                retryable=False,
+                partial=True,
+                checkpoint=result.checkpoint,
+                resume_cursor=result.resume_cursor,
             )
         results[task.task_id] = result
         reducer(state, task, result)
@@ -246,6 +309,16 @@ def execute_task_graph(
                     attempt=attempts[task.task_id],
                     dependency_results={dep: results[dep] for dep in task.depends_on},
                     reduced_state=dict(state),
+                    _heartbeat=(
+                        (lambda payload, current=task: heartbeat(current, payload))
+                        if heartbeat is not None
+                        else (lambda _payload: None)
+                    ),
+                    _checkpoint=(
+                        (lambda payload, current=task: checkpoint(current, payload))
+                        if checkpoint is not None
+                        else (lambda _payload: None)
+                    ),
                 )
                 running[executor.submit(call_runner, task, context)] = task
                 made_progress = True
@@ -263,6 +336,10 @@ def execute_task_graph(
                 can_retry = (
                     result.retryable
                     and attempts[task.task_id] <= task.retry_budget
+                    and (
+                        not task.retry_categories
+                        or result.failure_category in task.retry_categories
+                    )
                     and not external_stop.is_set()
                     and not target_stop.is_set()
                     and (task.deadline_at is None or datetime.now(UTC) < task.deadline_at)

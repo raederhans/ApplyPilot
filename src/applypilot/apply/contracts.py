@@ -297,9 +297,14 @@ class TaskSpec:
     depends_on: tuple[str, ...] = ()
     required_results: tuple[str, ...] = ()
     effect_class: str = "read"
+    authority_scope: tuple[str, ...] = ()
     resource_claims: tuple[ResourceClaim, ...] = ()
     retry_budget: int = 0
+    retry_categories: tuple[str, ...] = ()
     deadline_at: datetime | None = None
+    cancellation_mode: str = "cooperative"
+    partial_allowed: bool = False
+    conflict_keys: tuple[str, ...] = ()
     idempotency_key: str | None = None
     priority: int = 0
     counts_toward_target: bool = False
@@ -310,8 +315,14 @@ class TaskSpec:
             _required(getattr(self, name), name)
         ensure_persistable(self.inputs, path="$.inputs")
         ensure_persistable(self.resume_cursor, path="$.resume_cursor")
+        _strings(self.authority_scope, "authority_scope")
         _strings(self.depends_on, "depends_on")
         _strings(self.required_results, "required_results")
+        _strings(self.retry_categories, "retry_categories")
+        _strings(self.conflict_keys, "conflict_keys")
+        _required(self.cancellation_mode, "cancellation_mode")
+        if not isinstance(self.partial_allowed, bool):
+            raise TypeError("partial_allowed must be a boolean")
         if len(self.depends_on) > MAX_TASK_DEPENDENCIES:
             raise ValueError(f"a task may have at most {MAX_TASK_DEPENDENCIES} dependencies")
         if not set(self.required_results) <= set(self.depends_on):
@@ -335,10 +346,14 @@ class TaskResult:
     task_id: str
     status: str
     output: Mapping[str, object] = field(default_factory=dict)
+    authority_scope: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     metrics: Mapping[str, object] = field(default_factory=dict)
     failure_category: str | None = None
     retryable: bool = False
+    partial: bool = False
+    conflict_keys: tuple[str, ...] = ()
+    checkpoint: Mapping[str, object] = field(default_factory=dict)
     resume_cursor: Mapping[str, object] = field(default_factory=dict)
     completed_at: datetime = field(default_factory=utc_now)
 
@@ -348,14 +363,19 @@ class TaskResult:
         ensure_persistable(self.output, path="$.output")
         ensure_persistable(self.metrics, path="$.metrics")
         ensure_persistable(self.resume_cursor, path="$.resume_cursor")
+        ensure_persistable(self.checkpoint, path="$.checkpoint")
+        _strings(self.authority_scope, "authority_scope")
         _strings(self.evidence_refs, "evidence_refs")
+        _strings(self.conflict_keys, "conflict_keys")
+        if not isinstance(self.partial, bool):
+            raise TypeError("partial must be a boolean")
         if self.failure_category is not None:
             _required(self.failure_category, "failure_category")
         _aware(self.completed_at, "completed_at")
 
     @property
     def succeeded(self) -> bool:
-        return self.status.casefold() in {"completed", "succeeded", "ok"}
+        return not self.partial and self.status.casefold() in {"completed", "succeeded", "ok"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -979,6 +999,30 @@ class HumanRequest:
 def contract_json(value: object) -> dict[str, JsonValue]:
     """Return a JSON-safe dictionary for a contract dataclass."""
     raw = asdict(value)
+    # Keep canonical bytes stable for TaskSpec/TaskResult instances created
+    # before the optional P2 control fields existed. Durable journal identity
+    # must not change merely because a reader upgraded its contract library.
+    if isinstance(value, TaskSpec):
+        defaults: dict[str, object] = {
+            "authority_scope": (),
+            "retry_categories": (),
+            "cancellation_mode": "cooperative",
+            "partial_allowed": False,
+            "conflict_keys": (),
+        }
+        for key, default in defaults.items():
+            if getattr(value, key) == default:
+                raw.pop(key, None)
+    elif isinstance(value, TaskResult):
+        defaults = {
+            "authority_scope": (),
+            "partial": False,
+            "conflict_keys": (),
+            "checkpoint": {},
+        }
+        for key, default in defaults.items():
+            if getattr(value, key) == default:
+                raw.pop(key, None)
     for key, item in tuple(raw.items()):
         if isinstance(item, datetime):
             raw[key] = item.isoformat()
