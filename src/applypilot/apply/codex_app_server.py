@@ -30,6 +30,11 @@ from applypilot.apply.runtime_cell import (
     RuntimeCellTurn,
 )
 
+# App Server v2 deliberately uses different spellings for these two surfaces:
+# thread start/resume accepts SandboxMode, while turn/start accepts SandboxPolicy.
+_THREAD_SANDBOX_MODE = "read-only"
+_TURN_SANDBOX_POLICY_TYPE = "readOnly"
+
 
 class CodexAppServerError(RuntimeError):
     """Base error for the local App Server lifecycle."""
@@ -644,7 +649,7 @@ class CodexAppServerAdapter:
             "model": request.model,
             "cwd": str(request.cwd.resolve()),
             "approvalPolicy": "never",
-            "sandbox": "read-only",
+            "sandbox": _THREAD_SANDBOX_MODE,
         }
         if not resume:
             thread_params.update(
@@ -698,7 +703,7 @@ class CodexAppServerAdapter:
                     "cwd": str(request.cwd.resolve()),
                     "approvalPolicy": "never",
                     "sandboxPolicy": {
-                        "type": "readOnly",
+                        "type": _TURN_SANDBOX_POLICY_TYPE,
                         "access": {"type": "fullAccess"},
                     },
                     "model": request.model,
@@ -782,10 +787,14 @@ class CodexAppServerAdapter:
             state = self._active_turns.get(provider_turn_id)
         if state is None or state.terminal:
             return
+        self._interrupt_state(state)
+
+    def _interrupt_state(self, state: _ActiveTurn, *, timeout: float | None = None) -> None:
         try:
             self.transport.request(
                 "turn/interrupt",
                 {"threadId": state.thread_id, "turnId": state.turn_id},
+                timeout=timeout,
             )
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             raise CodexAppServerExecutionError(
@@ -836,12 +845,17 @@ class CodexAppServerAdapter:
     ) -> list[Mapping[str, object]]:
         deadline = time.monotonic() + timeout
         events: list[Mapping[str, object]] = []
-        with state.consumer_lock:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not state.consumer_lock.acquire(timeout=remaining):
+            raise CodexAppServerTimeout("Codex App Server drain timed out waiting for event consumer")
+        try:
             while not state.terminal:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CodexAppServerTimeout("Codex App Server drain timed out")
                 events.append(self._next_event(state, timeout=remaining))
+        finally:
+            state.consumer_lock.release()
         return events
 
     def _next_event(
@@ -857,6 +871,8 @@ class CodexAppServerAdapter:
                 raise CodexAppServerTimeout("Codex App Server event drain timed out")
             try:
                 message = self.transport.receive(state.subscription, timeout=remaining)
+            except CodexAppServerTimeout:
+                raise
             except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
                 raise CodexAppServerExecutionError(
                     "App Server event stream failed after the turn was accepted",
@@ -917,15 +933,23 @@ class CodexAppServerAdapter:
         """Interrupt and drain owned turns, then stop only the owned process."""
 
         with self._lock:
-            active_ids = tuple(self._active_turns)
-        for turn_id in active_ids:
-            try:
-                self.cancel(turn_id)
-                self.drain(turn_id, timeout=self.drain_timeout)
-            except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
-                # Process shutdown below is the final bounded containment step.
-                pass
-        self.transport.shutdown()
+            active_states = tuple(self._active_turns.values())
+        deadline = time.monotonic() + self.drain_timeout
+        try:
+            for state in active_states:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    self._interrupt_state(state, timeout=remaining)
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        self.drain(state.turn_id, timeout=remaining)
+                except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                    # Transport shutdown below is the final bounded containment step.
+                    pass
+        finally:
+            self.transport.shutdown()
 
     def __enter__(self) -> Self:
         health = self.health()
