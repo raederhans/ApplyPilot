@@ -32,7 +32,12 @@ from applypilot.apply.application_sessions import (
     PerTurnStdioEndpointManager,
     resolve_persistent_playwright_launcher,
 )
-from applypilot.apply.browser_broker import BrowserBrokerError, BrowserLeaseBundle
+from applypilot.apply.browser_authority import adopt_browser_authority
+from applypilot.apply.browser_broker import (
+    BrowserBrokerError,
+    BrowserLeaseBundle,
+    StalePageBinding,
+)
 from applypilot.apply.contracts import application_actor_id, contract_json
 from applypilot.apply.email_routing import (
     normalize_prepared_email_application,
@@ -291,7 +296,12 @@ def _consume_provenance_repair_artifacts(job: dict, repair_job: Mapping[str, obj
     if dict(repair_binding) != recomputed:
         return "provenance_binding_mismatch"
 
-    job["_browser_lease_binding"] = deepcopy(repair_job["_browser_lease_binding"])
+    try:
+        adopt_browser_authority(job, repair_job)
+    except StalePageBinding:
+        return "stale_page_epoch"
+    except (BrowserBrokerError, TypeError, ValueError):
+        return "browser_lease_mismatch"
     job["_answer_provenance_binding"] = deepcopy(dict(repair_binding))
     if isinstance(answer_mappings, Mapping):
         current_observations = job.get("_agent_observations")

@@ -63,6 +63,7 @@ from applypilot.apply.application_facts import (
 from applypilot.apply.application_sessions import ApplicationSupervisor
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
+from applypilot.apply.browser_authority import BrowserAuthorityHandle
 from applypilot.apply.browser_broker import (
     BrowserBrokerError,
     BrowserLeaseBundle,
@@ -517,18 +518,9 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
 
 def _release_application_browser_authority(job: dict) -> None:
     """Release only the exact application bundle currently carried by ``job``."""
-    raw_bundle = job.get("_browser_lease_binding")
-    if not isinstance(raw_bundle, Mapping):
+    if not isinstance(job.get("_browser_lease_binding"), Mapping):
         return
-    bundle = BrowserLeaseBundle.from_mapping(raw_bundle)
-    _browser_broker.release_scope(
-        bundle.profile.scope_id,
-        owner_id=bundle.profile.owner_id,
-        attempt_id=bundle.profile.attempt_id,
-        runtime_id=bundle.profile.runtime_id,
-        expected_bundles=(bundle,),
-    )
-    job.pop("_browser_lease_binding", None)
+    BrowserAuthorityHandle.rebuild(job, broker=_browser_broker).release()
 
 
 def _heartbeat_operator_handoff(
@@ -539,10 +531,9 @@ def _heartbeat_operator_handoff(
     """Keep one already-owned pre-submit attempt/page alive during a bounded wait."""
     from applypilot.database import update_application_attempt
 
-    raw_bundle = job.get("_browser_lease_binding")
     attempt_id = str(job.get("_attempt_id") or "").strip()
     if (
-        not isinstance(raw_bundle, Mapping)
+        not isinstance(job.get("_browser_lease_binding"), Mapping)
         or not attempt_id
         or isinstance(lease_minutes, bool)
         or not isinstance(lease_minutes, int)
@@ -550,9 +541,9 @@ def _heartbeat_operator_handoff(
     ):
         return False
     try:
-        previous = BrowserLeaseBundle.from_mapping(raw_bundle)
-        refreshed = _browser_broker.heartbeat(
-            previous,
+        authority = BrowserAuthorityHandle.rebuild(job, broker=_browser_broker)
+        previous = authority.bundle
+        refreshed = authority.heartbeat(
             ttl_seconds=min(3600.0, float(lease_minutes * 60)),
         )
     except (BrowserBrokerError, TypeError, ValueError):
@@ -567,16 +558,13 @@ def _heartbeat_operator_handoff(
     )
     if not fixed_identity:
         return False
-    if not update_application_attempt(
+    return update_application_attempt(
         attempt_id,
         phase="human_wait",
         submit_started=False,
         lease_minutes=lease_minutes,
         evidence={"operator_handoff": "waiting", "submit_started": False},
-    ):
-        return False
-    job["_browser_lease_binding"] = refreshed.as_dict()
-    return True
+    )
 
 def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
     """Compose typed worker ports from the current launcher compatibility surface."""
@@ -884,6 +872,8 @@ def _browser_lease_for_agent_turn(
     submission_phase: str,
     dry_run: bool,
     resume_existing_page: bool,
+    browser_generation: int = 1,
+    application_session_id: str | None = None,
 ) -> BrowserLeaseBundle:
     """Acquire or continue the non-authoritative browser continuity bundle."""
     browser_runtime = str(job.get("_browser_root_runtime") or "isolated")
@@ -896,42 +886,34 @@ def _browser_lease_for_agent_turn(
         60.0,
         float(load_runtime_settings().application_lease_minutes * 60),
     )
-    raw_previous = job.get("_browser_lease_binding")
-    if isinstance(raw_previous, Mapping):
-        previous = BrowserLeaseBundle.from_mapping(raw_previous)
-        bundle = _browser_broker.continue_bundle(
-            previous,
-            profile_id=profile_id,
-            page_id=page_id,
-            owner_id=actor_id,
-            scope_id=scope_id,
-            attempt_id=attempt_id,
-            runtime_id=runtime_id,
-            submit_started=submit_started,
-            resume_existing_page=resume_existing_page,
-            ttl_seconds=ttl_seconds,
-        )
-    else:
-        bundle = _browser_broker.acquire_bundle(
-            profile_id=profile_id,
-            page_id=page_id,
-            owner_id=actor_id,
-            scope_id=scope_id,
-            attempt_id=attempt_id,
-            runtime_id=runtime_id,
-            ttl_seconds=ttl_seconds,
-        )
-    job["_browser_lease_binding"] = bundle.as_dict()
-    return bundle
+    authority = BrowserAuthorityHandle.create(
+        job,
+        broker=_browser_broker,
+        browser_generation=browser_generation,
+        application_session_id=(
+            application_session_id or f"per-turn:{attempt_id}"
+        ),
+        actor_id=actor_id,
+        attempt_id=attempt_id,
+    )
+    return authority.acquire_or_continue(
+        profile_id=profile_id,
+        page_id=page_id,
+        scope_id=scope_id,
+        runtime_id=runtime_id,
+        submit_started=submit_started,
+        resume_existing_page=resume_existing_page,
+        ttl_seconds=ttl_seconds,
+    )
 
 
 def _refresh_semantic_browser_bundle(job: dict) -> BrowserLeaseBundle:
     """Reconstruct the current durable page epoch from an exact job-held bundle."""
 
-    raw_bundle = job.get("_browser_lease_binding")
-    if not isinstance(raw_bundle, Mapping):
+    if not isinstance(job.get("_browser_lease_binding"), Mapping):
         raise SemanticWriteDenied("semantic resume repair requires a browser lease")
-    previous = BrowserLeaseBundle.from_mapping(raw_bundle)
+    authority = BrowserAuthorityHandle.rebuild(job, broker=_browser_broker)
+    previous = authority.bundle
     attempt_id = str(job.get("_attempt_id") or "").strip()
     actor_id = application_actor_id(attempt_id) if attempt_id else ""
     if (
@@ -940,20 +922,23 @@ def _refresh_semantic_browser_bundle(job: dict) -> BrowserLeaseBundle:
         or previous.page_binding.owner_id != actor_id
     ):
         raise SemanticWriteDenied("semantic browser lease is not attempt-bound")
-    current = _browser_broker.acquire_bundle(
-        profile_id=previous.profile.resource_id,
-        page_id=previous.page.resource_id,
-        owner_id=previous.profile.owner_id,
-        scope_id=previous.profile.scope_id,
-        attempt_id=previous.profile.attempt_id,
-        runtime_id=previous.profile.runtime_id,
+    current = authority.reacquire_current(
         ttl_seconds=max(
             60.0,
             float(load_runtime_settings().application_lease_minutes * 60),
         ),
     )
-    job["_browser_lease_binding"] = current.as_dict()
     return current
+
+
+def _install_browser_authority(
+    job: dict, bundle: BrowserLeaseBundle
+) -> BrowserLeaseBundle:
+    """Publish one Broker result through the job authority mutation boundary."""
+
+    return BrowserAuthorityHandle.rebuild(
+        job, broker=_browser_broker
+    ).install(bundle)
 
 
 def _semantic_operation_relevant(
@@ -1052,6 +1037,8 @@ def _complete_observed_semantic_resume_effect(
 ) -> dict[str, object]:
     """Finish only the journal/CAS tail after an exact effect was observed."""
 
+    authority = BrowserAuthorityHandle.rebuild(job, broker=_browser_broker)
+    authority.adopt(bundle)
     binding = bundle.page_binding
     exact_lease = (
         binding.page_id == record.page_id
@@ -1067,8 +1054,7 @@ def _complete_observed_semantic_resume_effect(
         return {"status": "parked_stale_after_effect"}
     if binding.page_epoch == record.expected_page_epoch:
         try:
-            bundle = _browser_broker.advance_page(
-                bundle,
+            bundle = authority.advance_page(
                 expected_page_epoch=record.expected_page_epoch,
             )
         except BrowserBrokerError:
@@ -1090,7 +1076,6 @@ def _complete_observed_semantic_resume_effect(
         record.operation_id,
         resulting_page_epoch=record.expected_page_epoch + 1,
     )
-    job["_browser_lease_binding"] = bundle.as_dict()
     return {
         "status": "replayed",
         "operation_id": record.operation_id,
@@ -1266,7 +1251,7 @@ def _try_semantic_pre_submit_repair(
                     previous.resulting_page_epoch == bundle.page_binding.page_epoch
                     and previous.page_lease_id == bundle.page_binding.page_lease_id
                 ):
-                    job["_browser_lease_binding"] = bundle.as_dict()
+                    _install_browser_authority(job, bundle)
                     return {
                         "status": "replayed",
                         "operation_id": previous.operation_id,
@@ -1375,7 +1360,7 @@ def _try_semantic_pre_submit_repair(
                 operation.resulting_page_epoch == bundle.page_binding.page_epoch
                 and operation.page_lease_id == bundle.page_binding.page_lease_id
             ):
-                job["_browser_lease_binding"] = bundle.as_dict()
+                _install_browser_authority(job, bundle)
                 return {
                     "status": "replayed",
                     "operation_id": operation.operation_id,
@@ -1428,7 +1413,7 @@ def _try_semantic_pre_submit_repair(
             lifecycle=lifecycle,
         )
         result = semantic_ops.upload_bound_resume(bundle, authority, request)
-        job["_browser_lease_binding"] = result.bundle.as_dict()
+        _install_browser_authority(job, result.bundle)
         return {
             "status": "replayed" if result.replayed else "verified",
             "operation_id": operation.operation_id,
@@ -4911,6 +4896,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         submission_phase=submission_phase,
         dry_run=dry_run,
         resume_existing_page=resume_existing_page,
+        browser_generation=(
+            application_supervisor.browser_worker.generation
+            if application_supervisor is not None
+            else 1
+        ),
+        application_session_id=(
+            application_supervisor.application_session_id
+            if application_supervisor is not None
+            else f"per-turn:{attempt_id}"
+        ),
     )
     if application_supervisor is not None:
         application_supervisor.bind_browser_authority(browser_lease_bundle)
@@ -6089,7 +6084,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if lease_heartbeat is not None:
             lease_heartbeat.stop()
             browser_lease_bundle = lease_heartbeat.bundle
-            job["_browser_lease_binding"] = browser_lease_bundle.as_dict()
+            _install_browser_authority(job, browser_lease_bundle)
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
@@ -6238,8 +6233,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     type(exc).__name__,
                 )
         if not broker_session_persistent:
-            _browser_broker.release_scope(f"worker:{worker_id}")
-            job.pop("_browser_lease_binding", None)
+            _release_application_browser_authority(job)
         if report_path.exists():
             try:
                 report_path.unlink()
