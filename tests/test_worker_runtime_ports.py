@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 
 from applypilot.apply import launcher, worker_orchestration
+from applypilot.apply.runtime_cell_coordinator import RuntimeCellCoordinator
 
 
 def test_page_observation_ports_are_separate_from_application_execution() -> None:
@@ -30,5 +31,6 @@ def test_launcher_composes_migrated_public_observation_modules() -> None:
         is launcher.post_submit_observation_mod.submission_evidence_consistent
     )
     assert runtime.runtime_cells.production_enabled is False
+    assert runtime.runtime_cells.coordinator_factory is RuntimeCellCoordinator
     assert "submit" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}
     assert "receipt" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}

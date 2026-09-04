@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -20,18 +21,22 @@ from applypilot.apply.runtime_cell import RuntimeCellExecutionState
 from applypilot.apply.runtime_cell_coordinator import (
     APP_SERVER_PRODUCTION_CELL_ADMITTED,
     RUNTIME_CELL_GATE_NAMES,
+    RUNTIME_CELL_GATE_SCHEMAS,
+    DiagnosticRuntimeCellCoordinator,
     RuntimeCellAdmissionDecision,
     RuntimeCellAdmissionManifest,
     RuntimeCellCoordinator,
+    RuntimeCellGateReceipt,
     RuntimeCellHost,
     recovery_disposition,
     resolve_runtime_cell_admission,
+    source_manifest_identity,
 )
 from applypilot.database import init_db
 from applypilot.storage import runtime_cells
 
 SOURCE = "a" * 64
-RECEIPTS = {name: "b" * 64 for name in RUNTIME_CELL_GATE_NAMES}
+RECEIPTS = {name: RuntimeCellGateReceipt(RUNTIME_CELL_GATE_SCHEMAS[name], "b" * 64) for name in RUNTIME_CELL_GATE_NAMES}
 
 
 def _connection(path: Path) -> sqlite3.Connection:
@@ -126,14 +131,80 @@ def test_runtime_cell_migration_is_idempotent_and_newer_schema_fails_closed(
     tmp_path: Path,
 ) -> None:
     connection = _connection(tmp_path / "migration.sqlite3")
-    assert runtime_cells.ensure_schema(connection) == 1
-    assert runtime_cells.ensure_schema(connection) == 1
-    connection.execute(
-        "UPDATE runtime_cell_schema_version SET version=99 WHERE component='runtime_cells'"
-    )
+    assert runtime_cells.ensure_schema(connection) == 2
+    assert runtime_cells.ensure_schema(connection) == 2
+    connection.execute("UPDATE runtime_cell_schema_version SET version=99 WHERE component='runtime_cells'")
     connection.commit()
     with pytest.raises(RuntimeError, match="newer than supported"):
         runtime_cells.ensure_schema(connection)
+
+
+def test_scheduler_microbenchmark_schema_is_rejected_as_admission_receipt() -> None:
+    receipts = {name: receipt.as_dict() for name, receipt in RECEIPTS.items()}
+    receipts["runtime_cell_host_lifecycle_benchmark"] = {
+        "schema_version": "applypilot-runtime-cell-scheduler-microbenchmark/v1",
+        "sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="schema is not admissible"):
+        RuntimeCellAdmissionManifest.from_mapping(
+            {
+                "schema_version": "applypilot-runtime-cell-admission/v1",
+                "source_identity": SOURCE,
+                "workers": 2,
+                "gate_receipts": receipts,
+                "production_authority": True,
+                "authority_ref": "release:forged",
+            }
+        )
+
+
+def test_production_coordinator_self_evaluates_and_rejects_forged_decision(
+    tmp_path: Path,
+) -> None:
+    forged = RuntimeCellAdmissionDecision(
+        mode="canary",
+        requested_workers=2,
+        effective_cells=2,
+        status="ADMITTED",
+        reasons=(),
+        source_identity=SOURCE,
+        production_authority=True,
+    )
+    with pytest.raises(TypeError):
+        RuntimeCellCoordinator(lambda: _connection(tmp_path / "forged.sqlite3"), decision=forged)  # type: ignore[call-arg]
+
+    source_root = Path(__file__).resolve().parents[1]
+    current_identity = source_manifest_identity(source_root)
+    manifest = RuntimeCellAdmissionManifest(
+        source_identity=current_identity,
+        workers=2,
+        gate_receipts=RECEIPTS,
+        production_authority=True,
+        authority_ref="release:still-blocked-by-code-gate",
+    )
+    manifest_path = tmp_path / "admission.json"
+    manifest_path.write_text(json.dumps(manifest.as_dict()), encoding="utf-8")
+    coordinator = RuntimeCellCoordinator(
+        lambda: _connection(tmp_path / "production.sqlite3"),
+        mode="canary",
+        requested_workers=2,
+        source_root=source_root,
+        manifest_path=manifest_path,
+    )
+    assert coordinator.decision.effective_cells == 1
+    assert coordinator.decision.status == "NOT_ADMITTED"
+
+    diagnostic = DiagnosticRuntimeCellCoordinator(
+        lambda: _connection(tmp_path / "diagnostic.sqlite3"),
+        source_identity=current_identity,
+        cells=1,
+    )
+    with pytest.raises(TypeError):
+        diagnostic.register(  # type: ignore[call-arg]
+            cell_index=0,
+            generation=1,
+            runtime_id="missing-verified-process-birth-identity",
+        )
 
 
 @pytest.mark.parametrize(
@@ -261,6 +332,64 @@ def test_ttl_only_marks_suspect_and_never_allows_takeover(tmp_path: Path) -> Non
         runtime_cells.heartbeat_lease(connection, token, now=now + timedelta(seconds=2))
 
 
+def test_old_cleanup_failure_cannot_quarantine_new_lease_same_generation(
+    tmp_path: Path,
+) -> None:
+    connection = _connection(tmp_path / "old-token.sqlite3")
+    _register(connection, 0)
+    first = _claim(connection, 0, "first", "first.example.test")
+    first_token = runtime_cells.token_from_lease(first)
+    runtime_cells.begin_drain(connection, first_token, reason="first_done")
+    runtime_cells.release_after_cleanup(
+        connection,
+        first_token,
+        agent_stopped=True,
+        context_cleanup_verified=True,
+        residual_resources=0,
+    )
+    second = _claim(connection, 0, "second", "second.example.test")
+    with pytest.raises(runtime_cells.StaleRuntimeCellTokenError):
+        runtime_cells.release_after_cleanup(
+            connection,
+            first_token,
+            agent_stopped=False,
+            context_cleanup_verified=False,
+            residual_resources=None,
+        )
+    current = connection.execute(
+        "SELECT status FROM runtime_cell_leases WHERE lease_id=?", (second.lease_id,)
+    ).fetchone()
+    generation = runtime_cells.get_generation(connection, "runtime-cell-0", 1)
+    assert current[0] == "open"
+    assert generation is not None and generation.status == "active"
+
+
+def test_quarantined_process_identity_can_never_register_new_generation(
+    tmp_path: Path,
+) -> None:
+    connection = _connection(tmp_path / "process-fence.sqlite3")
+    _register(connection, 0)
+    lease = _claim(connection, 0, "quarantine", "q.example.test")
+    with pytest.raises(runtime_cells.RuntimeCellQuarantinedError):
+        runtime_cells.release_after_cleanup(
+            connection,
+            runtime_cells.token_from_lease(lease),
+            agent_stopped=False,
+            context_cleanup_verified=False,
+            residual_resources=None,
+        )
+    with pytest.raises(runtime_cells.RuntimeCellConflictError):
+        runtime_cells.register_generation(
+            connection,
+            cell_id="runtime-cell-0",
+            generation=2,
+            runtime_id="runtime-0-generation-2",
+            source_identity=SOURCE,
+            process_id=1000,
+            process_birth_time=2000,
+        )
+
+
 class _Page:
     frames = (object(),)
 
@@ -286,6 +415,7 @@ class _Browser:
     def __init__(self, *, residual: bool = False) -> None:
         self.residual = residual
         self.contexts: list[_Context] = []
+        self.closed = False
 
     def new_context(self, **_kwargs: object) -> _Context:
         context = _Context(residual=self.residual)
@@ -293,23 +423,12 @@ class _Browser:
         return context
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
 
-def _host(
-    tmp_path: Path, *, cell_index: int = 0, residual: bool = False
-) -> tuple[RuntimeCellHost, _Browser, Path]:
+def _host(tmp_path: Path, *, cell_index: int = 0, residual: bool = False) -> tuple[RuntimeCellHost, _Browser, Path]:
     path = tmp_path / "host.sqlite3"
-    decision = RuntimeCellAdmissionDecision(
-        mode="off",
-        requested_workers=2,
-        effective_cells=2,
-        status="NOT_ADMITTED",
-        reasons=("test",),
-        source_identity=SOURCE,
-        production_authority=False,
-    )
-    coordinator = RuntimeCellCoordinator(lambda: _connection(path), decision=decision)
+    coordinator = DiagnosticRuntimeCellCoordinator(lambda: _connection(path), source_identity=SOURCE, cells=2)
     binding = coordinator.register(
         cell_index=cell_index,
         generation=1,
@@ -352,6 +471,7 @@ def test_ten_contexts_close_zero_residual_after_agent_stop(tmp_path: Path) -> No
                 scope=scope,
                 state=state,
                 agent_stop=lambda events=order: events.append("agent_stopped"),
+                contain_runtime=lambda: None,
             )
             host.context_runtime.new_page(application.context_lease)
             host.close_application(application)
@@ -377,10 +497,46 @@ def test_residual_context_quarantines_generation(tmp_path: Path) -> None:
         scope=scope,
         state=state,
         agent_stop=lambda: None,
+        contain_runtime=lambda: None,
     )
     host.context_runtime.new_page(application.context_lease)
     with pytest.raises(runtime_cells.RuntimeCellQuarantinedError):
         host.close_application(application)
+    connection = _connection(path)
+    generation = runtime_cells.get_generation(connection, "runtime-cell-0", 1)
+    connection.close()
+    assert generation is not None and generation.status == "quarantined"
+
+
+def test_agent_stop_failure_terminally_contains_context_and_browser(
+    tmp_path: Path,
+) -> None:
+    host, browser, path = _host(tmp_path)
+    scope, state = _scope_state()
+    events: list[str] = []
+    attempt = "attempt-stop-failure"
+
+    def fail_stop() -> None:
+        events.append("stop")
+        raise RuntimeError("synthetic stop failure")
+
+    application = host.open_application(
+        application_id="application-stop-failure",
+        actor_id=f"application:{attempt}",
+        attempt_id=attempt,
+        application_url="https://tenant.example.test/apply",
+        scope=scope,
+        state=state,
+        agent_stop=fail_stop,
+        contain_runtime=lambda: events.append("contain_runtime"),
+    )
+    host.context_runtime.new_page(application.context_lease)
+    with pytest.raises(runtime_cells.RuntimeCellQuarantinedError):
+        host.close_application(application)
+    assert events == ["stop", "contain_runtime"]
+    assert host.context_runtime.metrics.active_contexts == 0
+    assert host.context_runtime.metrics.closed is True
+    assert browser.closed is True
     connection = _connection(path)
     generation = runtime_cells.get_generation(connection, "runtime-cell-0", 1)
     connection.close()

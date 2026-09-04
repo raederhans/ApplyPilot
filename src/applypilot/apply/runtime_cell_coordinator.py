@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import uuid
 from collections.abc import Callable, Mapping
@@ -42,8 +41,15 @@ RUNTIME_CELL_GATE_NAMES = frozenset(
         "context_cleanup_zero_residual",
         "failure_recovery_matrix",
         "safety_counters_zero",
-        "runtime_cell_no_submit_benchmark",
+        "runtime_cell_host_lifecycle_benchmark",
         "app_server_production_safety",
+    }
+)
+RUNTIME_CELL_GATE_SCHEMAS = MappingProxyType(
+    {
+        **{name: "applypilot-runtime-cell-gate-receipt/v1" for name in RUNTIME_CELL_GATE_NAMES},
+        "runtime_cell_host_lifecycle_benchmark": ("applypilot-runtime-cell-host-lifecycle/v1"),
+        "app_server_production_safety": ("applypilot-app-server-production-safety/v1"),
     }
 )
 RuntimeCellMode = Literal["off", "shadow", "canary"]
@@ -75,10 +81,31 @@ def _digest(value: object, name: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeCellGateReceipt:
+    schema_version: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not str(self.schema_version or "").strip():
+            raise ValueError("gate receipt schema_version is required")
+        object.__setattr__(self, "sha256", _digest(self.sha256, "gate receipt sha256"))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> RuntimeCellGateReceipt:
+        return cls(
+            schema_version=str(value.get("schema_version") or ""),
+            sha256=str(value.get("sha256") or ""),
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {"schema_version": self.schema_version, "sha256": self.sha256}
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeCellAdmissionManifest:
     source_identity: str
     workers: int
-    gate_receipts: Mapping[str, str]
+    gate_receipts: Mapping[str, RuntimeCellGateReceipt]
     production_authority: bool
     authority_ref: str | None
     local_diagnostic: bool = False
@@ -93,7 +120,14 @@ class RuntimeCellAdmissionManifest:
         receipts = dict(self.gate_receipts)
         if set(receipts) != RUNTIME_CELL_GATE_NAMES:
             raise ValueError("Runtime Cell admission must contain every exact gate receipt")
-        frozen = {name: _digest(receipts[name], f"gate_receipts.{name}") for name in sorted(receipts)}
+        frozen: dict[str, RuntimeCellGateReceipt] = {}
+        for name in sorted(receipts):
+            receipt = receipts[name]
+            if not isinstance(receipt, RuntimeCellGateReceipt):
+                raise TypeError("gate receipts must use RuntimeCellGateReceipt")
+            if receipt.schema_version != RUNTIME_CELL_GATE_SCHEMAS[name]:
+                raise ValueError(f"gate receipt schema is not admissible: {name}")
+            frozen[name] = receipt
         object.__setattr__(self, "gate_receipts", MappingProxyType(frozen))
         if self.production_authority and not str(self.authority_ref or "").strip():
             raise ValueError("production authority requires an authority_ref")
@@ -105,10 +139,15 @@ class RuntimeCellAdmissionManifest:
         receipts = value.get("gate_receipts")
         if not isinstance(receipts, Mapping):
             raise TypeError("gate_receipts must be an object")
+        parsed_receipts: dict[str, RuntimeCellGateReceipt] = {}
+        for key, item in receipts.items():
+            if not isinstance(item, Mapping):
+                raise TypeError("each gate receipt must be an object")
+            parsed_receipts[str(key)] = RuntimeCellGateReceipt.from_mapping(item)
         return cls(
             source_identity=str(value.get("source_identity") or ""),
             workers=value.get("workers"),  # type: ignore[arg-type]
-            gate_receipts={str(key): str(item) for key, item in receipts.items()},
+            gate_receipts=parsed_receipts,
             production_authority=value.get("production_authority") is True,
             authority_ref=(str(value["authority_ref"]) if value.get("authority_ref") is not None else None),
             local_diagnostic=value.get("local_diagnostic") is True,
@@ -120,7 +159,7 @@ class RuntimeCellAdmissionManifest:
             "schema_version": self.schema_version,
             "source_identity": self.source_identity,
             "workers": self.workers,
-            "gate_receipts": dict(self.gate_receipts),
+            "gate_receipts": {name: receipt.as_dict() for name, receipt in self.gate_receipts.items()},
             "production_authority": self.production_authority,
             "authority_ref": self.authority_ref,
             "local_diagnostic": self.local_diagnostic,
@@ -247,8 +286,8 @@ class RuntimeCellBinding:
     process_birth_time: int
 
 
-class RuntimeCellCoordinator:
-    """Persistent scheduler facade supporting shared-transaction claims."""
+class _RuntimeCellCoordinatorBase:
+    """Internal scheduler facade supporting shared-transaction claims."""
 
     def __init__(
         self,
@@ -265,15 +304,13 @@ class RuntimeCellCoordinator:
         cell_index: int,
         generation: int,
         runtime_id: str,
-        process_id: int | None = None,
-        process_birth_time: int | None = None,
+        process_id: int,
+        process_birth_time: int,
         connection: sqlite3.Connection | None = None,
     ) -> RuntimeCellBinding:
         if isinstance(cell_index, bool) or not 0 <= cell_index < self.decision.effective_cells:
             raise ValueError("cell_index is outside the effective Cell allocation")
         cell_id = f"runtime-cell-{cell_index}"
-        process_id = os.getpid() if process_id is None else process_id
-        process_birth_time = process_birth_time or max(1, int(uuid.uuid1().time))
         owns = connection is None
         conn = connection or self._connection_factory()
         try:
@@ -335,6 +372,53 @@ class RuntimeCellCoordinator:
                 conn.close()
 
 
+class RuntimeCellCoordinator(_RuntimeCellCoordinatorBase):
+    """Production coordinator whose Cell ceiling is always self-evaluated."""
+
+    def __init__(
+        self,
+        connection_factory: Callable[[], sqlite3.Connection],
+        *,
+        mode: str,
+        requested_workers: int,
+        source_root: Path | str,
+        manifest_path: Path | str | None,
+    ) -> None:
+        decision = configured_runtime_cell_admission(
+            mode=mode,
+            requested_workers=requested_workers,
+            source_root=source_root,
+            manifest_path=manifest_path,
+        )
+        if not APP_SERVER_PRODUCTION_CELL_ADMITTED and decision.effective_cells != 1:
+            raise RuntimeError("disabled App Server production gate cannot allocate two Cells")
+        super().__init__(connection_factory, decision=decision)
+
+
+class DiagnosticRuntimeCellCoordinator(_RuntimeCellCoordinatorBase):
+    """Explicit non-production scheduler used only by local microbenchmarks/tests."""
+
+    def __init__(
+        self,
+        connection_factory: Callable[[], sqlite3.Connection],
+        *,
+        source_identity: str,
+        cells: int,
+    ) -> None:
+        if isinstance(cells, bool) or cells not in {1, 2}:
+            raise ValueError("diagnostic cells must be 1 or 2")
+        decision = RuntimeCellAdmissionDecision(
+            mode="off",
+            requested_workers=cells,
+            effective_cells=cells,
+            status="DIAGNOSTIC_ONLY",
+            reasons=("diagnostic_coordinator_has_no_production_authority",),
+            source_identity=_digest(source_identity, "source_identity"),
+            production_authority=False,
+        )
+        super().__init__(connection_factory, decision=decision)
+
+
 def recovery_disposition(state: RuntimeCellExecutionState | None, *, state_readable: bool = True) -> str:
     """Return the only safe recovery lane for an observed App Server failure."""
 
@@ -352,6 +436,7 @@ class RuntimeCellApplication:
     lease_token: storage.RuntimeCellLeaseToken
     context_lease: ApplicationContextLease
     agent_stop: Callable[[], None]
+    contain_runtime: Callable[[], None]
 
 
 class RuntimeCellHost:
@@ -365,7 +450,7 @@ class RuntimeCellHost:
     def __init__(
         self,
         *,
-        coordinator: RuntimeCellCoordinator,
+        coordinator: _RuntimeCellCoordinatorBase,
         binding: RuntimeCellBinding,
         context_runtime: HotBrowserContextRuntime,
         connection_factory: Callable[[], sqlite3.Connection],
@@ -385,6 +470,7 @@ class RuntimeCellHost:
         scope: BrowserStateScope,
         state: ScopedBrowserState,
         agent_stop: Callable[[], None],
+        contain_runtime: Callable[[], None],
     ) -> RuntimeCellApplication:
         token = self.coordinator.claim(
             self.binding,
@@ -397,20 +483,26 @@ class RuntimeCellHost:
             context_lease = self.context_runtime.open_application(
                 application_id=application_id, scope=scope, state=state
             )
-        except BaseException:
+        except BaseException as open_error:
+            try:
+                contain_runtime()
+            except BaseException as containment_error:  # noqa: BLE001
+                open_error.add_note(f"runtime containment also failed: {type(containment_error).__name__}")
+            try:
+                self.context_runtime.close()
+            except BrowserContextRuntimeError as context_close_error:
+                open_error.add_note(f"context containment also failed: {type(context_close_error).__name__}")
             conn = self._connection_factory()
             try:
-                storage.quarantine_generation(
+                storage.quarantine_after_cleanup_failure(
                     conn,
-                    cell_id=self.binding.cell_id,
-                    generation=self.binding.generation,
-                    runtime_id=self.binding.runtime_id,
+                    token,
                     reason="context_open_failed",
                 )
             finally:
                 conn.close()
             raise
-        return RuntimeCellApplication(token, context_lease, agent_stop)
+        return RuntimeCellApplication(token, context_lease, agent_stop, contain_runtime)
 
     def close_application(self, application: RuntimeCellApplication) -> None:
         agent_stopped = False
@@ -422,19 +514,36 @@ class RuntimeCellHost:
             agent_stopped = True
         except BaseException as exc:  # noqa: BLE001 - containment continues after stop ambiguity.
             failure = exc
-        if agent_stopped:
+        if not agent_stopped:
             try:
-                self.context_runtime.close_application(application.context_lease)
-                metrics = self.context_runtime.metrics
-                residual = (
-                    metrics.active_contexts
-                    + metrics.pages_after_close
-                    + metrics.frames_after_close
-                    + metrics.service_workers_after_close
-                )
-                cleanup_verified = residual == 0 and not metrics.drained
+                application.contain_runtime()
+            except BaseException as exc:  # noqa: BLE001 - browser containment must still run.
+                failure = failure or exc
+            try:
+                self.context_runtime.close()
             except BrowserContextRuntimeError as exc:
                 failure = failure or exc
+        else:
+            try:
+                self.context_runtime.close_application(application.context_lease)
+            except BrowserContextRuntimeError as exc:
+                failure = failure or exc
+                try:
+                    application.contain_runtime()
+                except BaseException as containment_exc:  # noqa: BLE001
+                    failure = failure or containment_exc
+                try:
+                    self.context_runtime.close()
+                except BrowserContextRuntimeError as containment_exc:
+                    failure = failure or containment_exc
+        metrics = self.context_runtime.metrics
+        residual = (
+            metrics.active_contexts
+            + metrics.pages_after_close
+            + metrics.frames_after_close
+            + metrics.service_workers_after_close
+        )
+        cleanup_verified = residual == 0 and (agent_stopped or metrics.closed)
         conn = self._connection_factory()
         try:
             storage.release_after_cleanup(
@@ -456,11 +565,14 @@ __all__ = [
     "APP_SERVER_PRODUCTION_CELL_ADMITTED",
     "RUNTIME_CELL_ADMISSION_SCHEMA",
     "RUNTIME_CELL_GATE_NAMES",
+    "RUNTIME_CELL_GATE_SCHEMAS",
+    "DiagnosticRuntimeCellCoordinator",
     "RuntimeCellAdmissionDecision",
     "RuntimeCellAdmissionManifest",
     "RuntimeCellApplication",
     "RuntimeCellBinding",
     "RuntimeCellCoordinator",
+    "RuntimeCellGateReceipt",
     "RuntimeCellHost",
     "configured_runtime_cell_admission",
     "load_admission_manifest",

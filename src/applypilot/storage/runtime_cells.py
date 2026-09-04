@@ -181,7 +181,20 @@ def _migration_v1(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
-_MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_v1,)
+def _migration_v2(connection: sqlite3.Connection) -> None:
+    """Permanently fence a process identity after any Cell generation used it."""
+
+    connection.execute("DROP INDEX idx_runtime_cell_process_identity")
+    connection.execute(
+        """CREATE UNIQUE INDEX idx_runtime_cell_process_identity
+        ON runtime_cell_generations(process_id, process_birth_time)"""
+    )
+
+
+_MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    _migration_v1,
+    _migration_v2,
+)
 
 
 def ensure_schema(connection: sqlite3.Connection) -> int:
@@ -557,11 +570,9 @@ def release_after_cleanup(
     """Release only after Agent stop and readable zero-residual verification."""
 
     if not agent_stopped or not context_cleanup_verified or residual_resources != 0:
-        quarantine_generation(
+        quarantine_after_cleanup_failure(
             connection,
-            cell_id=token.cell_id,
-            generation=token.generation,
-            runtime_id=token.runtime_id,
+            token,
             reason="cleanup_unverified_or_residual",
             now=now,
         )
@@ -593,37 +604,55 @@ def release_after_cleanup(
     return lease
 
 
-def quarantine_generation(
+def quarantine_after_cleanup_failure(
     connection: sqlite3.Connection,
+    token: RuntimeCellLeaseToken,
     *,
-    cell_id: str,
-    generation: int,
-    runtime_id: str,
     reason: str,
     now: datetime | None = None,
-) -> None:
+) -> RuntimeCellLease:
+    """Quarantine only if the complete token still owns the current live lease."""
+
     reason = _required(reason, "reason")
     ensure_schema(connection)
     now_text = _iso(now or datetime.now(UTC))
-    with _write(connection, "runtime_cell_quarantine"):
+    with _write(connection, "runtime_cell_cleanup_quarantine"):
+        current = _lease(
+            connection.execute(
+                f"SELECT {_LEASE_COLUMNS} FROM runtime_cell_leases WHERE lease_id=? "
+                "AND cell_id=? AND generation=? AND runtime_id=? AND application_id=? "
+                "AND actor_id=? AND attempt_id=? AND hostname=? AND lease_epoch=? "
+                "AND status IN ('open','suspect','draining')",
+                _token_where(token),
+            ).fetchone()
+        )
+        if current is None:
+            raise StaleRuntimeCellTokenError("cleanup failure token does not own the current live lease")
         cursor = connection.execute(
             "UPDATE runtime_cell_generations SET status='quarantined',updated_at=?,"
             "quarantine_reason=? WHERE cell_id=? AND generation=? AND runtime_id=? "
             "AND status IN ('active','suspect','draining')",
-            (now_text, reason, cell_id, generation, runtime_id),
+            (now_text, reason, token.cell_id, token.generation, token.runtime_id),
         )
         if cursor.rowcount != 1:
-            existing = get_generation(connection, cell_id, generation)
-            if existing is None or existing.runtime_id != runtime_id:
-                raise StaleRuntimeCellTokenError("runtime cell quarantine identity is stale")
-            if existing.status != "quarantined" or existing.quarantine_reason != reason:
-                raise RuntimeCellQuarantinedError("runtime cell generation is already terminal")
-        connection.execute(
+            raise StaleRuntimeCellTokenError("cleanup failure token does not own the current generation")
+        cursor = connection.execute(
             "UPDATE runtime_cell_leases SET status='quarantined',released_at=?,"
-            "terminal_reason=? WHERE cell_id=? AND generation=? AND runtime_id=? "
-            "AND status IN ('open','suspect','draining')",
-            (now_text, reason, cell_id, generation, runtime_id),
+            "terminal_reason=? WHERE lease_id=? AND cell_id=? AND generation=? "
+            "AND runtime_id=? AND application_id=? AND actor_id=? AND attempt_id=? "
+            "AND hostname=? AND lease_epoch=? AND status IN ('open','suspect','draining')",
+            (now_text, reason, *_token_where(token)),
         )
+        if cursor.rowcount != 1:
+            raise StaleRuntimeCellTokenError("cleanup quarantine lease CAS failed")
+        quarantined = _lease(
+            connection.execute(
+                f"SELECT {_LEASE_COLUMNS} FROM runtime_cell_leases WHERE lease_id=?",
+                (token.lease_id,),
+            ).fetchone()
+        )
+    assert quarantined is not None
+    return quarantined
 
 
 __all__ = [
@@ -641,7 +670,7 @@ __all__ = [
     "heartbeat_lease",
     "mark_expired_suspect",
     "normalize_hostname",
-    "quarantine_generation",
+    "quarantine_after_cleanup_failure",
     "register_generation",
     "release_after_cleanup",
     "token_from_lease",

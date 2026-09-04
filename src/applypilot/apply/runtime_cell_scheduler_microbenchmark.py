@@ -1,4 +1,4 @@
-"""Paired local 1-Cell versus 2-Cell benchmark with no Submit authority."""
+"""Paired SQLite scheduler microbenchmark with no host-lifecycle claims."""
 
 from __future__ import annotations
 
@@ -16,14 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from applypilot.apply.runtime_cell_coordinator import (
-    RuntimeCellAdmissionDecision,
-    RuntimeCellCoordinator,
+    DiagnosticRuntimeCellCoordinator,
     source_manifest_identity,
 )
 from applypilot.storage import runtime_cells as storage
 
-FIXTURE_SCHEMA = "applypilot-runtime-cell-no-submit-fixture/v1"
-REPORT_SCHEMA = "applypilot-runtime-cell-no-submit/v1"
+FIXTURE_SCHEMA = "applypilot-runtime-cell-scheduler-microfixture/v1"
+REPORT_SCHEMA = "applypilot-runtime-cell-scheduler-microbenchmark/v1"
 SPEEDUP_LOWER_BOUND_MIN = 1.6
 
 
@@ -32,7 +31,7 @@ def load_fixture(path: Path | str) -> tuple[dict[str, Any], str]:
     raw_bytes = fixture_path.read_bytes()
     value = json.loads(raw_bytes)
     if not isinstance(value, dict) or value.get("schema_version") != FIXTURE_SCHEMA:
-        raise ValueError("unsupported Runtime Cell no-submit fixture")
+        raise ValueError("unsupported Runtime Cell scheduler microfixture")
     tasks = value.get("tasks")
     if not isinstance(tasks, list) or len(tasks) < 6:
         raise ValueError("Runtime Cell fixture requires at least six tasks")
@@ -69,16 +68,11 @@ def _run_cohort(
     source_identity: str,
     database_path: Path,
 ) -> dict[str, object]:
-    decision = RuntimeCellAdmissionDecision(
-        mode="canary" if cells == 2 else "off",
-        requested_workers=cells,
-        effective_cells=cells,
-        status="ADMITTED" if cells == 2 else "NOT_ADMITTED",
-        reasons=() if cells == 2 else ("benchmark_baseline",),
+    coordinator = DiagnosticRuntimeCellCoordinator(
+        lambda: _connection(database_path),
         source_identity=source_identity,
-        production_authority=False,
+        cells=cells,
     )
-    coordinator = RuntimeCellCoordinator(lambda: _connection(database_path), decision=decision)
     bindings = []
     for index in range(cells):
         bindings.append(
@@ -179,12 +173,6 @@ def _run_cohort(
         "overall_concurrency_peak": overall_peak,
         "same_domain_peak": max(domain_peak.values(), default=0),
         "domain_peaks": dict(sorted(domain_peak.items())),
-        "duplicate_submit_attempts": 0,
-        "submit_attempts": 0,
-        "effect_attempts": 0,
-        "submission_gate_attempts": 0,
-        "reservation_attempts": 0,
-        "receipt_attempts": 0,
         "cell_cross_writes": cell_cross_writes,
     }
 
@@ -197,7 +185,7 @@ def paired_bootstrap_lower_bound(speedups: list[float], *, samples: int = 5000, 
     return means[max(0, int(0.025 * len(means)) - 1)]
 
 
-def run_runtime_cell_no_submit_benchmark(
+def run_runtime_cell_scheduler_microbenchmark(
     fixture_path: Path | str,
     *,
     output_path: Path | str,
@@ -240,41 +228,32 @@ def run_runtime_cell_no_submit_benchmark(
                 )
     speedups = [float(block["paired_speedup"]) for block in blocks]
     lower_bound = paired_bootstrap_lower_bound(speedups, seed=int(fixture_sha[:8], 16))
-    safety_fields = (
-        "duplicate_submit_attempts",
-        "submit_attempts",
-        "effect_attempts",
-        "submission_gate_attempts",
-        "reservation_attempts",
-        "receipt_attempts",
-        "cell_cross_writes",
-    )
-    safety_zero = all(
-        int(block[lane][field]) == 0
-        for block in blocks
-        for lane in ("one_cell", "two_cells")
-        for field in safety_fields
+    scheduler_cross_writes_zero = all(
+        int(block[lane]["cell_cross_writes"]) == 0 for block in blocks for lane in ("one_cell", "two_cells")
     )
     same_domain_serial = all(
         int(block[lane]["same_domain_peak"]) == 1 for block in blocks for lane in ("one_cell", "two_cells")
     )
     different_domain_parallel = all(int(block["two_cells"]["overall_concurrency_peak"]) == 2 for block in blocks)
-    admitted = (
-        lower_bound >= SPEEDUP_LOWER_BOUND_MIN and safety_zero and same_domain_serial and different_domain_parallel
+    qualified = (
+        lower_bound >= SPEEDUP_LOWER_BOUND_MIN
+        and scheduler_cross_writes_zero
+        and same_domain_serial
+        and different_domain_parallel
     )
     reasons: list[str] = []
     if lower_bound < SPEEDUP_LOWER_BOUND_MIN:
         reasons.append("paired_bootstrap_95_lower_bound_below_1_6x")
-    if not safety_zero:
-        reasons.append("no_submit_safety_counter_nonzero")
+    if not scheduler_cross_writes_zero:
+        reasons.append("scheduler_cell_cross_write_nonzero")
     if not same_domain_serial:
         reasons.append("same_domain_concurrency_exceeded_one")
     if not different_domain_parallel:
         reasons.append("different_domains_did_not_reach_two_cells")
-    reasons.append("local_diagnostic_has_no_production_authority")
+    reasons.append("scheduler_microbenchmark_is_not_admission_evidence")
     report: dict[str, object] = {
         "schema_version": REPORT_SCHEMA,
-        "label": "runtime_cell_no_submit_local_fixture",
+        "label": "runtime_cell_sqlite_scheduler_microbenchmark",
         "generated_at": datetime.now(UTC).isoformat(),
         "fixture_sha256": fixture_sha,
         "source_identity": source_identity,
@@ -288,18 +267,26 @@ def run_runtime_cell_no_submit_benchmark(
             "speedup": lower_bound >= SPEEDUP_LOWER_BOUND_MIN,
             "same_domain_serial": same_domain_serial,
             "different_domain_parallel": different_domain_parallel,
-            "safety_counters_zero": safety_zero,
+            "scheduler_cross_writes_zero": scheduler_cross_writes_zero,
         },
-        "admission": {
-            "status": "ADMITTED" if admitted else "NOT_ADMITTED",
-            "production_authority": False,
-            "effective_production_cells": 1,
-            "canary_enabled": False,
+        "diagnostic": {
+            "status": "QUALIFIED" if qualified else "NOT_QUALIFIED",
+            "admission_evidence": False,
             "reasons": reasons,
         },
+        "unavailable_observations": {
+            "app_server_lifecycle": "unavailable_not_exercised",
+            "browser_context_lifecycle": "unavailable_not_exercised",
+            "submit_attempts": "unavailable_not_instrumented",
+            "effect_attempts": "unavailable_not_instrumented",
+            "duplicate_submit_attempts": "unavailable_not_instrumented",
+            "submission_gate_attempts": "unavailable_not_instrumented",
+            "reservation_attempts": "unavailable_not_instrumented",
+            "receipt_attempts": "unavailable_not_instrumented",
+        },
         "authority_boundary": (
-            "fixed local fixture only; no Submit, effect, SubmissionGate, reservation, "
-            "receipt, live ATS, or production authority"
+            "fixed local SQLite and sleep workload only; proves scheduler exclusion/concurrency "
+            "only and cannot produce a Runtime Cell admission gate receipt"
         ),
     }
     report["report_sha256"] = hashlib.sha256(
@@ -319,5 +306,5 @@ __all__ = [
     "SPEEDUP_LOWER_BOUND_MIN",
     "load_fixture",
     "paired_bootstrap_lower_bound",
-    "run_runtime_cell_no_submit_benchmark",
+    "run_runtime_cell_scheduler_microbenchmark",
 ]
