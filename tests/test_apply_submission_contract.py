@@ -14,8 +14,8 @@ from applypilot.apply import authorization, launcher
 from applypilot.apply.performance_attribution import (
     attribution_snapshot,
     bind_attempt_route,
-    safe_route_binding_snapshot,
     safe_record_job_span,
+    safe_route_binding_snapshot,
 )
 from applypilot.cli import (
     _build_standing_authorization_manifest,
