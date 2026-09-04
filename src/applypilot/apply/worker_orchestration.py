@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from applypilot.apply import application_actor as application_actor_mod
+from applypilot.apply import performance_attribution as performance_attribution_mod
 from applypilot.apply import recovery_execution as recovery_execution_mod
 from applypilot.apply.answer_provenance import build_host_provenance_binding
 from applypilot.apply.application_sessions import (
@@ -596,6 +597,10 @@ def _worker_loop_with_port(
             continue
 
         empty_polls = 0
+        # This is intentionally worker-local ordering, which remains stable
+        # even when several workers acquire applications concurrently.
+        job["_performance_application_index"] = jobs_done + 1
+        performance_attribution_mod.trace_for_job(job)
         preview_ticket: PreviewTicket | None = None
         if dry_run and run_progress is not None:
             preview_ticket = run_progress.claim_preview_ticket(job["url"])
@@ -696,6 +701,7 @@ def _worker_loop_with_port(
             metrics=orchestration_metrics,
             acquisition=acquisition_metrics,
             lane_state=submit_lane_state,
+            current_job=job,
         ) -> dict[str, object]:
             bounded = {
                 key: round(max(0.0, float(value)), 3)
@@ -708,11 +714,15 @@ def _worker_loop_with_port(
                     + (time.perf_counter() - held_at) * 1000,
                     3,
                 )
-            return {
+            snapshot: dict[str, object] = {
                 "version": 1,
                 "metrics": bounded,
                 "acquisition": acquisition,
             }
+            attribution = performance_attribution_mod.attribution_snapshot(current_job)
+            if attribution is not None:
+                snapshot["attribution"] = attribution
+            return snapshot
 
         def attach_performance(
             evidence: dict | None = None,
@@ -1653,9 +1663,11 @@ def _worker_loop_with_port(
                     audit_signal, audit_report = _enforce_stateful_control_coverage(
                         audit_signal, audit_report
                     )
-                    orchestration_metrics["pre_submit_audit_ms"] += (
-                        time.perf_counter() - audit_started
-                    ) * 1000
+                    audit_duration_ms = (time.perf_counter() - audit_started) * 1000
+                    orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
+                    performance_attribution_mod.record_job_span(
+                        job, "audit.pre_submit", audit_duration_ms
+                    )
                     if not _provenance_only_audit(audit_report):
                         pre_submit_audit_failure = dict(audit_report)
                         result = (
@@ -1975,9 +1987,11 @@ def _worker_loop_with_port(
                                 "disposition": "block",
                                 "blocking_issues": ["page_drift"],
                             }
-                    orchestration_metrics["pre_submit_audit_ms"] += (
-                        time.perf_counter() - audit_started
-                    ) * 1000
+                    audit_duration_ms = (time.perf_counter() - audit_started) * 1000
+                    orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
+                    performance_attribution_mod.record_job_span(
+                        job, "audit.pre_submit", audit_duration_ms
+                    )
                     observation_label = audit_signal or "clear"
                     add_event(
                         f"[W{worker_id}] Browser observation: {observation_label[:45]}"
@@ -2268,9 +2282,11 @@ def _worker_loop_with_port(
                             audit_signal, audit_report = _enforce_stateful_control_coverage(
                                 audit_signal, audit_report
                             )
-                            orchestration_metrics["pre_submit_audit_ms"] += (
-                                time.perf_counter() - audit_started
-                            ) * 1000
+                            audit_duration_ms = (time.perf_counter() - audit_started) * 1000
+                            orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
+                            performance_attribution_mod.record_job_span(
+                                job, "audit.pre_submit", audit_duration_ms
+                            )
                             if audit_signal or audit_report.get("disposition") != "clear":
                                 pre_submit_audit_failure = dict(audit_report)
                                 result = (
@@ -2688,6 +2704,7 @@ def _worker_loop_with_port(
                 and submitted_at is not None
                 and email_application is None
             ):
+                receipt_reconciliation_started = time.perf_counter()
                 receipt_attempts: list[dict[str, object]] = []
                 configured_observers = _configured_receipt_observers(profile)
                 receipt_gate_ready = bool(
@@ -2725,6 +2742,11 @@ def _worker_loop_with_port(
                     job["_receipt_reconciliation_pending"] = receipt_attempts
                     submission_evidence = dict(submission_evidence or {})
                     submission_evidence["mailbox_receipt_observers"] = receipt_attempts
+                performance_attribution_mod.record_job_span(
+                    job,
+                    "receipt.reconciliation",
+                    (time.perf_counter() - receipt_reconciliation_started) * 1000,
+                )
 
             if (
                 submission_started

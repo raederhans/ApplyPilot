@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from applypilot import database as database_mod
 from applypilot.apply import authorization, launcher
+from applypilot.apply.performance_attribution import attribution_snapshot, record_job_span
 from applypilot.cli import (
     _build_standing_authorization_manifest,
     _standing_auto_authorization_enabled,
@@ -1103,6 +1104,16 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
         evidence={"receipt": {"confirmed": True}},
         conn=conn,
     )
+    attribution_job = {
+        "provider": "workday",
+        "application_url": "https://careers.example.test/jobs/123",
+        "_performance_application_index": 1,
+    }
+    record_job_span(attribution_job, "agent.turn", 120)
+    record_job_span(attribution_job, "browser.prepare", 120)
+    record_job_span(attribution_job, "audit.pre_submit", 20)
+    attribution = attribution_snapshot(attribution_job)
+    assert attribution is not None
 
     recorded = record_application_attempt_performance(
         attempt_id,
@@ -1118,6 +1129,7 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
                 "worker_call_ms": 12.5,
                 "raw_url": "drop",
             },
+            "attribution": attribution,
         },
         conn=conn,
     )
@@ -1140,6 +1152,7 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
             "candidate_rows": 4.0,
             "worker_call_ms": 12.5,
         },
+        "attribution": attribution,
     }
 
 

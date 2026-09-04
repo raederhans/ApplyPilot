@@ -13,6 +13,8 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from applypilot.apply.performance_attribution import normalize_attribution
+
 
 def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
@@ -880,6 +882,9 @@ def record_attempt_performance(
                 if math.isfinite(numeric) and numeric >= 0:
                     values[key] = round(min(numeric, 86_400_000.0), 3)
         bounded[section] = values
+    attribution = normalize_attribution(performance.get("attribution"))
+    if attribution is not None:
+        bounded["attribution"] = attribution
     ensure_schema(connection)
     row = connection.execute(
         "SELECT evidence_json FROM application_attempts "
