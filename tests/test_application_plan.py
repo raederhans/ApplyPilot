@@ -29,18 +29,21 @@ from applypilot.apply.application_plan import (
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 DIGEST_C = "c" * 64
+REF_A = f"sha256:{DIGEST_A}"
+REF_B = f"sha256:{DIGEST_B}"
+REF_C = f"sha256:{DIGEST_C}"
 
 
 def _fact(*, digest: str = DIGEST_A) -> FactRef:
-    return FactRef("profile:preferred_name", "preferred_name", "application", digest)
+    return FactRef(REF_A, "preferred_name", "application", digest)
 
 
 def _material(*, digest: str = DIGEST_B) -> MaterialRef:
-    return MaterialRef("material:resume", "resume", digest)
+    return MaterialRef(REF_B, "resume", digest)
 
 
 def _provenance(*, digest: str = DIGEST_C) -> ProvenanceRef:
-    return ProvenanceRef("provenance:preferred_name", "preferred_name", digest)
+    return ProvenanceRef(REF_C, "preferred_name", digest)
 
 
 def _plan(
@@ -51,15 +54,19 @@ def _plan(
     facts: tuple[FactRef, ...] = (),
     materials: tuple[MaterialRef, ...] = (),
     provenance: tuple[ProvenanceRef, ...] = (),
+    provider: str | None = None,
+    application_url: str = "https://example.test/jobs/1",
+    plan_id: str = "plan-1",
+    attempt_id: str = "attempt-1",
 ) -> ApplicationPlan:
     return ApplicationPlan(
-        plan_id="plan-1",
-        attempt_id="attempt-1",
+        plan_id=plan_id,
+        attempt_id=attempt_id,
         revision=revision,
         route=route,  # type: ignore[arg-type]
-        provider="workday" if route == "browser_form" else "direct_email",
-        application_url="https://example.test/jobs/1",
-        target_binding_ref=f"sha256:{DIGEST_A}",
+        provider=provider or ("workday" if route == "browser_form" else "direct_email"),
+        application_url=application_url,
+        target_binding_ref=REF_A,
         fact_refs=facts,
         material_refs=materials,
         provenance_refs=provenance,
@@ -74,7 +81,7 @@ def test_application_plan_is_deeply_immutable_and_carries_only_typed_refs() -> N
         materials=(_material(),),
         provenance=(_provenance(),),
     )
-    facts.append(FactRef("profile:city", "city", "application", DIGEST_B))
+    facts.append(FactRef(REF_B, "city", "application", DIGEST_B))
 
     assert plan.fact_refs == (_fact(),)
     assert (
@@ -94,6 +101,76 @@ def test_application_plan_is_deeply_immutable_and_carries_only_typed_refs() -> N
         "submit_authority",
         "receipt_writer",
     }.isdisjoint(field.name for field in fields(plan))
+
+
+@pytest.mark.parametrize(
+    "bad_text",
+    (
+        r"C:\private\resume.pdf",
+        "Ada Lovelace",
+        "Yes, I am authorized to work without sponsorship.",
+    ),
+)
+@pytest.mark.parametrize(
+    "constructor",
+    (
+        lambda value: FactRef(value, "preferred_name", "application", DIGEST_A),
+        lambda value: FactRef(REF_A, value, "application", DIGEST_A),
+        lambda value: FactRef(REF_A, "preferred_name", value, DIGEST_A),
+        lambda value: MaterialRef(value, "resume", DIGEST_B),
+        lambda value: MaterialRef(REF_B, value, DIGEST_B),
+        lambda value: ProvenanceRef(value, "preferred_name", DIGEST_C),
+        lambda value: ProvenanceRef(REF_C, value, DIGEST_C),
+    ),
+)
+def test_prompt_visible_reference_fields_reject_paths_names_and_raw_answers(
+    constructor,
+    bad_text: str,
+) -> None:
+    with pytest.raises(ValueError):
+        constructor(bad_text)
+
+
+@pytest.mark.parametrize(
+    "bad_provider",
+    (r"C:\private\provider", "Ada Lovelace", "Use my original answer"),
+)
+def test_prompt_visible_provider_rejects_free_text(bad_provider: str) -> None:
+    with pytest.raises(ValueError, match="symbolic code"):
+        _plan(provider=bad_provider)
+
+
+def test_delta_strips_url_query_fragment_and_hashes_local_identifiers() -> None:
+    plan = _plan(
+        application_url=("https://example.test/jobs/1?candidate=Ada%20Lovelace&answer=yes#C:%5Cprivate%5Cresume.pdf"),
+        plan_id="Ada Lovelace local plan",
+        attempt_id=r"C:\private\attempt-Ada",
+    )
+
+    rendered = render_application_plan_delta(plan)
+
+    assert plan.application_url == "https://example.test/jobs/1"
+    assert "candidate=" not in rendered
+    assert "answer=" not in rendered
+    assert "Ada" not in rendered
+    assert "private" not in rendered
+    assert '"attempt_binding_ref":"sha256:' in rendered
+
+
+@pytest.mark.parametrize(
+    "local_identifier",
+    (r"C:\private\attempt", "Ada Lovelace", "Yes, use my original answer"),
+)
+def test_delta_and_plan_serialization_hash_local_identifiers(local_identifier: str) -> None:
+    plan = _plan(plan_id=local_identifier, attempt_id=local_identifier)
+    rendered = render_application_plan_delta(plan)
+    audit_issuer = HostAuditReceiptIssuer()
+    audit = _audit(plan, audit_issuer)
+
+    assert local_identifier not in rendered
+    assert local_identifier not in str(plan.as_dict())
+    assert local_identifier not in str(audit.claims())
+    assert plan.as_dict()["plan_binding_ref"] == plan.as_dict()["attempt_binding_ref"]
 
 
 def test_delta_prompt_is_deterministic_ref_only_and_parent_bound() -> None:
@@ -272,6 +349,17 @@ def test_enabled_host_submit_requires_exact_order_and_single_use_authority() -> 
     assert hooks.authority is not None
     with pytest.raises(HostSubmitDenied, match="already consumed"):
         authority_issuer.consume(hooks.authority, plan, audit, hooks.reservation)
+    calls_after_confirmation = tuple(hooks.calls)
+    with pytest.raises(HostSubmitDenied, match="terminal"):
+        executor.execute(plan=plan, audit=audit, hooks=hooks)
+    with pytest.raises(HostSubmitDenied, match="terminal"):
+        HostSubmitExecutor(feature_enabled=True, audit_issuer=audit_issuer).execute(
+            plan=plan,
+            audit=audit,
+            hooks=hooks,
+        )
+    assert tuple(hooks.calls) == calls_after_confirmation
+    assert hooks.calls.count("submit_once") == 1
 
 
 def test_submit_transport_error_never_retries_and_still_observes_and_reconciles() -> None:
@@ -280,16 +368,31 @@ def test_submit_transport_error_never_retries_and_still_observes_and_reconciles(
     audit = _audit(plan, audit_issuer)
     hooks = FakeHooks(plan, audit, submit_error=True)
 
-    result = HostSubmitExecutor(feature_enabled=True, audit_issuer=audit_issuer).execute(
-        plan=plan,
-        audit=audit,
-        hooks=hooks,
-    )
+    executor = HostSubmitExecutor(feature_enabled=True, audit_issuer=audit_issuer)
+
+    result = executor.execute(plan=plan, audit=audit, hooks=hooks)
 
     assert result.disposition == "uncertain"
     assert result.submit_effect_count == 1
     assert hooks.calls.count("submit_once") == 1
     assert hooks.calls[-2:] == ["observe", "reconcile"]
+    calls_after_uncertainty = tuple(hooks.calls)
+    with pytest.raises(HostSubmitDenied, match="receipt_only"):
+        executor.execute(plan=plan, audit=audit, hooks=hooks)
+    with pytest.raises(HostSubmitDenied, match="receipt_only"):
+        HostSubmitExecutor(feature_enabled=True, audit_issuer=audit_issuer).execute(
+            plan=plan,
+            audit=audit,
+            hooks=hooks,
+        )
+    assert tuple(hooks.calls) == calls_after_uncertainty
+    assert hooks.calls.count("submit_once") == 1
+
+    hooks.submit_error = False
+    reconciled = executor.reconcile_only(plan=plan, hooks=hooks)
+    assert reconciled.disposition == "confirmed"
+    assert reconciled.submit_effect_count == 0
+    assert hooks.calls.count("submit_once") == 1
 
 
 def test_direct_email_is_rejected_before_any_host_browser_hook() -> None:
@@ -318,13 +421,40 @@ def test_submit_authority_issuer_rejects_audit_from_another_host() -> None:
         plan.digest,
         foreign_audit.digest,
     )
+    latch = trusted_audit_issuer.attempt_latch
+    start_claim = latch.begin(plan)
 
     with pytest.raises(HostSubmitDenied, match="not issued by this host"):
         SubmitAuthorityIssuer(audit_issuer=trusted_audit_issuer).issue(
             plan,
             foreign_audit,
             reservation,
-            submit_started=True,
+            start_claim=start_claim,
+        )
+
+
+def test_attempt_latch_forbids_a_second_authority_nonce_for_one_submit_start() -> None:
+    plan = _plan()
+    audit_issuer = HostAuditReceiptIssuer()
+    audit = _audit(plan, audit_issuer)
+    reservation = HostReservation("reservation-once", plan.digest, audit.digest)
+    claim = audit_issuer.attempt_latch.begin(plan)
+    authority_issuer = SubmitAuthorityIssuer(audit_issuer=audit_issuer)
+
+    first = authority_issuer.issue(
+        plan,
+        audit,
+        reservation,
+        start_claim=claim,
+    )
+
+    assert first.nonce
+    with pytest.raises(HostSubmitDenied, match="single SubmitAuthority"):
+        authority_issuer.issue(
+            plan,
+            audit,
+            reservation,
+            start_claim=claim,
         )
 
 

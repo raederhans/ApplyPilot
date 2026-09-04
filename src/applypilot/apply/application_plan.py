@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
@@ -24,6 +26,42 @@ ApplicationRoute = Literal["browser_form", "direct_email"]
 AuditDisposition = Literal["clear", "blocked"]
 ObservationDisposition = Literal["confirmed", "uncertain", "blocked"]
 ReceiptStatus = Literal["admitted", "uncertain", "rejected"]
+AttemptSubmitState = Literal["submit_started", "receipt_only", "terminal"]
+
+FACT_KEY_CODES = frozenset(
+    {
+        "availability",
+        "city",
+        "country",
+        "email",
+        "legal_name",
+        "phone",
+        "portfolio_url",
+        "postal_code",
+        "preferred_name",
+        "salary_expectation",
+        "sponsorship",
+        "state",
+        "work_authorization",
+    }
+)
+FACT_SCOPE_CODES = frozenset({"application", "candidate_profile", "employer", "job", "jurisdiction"})
+MATERIAL_PURPOSE_CODES = frozenset({"cover_letter", "portfolio", "resume", "transcript", "writing_sample"})
+FIELD_SEMANTIC_CODES = FACT_KEY_CODES | frozenset({"cover_letter", "resume", "transcript", "writing_sample"})
+PROVIDER_CODES = frozenset(
+    {
+        "ashby",
+        "direct_email",
+        "generic",
+        "greenhouse",
+        "icims",
+        "lever",
+        "linkedin",
+        "smartrecruiters",
+        "taleo",
+        "workday",
+    }
+)
 
 BROWSER_SUBMIT_STAGES = (
     "pre_submit_audit",
@@ -73,6 +111,18 @@ def _content_ref(value: object, name: str) -> str:
     return f"sha256:{_sha256(digest, name)}"
 
 
+def _opaque_binding(value: object, name: str) -> str:
+    raw = _required(value, name).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _code(value: object, name: str, allowed: frozenset[str]) -> str:
+    text = _required(value, name)
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", text) or text not in allowed:
+        raise ValueError(f"{name} is not an admitted symbolic code")
+    return text
+
+
 def _https_url(value: object) -> str:
     raw = _required(value, "application_url")
     parsed = urlsplit(raw)
@@ -84,7 +134,7 @@ def _https_url(value: object) -> str:
         raise ValueError("application_url has an invalid port") from exc
     host = parsed.hostname.casefold().rstrip(".")
     netloc = host if port in {None, 443} else f"{host}:{port}"
-    return urlunsplit(("https", netloc, parsed.path or "/", parsed.query, parsed.fragment))
+    return urlunsplit(("https", netloc, parsed.path or "/", "", ""))
 
 
 def _canonical_json(value: object) -> bytes:
@@ -112,9 +162,9 @@ class FactRef:
     value_sha256: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "fact_ref", _required(self.fact_ref, "fact_ref"))
-        object.__setattr__(self, "key", _required(self.key, "key"))
-        object.__setattr__(self, "scope", _required(self.scope, "scope"))
+        object.__setattr__(self, "fact_ref", _content_ref(self.fact_ref, "fact_ref"))
+        object.__setattr__(self, "key", _code(self.key, "key", FACT_KEY_CODES))
+        object.__setattr__(self, "scope", _code(self.scope, "scope", FACT_SCOPE_CODES))
         object.__setattr__(self, "value_sha256", _sha256(self.value_sha256, "value_sha256"))
 
     def as_dict(self) -> dict[str, str]:
@@ -136,8 +186,16 @@ class MaterialRef:
     content_sha256: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "material_ref", _required(self.material_ref, "material_ref"))
-        object.__setattr__(self, "purpose", _required(self.purpose, "purpose"))
+        object.__setattr__(
+            self,
+            "material_ref",
+            _content_ref(self.material_ref, "material_ref"),
+        )
+        object.__setattr__(
+            self,
+            "purpose",
+            _code(self.purpose, "purpose", MATERIAL_PURPOSE_CODES),
+        )
         object.__setattr__(self, "content_sha256", _sha256(self.content_sha256, "content_sha256"))
 
     def as_dict(self) -> dict[str, str]:
@@ -158,8 +216,16 @@ class ProvenanceRef:
     snapshot_sha256: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "provenance_ref", _required(self.provenance_ref, "provenance_ref"))
-        object.__setattr__(self, "field_semantic", _required(self.field_semantic, "field_semantic"))
+        object.__setattr__(
+            self,
+            "provenance_ref",
+            _content_ref(self.provenance_ref, "provenance_ref"),
+        )
+        object.__setattr__(
+            self,
+            "field_semantic",
+            _code(self.field_semantic, "field_semantic", FIELD_SEMANTIC_CODES),
+        )
         object.__setattr__(self, "snapshot_sha256", _sha256(self.snapshot_sha256, "snapshot_sha256"))
 
     def as_dict(self) -> dict[str, str]:
@@ -215,7 +281,7 @@ class ApplicationPlan:
             raise ValueError("revision must be a positive integer")
         if self.route not in {"browser_form", "direct_email"}:
             raise ValueError("route must be browser_form or direct_email")
-        object.__setattr__(self, "provider", _required(self.provider, "provider").casefold())
+        object.__setattr__(self, "provider", _code(self.provider, "provider", PROVIDER_CODES))
         object.__setattr__(self, "application_url", _https_url(self.application_url))
         object.__setattr__(
             self,
@@ -257,8 +323,8 @@ class ApplicationPlan:
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
-            "plan_id": self.plan_id,
-            "attempt_id": self.attempt_id,
+            "plan_binding_ref": _opaque_binding(self.plan_id, "plan_id"),
+            "attempt_binding_ref": _opaque_binding(self.attempt_id, "attempt_id"),
             "revision": self.revision,
             "route": self.route,
             "provider": self.provider,
@@ -311,7 +377,7 @@ def render_application_plan_delta(
         "schema": "ApplicationPlanDelta/v1",
         "base_plan_sha256": base_digest,
         "plan_sha256": plan.digest,
-        "attempt_id": plan.attempt_id,
+        "attempt_binding_ref": _opaque_binding(plan.attempt_id, "attempt_id"),
         "revision": plan.revision,
         "route": plan.route,
         "provider": plan.provider,
@@ -378,7 +444,7 @@ class HostAuditReceipt:
         return {
             "schema_version": self.schema_version,
             "plan_sha256": self.plan_sha256,
-            "attempt_id": self.attempt_id,
+            "attempt_binding_ref": _opaque_binding(self.attempt_id, "attempt_id"),
             "route": self.route,
             "target_binding_ref": self.target_binding_ref,
             "audit_report_ref": self.audit_report_ref,
@@ -397,6 +463,11 @@ class HostAuditReceiptIssuer:
     def __init__(self) -> None:
         self._issuer_id = secrets.token_hex(16)
         self._secret = secrets.token_bytes(32)
+        self._attempt_latch = HostSubmitAttemptLatch()
+
+    @property
+    def attempt_latch(self) -> HostSubmitAttemptLatch:
+        return self._attempt_latch
 
     def issue(
         self,
@@ -527,6 +598,117 @@ class HostReservation:
 
 
 @dataclass(frozen=True, slots=True)
+class SubmitStartClaim:
+    """Host-local proof that one attempt crossed submit_started exactly once."""
+
+    attempt_id: str
+    plan_sha256: str
+    nonce: str
+
+    def __reduce__(self) -> object:
+        raise TypeError("SubmitStartClaim cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("SubmitStartClaim cannot be serialized")
+
+
+@dataclass(slots=True)
+class _AttemptLatchRecord:
+    plan_sha256: str
+    state: AttemptSubmitState
+    claim: SubmitStartClaim
+    authority_issued: bool = False
+
+
+class HostSubmitAttemptLatch:
+    """Process-host monotonic submit latch keyed by attempt_id.
+
+    Once ``begin`` succeeds, the attempt can only advance from submit_started
+    to receipt_only and then terminal.  It can never enter another submit lane
+    or mint another SubmitAuthority, even for a revised plan.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._attempts: dict[str, _AttemptLatchRecord] = {}
+
+    def require_submit_allowed(self, plan: ApplicationPlan) -> None:
+        with self._lock:
+            record = self._attempts.get(plan.attempt_id)
+            if record is not None:
+                raise HostSubmitDenied(f"attempt is {record.state}; only independent reconcile is allowed")
+
+    def begin(self, plan: ApplicationPlan) -> SubmitStartClaim:
+        with self._lock:
+            self.require_submit_allowed(plan)
+            claim = SubmitStartClaim(
+                attempt_id=plan.attempt_id,
+                plan_sha256=plan.digest,
+                nonce=secrets.token_hex(16),
+            )
+            self._attempts[plan.attempt_id] = _AttemptLatchRecord(
+                plan_sha256=plan.digest,
+                state="submit_started",
+                claim=claim,
+            )
+            return claim
+
+    def claim_authority(self, claim: SubmitStartClaim, plan: ApplicationPlan) -> None:
+        with self._lock:
+            record = self._require_claim(claim, plan)
+            if record.state != "submit_started":
+                raise HostSubmitDenied("attempt is receipt_only or terminal; authority is forbidden")
+            if record.authority_issued:
+                raise HostSubmitDenied("attempt already received its single SubmitAuthority")
+            record.authority_issued = True
+
+    def mark_receipt_only(self, claim: SubmitStartClaim, plan: ApplicationPlan) -> None:
+        with self._lock:
+            record = self._require_claim(claim, plan)
+            if record.state == "submit_started":
+                record.state = "receipt_only"
+
+    def mark_terminal(self, claim: SubmitStartClaim, plan: ApplicationPlan) -> None:
+        with self._lock:
+            record = self._require_claim(claim, plan)
+            if record.state not in {"submit_started", "receipt_only"}:
+                raise HostSubmitDenied("terminal submit attempt cannot transition again")
+            record.state = "terminal"
+
+    def require_reconcile_only(self, plan: ApplicationPlan) -> SubmitStartClaim:
+        with self._lock:
+            record = self._attempts.get(plan.attempt_id)
+            if record is None or record.plan_sha256 != plan.digest:
+                raise HostSubmitDenied("attempt has no matching receipt_only submit state")
+            if record.state != "receipt_only":
+                raise HostSubmitDenied("attempt is not eligible for reconcile-only execution")
+            return record.claim
+
+    def state(self, attempt_id: str) -> AttemptSubmitState | None:
+        with self._lock:
+            record = self._attempts.get(attempt_id)
+            return record.state if record is not None else None
+
+    def _require_claim(
+        self,
+        claim: SubmitStartClaim,
+        plan: ApplicationPlan,
+    ) -> _AttemptLatchRecord:
+        if not isinstance(claim, SubmitStartClaim):
+            raise HostSubmitDenied("invalid submit-start claim")
+        record = self._attempts.get(plan.attempt_id)
+        if (
+            record is None
+            or record.claim != claim
+            or record.plan_sha256 != plan.digest
+            or claim.attempt_id != plan.attempt_id
+            or claim.plan_sha256 != plan.digest
+        ):
+            raise HostSubmitDenied("submit-start claim does not bind this attempt and plan")
+        return record
+
+
+@dataclass(frozen=True, slots=True)
 class SubmitAuthority:
     """One-shot, host-local capability for one exact reserved submit effect."""
 
@@ -556,6 +738,7 @@ class SubmitAuthorityIssuer:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
         self._audit_issuer = audit_issuer
+        self._attempt_latch = audit_issuer.attempt_latch
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
         self._secret = secrets.token_bytes(32)
@@ -567,12 +750,11 @@ class SubmitAuthorityIssuer:
         audit: HostAuditReceipt,
         reservation: HostReservation,
         *,
-        submit_started: bool,
+        start_claim: SubmitStartClaim,
     ) -> SubmitAuthority:
-        if submit_started is not True:
-            raise HostSubmitDenied("SubmitAuthority requires submit_started")
         self._audit_issuer.validate(audit, plan)
         self._validate_binding(plan, audit, reservation)
+        self._attempt_latch.claim_authority(start_claim, plan)
         authority = SubmitAuthority(
             attempt_id=plan.attempt_id,
             plan_sha256=plan.digest,
@@ -585,6 +767,10 @@ class SubmitAuthorityIssuer:
         authority = replace(authority, signature=self._sign(authority))
         self._issued[authority.nonce] = authority.expires_at
         return authority
+
+    @property
+    def attempt_latch(self) -> HostSubmitAttemptLatch:
+        return self._attempt_latch
 
     def consume(
         self,
@@ -723,7 +909,14 @@ class HostSubmitExecutor:
             raise TypeError("feature_enabled must be bool")
         self._feature_enabled = feature_enabled
         self._audit_issuer = audit_issuer
-        self._authority_issuer = authority_issuer or SubmitAuthorityIssuer(audit_issuer=audit_issuer)
+        if authority_issuer is not None:
+            self._authority_issuer = authority_issuer
+            self._attempt_latch = authority_issuer.attempt_latch
+        else:
+            self._attempt_latch = audit_issuer.attempt_latch
+            self._authority_issuer = SubmitAuthorityIssuer(
+                audit_issuer=audit_issuer,
+            )
 
     def execute(
         self,
@@ -742,18 +935,22 @@ class HostSubmitExecutor:
             )
         if plan.route != "browser_form":
             raise HostSubmitDenied("direct email requires the mailbox route")
+        self._attempt_latch.require_submit_allowed(plan)
         self._audit_issuer.validate(audit, plan)
         stages = ["pre_submit_audit"]
         reservation: HostReservation | None = None
+        start_claim: SubmitStartClaim | None = None
         submit_started = False
         submit_effect_count = 0
         submit_path_error = False
         try:
             with hooks.global_submit_lane(plan):
+                self._attempt_latch.require_submit_allowed(plan)
                 stages.append("global_submit_lane")
                 reservation = hooks.reserve(plan, audit)
                 SubmitAuthorityIssuer._validate_binding(plan, audit, reservation)
                 stages.append("reservation")
+                start_claim = self._attempt_latch.begin(plan)
                 submit_started = True
                 hooks.mark_submit_started(reservation)
                 stages.append("submit_started")
@@ -761,7 +958,7 @@ class HostSubmitExecutor:
                     plan,
                     audit,
                     reservation,
-                    submit_started=True,
+                    start_claim=start_claim,
                 )
                 self._authority_issuer.consume(authority, plan, audit, reservation)
                 stages.append("single_use_submit_authority")
@@ -772,6 +969,10 @@ class HostSubmitExecutor:
             if not submit_started:
                 raise HostSubmitDenied("host submit stopped before submit_started") from exc
             submit_path_error = True
+
+        if start_claim is None:
+            raise HostSubmitDenied("submit_started has no host attempt claim")
+        self._attempt_latch.mark_receipt_only(start_claim, plan)
 
         try:
             observation = hooks.observe(plan)
@@ -795,12 +996,62 @@ class HostSubmitExecutor:
             )
 
         confirmed = not submit_path_error and observation.disposition == "confirmed" and receipt.status == "admitted"
+        if confirmed:
+            self._attempt_latch.mark_terminal(start_claim, plan)
         return HostSubmitResult(
             disposition="confirmed" if confirmed else "uncertain",
             reason_code=("HOST_SUBMIT_RECEIPT_ADMITTED" if confirmed else "HOST_SUBMIT_EFFECT_OR_RECEIPT_UNCERTAIN"),
             plan_sha256=plan.digest,
             stages=tuple(stages),
             submit_effect_count=submit_effect_count,
+            observation_ref=observation.evidence_ref,
+            receipt_ref=receipt.receipt_ref,
+        )
+
+    def reconcile_only(
+        self,
+        *,
+        plan: ApplicationPlan,
+        hooks: HostSubmitHooks,
+    ) -> HostSubmitResult:
+        """Observe and reconcile a receipt_only attempt without submit capability."""
+
+        if not self._feature_enabled:
+            return HostSubmitResult(
+                disposition="shadow",
+                reason_code="HOST_SUBMIT_FEATURE_DISABLED",
+                plan_sha256=plan.digest,
+                stages=(),
+                submit_effect_count=0,
+            )
+        claim = self._attempt_latch.require_reconcile_only(plan)
+        stages: list[str] = []
+        try:
+            observation = hooks.observe(plan)
+            if observation.plan_sha256 != plan.digest:
+                raise HostSubmitDenied("observer evidence does not bind the application plan")
+            stages.append("independent_observer")
+            receipt = hooks.reconcile(plan, observation)
+            if receipt.plan_sha256 != plan.digest or receipt.observation_ref != observation.evidence_ref:
+                raise HostSubmitDenied("reconciled receipt does not bind the observer evidence")
+            stages.append("receipt_reconciliation")
+        except Exception:  # noqa: BLE001
+            return HostSubmitResult(
+                disposition="uncertain",
+                reason_code="HOST_SUBMIT_OBSERVATION_OR_RECEIPT_UNCERTAIN",
+                plan_sha256=plan.digest,
+                stages=tuple(stages),
+                submit_effect_count=0,
+            )
+        confirmed = observation.disposition == "confirmed" and receipt.status == "admitted"
+        if confirmed:
+            self._attempt_latch.mark_terminal(claim, plan)
+        return HostSubmitResult(
+            disposition="confirmed" if confirmed else "uncertain",
+            reason_code=("HOST_SUBMIT_RECEIPT_ADMITTED" if confirmed else "HOST_SUBMIT_EFFECT_OR_RECEIPT_UNCERTAIN"),
+            plan_sha256=plan.digest,
+            stages=tuple(stages),
+            submit_effect_count=0,
             observation_ref=observation.evidence_ref,
             receipt_ref=receipt.receipt_ref,
         )
