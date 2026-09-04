@@ -55,6 +55,7 @@ from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import receipt_observer as receipt_observer_mod
 from applypilot.apply import resume_authorization as resume_authorization_mod
 from applypilot.apply import runtime_cell as runtime_cell_mod
+from applypilot.apply import runtime_cell_coordinator as runtime_cell_coordinator_mod
 from applypilot.apply import semantic_batch_runtime as semantic_batch_runtime_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
@@ -679,6 +680,12 @@ def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
             runtime_recovery_scope=_runtime_recovery_scope,
             runtime_submit_scope=_runtime_submit_scope,
             wait_for_manual_captcha=_wait_for_manual_captcha,
+        ),
+        runtime_cells=worker_orchestration_mod.WorkerRuntimeCellPorts(
+            resolve_admission=runtime_cell_coordinator_mod.configured_runtime_cell_admission,
+            coordinator_factory=runtime_cell_coordinator_mod.RuntimeCellCoordinator,
+            host_factory=runtime_cell_coordinator_mod.RuntimeCellHost,
+            production_enabled=runtime_cell_coordinator_mod.APP_SERVER_PRODUCTION_CELL_ADMITTED,
         ),
     )
 
@@ -2742,6 +2749,7 @@ def acquire_job(
     exclude_urls: set[str] | None = None,
     application_lease_minutes: int | None = None,
     performance_sink: dict[str, object] | None = None,
+    runtime_cell_claim: Callable[[sqlite3.Connection, dict, str], object] | None = None,
 ) -> dict | None:
     if application_lease_minutes is None:
         application_lease_minutes = load_runtime_settings().application_lease_minutes
@@ -2756,6 +2764,7 @@ def acquire_job(
         performance_sink=performance_sink,
         load_blocked=_load_blocked,
         application_lease_minutes=application_lease_minutes,
+        runtime_cell_claim=runtime_cell_claim,
     )
 
 

@@ -136,6 +136,7 @@ def acquire_job(
     performance_sink: dict[str, object] | None = None,
     load_blocked: Callable[[], tuple[list[str], list[str]]],
     application_lease_minutes: int,
+    runtime_cell_claim: Callable[[sqlite3.Connection, dict, str], object] | None = None,
 ) -> dict | None:
     """Atomically acquire the next job to apply to.
 
@@ -257,6 +258,7 @@ def acquire_job(
 
         row = None
         authorized_entry = None
+        runtime_candidates: list[tuple[sqlite3.Row, dict | None]] = []
         from applypilot.apply.submission_admission import evaluate_submission_admission
 
         minimum_fit_score = max(1, min(int(min_score), 10))
@@ -328,11 +330,95 @@ def acquire_job(
                 if authorized is None:
                     continue
                 authorized_entry = authorized
+            if runtime_cell_claim is not None:
+                runtime_candidates.append((candidate, authorized_entry))
+                authorized_entry = None
+                continue
             row = candidate
             break
         acquisition_performance["admission_scan_ms"] = _elapsed_ms(phase_started)
         acquisition_performance["admission_rows_scanned"] = admission_rows_scanned
         acquisition_performance["stale_materials_retired"] = retired_stale_materials
+
+        if runtime_cell_claim is not None and runtime_candidates:
+            # The attempt and Runtime Cell/domain lease share one savepoint.
+            # A same-domain conflict rolls back the provisional attempt and
+            # continues scanning without leaving an orphan attempt.
+            from applypilot.storage.runtime_cells import RuntimeCellConflictError
+
+            for candidate, candidate_authorization in runtime_candidates:
+                candidate_job = dict(candidate)
+                candidate_job["application_url"] = (
+                    candidate_job.get("application_url") or candidate_job.get("url")
+                )
+                apply_url = candidate_job["application_url"]
+                portal_gate = config.portal_application_gate(
+                    apply_url,
+                    source_site=candidate_job.get("source_site"),
+                    site=candidate_job.get("site"),
+                    preview_only=preview_only,
+                )
+                if portal_gate:
+                    conn.execute(
+                        "UPDATE jobs SET apply_status='manual',apply_error=? WHERE url=?",
+                        (portal_gate, candidate_job["url"]),
+                    )
+                    if target_url:
+                        conn.commit()
+                        acquisition_performance["outcome"] = "blocked"
+                        return None
+                    continue
+                if target_url and not preview_only and os.environ.get("APPLYPILOT_AUTO_SUBMIT") == "1":
+                    policy_min_score = max(
+                        minimum_fit_score,
+                        int(os.environ.get("APPLYPILOT_AUTO_SUBMIT_MIN_SCORE", "8")),
+                    )
+                    if (
+                        not str(candidate_job.get("company_name") or "").strip()
+                        or not str(candidate_job.get("full_description") or "").strip()
+                        or candidate_job.get("fit_score") is None
+                        or int(candidate_job["fit_score"]) < policy_min_score
+                    ):
+                        if target_url:
+                            conn.rollback()
+                            acquisition_performance["outcome"] = "blocked"
+                            return None
+                        continue
+                conn.execute("SAVEPOINT runtime_cell_job_acquisition")
+                try:
+                    attempt_id = start_application_attempt(
+                        candidate_job["url"],
+                        f"worker-{worker_id}",
+                        batch_id=(authorization_manifest or {}).get("batch_id"),
+                        lease_minutes=application_lease_minutes,
+                        conn=conn,
+                    )
+                    runtime_lease = runtime_cell_claim(conn, candidate_job, attempt_id)
+                    now = datetime.now(UTC).isoformat()
+                    conn.execute(
+                        "UPDATE jobs SET apply_status='in_progress',agent_id=?,"
+                        "last_attempted_at=?,apply_task_id=? WHERE url=?",
+                        (f"worker-{worker_id}", now, attempt_id, candidate_job["url"]),
+                    )
+                    conn.execute("RELEASE SAVEPOINT runtime_cell_job_acquisition")
+                except RuntimeCellConflictError:
+                    conn.execute("ROLLBACK TO SAVEPOINT runtime_cell_job_acquisition")
+                    conn.execute("RELEASE SAVEPOINT runtime_cell_job_acquisition")
+                    continue
+                except Exception:
+                    conn.execute("ROLLBACK TO SAVEPOINT runtime_cell_job_acquisition")
+                    conn.execute("RELEASE SAVEPOINT runtime_cell_job_acquisition")
+                    raise
+                conn.commit()
+                acquired = candidate_job
+                acquired["_attempt_id"] = attempt_id
+                acquired["_runtime_cell_lease"] = runtime_lease
+                if candidate_authorization is not None:
+                    acquired["_authorization_entry"] = dict(candidate_authorization)
+                acquisition_performance["outcome"] = "acquired"
+                acquisition_performance["total_ms"] = _elapsed_ms(acquisition_started)
+                acquired["_acquisition_performance"] = dict(acquisition_performance)
+                return acquired
 
         if not row:
             acquisition_performance["outcome"] = "empty"

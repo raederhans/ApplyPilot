@@ -29,3 +29,6 @@ def test_launcher_composes_migrated_public_observation_modules() -> None:
         runtime.submission.submission_evidence_consistent
         is launcher.post_submit_observation_mod.submission_evidence_consistent
     )
+    assert runtime.runtime_cells.production_enabled is False
+    assert "submit" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}
+    assert "receipt" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}

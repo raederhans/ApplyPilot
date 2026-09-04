@@ -1,0 +1,514 @@
+{
+  "schema_version": "applypilot-runtime-cell-no-submit/v1",
+  "label": "runtime_cell_no_submit_local_fixture",
+  "generated_at": "2026-09-04T09:11:37.408400+00:00",
+  "fixture_sha256": "9b9fc0d72fc9e8ae1baa163cac6506209a14dbde86344132e27400410abd1f31",
+  "source_identity": "dda6e14ba3a1efd3716b082ff7ffd6680c33701b7530d0a1531dbdb815165db6",
+  "measured_blocks": 10,
+  "warmup_blocks": 2,
+  "paired_blocks": [
+    {
+      "block": 0,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3895864999976766,
+        "throughput_per_second": 30.801888669323926,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21986800000013318,
+        "throughput_per_second": 54.57820146630129,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.7719108737853648
+    },
+    {
+      "block": 1,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3932150000000547,
+        "throughput_per_second": 30.51765573540768,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2042738999989524,
+        "throughput_per_second": 58.74465607236921,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.9249399947916561
+    },
+    {
+      "block": 2,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.4052558000003046,
+        "throughput_per_second": 29.610927221747303,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2225254999975732,
+        "throughput_per_second": 53.92640394081069,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8211656641810676
+    },
+    {
+      "block": 3,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.4156786000021384,
+        "throughput_per_second": 28.868457505241473,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2281951000004483,
+        "throughput_per_second": 52.58658051805856,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8215930140538592
+    },
+    {
+      "block": 4,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.4129501999996137,
+        "throughput_per_second": 29.059194062652654,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.22574119999990216,
+        "throughput_per_second": 53.15821834917685,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8293080749096429
+    },
+    {
+      "block": 5,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.40681750000294414,
+        "throughput_per_second": 29.497256140439276,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.4543527999994694,
+        "throughput_per_second": 26.41119412054688,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 0.8953779970177783
+    },
+    {
+      "block": 6,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3996459000009054,
+        "throughput_per_second": 30.026581030789544,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.23067280000032042,
+        "throughput_per_second": 52.02173815024282,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.7325228635554355
+    },
+    {
+      "block": 7,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.39654090000112774,
+        "throughput_per_second": 30.261695577848016,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21372589999737102,
+        "throughput_per_second": 56.14668133411818,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8553712956923119
+    },
+    {
+      "block": 8,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.40295569999943837,
+        "throughput_per_second": 29.779948515473848,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.22517290000178036,
+        "throughput_per_second": 53.292381098725116,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.7895390608561348
+    },
+    {
+      "block": 9,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.40428109999993467,
+        "throughput_per_second": 29.682317575572885,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2175132999982452,
+        "throughput_per_second": 55.16904023844432,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "duplicate_submit_attempts": 0,
+        "submit_attempts": 0,
+        "effect_attempts": 0,
+        "submission_gate_attempts": 0,
+        "reservation_attempts": 0,
+        "receipt_attempts": 0,
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8586500227949105
+    }
+  ],
+  "paired_speedup_mean": 1.7300378861638162,
+  "paired_bootstrap_95_lower_bound": 1.5351590966084585,
+  "threshold": {
+    "paired_bootstrap_95_lower_bound_min": 1.6
+  },
+  "gates": {
+    "speedup": false,
+    "same_domain_serial": true,
+    "different_domain_parallel": true,
+    "safety_counters_zero": true
+  },
+  "admission": {
+    "status": "NOT_ADMITTED",
+    "production_authority": false,
+    "effective_production_cells": 1,
+    "canary_enabled": false,
+    "reasons": [
+      "paired_bootstrap_95_lower_bound_below_1_6x",
+      "local_diagnostic_has_no_production_authority"
+    ]
+  },
+  "authority_boundary": "fixed local fixture only; no Submit, effect, SubmissionGate, reservation, receipt, live ATS, or production authority",
+  "report_sha256": "408f96ff6732e15212ec4e959aefb0f1ccef1c68dbdd05e3cbad75082231b262"
+}

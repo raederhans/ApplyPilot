@@ -178,6 +178,21 @@ class WorkerOperatorPorts:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerRuntimeCellPorts:
+    """Disabled-by-default composition seam for the M7 Cell coordinator.
+
+    It carries constructors and admission evaluation only.  Page, Submit,
+    reservation, receipt and ledger capabilities remain in their existing
+    owner ports and are deliberately absent here.
+    """
+
+    resolve_admission: Callable[..., Any]
+    coordinator_factory: Callable[..., Any]
+    host_factory: Callable[..., Any]
+    production_enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerRuntimePorts:
     """Responsibility-grouped runtime boundary consumed by the worker core."""
 
@@ -188,6 +203,7 @@ class WorkerRuntimePorts:
     observation: WorkerPageObservationPorts
     submission: WorkerSubmissionPorts
     operator: WorkerOperatorPorts
+    runtime_cells: WorkerRuntimeCellPorts
 
 
 @dataclass(frozen=True, slots=True)

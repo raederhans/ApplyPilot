@@ -1,0 +1,18 @@
+{
+  "schema_version": "applypilot-runtime-cell-no-submit-fixture/v1",
+  "label": "fixed_local_runtime_cell_no_submit_fixture",
+  "tasks": [
+    {"task_id": "a-01", "hostname": "alpha.example.test", "work_ms": 25},
+    {"task_id": "a-02", "hostname": "alpha.example.test", "work_ms": 25},
+    {"task_id": "b-01", "hostname": "beta.example.test", "work_ms": 25},
+    {"task_id": "b-02", "hostname": "beta.example.test", "work_ms": 25},
+    {"task_id": "c-01", "hostname": "gamma.example.test", "work_ms": 25},
+    {"task_id": "c-02", "hostname": "gamma.example.test", "work_ms": 25},
+    {"task_id": "a-03", "hostname": "alpha.example.test", "work_ms": 25},
+    {"task_id": "a-04", "hostname": "alpha.example.test", "work_ms": 25},
+    {"task_id": "b-03", "hostname": "beta.example.test", "work_ms": 25},
+    {"task_id": "b-04", "hostname": "beta.example.test", "work_ms": 25},
+    {"task_id": "c-03", "hostname": "gamma.example.test", "work_ms": 25},
+    {"task_id": "c-04", "hostname": "gamma.example.test", "work_ms": 25}
+  ]
+}

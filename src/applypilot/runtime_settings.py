@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,24 @@ class ApplyRuntimeSettings:
         raise ValueError(
             "APPLYPILOT_CODEX_APP_SERVER_ENABLED must be a boolean flag"
         )
+
+    @property
+    def runtime_cell_mode(self) -> str:
+        """Return the gated Runtime Cell rollout mode, defaulting fully off."""
+
+        mode = self.environ.get("APPLYPILOT_RUNTIME_CELL_MODE", "off").strip().casefold()
+        if mode not in {"off", "shadow", "canary"}:
+            raise ValueError(
+                "APPLYPILOT_RUNTIME_CELL_MODE must be off, shadow, or canary"
+            )
+        return mode
+
+    @property
+    def runtime_cell_admission_manifest(self) -> Path | None:
+        """Return an explicit manifest path; absence can never enable two Cells."""
+
+        raw = self.environ.get("APPLYPILOT_RUNTIME_CELL_ADMISSION_MANIFEST", "").strip()
+        return Path(raw).expanduser().resolve() if raw else None
 
     @property
     def semantic_batch_mode(self) -> str:

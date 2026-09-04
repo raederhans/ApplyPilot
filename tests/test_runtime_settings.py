@@ -8,6 +8,27 @@ from applypilot.commands.apply import (
 )
 from applypilot.runtime_settings import load_runtime_settings
 
+
+def test_runtime_cell_mode_defaults_off_and_manifest_is_explicit(tmp_path) -> None:
+    settings = load_runtime_settings({})
+    assert settings.runtime_cell_mode == "off"
+    assert settings.runtime_cell_admission_manifest is None
+
+    manifest = tmp_path / "admission.json"
+    configured = load_runtime_settings(
+        {
+            "APPLYPILOT_RUNTIME_CELL_MODE": "shadow",
+            "APPLYPILOT_RUNTIME_CELL_ADMISSION_MANIFEST": str(manifest),
+        }
+    )
+    assert configured.runtime_cell_mode == "shadow"
+    assert configured.runtime_cell_admission_manifest == manifest.resolve()
+
+    with pytest.raises(ValueError, match="off, shadow, or canary"):
+        assert load_runtime_settings(
+            {"APPLYPILOT_RUNTIME_CELL_MODE": "enabled"}
+        ).runtime_cell_mode
+
 pytestmark = pytest.mark.compatibility
 
 
