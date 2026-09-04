@@ -20,7 +20,6 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, runtime_checkable
-from urllib.parse import urlsplit, urlunsplit
 
 ApplicationRoute = Literal["browser_form", "direct_email"]
 AuditDisposition = Literal["clear", "blocked"]
@@ -62,6 +61,7 @@ PROVIDER_CODES = frozenset(
         "workday",
     }
 )
+TARGET_SEMANTIC_CODES = frozenset({"application_form", "application_review", "direct_email_application"})
 
 BROWSER_SUBMIT_STAGES = (
     "pre_submit_audit",
@@ -121,20 +121,6 @@ def _code(value: object, name: str, allowed: frozenset[str]) -> str:
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", text) or text not in allowed:
         raise ValueError(f"{name} is not an admitted symbolic code")
     return text
-
-
-def _https_url(value: object) -> str:
-    raw = _required(value, "application_url")
-    parsed = urlsplit(raw)
-    if parsed.scheme.casefold() != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("application_url must be an HTTPS URL without credentials")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("application_url has an invalid port") from exc
-    host = parsed.hostname.casefold().rstrip(".")
-    netloc = host if port in {None, 443} else f"{host}:{port}"
-    return urlunsplit(("https", netloc, parsed.path or "/", "", ""))
 
 
 def _canonical_json(value: object) -> bytes:
@@ -266,7 +252,7 @@ class ApplicationPlan:
     revision: int
     route: ApplicationRoute
     provider: str
-    application_url: str
+    target_semantic_code: str
     target_binding_ref: str
     fact_refs: tuple[FactRef, ...] = ()
     material_refs: tuple[MaterialRef, ...] = ()
@@ -282,7 +268,19 @@ class ApplicationPlan:
         if self.route not in {"browser_form", "direct_email"}:
             raise ValueError("route must be browser_form or direct_email")
         object.__setattr__(self, "provider", _code(self.provider, "provider", PROVIDER_CODES))
-        object.__setattr__(self, "application_url", _https_url(self.application_url))
+        object.__setattr__(
+            self,
+            "target_semantic_code",
+            _code(
+                self.target_semantic_code,
+                "target_semantic_code",
+                TARGET_SEMANTIC_CODES,
+            ),
+        )
+        if (self.route == "direct_email" and self.target_semantic_code != "direct_email_application") or (
+            self.route == "browser_form" and self.target_semantic_code == "direct_email_application"
+        ):
+            raise ValueError("target_semantic_code does not match the application route")
         object.__setattr__(
             self,
             "target_binding_ref",
@@ -328,7 +326,7 @@ class ApplicationPlan:
             "revision": self.revision,
             "route": self.route,
             "provider": self.provider,
-            "application_url": self.application_url,
+            "target_semantic_code": self.target_semantic_code,
             "target_binding_ref": self.target_binding_ref,
             "parent_plan_sha256": self.parent_plan_sha256,
             "fact_refs": [value.as_dict() for value in self.fact_refs],
@@ -381,7 +379,7 @@ def render_application_plan_delta(
         "revision": plan.revision,
         "route": plan.route,
         "provider": plan.provider,
-        "application_url": plan.application_url,
+        "target_semantic_code": plan.target_semantic_code,
         "target_binding_ref": plan.target_binding_ref,
         "added_refs": added,
         "changed_refs": changed,
@@ -621,11 +619,14 @@ class _AttemptLatchRecord:
 
 
 class HostSubmitAttemptLatch:
-    """Process-host monotonic submit latch keyed by attempt_id.
+    """Shadow-only process-host monotonic submit latch keyed by attempt_id.
 
     Once ``begin`` succeeds, the attempt can only advance from submit_started
     to receipt_only and then terminal.  It can never enter another submit lane
-    or mint another SubmitAuthority, even for a revised plan.
+    or mint another SubmitAuthority, even for a revised plan.  This is not a
+    cross-process exactly-once guarantee.  Before production wiring, callers
+    must restore the monotonic state from the durable ledger and reservation
+    record into this process-host boundary before any submit admission check.
     """
 
     def __init__(self) -> None:

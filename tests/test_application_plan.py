@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, fields, replace
 
@@ -55,7 +56,8 @@ def _plan(
     materials: tuple[MaterialRef, ...] = (),
     provenance: tuple[ProvenanceRef, ...] = (),
     provider: str | None = None,
-    application_url: str = "https://example.test/jobs/1",
+    target_semantic_code: str | None = None,
+    target_binding_ref: str = REF_A,
     plan_id: str = "plan-1",
     attempt_id: str = "attempt-1",
 ) -> ApplicationPlan:
@@ -65,8 +67,9 @@ def _plan(
         revision=revision,
         route=route,  # type: ignore[arg-type]
         provider=provider or ("workday" if route == "browser_form" else "direct_email"),
-        application_url=application_url,
-        target_binding_ref=REF_A,
+        target_semantic_code=target_semantic_code
+        or ("application_form" if route == "browser_form" else "direct_email_application"),
+        target_binding_ref=target_binding_ref,
         fact_refs=facts,
         material_refs=materials,
         provenance_refs=provenance,
@@ -140,21 +143,44 @@ def test_prompt_visible_provider_rejects_free_text(bad_provider: str) -> None:
         _plan(provider=bad_provider)
 
 
-def test_delta_strips_url_query_fragment_and_hashes_local_identifiers() -> None:
+def test_delta_never_exposes_target_hostname_path_query_or_fragment() -> None:
+    raw_target = "https://ada-lovelace.example/C:/private/resume.pdf?candidate=Ada%20Lovelace&answer=yes#private-resume"
     plan = _plan(
-        application_url=("https://example.test/jobs/1?candidate=Ada%20Lovelace&answer=yes#C:%5Cprivate%5Cresume.pdf"),
+        target_binding_ref=f"sha256:{hashlib.sha256(raw_target.encode()).hexdigest()}",
         plan_id="Ada Lovelace local plan",
         attempt_id=r"C:\private\attempt-Ada",
     )
 
     rendered = render_application_plan_delta(plan)
 
-    assert plan.application_url == "https://example.test/jobs/1"
+    assert "application_url" not in rendered
+    assert "ada-lovelace.example" not in rendered
+    assert "C:/private/resume.pdf" not in rendered
     assert "candidate=" not in rendered
     assert "answer=" not in rendered
     assert "Ada" not in rendered
     assert "private" not in rendered
     assert '"attempt_binding_ref":"sha256:' in rendered
+    assert '"target_semantic_code":"application_form"' in rendered
+    assert (
+        plan.digest
+        == _plan(
+            target_binding_ref=plan.target_binding_ref,
+            plan_id=plan.plan_id,
+            attempt_id=plan.attempt_id,
+        ).digest
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_semantic",
+    (r"C:\private\resume.pdf", "Ada Lovelace", "Use my original answer"),
+)
+def test_target_semantic_code_rejects_host_path_or_free_text(
+    unsafe_semantic: str,
+) -> None:
+    with pytest.raises(ValueError, match="symbolic code"):
+        _plan(target_semantic_code=unsafe_semantic)
 
 
 @pytest.mark.parametrize(
