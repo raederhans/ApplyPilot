@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import platform
 import queue
-import shutil
 import sqlite3
 import threading
 import time
@@ -26,6 +24,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from applypilot.apply.application_plan import ApplicationPlan, render_application_plan_delta
 from applypilot.apply.capabilities import CapabilityRegistry, capability_names_for_server
@@ -53,6 +52,15 @@ _EFFECT_ITEM_TYPES = frozenset(
         "tool_call",
     }
 )
+
+_READ_ONLY_PLAYWRIGHT_TOOLS = (
+    "browser_snapshot",
+    "browser_take_screenshot",
+    "browser_wait_for",
+    "browser_console_messages",
+    "browser_network_requests",
+)
+_LOOPBACK_PLAYWRIGHT_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class DurableAppServerStateError(RuntimeError):
@@ -549,9 +557,11 @@ def build_ref_only_request(
         context_refs["application_context"] = _content_ref(application_context)
     prompt_parts = [
         "APPLYPILOT_RUNTIME_CELL_V1",
+        "SHADOW_OBSERVATION_ONLY",
         f"phase={phase}",
         "Inputs are reference-only. Do not request browser handles, cookies, raw materials, paths, URLs, or SubmitAuthority.",
-        "Approval and elicitation are unavailable. Host browser writes and Submit remain outside this request.",
+        "This turn is non-authoritative and read-only. Do not navigate, write page state, or claim an application outcome.",
+        "Approval and elicitation are unavailable. All browser writes and Submit remain outside this request.",
         json.dumps(context_refs, sort_keys=True, separators=(",", ":")),
     ]
     if plan_shadow_enabled and plan is not None:
@@ -571,6 +581,30 @@ def build_ref_only_request(
     )
 
 
+def _validated_loopback_playwright_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("App Server Playwright endpoint has an invalid port") from exc
+    host = (parsed.hostname or "").casefold()
+    if (
+        parsed.scheme != "http"
+        or host not in _LOOPBACK_PLAYWRIGHT_HOSTS
+        or port is None
+        or parsed.path != "/mcp"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "App Server Playwright endpoint must be http://<loopback>:<port>/mcp"
+        )
+    rendered_host = f"[{host}]" if host == "::1" else host
+    return f"http://{rendered_host}:{port}/mcp"
+
+
 def build_thread_config(
     mcp_config: Mapping[str, object],
     *,
@@ -584,27 +618,20 @@ def build_thread_config(
         raise TypeError("MCP config does not contain mcpServers")
     tool_names = enabled_tools or {}
     servers: dict[str, object] = {}
-    raw_config = raw_servers.get("playwright")
-    if not isinstance(raw_config, Mapping):
+    # The existing CLI config may contain user-controlled launcher/extra args,
+    # storage-state paths, signed URLs, or secrets.  Never copy any part of it;
+    # its presence is checked only to preserve the input schema contract.
+    if "playwright" in raw_servers and not isinstance(raw_servers["playwright"], Mapping):
         raise TypeError("MCP server config is invalid: playwright")
     if playwright_url is not None:
-        config: dict[str, object] = {"url": playwright_url}
-    else:
-        command = raw_config.get("command")
-        args = raw_config.get("args", ())
-        if not isinstance(command, str) or not command:
-            raise TypeError("Playwright MCP command is invalid")
-        if not isinstance(args, (list, tuple)) or not all(isinstance(arg, str) for arg in args):
-            raise TypeError("Playwright MCP arguments are invalid")
-        if command == "npx" and platform.system() == "Windows":
-            config = {"command": "cmd.exe", "args": ["/d", "/s", "/c", "npx", *args]}
-        elif command == "npx":
-            config = {"command": shutil.which("npx") or "npx", "args": list(args)}
-        else:
-            config = {"command": command, "args": list(args)}
-    config["enabled_tools"] = list(tool_names.get("playwright", ()))
-    config["default_tools_approval_mode"] = "approve"
-    servers["playwright"] = config
+        requested = frozenset(tool_names.get("playwright", ()))
+        read_only_tools = [name for name in _READ_ONLY_PLAYWRIGHT_TOOLS if name in requested]
+        if read_only_tools:
+            servers["playwright"] = {
+                "url": _validated_loopback_playwright_url(playwright_url),
+                "enabled_tools": read_only_tools,
+                "default_tools_approval_mode": "approve",
+            }
     return {
         "features": {
             "shell_tool": False,
@@ -807,11 +834,15 @@ def open_app_server_turn(
     try:
         turn = adapter.resume(request) if request.parent_provider_session_id else adapter.start(request)
     except CodexAppServerExecutionError as exc:
-        state_store.record_uncertain_acceptance(
-            actor_id=request.actor_id,
-            attempt_id=request.attempt_id,
-            execution_state=exc.execution_state,
-        )
+        try:
+            state_store.record_uncertain_acceptance(
+                actor_id=request.actor_id,
+                attempt_id=request.attempt_id,
+                execution_state=exc.execution_state,
+            )
+        finally:
+            if on_transport_failure is not None:
+                on_transport_failure(adapter)
         raise
     state_store.record_accepted(
         actor_id=request.actor_id,

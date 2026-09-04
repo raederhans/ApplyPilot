@@ -146,18 +146,24 @@ def test_ref_only_request_adds_optional_plan_delta_without_raw_inputs(tmp_path: 
     assert all(value.startswith("sha256:") for value in request.context_refs.values())
 
 
-def test_thread_config_is_playwright_only_and_never_serializes_env_values() -> None:
+def test_prepare_shadow_config_rejects_submit_writers_and_serialized_secrets() -> None:
     secret_values = {
         "C:/private/agent-turn-report.json",
         "mailbox-secret-token",
         "credential-secret-path",
+        "https://evil.example/mcp?token=signed-secret",
+        "candidate@example.com",
     }
     config = build_thread_config(
         {
             "mcpServers": {
                 "playwright": {
-                    "command": "pw",
-                    "args": ["--old"],
+                    "command": "C:/private/bin/pw.exe",
+                    "args": [
+                        "--storage-state=C:/private/state.json",
+                        "--endpoint=https://evil.example/mcp?token=signed-secret",
+                        "--user=candidate@example.com",
+                    ],
                     "env": {"PLAYWRIGHT_SECRET": "must-not-survive"},
                 },
                 "applypilot_control": {
@@ -176,7 +182,20 @@ def test_thread_config_is_playwright_only_and_never_serializes_env_values() -> N
             }
         },
         enabled_tools={
-            "playwright": ("browser_snapshot",),
+            "playwright": (
+                "browser_snapshot",
+                "browser_take_screenshot",
+                "browser_wait_for",
+                "browser_console_messages",
+                "browser_network_requests",
+                "browser_click",
+                "browser_fill_form",
+                "browser_file_upload",
+                "browser_navigate",
+                "browser_press_key",
+                "browser_select_option",
+                "browser_type",
+            ),
         },
         playwright_url="http://127.0.0.1:3210/mcp",
     )
@@ -185,12 +204,67 @@ def test_thread_config_is_playwright_only_and_never_serializes_env_values() -> N
     assert set(servers) == {"playwright"}
     assert servers["playwright"]["url"] == "http://127.0.0.1:3210/mcp"
     assert "command" not in servers["playwright"]
+    assert servers["playwright"]["enabled_tools"] == [
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_wait_for",
+        "browser_console_messages",
+        "browser_network_requests",
+    ]
+    assert not {
+        "browser_click",
+        "browser_fill_form",
+        "browser_file_upload",
+        "browser_navigate",
+        "browser_press_key",
+        "browser_select_option",
+        "browser_type",
+    }.intersection(servers["playwright"]["enabled_tools"])
     serialized = json.dumps(config)
     assert "env" not in serialized
     assert "mailbox" not in serialized
     assert "credential_relay" not in serialized
     assert "applypilot_control" not in serialized
     assert all(value not in serialized for value in secret_values)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "https://127.0.0.1:3210/mcp",
+        "http://example.com:3210/mcp",
+        "http://127.0.0.1:3210/other",
+        "http://127.0.0.1:3210/mcp?token=signed",
+        "http://candidate@example.com:3210/mcp",
+        "http://127.0.0.1/mcp",
+    ),
+)
+def test_thread_config_rejects_noncanonical_or_signed_browser_endpoint(
+    endpoint: str,
+) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        build_thread_config(
+            {"mcpServers": {"playwright": {"args": ["--untrusted"]}}},
+            enabled_tools={"playwright": ("browser_snapshot",)},
+            playwright_url=endpoint,
+        )
+
+
+def test_thread_config_without_trusted_endpoint_exposes_no_browser_mcp() -> None:
+    config = build_thread_config(
+        {
+            "mcpServers": {
+                "playwright": {
+                    "command": "pw",
+                    "args": ["--storage-state=C:/secret/state.json"],
+                }
+            }
+        },
+        enabled_tools={"playwright": ("browser_snapshot", "browser_click")},
+        playwright_url=None,
+    )
+
+    assert config["mcp_servers"] == {}
 
 
 def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: Path) -> None:

@@ -5323,10 +5323,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         ), 0
     app_server_eligible = runtime_route == "browser" and submission_phase != "submit"
     app_server_adapter = None
-    if submission_phase != "submit" and (
-        app_server_bound
-        or runtime_settings.codex_app_server_enabled
+    if (
+        agent_backend.strip().casefold() == "codex"
+        and runtime_settings.codex_app_server_enabled
         and app_server_eligible
+        and not app_server_bound
     ):
         app_server_adapter = _app_server_runtime_pool.adapter_for_worker(worker_id)
     runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
@@ -5337,17 +5338,35 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         execution_state=runtime_cell_execution_state,
         codex_app_server_adapter=app_server_adapter,
     )
-    job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
     if runtime_cell_selection.health.disposition == "receipt_only":
+        job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
         return "submission_uncertain", 0
-    if runtime_cell_selection.health.disposition == "park":
-        return "failed:runtime_parked", 0
-    if not runtime_cell_selection.can_start and not (
-        runtime_cell_selection.health.disposition == "continue"
+    app_server_shadow_should_run = bool(
+        runtime_cell_selection.can_start
         and runtime_cell_selection.active_backend == "codex-app-server"
+    )
+    # App Server is an optional read-only observation lane.  The CLI remains
+    # the only authoritative prepare/submit runtime until a resolver/report
+    # channel exists.  A durable App Server binding prevents shadow replay but
+    # never lets shadow RESULT/report text decide the application outcome.
+    runtime_backend = (
+        "codex-cli"
+        if agent_backend.strip().casefold() == "codex"
+        else "claude-cli"
+    )
+    runtime_cell_metadata = runtime_cell_selection.health.as_dict()
+    if app_server_bound or (
+        runtime_settings.codex_app_server_enabled and app_server_eligible
     ):
-        raise RuntimeError("Runtime Cell did not authorize an Agent turn")
-    runtime_backend = runtime_cell_selection.active_backend
+        runtime_cell_metadata.update(
+            {
+                "mode": "shadow_observation",
+                "authoritative_backend": runtime_backend,
+                "shadow_will_run": app_server_shadow_should_run,
+                "shadow_replay_blocked": app_server_bound,
+            }
+        )
+    job["_runtime_cell"] = runtime_cell_metadata
     setup_metrics["exposed_tool_count"] = len(job["_available_tools"])
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
@@ -5460,7 +5479,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     runtime_metadata: dict = {}
-    runtime_metadata["runtime_cell"] = runtime_cell_selection.health.as_dict()
+    runtime_metadata["runtime_cell"] = dict(job["_runtime_cell"])
     runtime_metadata["browser_broker"] = {
         "schema_version": "1",
         "profile_id": browser_lease_bundle.profile.resource_id,
@@ -5891,103 +5910,174 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             if isinstance(raw_control_contract, Mapping)
             else {}
         )
-        if runtime_backend == "codex-app-server":
+        if app_server_shadow_should_run:
             assert app_server_adapter is not None
             plan = job.get("_application_plan")
             previous_plan = job.get("_previous_application_plan")
-            app_server_turn_process = app_server_wiring_mod.open_configured_app_server_turn(
-                adapter=app_server_adapter,
-                state_store=_app_server_state_store,
-                run_id=run_id,
-                actor_id=actor_id,
-                attempt_id=attempt_id,
-                phase=submission_phase,
-                cwd=worker_dir,
-                model=model,
-                mcp_config=mcp_config,
-                runtime_capabilities=runtime_capabilities,
-                playwright_url=(
-                    application_context.endpoint.address
-                    if application_context is not None
-                    and application_context.endpoint.transport == "streamable-http"
-                    and application_context.endpoint.reusable
-                    else None
-                ),
-                prompt_contract={
-                    "schema_version": "1",
-                    "phase": submission_phase,
-                    "dry_run": dry_run,
-                    "control_contract": prompt_contract,
-                },
-                ats_context=ats_context,
-                application_context=(
-                    application_context.as_dict()
-                    if application_context is not None
-                    else None
-                ),
-                plan=(plan if isinstance(plan, application_plan_mod.ApplicationPlan) else None),
-                previous_plan=(
-                    previous_plan
-                    if isinstance(previous_plan, application_plan_mod.ApplicationPlan)
-                    else None
-                ),
-                plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
-                on_transport_failure=lambda failed_adapter: _app_server_runtime_pool.evict_worker(
-                    worker_id, failed_adapter
-                ),
-            )
-            proc = app_server_turn_process
-            runtime_metadata["provider_session_id"] = proc.turn.provider_session_id
-            runtime_metadata["provider_turn_id"] = proc.turn.provider_turn_id
-        else:
-            launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
-                run_id=run_id,
-                attempt_id=attempt_id,
-                actor_id=actor_id,
-                turn_id=turn_id,
-                command=tuple(cmd),
-                prompt=agent_prompt,
-                cwd=worker_dir,
-                env=env,
-                runtime_id=browser_lease_bundle.profile.runtime_id,
-                profile_id=browser_lease_bundle.profile.resource_id,
-                parent_run_id=runtime_parent_turn_id,
-                submit_started=submission_phase == "submit" and not dry_run,
-            )
-            durable_intent = DurableLaunchIntent(
-                spec=launch_spec,
-                runtime_backend=runtime_backend,
-                resume_mode="resume" if runtime_parent_turn_id else "root",
-                checkpoint_id=runtime_parent_checkpoint_id,
-                model=model,
-                recovery_authorization_id=runtime_authorization_id,
-                tool_surface_hash=_control_contract_digest(
-                    {
-                        "schema_version": "1",
-                        "available_tools": sorted(agent_request.available_tools),
-                    }
-                ),
-                prompt_contract_hash=_control_contract_digest(
-                    {
+            shadow_watchdog: threading.Timer | None = None
+            shadow_timed_out = threading.Event()
+            try:
+                app_server_turn_process = app_server_wiring_mod.open_configured_app_server_turn(
+                    adapter=app_server_adapter,
+                    state_store=_app_server_state_store,
+                    run_id=run_id,
+                    actor_id=actor_id,
+                    attempt_id=attempt_id,
+                    phase=submission_phase,
+                    cwd=worker_dir,
+                    model=model,
+                    mcp_config=mcp_config,
+                    runtime_capabilities=runtime_capabilities,
+                    playwright_url=(
+                        application_context.endpoint.address
+                        if application_context is not None
+                        and application_context.endpoint.transport == "streamable-http"
+                        and application_context.endpoint.reusable
+                        else None
+                    ),
+                    prompt_contract={
                         "schema_version": "1",
                         "phase": submission_phase,
                         "dry_run": dry_run,
                         "control_contract": prompt_contract,
+                    },
+                    ats_context=ats_context,
+                    application_context=(
+                        application_context.as_dict()
+                        if application_context is not None
+                        else None
+                    ),
+                    plan=(
+                        plan
+                        if isinstance(plan, application_plan_mod.ApplicationPlan)
+                        else None
+                    ),
+                    previous_plan=(
+                        previous_plan
+                        if isinstance(previous_plan, application_plan_mod.ApplicationPlan)
+                        else None
+                    ),
+                    plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
+                    on_transport_failure=lambda failed_adapter: _app_server_runtime_pool.evict_worker(
+                        worker_id, failed_adapter
+                    ),
+                )
+                runtime_metadata["app_server_shadow"] = {
+                    "status": "running",
+                    "provider_session_id": app_server_turn_process.turn.provider_session_id,
+                    "provider_turn_id": app_server_turn_process.turn.provider_turn_id,
+                    "authoritative": False,
+                }
+                with _claude_lock:
+                    _app_server_turn_cancellations[worker_id] = app_server_turn_process.cancel
+
+                def cancel_shadow_on_timeout() -> None:
+                    if (
+                        app_server_turn_process is not None
+                        and app_server_turn_process.poll() is None
+                    ):
+                        shadow_timed_out.set()
+                        try:
+                            app_server_turn_process.cancel()
+                        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                            pass
+
+                shadow_watchdog = threading.Timer(
+                    min(agent_timeout_seconds, 60), cancel_shadow_on_timeout
+                )
+                shadow_watchdog.daemon = True
+                shadow_watchdog.start()
+                for _shadow_line in app_server_turn_process.stdout:
+                    pass
+                app_server_turn_process.wait(timeout=5)
+                runtime_metadata["app_server_shadow"].update(
+                    {
+                        "status": (
+                            "timed_out"
+                            if shadow_timed_out.is_set()
+                            else app_server_turn_process.terminal_status or "failed"
+                        ),
+                        "returncode": app_server_turn_process.returncode,
                     }
-                ),
-                idempotency_key=f"agent-turn:v2:{actor_id}:{turn_id}:spawn",
+                )
+            except Exception as exc:  # noqa: BLE001
+                runtime_metadata["app_server_shadow"] = {
+                    "status": "timed_out" if shadow_timed_out.is_set() else "failed",
+                    "failure_code": type(exc).__name__,
+                    "authoritative": False,
+                }
+                if app_server_turn_process is None:
+                    _app_server_runtime_pool.evict_worker(worker_id, app_server_adapter)
+            finally:
+                if shadow_watchdog is not None:
+                    shadow_watchdog.cancel()
+                with _claude_lock:
+                    _app_server_turn_cancellations.pop(worker_id, None)
+                if (
+                    app_server_turn_process is not None
+                    and app_server_turn_process.poll() is None
+                ):
+                    try:
+                        app_server_turn_process.cancel()
+                        app_server_turn_process.drain(timeout=5)
+                    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                        _app_server_runtime_pool.evict_worker(worker_id, app_server_adapter)
+                app_server_turn_process = None
+                # Shadow output is never an authoritative report or checkpoint.
+                if report_path.exists():
+                    report_path.unlink()
+                if final_message_path and final_message_path.exists():
+                    final_message_path.unlink()
+
+        process_spawn_started = time.perf_counter()
+        launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            actor_id=actor_id,
+            turn_id=turn_id,
+            command=tuple(cmd),
+            prompt=agent_prompt,
+            cwd=worker_dir,
+            env=env,
+            runtime_id=browser_lease_bundle.profile.runtime_id,
+            profile_id=browser_lease_bundle.profile.resource_id,
+            parent_run_id=runtime_parent_turn_id,
+            submit_started=submission_phase == "submit" and not dry_run,
+        )
+        durable_intent = DurableLaunchIntent(
+            spec=launch_spec,
+            runtime_backend=runtime_backend,
+            resume_mode="resume" if runtime_parent_turn_id else "root",
+            checkpoint_id=runtime_parent_checkpoint_id,
+            model=model,
+            recovery_authorization_id=runtime_authorization_id,
+            tool_surface_hash=_control_contract_digest(
+                {
+                    "schema_version": "1",
+                    "available_tools": sorted(agent_request.available_tools),
+                }
+            ),
+            prompt_contract_hash=_control_contract_digest(
+                {
+                    "schema_version": "1",
+                    "phase": submission_phase,
+                    "dry_run": dry_run,
+                    "control_contract": prompt_contract,
+                }
+            ),
+            idempotency_key=f"agent-turn:v2:{actor_id}:{turn_id}:spawn",
+        )
+        if runtime_parent_turn_id:
+            durable_handle = _durable_agent_runtime.resume(
+                durable_intent,
+                popen_factory=subprocess.Popen,
             )
-            if runtime_parent_turn_id:
-                durable_handle = _durable_agent_runtime.resume(
-                    durable_intent,
-                    popen_factory=subprocess.Popen,
-                )
-            else:
-                durable_handle = _durable_agent_runtime.start(
-                    durable_intent,
-                    popen_factory=subprocess.Popen,
-                )
-            proc = durable_handle.process
+        else:
+            durable_handle = _durable_agent_runtime.start(
+                durable_intent,
+                popen_factory=subprocess.Popen,
+            )
+        proc = durable_handle.process
         process_spawned_at = time.perf_counter()
         performance_attribution_mod.safe_record(
             performance_trace,

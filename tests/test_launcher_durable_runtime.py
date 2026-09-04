@@ -400,17 +400,21 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
             "turn/interrupt",
             "turn/start",
         ],
+        "mode": "shadow_observation",
+        "authoritative_backend": "codex-cli",
+        "shadow_will_run": False,
+        "shadow_replay_blocked": False,
     }
     turn = _durable_turn(db_path, "attempt-runtime-cell-fallback")
     assert turn["runtime_backend"] == "codex-cli"
     assert events[:5] == ["reserve", "popen", "attach", "prompt", "advisory_started"]
 
 
-def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
+def test_run_job_app_server_is_non_authoritative_shadow_and_cli_owns_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     events: list[str] = []
-    _configure_launcher(monkeypatch, tmp_path, events)
+    db_path = _configure_launcher(monkeypatch, tmp_path, events)
     monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
     monkeypatch.setenv("APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED", "1")
 
@@ -421,7 +425,7 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
             self.transport = SimpleNamespace(process=SimpleNamespace(pid=4002))
             self.requests: list[tuple[str, RuntimeCellRequest]] = []
             self.thread_config: dict[str, object] = {}
-            self.terminal_status = "completed"
+            self.terminal_status = "failed"
 
         def health(self) -> RuntimeAdapterHealth:
             return RuntimeAdapterHealth(
@@ -443,8 +447,8 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
                     {
                         "schema_version": "future-compatible",
                         "run_id": request.run_id,
-                        "status": "ready_to_submit",
-                        "summary": "Synthetic App Server result",
+                        "status": "applied",
+                        "summary": "Conflicting shadow result must be ignored",
                         "observations": _ready_answer_mapping_observations(),
                     }
                 ),
@@ -470,7 +474,7 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
                             "type": "item.completed",
                             "item": {
                                 "type": "agent_message",
-                                "text": "RESULT:READY_TO_SUBMIT",
+                                "text": "RESULT:APPLIED",
                             },
                         },
                         {
@@ -544,25 +548,12 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
         submission_phase="prepare",
         resume_existing_page=True,
     )
-    adapter.terminal_status = "failed"
-    failed_status, _ = launcher.run_job(
-        job,
-        port=9432,
-        worker_id=0,
-        model="model",
-        agent_backend="codex",
-        submission_phase="prepare",
-        resume_existing_page=True,
-    )
-
     assert (first_status, second_status) == ("ready_to_submit", "ready_to_submit")
-    assert failed_status == "failed:app_server_turn_failed"
-    assert [kind for kind, _request in adapter.requests] == ["start", "resume", "resume"]
-    assert adapter.requests[1][1].parent_provider_session_id == "provider-thread-1"
+    assert [kind for kind, _request in adapter.requests] == ["start"]
     assert all(job["url"] not in request.prompt for _kind, request in adapter.requests)
     assert all(str(tmp_path) not in request.prompt for _kind, request in adapter.requests)
     assert all("APPLICATION_PLAN_DELTA_V1" in request.prompt for _kind, request in adapter.requests)
-    assert set(adapter.thread_config["mcp_servers"]) == {"playwright"}
+    assert adapter.thread_config["mcp_servers"] == {}
     serialized_config = json.dumps(adapter.thread_config)
     assert str(tmp_path) not in serialized_config
     assert "mailbox" not in serialized_config
@@ -570,6 +561,13 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
     assert "applypilot_control" not in serialized_config
     assert "applypilot_ats" not in serialized_config
     assert job["_runtime_cell"]["active_backend"] == "codex-app-server"
+    assert job["_runtime_cell"]["authoritative_backend"] == "codex-cli"
+    assert job["_runtime_cell"]["shadow_will_run"] is False
+    assert job["_runtime_cell"]["shadow_replay_blocked"] is True
+    assert events.count("popen") == 2
+    assert _durable_turn(db_path, "attempt-runtime-cell-app-server")[
+        "runtime_backend"
+    ] == "codex-cli"
 
 
 def test_run_job_keeps_direct_email_on_cli_mailbox_route_when_app_server_enabled(
