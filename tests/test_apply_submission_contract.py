@@ -14,6 +14,7 @@ from applypilot.apply import authorization, launcher
 from applypilot.apply.performance_attribution import (
     attribution_snapshot,
     bind_attempt_route,
+    safe_route_binding_snapshot,
     safe_record_job_span,
 )
 from applypilot.cli import (
@@ -1104,12 +1105,6 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
     attempt_id = start_application_attempt(
         "https://acme.myworkdayjobs.com/job/123", "worker-1", conn=conn
     )
-    assert finalize_application_attempt(
-        attempt_id,
-        "applied",
-        evidence={"receipt": {"confirmed": True}},
-        conn=conn,
-    )
     attribution_job = {
         "application_url": "https://acme.myworkdayjobs.com/job/123",
     }
@@ -1125,6 +1120,17 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
     safe_record_job_span(attribution_job, "audit.pre_submit", 20)
     attribution = attribution_snapshot(attribution_job)
     assert attribution is not None
+    route = safe_route_binding_snapshot(attribution_job)
+    assert route is not None
+    assert finalize_application_attempt(
+        attempt_id,
+        "applied",
+        evidence={
+            "receipt": {"confirmed": True},
+            "orchestration_performance": {"attribution_route": route},
+        },
+        conn=conn,
+    )
 
     recorded = record_application_attempt_performance(
         attempt_id,

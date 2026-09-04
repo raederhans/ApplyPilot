@@ -5672,13 +5672,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     "model.first_tool_decision",
                                     (first_tool_at - process_spawned_at) * 1000,
                                 )
-                            if first_mcp_ready_at is None and item_type == "mcp_tool_call":
-                                first_mcp_ready_at = now_tool
-                                performance_attribution_mod.safe_record(
-                                    performance_trace,
-                                    "mcp.first_tool_request",
-                                    (first_mcp_ready_at - process_spawned_at) * 1000,
-                                )
                             last_tool_at = now_tool
                             tool_key = record_tool_call(
                                 item.get("id"), f"{server}:{tool}"

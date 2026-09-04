@@ -890,17 +890,25 @@ def record_attempt_performance(
     ).fetchone()
     if row is None:
         return False
-    attribution = attribution_for_attempt(
-        performance.get("attribution"), worker_id=row[1], job_url=row[2]
-    )
-    if attribution is not None:
-        bounded["attribution"] = attribution
     try:
         existing = json.loads(row[0]) if row[0] else {}
     except (TypeError, json.JSONDecodeError):
         existing = {}
     if not isinstance(existing, dict):
         existing = {}
+    stored_performance = existing.get("orchestration_performance")
+    stored_route = (
+        stored_performance.get("attribution_route")
+        if isinstance(stored_performance, dict)
+        else None
+    )
+    attribution = attribution_for_attempt(performance.get("attribution"), worker_id=row[1])
+    if (
+        attribution is not None
+        and isinstance(stored_route, dict)
+        and stored_route == attribution.get("dimensions")
+    ):
+        bounded["attribution"] = attribution
     existing["orchestration_performance"] = bounded
     cursor = connection.execute(
         "UPDATE application_attempts SET evidence_json=?, updated_at=? "

@@ -161,6 +161,5 @@ def test_attempt_route_mismatch_is_rejected_even_when_shape_is_valid() -> None:
 
     assert attribution_mod.attribution_for_attempt(
         snapshot,
-        worker_id="worker-1",
-        job_url="https://jane-doe.example.test/apply",
+        worker_id="worker-9",
     ) is None

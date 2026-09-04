@@ -226,6 +226,14 @@ def safe_attribution_snapshot(job: Mapping[str, object]) -> dict[str, object] | 
         return None
 
 
+def safe_route_binding_snapshot(job: Mapping[str, object]) -> dict[str, int | str] | None:
+    try:
+        dimensions = _route_dimensions(job)
+        return None if "unavailable" in dimensions.values() else dimensions
+    except Exception:  # noqa: BLE001 - telemetry must never affect authority
+        return None
+
+
 def normalize_attribution(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping) or value.get("schema_version") != SCHEMA_VERSION:
         return None
@@ -297,19 +305,13 @@ def safe_normalize_attribution(value: object) -> dict[str, object] | None:
         return None
 
 
-def attribution_for_attempt(value: object, *, worker_id: object, job_url: object) -> dict[str, object] | None:
+def attribution_for_attempt(value: object, *, worker_id: object) -> dict[str, object] | None:
     normalized = safe_normalize_attribution(value)
     if normalized is None:
         return None
-    provider = provider_for_url(job_url, "detection")
-    hostname = _safe_hostname(urlparse(str(job_url or "")).hostname or "")
     dimensions = normalized["dimensions"]
     if (
-        provider is None
-        or hostname is None
-        or dimensions.get("provider") != provider
-        or dimensions.get("domain") != hostname
-        or dimensions.get("worker_id") != worker_id
+        dimensions.get("worker_id") != worker_id
     ):
         return None
     return normalized

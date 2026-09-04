@@ -719,6 +719,9 @@ def _worker_loop_with_port(
             attribution = performance_attribution_mod.safe_attribution_snapshot(current_job)
             if attribution is not None:
                 snapshot["attribution"] = attribution
+            route_binding = performance_attribution_mod.safe_route_binding_snapshot(current_job)
+            if route_binding is not None:
+                snapshot["attribution_route"] = route_binding
             return snapshot
 
         def attach_performance(
