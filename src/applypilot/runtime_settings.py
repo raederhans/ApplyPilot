@@ -57,6 +57,20 @@ class ApplyRuntimeSettings:
         return self.environ.get("APPLYPILOT_CLAUDE_MODEL", "opus")
 
     @property
+    def codex_app_server_enabled(self) -> bool:
+        """Return the explicit App Server feature flag, defaulting off."""
+        raw = self.environ.get(
+            "APPLYPILOT_CODEX_APP_SERVER_ENABLED", "0"
+        ).strip().casefold()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off", ""}:
+            return False
+        raise ValueError(
+            "APPLYPILOT_CODEX_APP_SERVER_ENABLED must be a boolean flag"
+        )
+
+    @property
     def agent_timeout_seconds(self) -> int:
         return int(self.environ.get("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "300"))
 

@@ -18,6 +18,7 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.resolve_browser_backend() == "edge"
     assert settings.resolve_interaction_mode() == "auto"
     assert settings.resolve_model("codex") == "gpt-5.6-sol"
+    assert settings.codex_app_server_enabled is False
     assert settings.agent_timeout_seconds == 300
     assert settings.application_lease_minutes == 45
 
@@ -31,6 +32,22 @@ def test_runtime_settings_are_snapshotted_per_command() -> None:
     assert first.agent_timeout_seconds == 300
     assert second.agent_timeout_seconds == 3600
     assert second.application_lease_minutes == 62
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_runtime_settings_enable_codex_app_server_only_explicitly(value: str) -> None:
+    settings = load_runtime_settings({"APPLYPILOT_CODEX_APP_SERVER_ENABLED": value})
+
+    assert settings.codex_app_server_enabled is True
+
+
+def test_runtime_settings_reject_invalid_codex_app_server_flag() -> None:
+    settings = load_runtime_settings(
+        {"APPLYPILOT_CODEX_APP_SERVER_ENABLED": "sometimes"}
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean flag"):
+        _ = settings.codex_app_server_enabled
 
 
 def test_runtime_settings_keep_backend_and_browser_validation_contracts() -> None:

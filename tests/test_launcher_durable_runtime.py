@@ -335,6 +335,45 @@ def test_run_job_durable_launch_attaches_before_prompt_and_advisory_start(
     )
 
 
+def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    db_path = _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+    job = _job("attempt-runtime-cell-fallback")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert job["_runtime_cell"] == {
+        "schema_version": "1",
+        "status": "degraded",
+        "requested_backend": "codex-app-server",
+        "active_backend": "codex-cli",
+        "reason_code": "CODEX_APP_SERVER_ADAPTER_UNAVAILABLE",
+        "feature_enabled": True,
+        "fallback_used": True,
+        "missing_capabilities": [
+            "initialize",
+            "thread/resume",
+            "thread/start",
+            "turn/interrupt",
+            "turn/start",
+        ],
+    }
+    turn = _durable_turn(db_path, "attempt-runtime-cell-fallback")
+    assert turn["runtime_backend"] == "codex-cli"
+    assert events[:5] == ["reserve", "popen", "attach", "prompt", "advisory_started"]
+
+
 def test_checkpoint_write_failure_keeps_durable_turn_unknown_and_no_parent_continuation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

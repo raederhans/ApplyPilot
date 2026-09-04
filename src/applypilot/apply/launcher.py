@@ -52,6 +52,7 @@ from applypilot.apply import prepared_state as prepared_state_mod
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import receipt_observer as receipt_observer_mod
 from applypilot.apply import resume_authorization as resume_authorization_mod
+from applypilot.apply import runtime_cell as runtime_cell_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
@@ -4784,6 +4785,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ),
         )
     profile = config.load_profile()
+    runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
+        agent_backend,
+        codex_app_server_enabled=runtime_settings.codex_app_server_enabled,
+    )
+    # This slice defines and consumes the host-selection seam, while the only
+    # installed production executor remains the existing CLI subprocess.  A
+    # future App Server transport must inject a concrete adapter and execute
+    # through RuntimeCellAdapter before it can become active here.
+    if runtime_cell_selection.adapter is not None:
+        raise RuntimeError("Codex App Server execution adapter is not installed")
+    runtime_backend = runtime_cell_selection.active_backend
+    job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
     authentication = profile.get("authentication", {})
     credential_relay_authorized = _credential_relay_allowed(profile, job)
     identity_relay_authorized = _identity_relay_allowed(profile, job)
@@ -4929,7 +4942,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         application_supervisor.context_bundle(
             namespace=runtime_namespace,
             phase=submission_phase,
-            runtime_backend=f"{agent_backend}-cli",
+            runtime_backend=runtime_backend,
         )
         if application_supervisor is not None
         else None
@@ -4989,6 +5002,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     runtime_metadata: dict = {}
+    runtime_metadata["runtime_cell"] = runtime_cell_selection.health.as_dict()
     runtime_metadata["browser_broker"] = {
         "schema_version": "1",
         "profile_id": browser_lease_bundle.profile.resource_id,
@@ -5429,7 +5443,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         )
         durable_intent = DurableLaunchIntent(
             spec=launch_spec,
-            runtime_backend=f"{agent_backend}-cli",
+            runtime_backend=runtime_backend,
             resume_mode="resume" if runtime_parent_turn_id else "root",
             checkpoint_id=runtime_parent_checkpoint_id,
             model=model,
