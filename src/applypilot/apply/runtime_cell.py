@@ -6,8 +6,10 @@ remain launcher/domain concerns and are deliberately absent from this module.
 
 The Codex App Server seam is intentionally transport-neutral.  A concrete
 adapter may use stdio, a local socket, or another supported transport, but it
-must prove the minimum lifecycle surface before the cell can select it.  Until
-such an adapter is installed, the established CLI subprocess remains active.
+must prove the minimum lifecycle surface before the cell can select it.  The
+stdio implementation lives in :mod:`applypilot.apply.codex_app_server`; the
+established CLI subprocess remains the fallback while the feature flag is off
+or a pristine App Server health check fails.
 """
 
 from __future__ import annotations
@@ -184,7 +186,16 @@ class RuntimeCellAdapter(Protocol):
 
     def cancel(self, provider_turn_id: str) -> None: ...
 
+    def drain(
+        self,
+        provider_turn_id: str | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[Mapping[str, object], ...]: ...
+
     def close_application(self, provider_session_id: str) -> None: ...
+
+    def shutdown(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
