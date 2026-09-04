@@ -35,4 +35,3 @@ Turn the existing shadow/default-off runtime components into a measured online c
 - Increasing worker count without a fresh production admission receipt.
 - Weakening CAPTCHA, assessment, identity/financial document, unsupported declaration, SubmissionGate, or uncertain-receipt stops.
 - Pushing, deploying, or making a real ATS submission without a later explicit closeout decision.
-
