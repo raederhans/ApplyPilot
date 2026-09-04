@@ -139,6 +139,28 @@ def test_runtime_cell_migration_is_idempotent_and_newer_schema_fails_closed(
         runtime_cells.ensure_schema(connection)
 
 
+def test_runtime_cell_schema_version_matches_fresh_and_upgrade_databases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fresh = _connection(tmp_path / "fresh-schema-contract.sqlite3")
+    assert (
+        runtime_cells.RUNTIME_CELL_SCHEMA_VERSION
+        == len(runtime_cells._MIGRATIONS)
+        == runtime_cells.ensure_schema(fresh)
+    )
+
+    upgrade = _connection(tmp_path / "upgrade-schema-contract.sqlite3")
+    migrations = runtime_cells._MIGRATIONS
+    monkeypatch.setattr(runtime_cells, "_MIGRATIONS", (runtime_cells._migration_v1,))
+    assert runtime_cells.ensure_schema(upgrade) == 1
+    monkeypatch.setattr(runtime_cells, "_MIGRATIONS", migrations)
+    assert (
+        runtime_cells.RUNTIME_CELL_SCHEMA_VERSION
+        == len(runtime_cells._MIGRATIONS)
+        == runtime_cells.ensure_schema(upgrade)
+    )
+
+
 def test_v1_terminal_duplicate_process_identities_migrate_without_history_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

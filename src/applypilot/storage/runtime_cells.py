@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-RUNTIME_CELL_SCHEMA_VERSION = 1
+RUNTIME_CELL_SCHEMA_VERSION = 2
 _CELL_ACTIVE = {"active", "suspect", "draining"}
 _LEASE_ACTIVE = {"open", "suspect", "draining"}
 
