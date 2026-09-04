@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from applypilot.apply.semantic_batch import (
+    DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY,
     ApplicationRecipe,
     BatchPageBinding,
     BatchSemanticAuthorityIssuer,
@@ -19,6 +20,8 @@ from applypilot.apply.semantic_batch import (
     BrowserContextRegistry,
     BrowserResourceIdentity,
     ProviderSemanticPatchAdapter,
+    SemanticBatchAdapterRegistry,
+    SemanticBatchDenied,
     SemanticBatchExecutionError,
     SemanticPatch,
     SemanticPatchBatch,
@@ -89,7 +92,7 @@ class SemanticBatchRuntimeRequest:
             raise ValueError("semantic batch mode is invalid")
         if not self.attempt_id or not self.actor_id:
             raise ValueError("semantic batch runtime identity is incomplete")
-        if self.provider not in {"workday", "smartrecruiters"}:
+        if DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY.registration_for(self.provider) is None:
             raise ValueError("semantic batch provider is unsupported")
         if not self.adapter_version:
             raise ValueError("semantic batch adapter version is required")
@@ -312,6 +315,7 @@ def run_production_semantic_batch(
     request: SemanticBatchRuntimeRequest,
     *,
     adapter: ProductionSemanticPatchAdapter,
+    adapter_registry: SemanticBatchAdapterRegistry = DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY,
     connection: sqlite3.Connection,
     close_resources: Callable[[], None],
     advance_page: Callable[[int], int],
@@ -327,6 +331,15 @@ def run_production_semantic_batch(
             effect_count=0,
             legacy_fallback_safe=True,
             reason_code="feature_disabled",
+        )
+    try:
+        adapter_registry.require_execution(request.provider, request.adapter_version)
+    except SemanticBatchDenied:
+        return _result(
+            request,
+            "not_applicable",
+            safe=True,
+            reason="provider_capability_disabled",
         )
     batch = _batch(request)
     claims = _claims(request)

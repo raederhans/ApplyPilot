@@ -17,7 +17,7 @@ import re
 import secrets
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -91,6 +91,94 @@ _FORBIDDEN_SEMANTIC_TOKENS = frozenset(
     }
 )
 _CLASSIFICATIONS = frozenset({"routine", "sensitive", "navigation", "frame", "final_submit"})
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticBatchAdapterRegistration:
+    """One provider/version admission record for the M4 execution boundary."""
+
+    provider: str
+    adapter_versions: tuple[str, ...] = ()
+    execution_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        provider = str(self.provider or "").strip().casefold()
+        if not provider:
+            raise ValueError("provider is required")
+        versions = tuple(str(item or "").strip() for item in self.adapter_versions)
+        if any(not item for item in versions):
+            raise ValueError("adapter_version is required")
+        if len(versions) != len(set(versions)):
+            raise ValueError("semantic batch adapter versions must be unique")
+        if not isinstance(self.execution_enabled, bool):
+            raise TypeError("execution_enabled must be a boolean")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "adapter_versions", versions)
+
+    def admits(self, adapter_version: object) -> bool:
+        version = str(adapter_version or "").strip()
+        return bool(
+            self.execution_enabled
+            and version
+            and (not self.adapter_versions or version in self.adapter_versions)
+        )
+
+
+class SemanticBatchAdapterRegistry:
+    """Injectable, provider-scoped registry; disabled entries always fail closed."""
+
+    def __init__(self, registrations: Iterable[SemanticBatchAdapterRegistration] = ()) -> None:
+        self._items: dict[str, SemanticBatchAdapterRegistration] = {}
+        for registration in registrations:
+            self.register(registration)
+
+    def register(
+        self,
+        registration: SemanticBatchAdapterRegistration,
+        *,
+        replace_existing: bool = False,
+    ) -> None:
+        if not isinstance(registration, SemanticBatchAdapterRegistration):
+            raise TypeError("registration must be a SemanticBatchAdapterRegistration")
+        if registration.provider in self._items and not replace_existing:
+            raise ValueError(f"semantic batch adapter already registered: {registration.provider}")
+        self._items[registration.provider] = registration
+
+    def registration_for(self, provider: object) -> SemanticBatchAdapterRegistration | None:
+        return self._items.get(str(provider or "").casefold().strip())
+
+    def supports_execution(self, provider: object, adapter_version: object) -> bool:
+        registration = self.registration_for(provider)
+        return bool(registration and registration.admits(adapter_version))
+
+    def require_execution(self, provider: object, adapter_version: object) -> None:
+        if not self.supports_execution(provider, adapter_version):
+            raise SemanticBatchDenied("provider adapter capability is disabled or version-mismatched")
+
+    def providers(self) -> tuple[str, ...]:
+        return tuple(self._items)
+
+
+DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY = SemanticBatchAdapterRegistry(
+    (
+        SemanticBatchAdapterRegistration("workday", execution_enabled=True),
+        SemanticBatchAdapterRegistration("smartrecruiters", execution_enabled=True),
+        # These M6 structural adapters have no verified production DOM identity
+        # evidence yet. Registration is explicit, but browser writes stay off.
+        SemanticBatchAdapterRegistration(
+            "greenhouse",
+            ("greenhouse-semantic-recipe/v1",),
+        ),
+        SemanticBatchAdapterRegistration(
+            "lever",
+            ("lever-semantic-recipe/v1",),
+        ),
+        SemanticBatchAdapterRegistration(
+            "ashby",
+            ("ashby-semantic-recipe/v1",),
+        ),
+    )
+)
 
 
 def _required(value: object, name: str) -> str:
@@ -722,6 +810,7 @@ class SemanticPatchBatchRunner:
 
 
 __all__ = [
+    "DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY",
     "ApplicationRecipe",
     "BatchControlDescriptor",
     "BatchPageBinding",
@@ -735,6 +824,8 @@ __all__ = [
     "BrowserResourceIdentity",
     "ProviderAdapter",
     "ProviderSemanticPatchAdapter",
+    "SemanticBatchAdapterRegistration",
+    "SemanticBatchAdapterRegistry",
     "SemanticBatchDenied",
     "SemanticBatchExecutionError",
     "SemanticPatch",
