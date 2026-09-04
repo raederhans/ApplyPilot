@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from applypilot.apply.provider_registry import provider_matches_host
 from applypilot.apply.semantic_batch import normalize_field_semantic
 
 RECIPE_CACHE_SCHEMA_VERSION = "provider-recipe-cache/v1"
@@ -43,8 +44,12 @@ _PROVIDER_DOMAINS = {
     "greenhouse": frozenset({"boards.greenhouse.io", "job-boards.greenhouse.io"}),
     "lever": frozenset({"jobs.lever.co", "jobs.eu.lever.co"}),
     "ashby": frozenset({"jobs.ashbyhq.com"}),
+    "smartrecruiters": frozenset({"jobs.smartrecruiters.com"}),
+    "workday": frozenset({"myworkdayjobs.com", "myworkdaysite.com"}),
 }
-_ADAPTER_VERSION_RE = re.compile(r"^(greenhouse|lever|ashby)-semantic-recipe/v[1-9][0-9]*$")
+_ADAPTER_VERSION_RE = re.compile(
+    r"^(greenhouse|lever|ashby|smartrecruiters|workday)-semantic-recipe/v[1-9][0-9]*$"
+)
 _ALLOWED_PAYLOAD_KEYS = frozenset(
     {
         "adapter_version",
@@ -162,11 +167,10 @@ class RecipeCacheKey:
         provider = _required(self.provider, "provider").casefold()
         domain = _domain(self.domain)
         adapter_version = _required(self.adapter_version, "adapter_version")
-        domains = _PROVIDER_DOMAINS.get(provider)
         version_match = _ADAPTER_VERSION_RE.fullmatch(adapter_version)
         if (
-            domains is None
-            or domain not in domains
+            provider not in _PROVIDER_DOMAINS
+            or not provider_matches_host(provider, domain, "detection")
             or version_match is None
             or version_match.group(1) != provider
         ):
@@ -464,7 +468,7 @@ def payload_is_value_free(payload: Mapping[str, object]) -> bool:
         "final_submit",
     }
 
-    def walk(value: object) -> bool:
+    def walk(value: object, *, parent_key: str | None = None) -> bool:
         if isinstance(value, Mapping):
             for key, nested in value.items():
                 normalized = str(key).casefold()
@@ -474,14 +478,22 @@ def payload_is_value_free(payload: Mapping[str, object]) -> bool:
                     or any(normalized.startswith(f"{item}_") for item in forbidden)
                 ):
                     return False
-                if not walk(nested):
+                if not walk(nested, parent_key=normalized):
                     return False
         elif isinstance(value, (list, tuple)):
-            return all(walk(item) for item in value)
+            return all(walk(item, parent_key=parent_key) for item in value)
         elif isinstance(value, str):
             return value in _SAFE_PLAINTEXT_VALUES or (
                 len(value) == 64 and all(char in "0123456789abcdef" for char in value)
-            ) or _ADAPTER_VERSION_RE.fullmatch(value) is not None
+            ) or _ADAPTER_VERSION_RE.fullmatch(value) is not None or (
+                parent_key == "domain"
+                and "." in value
+                and all(char.isalnum() or char in {"-", "."} for char in value)
+                and any(
+                    provider_matches_host(provider, value, "detection")
+                    for provider in _PROVIDER_DOMAINS
+                )
+            )
         elif not isinstance(value, (bool, int)):
             return False
         return True

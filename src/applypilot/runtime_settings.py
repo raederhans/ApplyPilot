@@ -7,6 +7,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_PROVIDER_RECIPE_SHADOW_PROVIDERS = frozenset(
+    {"greenhouse", "smartrecruiters", "workday"}
+)
+
 
 @dataclass(frozen=True)
 class ApplyRuntimeSettings:
@@ -115,6 +119,30 @@ class ApplyRuntimeSettings:
                 "APPLYPILOT_SEMANTIC_BATCH_MODE must be off, shadow, or canary"
             )
         return mode
+
+    @property
+    def provider_recipe_shadow_providers(self) -> tuple[str, ...]:
+        """Return independently admitted providers for read-only recipe shadowing."""
+
+        raw = self.environ.get("APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS", "")
+        if not raw.strip():
+            return ()
+        providers = tuple(item.strip().casefold() for item in raw.split(","))
+        if any(not item for item in providers):
+            raise ValueError(
+                "APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS must be a comma-separated provider list"
+            )
+        if len(providers) != len(set(providers)):
+            raise ValueError(
+                "APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS must not contain duplicates"
+            )
+        unknown = set(providers) - _PROVIDER_RECIPE_SHADOW_PROVIDERS
+        if unknown:
+            raise ValueError(
+                "APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS supports only "
+                "greenhouse, smartrecruiters, and workday"
+            )
+        return providers
 
     @property
     def application_plan_shadow_enabled(self) -> bool:

@@ -12,6 +12,7 @@ from applypilot.apply.ats import default_ats_registry
 from applypilot.apply.provider_semantic_adapters import (
     ProviderControlStructure,
     ProviderPageRecipeObservation,
+    default_provider_recipe_shadow_registry,
     default_provider_semantic_recipe_registry,
 )
 from applypilot.apply.recipe_cache import (
@@ -296,6 +297,13 @@ def test_recursive_value_free_guard_rejects_urls_tokens_email_paths_and_unknown_
     assert payload_is_value_free(payload) is False
 
 
+def test_value_free_guard_allows_dynamic_workday_host_only_in_domain_field() -> None:
+    host = "acme.wd5.myworkdayjobs.com"
+
+    assert payload_is_value_free({"domain": host}) is True
+    assert payload_is_value_free({"semantic": host}) is False
+
+
 def test_caller_sha_fingerprints_are_rekeyed_with_process_private_hmac() -> None:
     registry = default_provider_semantic_recipe_registry()
     raw_locator = canonical_digest("email-locator")
@@ -541,3 +549,82 @@ def test_non_greenhouse_cross_origin_frames_are_rejected() -> None:
 
     with pytest.raises(SemanticBatchDenied, match="framed"):
         registry.normalize(observation)
+
+
+@pytest.mark.parametrize(
+    ("provider", "url"),
+    [
+        (
+            "workday",
+            "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/Singapore/Engineer_R123/apply",
+        ),
+        (
+            "smartrecruiters",
+            "https://jobs.smartrecruiters.com/Acme/744000012345678-engineer",
+        ),
+    ],
+)
+def test_shadow_registry_normalizes_workday_and_smartrecruiters_without_execution(
+    provider: str,
+    url: str,
+) -> None:
+    registry = default_provider_recipe_shadow_registry()
+
+    recipe = registry.normalize(_observation(provider, url))
+
+    assert recipe.key.provider == provider
+    assert recipe.synthetic_only is True
+    assert recipe.operations == ("set_text",)
+    assert registry.get(provider).m4_execution_enabled is False  # type: ignore[union-attr]
+    assert payload_is_value_free(recipe.as_dict())
+    with pytest.raises(SemanticBatchDenied, match="shadow-only"):
+        registry.require_m4_execution(provider, recipe.key.adapter_version)
+
+
+@pytest.mark.parametrize(
+    ("provider", "url", "lookalike"),
+    [
+        (
+            "workday",
+            "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/Engineer_R123",
+            "https://acme.wd5.myworkdayjobs.com.evil.example/en-US/jobs/job/Engineer_R123",
+        ),
+        (
+            "smartrecruiters",
+            "https://jobs.smartrecruiters.com/Acme/744000012345678-engineer",
+            "https://jobs.smartrecruiters.com.evil.example/Acme/744000012345678-engineer",
+        ),
+    ],
+)
+def test_shadow_provider_adapters_reject_lookalike_hosts_and_target_drift(
+    provider: str,
+    url: str,
+    lookalike: str,
+) -> None:
+    registry = default_provider_recipe_shadow_registry()
+    observation = _observation(provider, url)
+
+    with pytest.raises(SemanticBatchDenied, match="host is not exact"):
+        registry.normalize(replace(observation, application_target_url=lookalike))
+    with pytest.raises(SemanticBatchDenied, match="changed application target"):
+        registry.normalize(replace(observation, page_url=url + "-other"))
+
+
+@pytest.mark.parametrize("provider", ["workday", "smartrecruiters"])
+def test_shadow_provider_adapters_keep_frames_fail_closed(provider: str) -> None:
+    url = (
+        "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/Engineer_R123"
+        if provider == "workday"
+        else "https://jobs.smartrecruiters.com/Acme/744000012345678-engineer"
+    )
+    registry = default_provider_recipe_shadow_registry()
+
+    with pytest.raises(SemanticBatchDenied, match="framed"):
+        registry.normalize(
+            _observation(
+                provider,
+                url,
+                frame_path=(0,),
+                frame_url="https://forms.example.test/apply",
+            )
+        )

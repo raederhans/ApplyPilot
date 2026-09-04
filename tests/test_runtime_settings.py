@@ -42,6 +42,7 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.codex_app_server_mode == "off"
     assert settings.codex_app_server_enabled is False
     assert settings.semantic_batch_mode == "off"
+    assert settings.provider_recipe_shadow_providers == ()
     assert settings.application_plan_shadow_enabled is False
     assert settings.agent_timeout_seconds == 300
     assert settings.application_lease_minutes == 45
@@ -112,6 +113,41 @@ def test_runtime_settings_reject_invalid_semantic_batch_mode() -> None:
 
     with pytest.raises(ValueError, match="must be off, shadow, or canary"):
         _ = settings.semantic_batch_mode
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("greenhouse", ("greenhouse",)),
+        ("WORKDAY", ("workday",)),
+        ("smartrecruiters", ("smartrecruiters",)),
+        (
+            "greenhouse, workday, smartrecruiters",
+            ("greenhouse", "workday", "smartrecruiters"),
+        ),
+    ],
+)
+def test_runtime_settings_admit_provider_recipe_shadow_independently(
+    value: str,
+    expected: tuple[str, ...],
+) -> None:
+    settings = load_runtime_settings(
+        {"APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS": value}
+    )
+
+    assert settings.provider_recipe_shadow_providers == expected
+
+
+@pytest.mark.parametrize("value", ["lever", "workday,workday", "greenhouse,"])
+def test_runtime_settings_reject_unsafe_provider_recipe_shadow_lists(value: str) -> None:
+    settings = load_runtime_settings(
+        {"APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS": value}
+    )
+
+    with pytest.raises(
+        ValueError, match="APPLYPILOT_PROVIDER_RECIPE_SHADOW_PROVIDERS"
+    ):
+        _ = settings.provider_recipe_shadow_providers
 
 
 @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])

@@ -22,6 +22,7 @@ from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.answer_provenance import audit_pre_submit_answer_provenance
 from applypilot.apply.identity_materials import classify_identity_requirement
 from applypilot.apply.prepared_state import current_prepared_observations
+from applypilot.apply.provider_recipe_shadow import observe_prepare_recipe_shadow
 from applypilot.apply.specialists import (
     ATS_FORM_SNAPSHOT_SCHEMA_VERSION,
     freeze_ats_fill_plan_snapshot,
@@ -35,6 +36,7 @@ from applypilot.apply.workday_state import (
     evaluate_page_progress,
     observation_from_mapping,
 )
+from applypilot.runtime_settings import load_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1890,6 +1892,33 @@ def _audit_live_pre_submit_page(
         _redact_protected_identifier_snapshot(snapshot)
         snapshot["document_url"] = snapshot.get("url", "")
         snapshot["url"] = page.url
+        try:
+            provider_recipe_shadow = observe_prepare_recipe_shadow(
+                job=job,
+                page_url=page.url,
+                surface_url=str(snapshot.get("document_url") or ""),
+                surface_is_main_frame=application_surface == page.main_frame,
+                snapshot=snapshot,
+                enabled_providers=(
+                    load_runtime_settings().provider_recipe_shadow_providers
+                ),
+            ).as_dict()
+        except (TypeError, ValueError):
+            provider_recipe_shadow = {
+                "schema_version": "provider-recipe-shadow/v1",
+                "provider": None,
+                "outcome": "denied",
+                "admission_enabled": False,
+                "cache_hit": False,
+                "agent_fallback_required": True,
+                "reason_code": "invalid_shadow_configuration",
+                "duration_ms": 0.0,
+                "routine_control_count": 0,
+                "browser_write_authority": False,
+                "file_upload_authority": False,
+                "submit_authority": False,
+                "throughput_admission_evidence": False,
+            }
         issues = _validate_pre_submit_snapshot(snapshot, profile, job)
         coverage_error = stateful_control_coverage_error(snapshot)
         if coverage_error is not None:
@@ -1942,6 +1971,7 @@ def _audit_live_pre_submit_page(
                 snapshot.get("sensitive_required_unknown", [])
             ),
             "ats_adapter_context": ats_context,
+            "provider_recipe_shadow": provider_recipe_shadow,
             **({"workday_state": workday_context} if workday_context else {}),
         }
         ordinary_dynamic_repair = any(

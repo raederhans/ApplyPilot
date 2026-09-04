@@ -1,4 +1,4 @@
-"""Synthetic-only Greenhouse, Lever, and Ashby recipe normalizers.
+"""Synthetic-only provider recipe normalizers.
 
 These adapters normalize already-observed, value-free DOM structure for the M4
 semantic-batch recipe boundary. They intentionally provide no locator, browser,
@@ -30,12 +30,16 @@ from applypilot.apply.semantic_batch import (
     normalize_field_semantic,
 )
 
-ProviderName = Literal["greenhouse", "lever", "ashby"]
+ProviderName = Literal[
+    "greenhouse", "lever", "ashby", "smartrecruiters", "workday"
+]
 RoutineKind = Literal["text", "native_select"]
 
 GREENHOUSE_ADAPTER_VERSION = "greenhouse-semantic-recipe/v1"
 LEVER_ADAPTER_VERSION = "lever-semantic-recipe/v1"
 ASHBY_ADAPTER_VERSION = "ashby-semantic-recipe/v1"
+SMARTRECRUITERS_ADAPTER_VERSION = "smartrecruiters-semantic-recipe/v1"
+WORKDAY_ADAPTER_VERSION = "workday-semantic-recipe/v1"
 
 _ROUTINE_SEMANTICS = frozenset(
     {
@@ -58,6 +62,7 @@ _FORBIDDEN_MARKERS = frozenset(
         "direct_email",
         "eeo",
         "final_submit",
+        "file_upload",
         "financial",
         "identity",
         "legal",
@@ -174,7 +179,13 @@ class ProviderPageRecipeObservation:
     control_schema_version: str = "1"
 
     def __post_init__(self) -> None:
-        if self.provider not in {"greenhouse", "lever", "ashby"}:
+        if self.provider not in {
+            "greenhouse",
+            "lever",
+            "ashby",
+            "smartrecruiters",
+            "workday",
+        }:
             raise ValueError("provider recipe observation is unsupported")
         object.__setattr__(
             self,
@@ -357,6 +368,14 @@ class ProviderSemanticRecipeAdapter:
         )
 
 
+class ShadowOnlyProviderSemanticRecipeAdapter(ProviderSemanticRecipeAdapter):
+    """Structural normalizer that explicitly refuses M4 execution admission."""
+
+    @property
+    def m4_execution_enabled(self) -> bool:
+        return False
+
+
 def _direct_target(
     provider: ProviderName,
     url: str,
@@ -446,11 +465,81 @@ class AshbySemanticRecipeAdapter(ProviderSemanticRecipeAdapter):
         return target
 
 
+def _opaque_direct_target(
+    provider: Literal["smartrecruiters", "workday"],
+    url: str,
+) -> _TargetIdentity:
+    """Bind dynamic-host providers to one exact, query-free application path."""
+
+    parsed = urlsplit(url)
+    domain = (parsed.hostname or "").casefold()
+    if not provider_matches_host(provider, domain, "detection"):
+        raise SemanticBatchDenied("provider application target host is not exact")
+    segments = _path_segments(url)
+    if segments and segments[-1].casefold() == "apply":
+        segments = segments[:-1]
+    if len(segments) < 2:
+        raise SemanticBatchDenied(
+            f"{provider} application target identity is unsupported"
+        )
+    canonical_path = "/" + "/".join(segments)
+    return _TargetIdentity(
+        domain=domain,
+        tenant=f"{domain}:{segments[0]}",
+        requisition=canonical_path,
+        canonical_target=urlunsplit(("https", domain, canonical_path, "", "")),
+    )
+
+
+class SmartRecruitersSemanticRecipeAdapter(ShadowOnlyProviderSemanticRecipeAdapter):
+    provider: ProviderName = "smartrecruiters"
+    adapter_version = SMARTRECRUITERS_ADAPTER_VERSION
+
+    def _target_identity(self, observation: ProviderPageRecipeObservation) -> _TargetIdentity:
+        if observation.frame_path or observation.frame_url not in {
+            None,
+            observation.page_url,
+        }:
+            raise SemanticBatchDenied(
+                "SmartRecruiters framed application targets are not admitted"
+            )
+        target = _opaque_direct_target("smartrecruiters", observation.application_target_url)
+        page = _opaque_direct_target("smartrecruiters", observation.page_url)
+        if page.canonical_target != target.canonical_target:
+            raise SemanticBatchDenied(
+                "SmartRecruiters live page changed application target"
+            )
+        return target
+
+
+class WorkdaySemanticRecipeAdapter(ShadowOnlyProviderSemanticRecipeAdapter):
+    provider: ProviderName = "workday"
+    adapter_version = WORKDAY_ADAPTER_VERSION
+
+    def _target_identity(self, observation: ProviderPageRecipeObservation) -> _TargetIdentity:
+        if observation.frame_path or observation.frame_url not in {
+            None,
+            observation.page_url,
+        }:
+            raise SemanticBatchDenied("Workday framed application targets are not admitted")
+        target = _opaque_direct_target("workday", observation.application_target_url)
+        page = _opaque_direct_target("workday", observation.page_url)
+        if page.canonical_target != target.canonical_target:
+            raise SemanticBatchDenied("Workday live page changed application target")
+        return target
+
+
 class ProviderSemanticRecipeRegistry:
     """Injectable provider recipe registry linked to M4 capability admission."""
 
-    def __init__(self, adapters: Iterable[ProviderSemanticRecipeAdapter] = ()) -> None:
+    def __init__(
+        self,
+        adapters: Iterable[ProviderSemanticRecipeAdapter] = (),
+        *,
+        execution_authority: bool = True,
+    ) -> None:
         self._items: dict[str, ProviderSemanticRecipeAdapter] = {}
+        self._execution_authority = execution_authority
         for adapter in adapters:
             self.register(adapter)
 
@@ -470,6 +559,8 @@ class ProviderSemanticRecipeRegistry:
         return adapter.normalize(observation)
 
     def require_m4_execution(self, provider: object, adapter_version: object) -> None:
+        if not self._execution_authority:
+            raise SemanticBatchDenied("provider recipe registry is shadow-only")
         DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY.require_execution(provider, adapter_version)
 
     def providers(self) -> tuple[str, ...]:
@@ -486,10 +577,25 @@ def default_provider_semantic_recipe_registry() -> ProviderSemanticRecipeRegistr
     )
 
 
+def default_provider_recipe_shadow_registry() -> ProviderSemanticRecipeRegistry:
+    """Return read-only normalizers; this registry grants no execution capability."""
+
+    return ProviderSemanticRecipeRegistry(
+        (
+            GreenhouseSemanticRecipeAdapter(),
+            SmartRecruitersSemanticRecipeAdapter(),
+            WorkdaySemanticRecipeAdapter(),
+        ),
+        execution_authority=False,
+    )
+
+
 __all__ = [
     "ASHBY_ADAPTER_VERSION",
     "GREENHOUSE_ADAPTER_VERSION",
     "LEVER_ADAPTER_VERSION",
+    "SMARTRECRUITERS_ADAPTER_VERSION",
+    "WORKDAY_ADAPTER_VERSION",
     "AshbySemanticRecipeAdapter",
     "GreenhouseSemanticRecipeAdapter",
     "LeverSemanticRecipeAdapter",
@@ -497,5 +603,9 @@ __all__ = [
     "ProviderPageRecipeObservation",
     "ProviderSemanticRecipeAdapter",
     "ProviderSemanticRecipeRegistry",
+    "ShadowOnlyProviderSemanticRecipeAdapter",
+    "SmartRecruitersSemanticRecipeAdapter",
+    "WorkdaySemanticRecipeAdapter",
+    "default_provider_recipe_shadow_registry",
     "default_provider_semantic_recipe_registry",
 ]
