@@ -1,10 +1,10 @@
-"""Fail-closed, provider-bound semantic patch batches.
+"""Foundation contracts for fail-closed, provider-bound semantic patch batches.
 
-This module is deliberately a small composition boundary.  It does not own a
-browser process, final submission, credentials, sensitive material, or a
-worker scheduler.  A caller may use it to bind a small set of routine form
-patches to one application context and an exact adapter recipe before handing
-the patches to a provider-specific browser driver.
+This module is intentionally not wired into the production worker. It owns
+only a narrow future composition boundary: a batch can call an adapter's
+routine-control capability after rechecking its exact page, frame, descriptor
+classification, and one-shot authority. It cannot navigate, enter a frame,
+handle credentials or sensitive fields, or submit an application.
 """
 
 from __future__ import annotations
@@ -12,26 +12,29 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 from applypilot.apply.provider_registry import provider_matches_host
 
 
 class SemanticBatchDenied(RuntimeError):
-    """A batch, authority, or context failed its fail-closed admission."""
+    """A batch, authority, adapter, or context failed a fail-closed check."""
 
 
 class BrowserContextTainted(SemanticBatchDenied):
-    """The application context observed a failed semantic operation."""
+    """The application context observed an unsafe or uncertain operation."""
 
 
 class SemanticBatchExecutionError(SemanticBatchDenied):
-    """A provider driver failed; its application context was drained."""
+    """A semantic batch stopped and terminally drained its context."""
 
 
 RecipeOperation = Literal[
@@ -40,50 +43,53 @@ RecipeOperation = Literal[
     "resolve_validation_errors",
     "upload_bound_artifact",
 ]
+ControlClassification = Literal["routine", "sensitive", "navigation", "frame", "final_submit"]
 
-_RECIPE_OPERATIONS: frozenset[str] = frozenset(
-    {
-        "observe_form",
-        "apply_semantic_patch",
-        "resolve_validation_errors",
-        "upload_bound_artifact",
-    }
+_RECIPE_OPERATIONS = frozenset(
+    {"observe_form", "apply_semantic_patch", "resolve_validation_errors", "upload_bound_artifact"}
 )
-_FORBIDDEN_SEMANTIC_TOKENS: frozenset[str] = frozenset(
+_ROUTINE_FIELD_SEMANTICS = frozenset(
+    {"city", "country", "email", "phone", "portfolio_url", "preferred_name", "postal_code", "state"}
+)
+_FORBIDDEN_SEMANTIC_TOKENS = frozenset(
     {
+        "authorization",
         "bank",
         "biometric",
-        "authorization",
+        "citizenship",
+        "code",
         "credential",
-        "credentials",
         "criminal",
-        "date_of_birth",
+        "date",
+        "declaration",
         "disability",
         "dob",
-        "driver_license",
         "ethnicity",
         "financial",
         "fin",
+        "frame",
         "gender",
         "identity",
         "immigration",
         "legal",
+        "navigate",
+        "navigation",
         "nric",
+        "otp",
         "passport",
         "password",
-        "pronoun",
         "payment",
+        "pronoun",
         "race",
-        "security_answer",
         "salary",
-        "social_security",
+        "security",
         "sponsorship",
-        "ssn",
+        "submit",
         "tax",
         "veteran",
-        "work_authorization",
     }
 )
+_CLASSIFICATIONS = frozenset({"routine", "sensitive", "navigation", "frame", "final_submit"})
 
 
 def _required(value: object, name: str) -> str:
@@ -101,6 +107,14 @@ def _hostname(value: object) -> str:
     return raw
 
 
+def _https_url(value: object, name: str) -> str:
+    url = _required(value, name)
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{name} must be an HTTPS URL without credentials")
+    return url
+
+
 def _sha256(value: object, name: str) -> str:
     text = _required(value, name).casefold()
     if len(text) != 64 or any(item not in "0123456789abcdef" for item in text):
@@ -108,22 +122,42 @@ def _sha256(value: object, name: str) -> str:
     return text
 
 
+def _page_epoch(value: object, name: str = "page_epoch") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _frame_path(value: object) -> tuple[int, ...]:
+    if not isinstance(value, tuple) or any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in value
+    ):
+        raise ValueError("frame_path must be a tuple of non-negative integers")
+    return value
+
+
+def _absolute_path(value: object, name: str) -> str:
+    return str(Path(_required(value, name)).expanduser().resolve(strict=False))
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
-def _recipe_key(recipe: ApplicationRecipe) -> tuple[str, str, str, str]:
-    return (
-        recipe.provider,
-        recipe.domain,
-        recipe.adapter_version,
-        recipe.page_signature,
-    )
+def normalize_field_semantic(value: object) -> str:
+    """Normalize whitespace, punctuation, and camelCase before policy checks."""
+
+    text = unicodedata.normalize("NFKC", _required(value, "field_semantic"))
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").casefold()
+    if not text:
+        raise ValueError("field_semantic is required")
+    return text
 
 
 @dataclass(frozen=True, slots=True)
 class ApplicationRecipe:
-    """A provider adapter's exact, non-submit recipe for one page signature."""
+    """One adapter version's exact, explicitly non-submit page recipe."""
 
     provider: str
     domain: str
@@ -134,8 +168,6 @@ class ApplicationRecipe:
     def __post_init__(self) -> None:
         provider = _required(self.provider, "provider").casefold()
         domain = _hostname(self.domain)
-        adapter_version = _required(self.adapter_version, "adapter_version")
-        page_signature = _sha256(self.page_signature, "page_signature")
         if not self.operations or len(set(self.operations)) != len(self.operations):
             raise ValueError("operations must be a non-empty unique sequence")
         if any(operation not in _RECIPE_OPERATIONS for operation in self.operations):
@@ -146,13 +178,13 @@ class ApplicationRecipe:
             raise ValueError("recipe domain is not admitted for its provider semantic capability")
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "domain", domain)
-        object.__setattr__(self, "adapter_version", adapter_version)
-        object.__setattr__(self, "page_signature", page_signature)
+        object.__setattr__(self, "adapter_version", _required(self.adapter_version, "adapter_version"))
+        object.__setattr__(self, "page_signature", _sha256(self.page_signature, "page_signature"))
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderAdapter:
-    """Versioned provider declaration containing only exact page recipes."""
+    """Versioned declaration of exact recipes; it has no browser capability."""
 
     provider: str
     version: str
@@ -163,26 +195,22 @@ class ProviderAdapter:
         version = _required(self.version, "version")
         if not self.recipes:
             raise ValueError("ProviderAdapter requires at least one recipe")
-        keys: set[tuple[str, str, str, str]] = set()
+        identities: set[tuple[str, str, str, str]] = set()
         for recipe in self.recipes:
             if recipe.provider != provider or recipe.adapter_version != version:
                 raise ValueError("adapter recipes must bind the adapter provider and version")
-            key = _recipe_key(recipe)
-            if key in keys:
-                raise ValueError("adapter recipes must be unique by provider/page identity")
-            keys.add(key)
+            identity = (recipe.provider, recipe.domain, recipe.adapter_version, recipe.page_signature)
+            if identity in identities:
+                raise ValueError("adapter recipes must be unique by exact page identity")
+            identities.add(identity)
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "version", version)
 
     def recipe_for(self, *, domain: str, page_signature: str) -> ApplicationRecipe:
-        """Return the one exact recipe, never a domain-wide fallback."""
-
-        requested_domain = _hostname(domain)
-        requested_signature = _sha256(page_signature, "page_signature")
         matches = tuple(
             recipe
             for recipe in self.recipes
-            if recipe.domain == requested_domain and recipe.page_signature == requested_signature
+            if recipe.domain == _hostname(domain) and recipe.page_signature == _sha256(page_signature, "page_signature")
         )
         if len(matches) != 1:
             raise SemanticBatchDenied("no exact application recipe is admitted")
@@ -191,23 +219,23 @@ class ProviderAdapter:
 
 @dataclass(frozen=True, slots=True)
 class SemanticPatch:
-    """One routine, non-sensitive value bound to a declared field semantic."""
+    """One allowlisted routine field. Unknown semantics fail closed."""
 
     field_semantic: str
     value: str
 
     def __post_init__(self) -> None:
-        semantic = _required(self.field_semantic, "field_semantic").casefold()
+        semantic = normalize_field_semantic(self.field_semantic)
         _required(self.value, "value")
-        tokens = frozenset(part for part in semantic.replace("-", "_").split("_") if part)
-        if tokens & _FORBIDDEN_SEMANTIC_TOKENS:
-            raise ValueError("sensitive or credential field semantics are not batchable")
+        tokens = frozenset(semantic.split("_"))
+        if tokens & _FORBIDDEN_SEMANTIC_TOKENS or semantic not in _ROUTINE_FIELD_SEMANTICS:
+            raise ValueError("sensitive, privileged, or unrecognized field semantic is not batchable")
         object.__setattr__(self, "field_semantic", semantic)
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticPatchBatch:
-    """An immutable, exact-page group of routine semantic form patches."""
+    """An immutable routine-only batch for one exact application page epoch."""
 
     batch_id: str
     attempt_id: str
@@ -220,63 +248,103 @@ class SemanticPatchBatch:
         _required(self.attempt_id, "attempt_id")
         if not self.patches:
             raise ValueError("SemanticPatchBatch requires at least one patch")
-        if (
-            isinstance(self.expected_page_epoch, bool)
-            or not isinstance(self.expected_page_epoch, int)
-            or self.expected_page_epoch < 0
-        ):
-            raise ValueError("expected_page_epoch must be a non-negative integer")
-        names = tuple(patch.field_semantic for patch in self.patches)
-        if len(set(names)) != len(names):
+        _page_epoch(self.expected_page_epoch, "expected_page_epoch")
+        if len({patch.field_semantic for patch in self.patches}) != len(self.patches):
             raise ValueError("SemanticPatchBatch cannot write a field twice")
         if "apply_semantic_patch" not in self.recipe.operations:
             raise ValueError("recipe does not admit semantic patches")
 
     @property
     def digest(self) -> str:
-        """Stable identity used to bind a one-shot authority to this exact batch."""
-
         return hashlib.sha256(
             _canonical_json(
                 {
                     "attempt_id": self.attempt_id,
                     "batch_id": self.batch_id,
-                    "patches": [{"field_semantic": item.field_semantic, "value": item.value} for item in self.patches],
-                    "recipe": {
-                        "adapter_version": self.recipe.adapter_version,
-                        "domain": self.recipe.domain,
-                        "operations": self.recipe.operations,
-                        "page_signature": self.recipe.page_signature,
-                        "provider": self.recipe.provider,
-                    },
                     "expected_page_epoch": self.expected_page_epoch,
+                    "patches": [{"semantic": item.field_semantic, "value": item.value} for item in self.patches],
+                    "recipe": {
+                        "provider": self.recipe.provider,
+                        "domain": self.recipe.domain,
+                        "adapter_version": self.recipe.adapter_version,
+                        "page_signature": self.recipe.page_signature,
+                        "operations": self.recipe.operations,
+                    },
                     "submit_authority": False,
                 }
             )
         ).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserPageObservation:
+    """Current adapter-observed root URL, frame, page signature, and epoch."""
+
+    page_url: str
+    frame_path: tuple[int, ...]
+    page_signature: str
+    page_epoch: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "page_url", _https_url(self.page_url, "page_url"))
+        object.__setattr__(self, "frame_path", _frame_path(self.frame_path))
+        object.__setattr__(self, "page_signature", _sha256(self.page_signature, "page_signature"))
+        _page_epoch(self.page_epoch)
+
+
+@dataclass(frozen=True, slots=True)
+class BatchControlDescriptor:
+    """Adapter-projected descriptor; only a matching ``routine`` control can run."""
+
+    control_id: str
+    field_semantic: str
+    classification: ControlClassification
+    page: BrowserPageObservation
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "control_id", _required(self.control_id, "control_id"))
+        object.__setattr__(self, "field_semantic", normalize_field_semantic(self.field_semantic))
+        if self.classification not in _CLASSIFICATIONS:
+            raise ValueError("unsupported control classification")
+
+
+@runtime_checkable
+class ProviderSemanticPatchAdapter(Protocol):
+    """The only browser capability accepted by ``SemanticPatchBatchRunner``."""
+
+    provider: str
+    adapter_version: str
+
+    def observe_page(self) -> BrowserPageObservation: ...
+
+    def control_for(self, field_semantic: str) -> BatchControlDescriptor: ...
+
+    def apply_routine_control(self, control: BatchControlDescriptor, value: str) -> None: ...
+
+
 @dataclass(slots=True)
 class BrowserContext:
-    """One application-only browser context with terminal taint/drain state."""
+    """One application-owned context; taint requires terminal draining."""
 
     context_id: str
     attempt_id: str
     sqlite_path: str
-    profile_id: str
+    profile_path: str
     debug_port: int
     provider: str
-    domain: str
+    page_url: str
+    frame_path: tuple[int, ...]
     page_signature: str
     page_epoch: int = 0
     taint_reason: str | None = None
     drained: bool = False
+    closed: bool = False
 
     def __post_init__(self) -> None:
         self.context_id = _required(self.context_id, "context_id")
         self.attempt_id = _required(self.attempt_id, "attempt_id")
-        self.sqlite_path = _required(self.sqlite_path, "sqlite_path")
-        self.profile_id = _required(self.profile_id, "profile_id")
+        self.sqlite_path = _absolute_path(self.sqlite_path, "sqlite_path")
+        self.profile_path = _absolute_path(self.profile_path, "profile_path")
         if (
             isinstance(self.debug_port, bool)
             or not isinstance(self.debug_port, int)
@@ -284,78 +352,124 @@ class BrowserContext:
         ):
             raise ValueError("debug_port must be a TCP port")
         self.provider = _required(self.provider, "provider").casefold()
-        self.domain = _hostname(self.domain)
+        self.page_url = _https_url(self.page_url, "page_url")
+        self.frame_path = _frame_path(self.frame_path)
         self.page_signature = _sha256(self.page_signature, "page_signature")
-        if isinstance(self.page_epoch, bool) or not isinstance(self.page_epoch, int) or self.page_epoch < 0:
-            raise ValueError("page_epoch must be a non-negative integer")
+        _page_epoch(self.page_epoch)
         if self.taint_reason is not None:
             self.taint_reason = _required(self.taint_reason, "taint_reason")
         if self.drained and self.taint_reason is None:
             raise ValueError("only a tainted browser context may be drained")
-
-    @property
-    def active(self) -> bool:
-        return self.taint_reason is None and not self.drained
+        if self.closed and self.taint_reason is not None:
+            raise ValueError("a tainted browser context must be drained, not healthy-closed")
 
     def require_active(self) -> None:
         if self.taint_reason is not None:
             raise BrowserContextTainted("browser context is tainted")
         if self.drained:
             raise SemanticBatchDenied("browser context is drained")
+        if self.closed:
+            raise SemanticBatchDenied("browser context is closed")
 
-    def taint(self, reason: str) -> None:
-        if self.drained:
-            raise SemanticBatchDenied("cannot taint a drained browser context")
-        self.taint_reason = _required(reason, "taint_reason")
+    def taint_and_drain(self, reason: str) -> None:
+        if self.closed:
+            raise SemanticBatchDenied("cannot taint a healthy-closed browser context")
+        if not self.drained:
+            self.taint_reason = _required(reason, "taint_reason")
+            self.drained = True
 
-    def drain(self) -> None:
-        if self.taint_reason is None:
-            raise SemanticBatchDenied("only a tainted browser context may be drained")
-        self.drained = True
+    def close_healthy(self) -> None:
+        self.require_active()
+        self.closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserContextLease:
+    """Registry-issued non-serializable capability for exact context release."""
+
+    context_id: str
+    nonce: str
+    signature: str
+
+    def __reduce__(self) -> object:
+        raise TypeError("browser context lease cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("browser context lease cannot be serialized")
 
 
 class BrowserContextRegistry:
-    """Reserve testable application-local SQLite, profile, and port identities.
-
-    This is a logical ownership boundary, not a browser launcher or a SQLite
-    connection factory.  The composition root remains responsible for opening
-    the resources after it has acquired them here.
-    """
+    """Reserve normalized SQLite/profile/port identities until exact teardown."""
 
     def __init__(self) -> None:
+        self._secret = secrets.token_bytes(32)
         self._sqlite_owners: dict[str, str] = {}
         self._profile_owners: dict[str, str] = {}
         self._port_owners: dict[int, str] = {}
+        self._leases: dict[str, BrowserContextLease] = {}
 
-    def acquire(self, context: BrowserContext) -> None:
+    def acquire(self, context: BrowserContext) -> BrowserContextLease:
         context.require_active()
-        requested = (
+        if context.context_id in self._leases:
+            raise SemanticBatchDenied("browser context_id is already leased")
+        resources = self._resources(context)
+        for owners, resource_id, name in resources:
+            if resource_id in owners:
+                raise SemanticBatchDenied(f"{name} is already owned by another application context")
+        lease = BrowserContextLease(context.context_id, secrets.token_hex(16), "")
+        lease = replace(lease, signature=self._sign(lease))
+        for owners, resource_id, _name in resources:
+            owners[resource_id] = context.context_id
+        self._leases[context.context_id] = lease
+        return lease
+
+    def release_after_close(
+        self,
+        context: BrowserContext,
+        lease: BrowserContextLease,
+        *,
+        close_resources: Callable[[], None],
+    ) -> None:
+        self._validate_lease(context, lease)
+        try:
+            close_resources()
+        except Exception as exc:
+            context.taint_and_drain(f"effect_unknown:resource_close_failed:{type(exc).__name__}")
+            raise SemanticBatchExecutionError("browser context resource close failed") from exc
+        if context.taint_reason is None:
+            context.close_healthy()
+        for owners, resource_id, _name in self._resources(context):
+            if owners.get(resource_id) != context.context_id:
+                raise SemanticBatchDenied("browser context resource ownership changed before release")
+            del owners[resource_id]
+        del self._leases[context.context_id]
+
+    def _validate_lease(self, context: BrowserContext, lease: BrowserContextLease) -> None:
+        if not isinstance(lease, BrowserContextLease) or lease.context_id != context.context_id:
+            raise SemanticBatchDenied("browser context lease does not match the context")
+        if not hmac.compare_digest(lease.signature, self._sign(replace(lease, signature=""))):
+            raise SemanticBatchDenied("browser context lease signature is invalid")
+        if self._leases.get(context.context_id) != lease:
+            raise SemanticBatchDenied("browser context lease is stale or was not issued here")
+
+    def _resources(self, context: BrowserContext) -> tuple[tuple[dict[object, str], object, str], ...]:
+        return (
             (self._sqlite_owners, context.sqlite_path, "sqlite path"),
-            (self._profile_owners, context.profile_id, "browser profile"),
+            (self._profile_owners, context.profile_path, "browser profile"),
             (self._port_owners, context.debug_port, "debug port"),
         )
-        for owners, resource_id, resource_name in requested:
-            owner = owners.get(resource_id)
-            if owner is not None and owner != context.context_id:
-                raise SemanticBatchDenied(f"{resource_name} is already owned by another application context")
-        for owners, resource_id, _resource_name in requested:
-            owners[resource_id] = context.context_id
 
-    def release_drained(self, context: BrowserContext) -> None:
-        if not context.drained:
-            raise SemanticBatchDenied("only a drained browser context may release resources")
-        for owners, resource_id in (
-            (self._sqlite_owners, context.sqlite_path),
-            (self._profile_owners, context.profile_id),
-            (self._port_owners, context.debug_port),
-        ):
-            if owners.get(resource_id) == context.context_id:
-                del owners[resource_id]
+    def _sign(self, lease: BrowserContextLease) -> str:
+        return hmac.new(
+            self._secret,
+            _canonical_json({"context_id": lease.context_id, "nonce": lease.nonce}),
+            hashlib.sha256,
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
 class BatchSemanticAuthority:
-    """Non-serializable, one-shot authority for one exact semantic patch batch."""
+    """One-shot, non-serializable authority for exactly one semantic batch."""
 
     context_id: str
     attempt_id: str
@@ -374,7 +488,7 @@ class BatchSemanticAuthority:
 
 
 class BatchSemanticAuthorityIssuer:
-    """Parent-owned HMAC issuer that binds one batch to one application context."""
+    """Parent-owned HMAC issuer; authority is never submit authority."""
 
     def __init__(self, *, ttl_seconds: float = 60.0, clock: Callable[[], float] = time.time) -> None:
         if ttl_seconds <= 0:
@@ -397,63 +511,59 @@ class BatchSemanticAuthorityIssuer:
             submit_authority=False,
             signature="",
         )
-        signed = replace(authority, signature=self._sign(authority))
-        self._issued[signed.nonce] = signed.expires_at
-        return signed
+        authority = replace(authority, signature=self._sign(authority))
+        self._issued[authority.nonce] = authority.expires_at
+        return authority
 
     def consume(self, authority: BatchSemanticAuthority, context: BrowserContext, batch: SemanticPatchBatch) -> None:
         context.require_active()
         self._validate_context_batch(context, batch)
-        if not isinstance(authority, BatchSemanticAuthority):
-            raise SemanticBatchDenied("batch semantic authority has the wrong type")
-        if authority.submit_authority is not False:
-            raise SemanticBatchDenied("semantic batch authority must never authorize submit")
-        expected = replace(authority, signature="")
-        if not hmac.compare_digest(authority.signature, self._sign(expected)):
+        if not isinstance(authority, BatchSemanticAuthority) or authority.submit_authority is not False:
+            raise SemanticBatchDenied("semantic batch authority must not grant submit")
+        if not hmac.compare_digest(authority.signature, self._sign(replace(authority, signature=""))):
             raise SemanticBatchDenied("batch semantic authority signature is invalid")
         if self._clock() >= authority.expires_at:
             raise SemanticBatchDenied("batch semantic authority expired")
-        if (
-            authority.context_id,
-            authority.attempt_id,
-            authority.batch_digest,
-            authority.recipe,
-        ) != (context.context_id, context.attempt_id, batch.digest, batch.recipe):
+        if (authority.context_id, authority.attempt_id, authority.batch_digest, authority.recipe) != (
+            context.context_id,
+            context.attempt_id,
+            batch.digest,
+            batch.recipe,
+        ):
             raise SemanticBatchDenied("batch semantic authority binding mismatch")
-        expiry = self._issued.pop(authority.nonce, None)
-        if expiry != authority.expires_at:
+        if self._issued.pop(authority.nonce, None) != authority.expires_at:
             raise SemanticBatchDenied("batch semantic authority was already consumed or was not issued here")
 
     @staticmethod
     def _validate_context_batch(context: BrowserContext, batch: SemanticPatchBatch) -> None:
+        page_host = (urlparse(context.page_url).hostname or "").casefold()
         if context.attempt_id != batch.attempt_id:
             raise SemanticBatchDenied("batch does not belong to this application context")
-        if (context.provider, context.domain, context.page_signature) != (
+        if (context.provider, page_host, context.page_signature, context.page_epoch) != (
             batch.recipe.provider,
             batch.recipe.domain,
             batch.recipe.page_signature,
+            batch.expected_page_epoch,
         ):
-            raise SemanticBatchDenied("batch recipe does not match the current application page")
-        if context.page_epoch != batch.expected_page_epoch:
-            raise SemanticBatchDenied("batch page epoch is stale")
+            raise SemanticBatchDenied("batch recipe or page epoch does not match the current application context")
 
     def _sign(self, authority: BatchSemanticAuthority) -> str:
         return hmac.new(
             self._secret,
             _canonical_json(
                 {
+                    "context_id": authority.context_id,
                     "attempt_id": authority.attempt_id,
                     "batch_digest": authority.batch_digest,
-                    "context_id": authority.context_id,
+                    "recipe": {
+                        "provider": authority.recipe.provider,
+                        "domain": authority.recipe.domain,
+                        "adapter_version": authority.recipe.adapter_version,
+                        "page_signature": authority.recipe.page_signature,
+                        "operations": authority.recipe.operations,
+                    },
                     "expires_at": authority.expires_at,
                     "nonce": authority.nonce,
-                    "recipe": {
-                        "adapter_version": authority.recipe.adapter_version,
-                        "domain": authority.recipe.domain,
-                        "operations": authority.recipe.operations,
-                        "page_signature": authority.recipe.page_signature,
-                        "provider": authority.recipe.provider,
-                    },
                     "submit_authority": authority.submit_authority,
                 }
             ),
@@ -463,12 +573,10 @@ class BatchSemanticAuthorityIssuer:
 
 @dataclass(frozen=True, slots=True)
 class SemanticPatchBatchResult:
-    """A successful local driver result; it carries no submission result."""
-
     batch_id: str
     batch_digest: str
     applied_fields: tuple[str, ...]
-    next_page_epoch: int
+    page_epoch: int
     submit_authority: bool = False
 
     def __post_init__(self) -> None:
@@ -477,7 +585,7 @@ class SemanticPatchBatchResult:
 
 
 class SemanticPatchBatchRunner:
-    """Run a batch via a provider driver and terminally drain on any driver error."""
+    """Execute only verified routine descriptors and park any unexpected effect."""
 
     def __init__(self, issuer: BatchSemanticAuthorityIssuer) -> None:
         self._issuer = issuer
@@ -488,39 +596,69 @@ class SemanticPatchBatchRunner:
         context: BrowserContext,
         authority: BatchSemanticAuthority,
         batch: SemanticPatchBatch,
-        apply_patch: Callable[[SemanticPatch], None],
+        adapter: ProviderSemanticPatchAdapter,
     ) -> SemanticPatchBatchResult:
         self._issuer.consume(authority, context, batch)
         try:
+            if (adapter.provider.casefold(), adapter.adapter_version) != (
+                batch.recipe.provider,
+                batch.recipe.adapter_version,
+            ):
+                raise SemanticBatchDenied("provider adapter does not match the admitted recipe")
+            applied: list[str] = []
             for patch in batch.patches:
-                apply_patch(patch)
-            if context.page_epoch != batch.expected_page_epoch:
-                raise RuntimeError("page_epoch_changed_after_effect")
+                self._validate_page(context, batch, adapter.observe_page())
+                control = adapter.control_for(patch.field_semantic)
+                self._validate_control(context, batch, patch, control)
+                adapter.apply_routine_control(control, patch.value)
+                self._validate_page(context, batch, adapter.observe_page())
+                applied.append(patch.field_semantic)
         except Exception as exc:
-            context.taint(f"effect_unknown:semantic_patch_failed:{type(exc).__name__}")
-            context.drain()
-            raise SemanticBatchExecutionError("semantic patch execution failed; context was drained") from exc
-        context.page_epoch += 1
-        return SemanticPatchBatchResult(
-            batch_id=batch.batch_id,
-            batch_digest=batch.digest,
-            applied_fields=tuple(patch.field_semantic for patch in batch.patches),
-            next_page_epoch=context.page_epoch,
-        )
+            context.taint_and_drain(f"effect_unknown:semantic_patch_batch:{type(exc).__name__}")
+            raise SemanticBatchExecutionError("semantic patch batch stopped; context was drained") from exc
+        return SemanticPatchBatchResult(batch.batch_id, batch.digest, tuple(applied), context.page_epoch)
+
+    @staticmethod
+    def _validate_page(context: BrowserContext, batch: SemanticPatchBatch, page: BrowserPageObservation) -> None:
+        if (page.page_url, page.frame_path, page.page_signature, page.page_epoch) != (
+            context.page_url,
+            context.frame_path,
+            batch.recipe.page_signature,
+            batch.expected_page_epoch,
+        ):
+            raise SemanticBatchDenied("adapter page URL, frame, signature, or epoch changed")
+
+    @staticmethod
+    def _validate_control(
+        context: BrowserContext,
+        batch: SemanticPatchBatch,
+        patch: SemanticPatch,
+        control: BatchControlDescriptor,
+    ) -> None:
+        if control.classification != "routine":
+            raise SemanticBatchDenied("final, navigation, frame, or sensitive control is outside batch authority")
+        if control.field_semantic != patch.field_semantic:
+            raise SemanticBatchDenied("adapter control semantic does not match the batch patch")
+        SemanticPatchBatchRunner._validate_page(context, batch, control.page)
 
 
 __all__ = [
     "ApplicationRecipe",
+    "BatchControlDescriptor",
     "BatchSemanticAuthority",
     "BatchSemanticAuthorityIssuer",
     "BrowserContext",
+    "BrowserContextLease",
     "BrowserContextRegistry",
     "BrowserContextTainted",
+    "BrowserPageObservation",
     "ProviderAdapter",
+    "ProviderSemanticPatchAdapter",
     "SemanticBatchDenied",
     "SemanticBatchExecutionError",
     "SemanticPatch",
     "SemanticPatchBatch",
     "SemanticPatchBatchResult",
     "SemanticPatchBatchRunner",
+    "normalize_field_semantic",
 ]
