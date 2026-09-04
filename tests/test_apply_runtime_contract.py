@@ -19,6 +19,7 @@ from applypilot.apply import (
     browser_broker,
     launcher,
     page_observation,
+    performance_attribution,
     prompt,
     router,
     worker_orchestration,
@@ -2961,6 +2962,29 @@ def test_submit_lane_excludes_audit_repair_and_independent_observer(
     assert final_metrics["submit_lane_hold_ms"] == persisted_before_release[
         "submit_lane_hold_ms"
     ]
+
+
+def test_attribution_faults_do_not_change_worker_terminal_or_ledger_contract(
+    monkeypatch,
+) -> None:
+    def telemetry_fault(*_args, **_kwargs):
+        raise RuntimeError("fault injected")
+
+    monkeypatch.setattr(performance_attribution, "bind_attempt_route", telemetry_fault)
+    monkeypatch.setattr(performance_attribution, "trace_for_job", telemetry_fault)
+    monkeypatch.setattr(performance_attribution, "attribution_snapshot", telemetry_fault)
+    final_records: list[dict] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        final_performance_records=final_records,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[-1][0] == "applied"
+    assert marked[0][1]["evidence"]["orchestration_performance"].get("attribution") is None
+    assert final_records[0].get("attribution") is None
 
 
 def test_lossy_degree_and_work_status_mappings_are_audited_without_blocking() -> None:

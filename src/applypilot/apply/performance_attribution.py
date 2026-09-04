@@ -1,28 +1,34 @@
-"""Bounded, advisory timing spans for application-path attribution.
+"""Bounded advisory timing spans for application-path attribution.
 
-The collector is deliberately separate from browser authority and durable
-workflow decisions.  It only records a small, named set of elapsed durations
-on the in-memory job envelope; callers may attach its normalized snapshot to
-terminal evidence after their existing authorization path has completed.
+This module cannot grant authority or alter an application result. Production
+callers use only the ``advisory_*`` helpers, which swallow telemetry failures.
+Spans are nested diagnostics, not additive wall-clock accounting.
 """
 
 from __future__ import annotations
 
 import math
-import time
-from collections.abc import Callable, Iterable, Mapping
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-SCHEMA_VERSION = "applypilot-performance-attribution/v1"
+SCHEMA_VERSION = "applypilot-performance-attribution/v2"
 TRACE_JOB_KEY = "_performance_attribution_trace"
+ROUTE_JOB_KEY = "_performance_attribution_route"
 MAX_DURATION_MS = 86_400_000.0
 MAX_SPANS = 32
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$"
+)
+_PROVIDERS = frozenset(
+    {"workday", "smartrecruiters", "greenhouse", "lever", "linkedin", "direct_email"}
+)
 
 SPAN_GROUPS = {
     "agent.turn": "agent",
     "agent.startup": "agent",
-    "mcp.startup": "mcp",
+    "mcp.first_tool_ready": "mcp",
     "model.first_output": "agent",
     "model.first_tool_decision": "agent",
     "browser.prepare": "browser",
@@ -31,52 +37,115 @@ SPAN_GROUPS = {
     "receipt.reconciliation": "observation",
     "recovery.agent": "recovery",
 }
+_GROUP_ROOT_SPANS = {
+    "agent": frozenset({"agent.turn"}),
+    "mcp": frozenset({"mcp.first_tool_ready"}),
+    "observation": frozenset({"audit.pre_submit", "receipt.reconciliation"}),
+    "recovery": frozenset({"recovery.agent"}),
+}
 _PRIMARY_TURN_SPANS = frozenset({"browser.prepare", "submit.agent"})
 
 
-def _bounded_text(value: object, *, maximum: int = 120) -> str:
-    return str(value or "").strip()[:maximum]
+def _safe_hostname(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 253 or not value:
+        return None
+    candidate = value.casefold()
+    if any(character.isspace() or ord(character) < 32 for character in candidate):
+        return None
+    parsed = urlparse(f"https://{candidate}")
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname != candidate
+        or not _HOSTNAME_RE.fullmatch(candidate)
+    ):
+        return None
+    return candidate
 
 
-def _provider(job: Mapping[str, object]) -> str:
-    for key in ("provider", "source_site", "site"):
-        value = _bounded_text(job.get(key))
-        if value:
-            return value.casefold()
-    return "unavailable"
-
-
-def _domain(job: Mapping[str, object]) -> str:
-    for key in ("application_url", "url"):
-        raw = _bounded_text(job.get(key), maximum=2_000)
-        if raw:
-            hostname = (urlparse(raw).hostname or "").casefold()
-            if hostname:
-                return hostname[:253]
-    return "unavailable"
-
-
-def _application_index(job: Mapping[str, object]) -> int | str:
-    value = job.get("_performance_application_index")
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return "unavailable"
-
-
-def dimensions_for_job(job: Mapping[str, object]) -> dict[str, int | str]:
-    """Produce the required bounded attribution dimensions without PII."""
-
+def _route_dimensions(job: Mapping[str, object]) -> dict[str, int | str]:
+    route = job.get(ROUTE_JOB_KEY)
+    if not isinstance(route, Mapping):
+        return {
+            "provider": "unavailable",
+            "domain": "unavailable",
+            "worker_application_index": "unavailable",
+            "worker_id": "unavailable",
+        }
+    provider = route.get("provider")
+    domain = _safe_hostname(route.get("domain"))
+    index = route.get("worker_application_index")
+    worker_id = route.get("worker_id")
     return {
-        "provider": _provider(job),
-        "domain": _domain(job),
-        "application_index": _application_index(job),
+        "provider": provider if isinstance(provider, str) and provider in _PROVIDERS else "unavailable",
+        "domain": domain or "unavailable",
+        "worker_application_index": (
+            index if isinstance(index, int) and not isinstance(index, bool) and index > 0 else "unavailable"
+        ),
+        "worker_id": (
+            worker_id
+            if isinstance(worker_id, int) and not isinstance(worker_id, bool) and worker_id >= 0
+            else "unavailable"
+        ),
     }
+
+
+def bind_attempt_route(
+    job: dict[str, object],
+    *,
+    provider: object,
+    target_url: object,
+    worker_application_index: object,
+    worker_id: object,
+) -> None:
+    """Bind dimensions only from admitted ATS/authorization route facts."""
+
+    candidate_provider = str(provider or "").strip().casefold()
+    parsed = urlparse(str(target_url or ""))
+    hostname = _safe_hostname(parsed.hostname or "")
+    if candidate_provider not in _PROVIDERS or hostname is None:
+        return
+    if (
+        isinstance(worker_application_index, bool)
+        or not isinstance(worker_application_index, int)
+        or worker_application_index <= 0
+        or isinstance(worker_id, bool)
+        or not isinstance(worker_id, int)
+        or worker_id < 0
+    ):
+        return
+    job[ROUTE_JOB_KEY] = {
+        "provider": candidate_provider,
+        "domain": hostname,
+        "worker_application_index": worker_application_index,
+        "worker_id": worker_id,
+    }
+    existing = job.get(TRACE_JOB_KEY)
+    if isinstance(existing, PerformanceTrace):
+        existing.dimensions = _route_dimensions(job)
+
+
+def safe_bind_attempt_route(
+    job: dict[str, object],
+    **kwargs: object,
+) -> None:
+    try:
+        bind_attempt_route(job, **kwargs)
+    except Exception:  # noqa: BLE001 - telemetry must never affect authority
+        return
 
 
 @dataclass(slots=True)
 class PerformanceTrace:
-    """Aggregate named timings for one application without changing its flow."""
-
     dimensions: dict[str, int | str]
     _spans_ms: dict[str, float] = field(default_factory=dict)
 
@@ -92,15 +161,6 @@ class PerformanceTrace:
             MAX_DURATION_MS,
             self._spans_ms.get(name, 0.0) + min(duration, MAX_DURATION_MS),
         )
-
-    def record_elapsed(
-        self,
-        name: str,
-        started_at: float,
-        *,
-        clock: Callable[[], float] = time.perf_counter,
-    ) -> None:
-        self.record(name, (clock() - started_at) * 1000)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -119,21 +179,37 @@ class PerformanceTrace:
         }
 
 
-def trace_for_job(job: dict[str, object]) -> PerformanceTrace:
-    """Return the one advisory collector shared by shallow job copies."""
+class _NoopTrace:
+    def record(self, _name: str, _duration_ms: object) -> None:
+        return
 
+
+def trace_for_job(job: dict[str, object]) -> PerformanceTrace:
     existing = job.get(TRACE_JOB_KEY)
     if isinstance(existing, PerformanceTrace):
         return existing
-    trace = PerformanceTrace(dimensions_for_job(job))
+    trace = PerformanceTrace(_route_dimensions(job))
     job[TRACE_JOB_KEY] = trace
     return trace
 
 
-def record_job_span(job: dict[str, object], name: str, duration_ms: object) -> None:
-    """Record one safe span; validation errors are deliberately local to telemetry."""
+def advisory_trace_for_job(job: dict[str, object]) -> PerformanceTrace | _NoopTrace:
+    try:
+        return trace_for_job(job)
+    except Exception:  # noqa: BLE001 - telemetry must never affect authority
+        return _NoopTrace()
 
-    trace_for_job(job).record(name, duration_ms)
+
+def safe_record(trace: object, name: str, duration_ms: object) -> None:
+    try:
+        record = trace.record  # type: ignore[attr-defined]
+        record(name, duration_ms)
+    except Exception:  # noqa: BLE001 - telemetry must never affect authority
+        return
+
+
+def safe_record_job_span(job: dict[str, object], name: str, duration_ms: object) -> None:
+    safe_record(advisory_trace_for_job(job), name, duration_ms)
 
 
 def attribution_snapshot(job: Mapping[str, object]) -> dict[str, object] | None:
@@ -141,29 +217,43 @@ def attribution_snapshot(job: Mapping[str, object]) -> dict[str, object] | None:
     return trace.snapshot() if isinstance(trace, PerformanceTrace) else None
 
 
-def normalize_attribution(value: object) -> dict[str, object] | None:
-    """Fail closed when durable evidence is not this collector's bounded schema."""
+def safe_attribution_snapshot(job: Mapping[str, object]) -> dict[str, object] | None:
+    try:
+        return attribution_snapshot(job)
+    except Exception:  # noqa: BLE001 - telemetry must never affect authority
+        return None
 
+
+def normalize_attribution(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping) or value.get("schema_version") != SCHEMA_VERSION:
         return None
     dimensions = value.get("dimensions")
     if not isinstance(dimensions, Mapping):
         return None
-    provider = _bounded_text(dimensions.get("provider"))
-    domain = _bounded_text(dimensions.get("domain"), maximum=253)
-    application_index = dimensions.get("application_index")
-    if not provider or not domain or (
-        application_index != "unavailable"
-        and (isinstance(application_index, bool) or not isinstance(application_index, int) or application_index <= 0)
+    provider = dimensions.get("provider")
+    domain = _safe_hostname(dimensions.get("domain"))
+    index = dimensions.get("worker_application_index")
+    worker_id = dimensions.get("worker_id")
+    if (
+        not isinstance(provider, str)
+        or provider not in _PROVIDERS
+        or domain is None
+        or isinstance(index, bool)
+        or not isinstance(index, int)
+        or index <= 0
+        or isinstance(worker_id, bool)
+        or not isinstance(worker_id, int)
+        or worker_id < 0
     ):
         return None
     normalized_dimensions: dict[str, int | str] = {
         "provider": provider,
         "domain": domain,
-        "application_index": application_index,
+        "worker_application_index": index,
+        "worker_id": worker_id,
     }
     raw_spans = value.get("spans")
-    if not isinstance(raw_spans, list) or len(raw_spans) > MAX_SPANS:
+    if not isinstance(raw_spans, list) or not raw_spans or len(raw_spans) > MAX_SPANS:
         return None
     normalized_spans: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -199,39 +289,50 @@ def normalize_attribution(value: object) -> dict[str, object] | None:
     }
 
 
+def safe_normalize_attribution(value: object) -> dict[str, object] | None:
+    try:
+        return normalize_attribution(value)
+    except Exception:  # noqa: BLE001 - telemetry must never affect terminal state
+        return None
+
+
 def summarize_amplification(samples: Iterable[object]) -> dict[str, object]:
-    """Summarize nested Agent/MCP/observation/recovery work without double counting.
+    """Report observed groups without inventing zero-duration observations."""
 
-    Ratios use only normal browser/submit turns as their denominator.  The
-    individual groups are intentionally not added together because startup and
-    first-output spans sit inside an Agent turn.
-    """
-
-    totals = {group: 0.0 for group in sorted(set(SPAN_GROUPS.values()))}
     primary_turn_ms = 0.0
     sample_count = 0
+    observed: dict[str, dict[str, float | int]] = {}
     for sample in samples:
-        normalized = normalize_attribution(sample)
+        normalized = safe_normalize_attribution(sample)
         if normalized is None:
             continue
         sample_count += 1
         for span in normalized["spans"]:  # type: ignore[index]
             name = str(span["name"])
             duration = float(span["duration_ms"])
-            totals[SPAN_GROUPS[name]] += duration
             if name in _PRIMARY_TURN_SPANS:
                 primary_turn_ms += duration
+            for group, root_spans in _GROUP_ROOT_SPANS.items():
+                if name in root_spans:
+                    aggregate = observed.setdefault(
+                        group, {"duration_ms": 0.0, "observed_span_count": 0}
+                    )
+                    aggregate["duration_ms"] = float(aggregate["duration_ms"]) + duration
+                    aggregate["observed_span_count"] = int(aggregate["observed_span_count"]) + 1
     return {
         "measurement_model": "nested_advisory_spans",
         "sample_count": sample_count,
-        "primary_turn_ms": round(primary_turn_ms, 3),
+        "primary_turn_ms": round(primary_turn_ms, 3) if primary_turn_ms else None,
         "groups": {
             group: {
-                "duration_ms": round(duration, 3),
+                "duration_ms": round(float(values["duration_ms"]), 3),
+                "observed_span_count": int(values["observed_span_count"]),
                 "ratio_to_primary_turn": (
-                    None if primary_turn_ms == 0 else round(duration / primary_turn_ms, 6)
+                    None
+                    if primary_turn_ms == 0
+                    else round(float(values["duration_ms"]) / primary_turn_ms, 6)
                 ),
             }
-            for group, duration in sorted(totals.items())
+            for group, values in sorted(observed.items())
         },
     }

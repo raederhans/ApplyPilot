@@ -4163,18 +4163,27 @@ def _process_receipt_observer_result(
     submitted_at: datetime,
     observation: Mapping[str, object],
 ) -> dict[str, object]:
-    return receipt_observer_mod.process_receipt_observation(
-        get_connection(),
-        job,
-        provider=provider,
-        submitted_at=submitted_at,
-        observation=observation,
-        gate_binding=(
-            job.get("_submission_gate_binding")
-            if isinstance(job.get("_submission_gate_binding"), Mapping)
-            else None
-        ),
-    )
+    started = time.perf_counter()
+    try:
+        return receipt_observer_mod.process_receipt_observation(
+            get_connection(),
+            job,
+            provider=provider,
+            submitted_at=submitted_at,
+            observation=observation,
+            gate_binding=(
+                job.get("_submission_gate_binding")
+                if isinstance(job.get("_submission_gate_binding"), Mapping)
+                else None
+            ),
+        )
+    finally:
+        if isinstance(job, dict):
+            performance_attribution_mod.safe_record_job_span(
+                job,
+                "receipt.reconciliation",
+                (time.perf_counter() - started) * 1000,
+            )
 
 
 def _consume_manual_resume_authorization(
@@ -4666,7 +4675,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "requires_fresh_observation": True,
         }
         return "submission_uncertain", 0
-    performance_trace = performance_attribution_mod.trace_for_job(job)
+    performance_trace = performance_attribution_mod.advisory_trace_for_job(job)
     turn_id = f"agent-{uuid.uuid4()}"
     run_id = turn_id  # Backward-compatible runtime/report identity.
     attempt_id = str(
@@ -5227,6 +5236,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
 
     start = time.time()
+    performance_turn_started = time.perf_counter()
     ats_context_path.write_text(
         ats_context_json,
         encoding="utf-8",
@@ -5459,7 +5469,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
         proc = durable_handle.process
         process_spawned_at = time.perf_counter()
-        performance_trace.record(
+        performance_attribution_mod.safe_record(
+            performance_trace,
             "agent.startup",
             (process_spawned_at - process_spawn_started) * 1000,
         )
@@ -5504,12 +5515,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         agent_runtime_mod.process_rss_bytes(proc.pid),
                     )
                     last_rss_sample_at = rss_sample_at
-                if first_output_at is None:
-                    first_output_at = time.perf_counter()
-                    performance_trace.record(
-                        "model.first_output",
-                        (first_output_at - process_spawned_at) * 1000,
-                    )
                 try:
                     msg = json.loads(line)
                     msg_type = msg.get("type")
@@ -5517,6 +5522,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         for block in msg.get("message", {}).get("content", []):
                             bt = block.get("type")
                             if bt == "text":
+                                if first_output_at is None:
+                                    first_output_at = time.perf_counter()
+                                    performance_attribution_mod.safe_record(
+                                        performance_trace,
+                                        "model.first_output",
+                                        (first_output_at - process_spawned_at) * 1000,
+                                    )
                                 text_parts.append(block["text"])
                                 lf.write(_redacted_agent_log_line(block["text"]))
                             elif bt == "tool_use":
@@ -5524,7 +5536,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 now_tool = time.perf_counter()
                                 if first_tool_at is None:
                                     first_tool_at = now_tool
-                                    performance_trace.record(
+                                    performance_attribution_mod.safe_record(
+                                        performance_trace,
                                         "model.first_tool_decision",
                                         (first_tool_at - process_spawned_at) * 1000,
                                     )
@@ -5533,8 +5546,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     and str(raw_name).startswith("mcp__")
                                 ):
                                     first_mcp_ready_at = now_tool
-                                    performance_trace.record(
-                                        "mcp.startup",
+                                    performance_attribution_mod.safe_record(
+                                        performance_trace,
+                                        "mcp.first_tool_ready",
                                         (first_mcp_ready_at - process_spawned_at) * 1000,
                                     )
                                 last_tool_at = now_tool
@@ -5638,6 +5652,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         if item_type == "agent_message":
                             text = item.get("text", "")
                             if text:
+                                if first_output_at is None:
+                                    first_output_at = time.perf_counter()
+                                    performance_attribution_mod.safe_record(
+                                        performance_trace,
+                                        "model.first_output",
+                                        (first_output_at - process_spawned_at) * 1000,
+                                    )
                                 text_parts.append(text)
                                 lf.write(_redacted_agent_log_line(text))
                         elif item_type in {"mcp_tool_call", "tool_call"}:
@@ -5646,14 +5667,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             now_tool = time.perf_counter()
                             if first_tool_at is None:
                                 first_tool_at = now_tool
-                                performance_trace.record(
+                                performance_attribution_mod.safe_record(
+                                    performance_trace,
                                     "model.first_tool_decision",
                                     (first_tool_at - process_spawned_at) * 1000,
                                 )
                             if first_mcp_ready_at is None and item_type == "mcp_tool_call":
                                 first_mcp_ready_at = now_tool
-                                performance_trace.record(
-                                    "mcp.startup",
+                                performance_attribution_mod.safe_record(
+                                    performance_trace,
+                                    "mcp.first_tool_ready",
                                     (first_mcp_ready_at - process_spawned_at) * 1000,
                                 )
                             last_tool_at = now_tool
@@ -6090,13 +6113,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             job.pop("_parent_agent_run_id", None)
             job.pop("_parent_agent_checkpoint_id", None)
             final_duration_ms = turn_duration_ms or int((time.time() - start) * 1000)
-            performance_trace.record("agent.turn", final_duration_ms)
+            performance_turn_ms = (time.perf_counter() - performance_turn_started) * 1000
+            performance_attribution_mod.safe_record(
+                performance_trace, "agent.turn", performance_turn_ms
+            )
             if recovery_command is not None or operator_resume is not None or audit_verification is not None:
-                performance_trace.record("recovery.agent", final_duration_ms)
+                performance_attribution_mod.safe_record(
+                    performance_trace, "recovery.agent", performance_turn_ms
+                )
             elif submission_phase == "submit":
-                performance_trace.record("submit.agent", final_duration_ms)
+                performance_attribution_mod.safe_record(
+                    performance_trace, "submit.agent", performance_turn_ms
+                )
             else:
-                performance_trace.record("browser.prepare", final_duration_ms)
+                performance_attribution_mod.safe_record(
+                    performance_trace, "browser.prepare", performance_turn_ms
+                )
             final_status = turn_application_status or (
                 "submission_uncertain"
                 if submission_phase == "submit" and not dry_run

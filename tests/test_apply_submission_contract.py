@@ -11,7 +11,11 @@ from typer.testing import CliRunner
 
 from applypilot import database as database_mod
 from applypilot.apply import authorization, launcher
-from applypilot.apply.performance_attribution import attribution_snapshot, record_job_span
+from applypilot.apply.performance_attribution import (
+    attribution_snapshot,
+    bind_attempt_route,
+    safe_record_job_span,
+)
 from applypilot.cli import (
     _build_standing_authorization_manifest,
     _standing_auto_authorization_enabled,
@@ -1105,13 +1109,18 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
         conn=conn,
     )
     attribution_job = {
-        "provider": "workday",
         "application_url": "https://careers.example.test/jobs/123",
-        "_performance_application_index": 1,
     }
-    record_job_span(attribution_job, "agent.turn", 120)
-    record_job_span(attribution_job, "browser.prepare", 120)
-    record_job_span(attribution_job, "audit.pre_submit", 20)
+    bind_attempt_route(
+        attribution_job,
+        provider="workday",
+        target_url=attribution_job["application_url"],
+        worker_application_index=1,
+        worker_id=0,
+    )
+    safe_record_job_span(attribution_job, "agent.turn", 120)
+    safe_record_job_span(attribution_job, "browser.prepare", 120)
+    safe_record_job_span(attribution_job, "audit.pre_submit", 20)
     attribution = attribution_snapshot(attribution_job)
     assert attribution is not None
 

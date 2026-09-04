@@ -597,10 +597,7 @@ def _worker_loop_with_port(
             continue
 
         empty_polls = 0
-        # This is intentionally worker-local ordering, which remains stable
-        # even when several workers acquire applications concurrently.
-        job["_performance_application_index"] = jobs_done + 1
-        performance_attribution_mod.trace_for_job(job)
+        worker_application_index = jobs_done + 1
         preview_ticket: PreviewTicket | None = None
         if dry_run and run_progress is not None:
             preview_ticket = run_progress.claim_preview_ticket(job["url"])
@@ -719,7 +716,7 @@ def _worker_loop_with_port(
                 "metrics": bounded,
                 "acquisition": acquisition,
             }
-            attribution = performance_attribution_mod.attribution_snapshot(current_job)
+            attribution = performance_attribution_mod.safe_attribution_snapshot(current_job)
             if attribution is not None:
                 snapshot["attribution"] = attribution
             return snapshot
@@ -903,6 +900,23 @@ def _worker_loop_with_port(
             ats_binding = _resolve_ats_application_binding(job)
         if isinstance(ats_binding, dict):
             job["_ats_application_binding"] = ats_binding
+        admitted_provider = (
+            ats_binding.get("provider") or read_only_preflight.get("provider")
+            if isinstance(ats_binding, Mapping)
+            else read_only_preflight.get("provider")
+        )
+        admitted_target_url = (
+            ats_binding.get("application_url") or ats_binding.get("url")
+            if isinstance(ats_binding, Mapping)
+            else job.get("application_url") or job.get("url")
+        )
+        performance_attribution_mod.safe_bind_attempt_route(
+            job,
+            provider=admitted_provider,
+            target_url=admitted_target_url,
+            worker_application_index=worker_application_index,
+            worker_id=worker_id,
+        )
         if read_only_preflight.get("provider") == "smartrecruiters" and not (
             isinstance(ats_binding, dict)
             and ats_binding.get("provider") == "smartrecruiters"
@@ -1665,7 +1679,7 @@ def _worker_loop_with_port(
                     )
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
-                    performance_attribution_mod.record_job_span(
+                    performance_attribution_mod.safe_record_job_span(
                         job, "audit.pre_submit", audit_duration_ms
                     )
                     if not _provenance_only_audit(audit_report):
@@ -1989,7 +2003,7 @@ def _worker_loop_with_port(
                             }
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
-                    performance_attribution_mod.record_job_span(
+                    performance_attribution_mod.safe_record_job_span(
                         job, "audit.pre_submit", audit_duration_ms
                     )
                     observation_label = audit_signal or "clear"
@@ -2284,7 +2298,7 @@ def _worker_loop_with_port(
                             )
                             audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                             orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
-                            performance_attribution_mod.record_job_span(
+                            performance_attribution_mod.safe_record_job_span(
                                 job, "audit.pre_submit", audit_duration_ms
                             )
                             if audit_signal or audit_report.get("disposition") != "clear":
@@ -2704,7 +2718,6 @@ def _worker_loop_with_port(
                 and submitted_at is not None
                 and email_application is None
             ):
-                receipt_reconciliation_started = time.perf_counter()
                 receipt_attempts: list[dict[str, object]] = []
                 configured_observers = _configured_receipt_observers(profile)
                 receipt_gate_ready = bool(
@@ -2742,11 +2755,6 @@ def _worker_loop_with_port(
                     job["_receipt_reconciliation_pending"] = receipt_attempts
                     submission_evidence = dict(submission_evidence or {})
                     submission_evidence["mailbox_receipt_observers"] = receipt_attempts
-                performance_attribution_mod.record_job_span(
-                    job,
-                    "receipt.reconciliation",
-                    (time.perf_counter() - receipt_reconciliation_started) * 1000,
-                )
 
             if (
                 submission_started
