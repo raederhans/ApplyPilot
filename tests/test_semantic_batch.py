@@ -6,14 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from applypilot.apply import semantic_batch
 from applypilot.apply.semantic_batch import (
     ApplicationRecipe,
     BatchControlDescriptor,
+    BatchPageBinding,
     BatchSemanticAuthorityIssuer,
     BrowserContext,
     BrowserContextLease,
     BrowserContextRegistry,
     BrowserPageObservation,
+    BrowserResourceIdentity,
     ProviderAdapter,
     SemanticBatchDenied,
     SemanticBatchExecutionError,
@@ -50,24 +53,27 @@ def _context(
     return BrowserContext(
         context_id=context_id,
         attempt_id=attempt_id,
-        sqlite_path=str(sqlite_path or tmp_path / "application.sqlite"),
-        profile_path=str(profile_path or tmp_path / "profile"),
-        debug_port=debug_port,
+        resources=BrowserResourceIdentity(
+            str(sqlite_path or tmp_path / "application.sqlite"),
+            str(profile_path or tmp_path / "profile"),
+            debug_port,
+        ),
         provider="workday",
-        page_url=PAGE_URL,
-        frame_path=(),
-        page_signature=PAGE_SIGNATURE,
-        page_epoch=page_epoch,
+        page_binding=BatchPageBinding(PAGE_URL, (), PAGE_SIGNATURE, page_epoch),
     )
 
 
-def _batch(*, recipe: ApplicationRecipe | None = None, page_epoch: int = 0) -> SemanticPatchBatch:
+def _batch(
+    *,
+    recipe: ApplicationRecipe | None = None,
+    page_binding: BatchPageBinding | None = None,
+) -> SemanticPatchBatch:
     return SemanticPatchBatch(
         batch_id="batch-1",
         attempt_id="attempt-1",
         recipe=recipe or _recipe(),
+        page_binding=page_binding or BatchPageBinding(PAGE_URL, (), PAGE_SIGNATURE, 0),
         patches=(SemanticPatch("preferred_name", "Ada"), SemanticPatch("city", "Singapore")),
-        expected_page_epoch=page_epoch,
     )
 
 
@@ -138,10 +144,11 @@ def test_exact_routine_descriptor_batch_runs_without_submit_authority(tmp_path: 
     batch = _batch()
     issuer = BatchSemanticAuthorityIssuer()
     adapter = FakeAdapter()
+    authority = issuer.issue(context, batch)
 
     result = SemanticPatchBatchRunner(issuer).run(
         context=context,
-        authority=issuer.issue(context, batch),
+        authority=authority,
         batch=batch,
         adapter=adapter,
     )
@@ -149,6 +156,13 @@ def test_exact_routine_descriptor_batch_runs_without_submit_authority(tmp_path: 
     assert adapter.applied == ["preferred_name", "city"]
     assert result.page_epoch == 0
     assert result.submit_authority is False
+    with pytest.raises(SemanticBatchDenied, match="already consumed"):
+        SemanticPatchBatchRunner(issuer).run(
+            context=context,
+            authority=authority,
+            batch=batch,
+            adapter=adapter,
+        )
 
 
 @pytest.mark.parametrize("classification", ("final_submit", "navigation", "frame", "sensitive"))
@@ -206,16 +220,26 @@ def test_url_frame_or_epoch_change_after_first_effect_stops_remaining_patches(
         )
 
 
-def test_url_frame_or_epoch_change_before_first_effect_has_zero_writes(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "changed_page",
+    (
+        BrowserPageObservation("https://tenant.myworkdayjobs.com/en-US/example/job/other", (), PAGE_SIGNATURE, 0),
+        BrowserPageObservation(PAGE_URL, (0,), PAGE_SIGNATURE, 0),
+    ),
+)
+def test_url_or_frame_change_after_signing_has_zero_writes(
+    tmp_path: Path, changed_page: BrowserPageObservation
+) -> None:
     context = _context(tmp_path)
     batch = _batch()
     issuer = BatchSemanticAuthorityIssuer()
-    adapter = FakeAdapter(before_page=BrowserPageObservation(PAGE_URL, (0,), PAGE_SIGNATURE, 0))
+    adapter = FakeAdapter(before_page=changed_page)
+    authority = issuer.issue(context, batch)
 
     with pytest.raises(SemanticBatchExecutionError, match="context was drained"):
         SemanticPatchBatchRunner(issuer).run(
             context=context,
-            authority=issuer.issue(context, batch),
+            authority=authority,
             batch=batch,
             adapter=adapter,
         )
@@ -233,6 +257,13 @@ def test_hmac_tamper_expiry_batch_recipe_and_epoch_fail_closed(tmp_path: Path) -
 
     with pytest.raises(SemanticBatchDenied, match="signature"):
         runner.run(context=context, authority=replace(authority, nonce="f" * 32), batch=batch, adapter=FakeAdapter())
+    with pytest.raises(SemanticBatchDenied, match="signature"):
+        runner.run(
+            context=context,
+            authority=replace(authority, page_binding=BatchPageBinding(PAGE_URL, (0,), PAGE_SIGNATURE, 0)),
+            batch=batch,
+            adapter=FakeAdapter(),
+        )
 
     expired = issuer.issue(context, batch)
     clock[0] = 106.0
@@ -252,19 +283,15 @@ def test_hmac_tamper_expiry_batch_recipe_and_epoch_fail_closed(tmp_path: Path) -
         runner.run(context=context, authority=fresh, batch=recipe_batch, adapter=FakeAdapter())
 
     stale_context = _context(tmp_path, context_id="context-stale", page_epoch=1)
-    with pytest.raises(SemanticBatchDenied, match="page epoch"):
+    with pytest.raises(SemanticBatchDenied, match="page binding"):
         issuer.issue(stale_context, batch)
 
-    current_context = _context(tmp_path, context_id="context-current")
-    current_authority = issuer.issue(current_context, batch)
-    current_context.page_epoch = 1
-    with pytest.raises(SemanticBatchDenied, match="page epoch"):
-        runner.run(
-            context=current_context,
-            authority=current_authority,
-            batch=batch,
-            adapter=FakeAdapter(),
-        )
+    different_epoch = replace(batch, page_binding=BatchPageBinding(PAGE_URL, (), PAGE_SIGNATURE, 1))
+    fresh = issuer.issue(context, batch)
+    with pytest.raises(SemanticBatchDenied, match="binding mismatch"):
+        runner.run(context=context, authority=fresh, batch=different_epoch, adapter=FakeAdapter())
+    with pytest.raises(AttributeError, match="immutable"):
+        context.page_binding = BatchPageBinding(PAGE_URL, (0,), PAGE_SIGNATURE, 0)
 
 
 def test_context_registry_normalizes_paths_rejects_duplicate_context_and_closes_before_release(tmp_path: Path) -> None:
@@ -306,10 +333,29 @@ def test_context_registry_normalizes_paths_rejects_duplicate_context_and_closes_
     with pytest.raises(SemanticBatchDenied, match="signature"):
         registry.release_after_close(
             first,
-            BrowserContextLease(first.context_id, first_lease.nonce, "bad"),
+            BrowserContextLease(first.context_id, first.resources, first_lease.nonce, "bad"),
             close_resources=lambda: close_attempts.append("should-not-close"),
         )
     assert close_attempts == []
+    with pytest.raises(SemanticBatchDenied, match="resources do not match"):
+        registry.release_after_close(
+            first,
+            replace(
+                first_lease,
+                resources=BrowserResourceIdentity(str(tmp_path / "other.sqlite"), str(tmp_path / "profile"), 9231),
+            ),
+            close_resources=lambda: close_attempts.append("should-not-close"),
+        )
+    assert close_attempts == []
+    registry._port_owners[first.resources.debug_port] = "other-context"  # prove ownership is checked before close
+    with pytest.raises(SemanticBatchDenied, match="resources are not exactly owned"):
+        registry.release_after_close(
+            first,
+            first_lease,
+            close_resources=lambda: close_attempts.append("should-not-close"),
+        )
+    assert close_attempts == []
+    registry._port_owners[first.resources.debug_port] = first.context_id
 
     closed: list[bool] = []
 
@@ -323,3 +369,21 @@ def test_context_registry_normalizes_paths_rejects_duplicate_context_and_closes_
         first.require_active()
     replacement = _context(tmp_path, context_id="context-replacement", debug_port=9231)
     registry.acquire(replacement)
+
+
+def test_resource_identity_normalizes_windows_case_aliases_after_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(semantic_batch.os.path, "normcase", lambda value: value.casefold())
+    first = BrowserResourceIdentity(
+        str(tmp_path / "SQLite" / "Application.sqlite"),
+        str(tmp_path / "Profiles" / "Default"),
+        9231,
+    )
+    alias = BrowserResourceIdentity(
+        str(tmp_path / "sqlite" / "application.SQLITE"),
+        str(tmp_path / "profiles" / "default"),
+        9231,
+    )
+
+    assert first == alias
