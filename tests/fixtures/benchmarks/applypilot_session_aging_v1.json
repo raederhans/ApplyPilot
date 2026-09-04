@@ -1,0 +1,9 @@
+{
+  "schema_version": "applypilot-session-aging-fixture/v1",
+  "fixture_id": "applypilot-session-aging-minimal-v1",
+  "claim_boundary": "local intercepted Workday and SmartRecruiters fixtures only; no provider network or submit authority",
+  "tasks": [
+    {"task_id": "wd-aging-01", "provider": "workday"},
+    {"task_id": "sr-aging-01", "provider": "smartrecruiters"}
+  ]
+}
