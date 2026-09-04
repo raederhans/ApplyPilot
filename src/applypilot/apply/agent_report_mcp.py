@@ -11,9 +11,11 @@ import json
 import os
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from applypilot.apply.agent_output import validate_ready_answer_mappings
+from applypilot.apply.capabilities import CapabilityRegistry, default_auxiliary_capabilities
 from applypilot.apply.contracts import (
     FAILURE_MISSING_CAPABILITIES,
     FAILURE_MISSING_MATERIALS,
@@ -24,13 +26,16 @@ from applypilot.apply.contracts import (
     MAX_AGENT_PROPOSALS,
     MAX_AGENT_REPORT_BYTES,
     MAX_PROPOSAL_DEPENDENCIES,
+    ToolSpec,
     agent_turn_result_from_mapping,
     contract_json,
 )
+from applypilot.apply.tool_broker import ToolBroker, ToolSurface
 
 REPORT_SCHEMA_VERSION = "1"
 REPORT_PATH_ENV = "APPLYPILOT_AGENT_REPORT_PATH"
 RUN_ID_ENV = "APPLYPILOT_AGENT_RUN_ID"
+TOOL_BROKER_MODE_ENV = "APPLYPILOT_TOOL_BROKER_MODE"
 _CONTRACT_DENIAL_STATUS = "failed:answer_provenance_report_invalid"
 _CONTRACT_DENIAL_SUMMARY = "Provenance-aware ready report failed its structured contract"
 _ANSWER_MAPPING_CONTRACT_ERRORS = frozenset(
@@ -54,7 +59,7 @@ def _error(request_id: object, message: str) -> dict[str, object]:
     }
 
 
-def _report_tool() -> dict[str, object]:
+def _report_tool_definition() -> dict[str, object]:
     return {
         "name": "report_agent_turn",
         "description": (
@@ -163,6 +168,43 @@ def _report_tool() -> dict[str, object]:
             "additionalProperties": False,
         },
     }
+
+
+def _report_spec() -> ToolSpec:
+    definition = _report_tool_definition()
+    base = default_auxiliary_capabilities().get("report_agent_turn")
+    if base is None:
+        raise ValueError("canonical reporting capability is missing: report_agent_turn")
+    return replace(
+        base,
+        description=str(definition["description"]),
+        input_schema=definition["inputSchema"],
+    )
+
+
+def _mcp_tool(spec: ToolSpec) -> dict[str, object]:
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "inputSchema": dict(spec.input_schema),
+    }
+
+
+def _broker_surface() -> tuple[ToolBroker, ToolSurface]:
+    broker = ToolBroker(
+        CapabilityRegistry((_report_spec(),)),
+        mode=os.environ.get(TOOL_BROKER_MODE_ENV, "shadow"),
+    )
+    surface = broker.compile_surface(phase="prepare")
+    return broker, surface
+
+
+def _report_tool() -> dict[str, object]:
+    _broker, surface = _broker_surface()
+    spec = surface.registry.get("report_agent_turn")
+    if spec is None:
+        raise ValueError("report_agent_turn is not admitted on this MCP surface")
+    return _mcp_tool(spec)
 
 
 def _write_report(arguments: dict[str, object]) -> dict[str, object]:
@@ -329,7 +371,11 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
     if method.startswith("notifications/"):
         return None
     if method == "tools/list":
-        return _result(request_id, {"tools": [_report_tool()]})
+        _broker, surface = _broker_surface()
+        return _result(
+            request_id,
+            {"tools": [_mcp_tool(spec) for spec in surface.registry.values()]},
+        )
     if method == "tools/call":
         params = message.get("params")
         params = params if isinstance(params, dict) else {}
@@ -338,6 +384,12 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
         arguments = params.get("arguments")
         arguments = arguments if isinstance(arguments, dict) else {}
         try:
+            broker, _surface = _broker_surface()
+            if not broker.admit_call("report_agent_turn"):
+                decision = broker.classify_call("report_agent_turn")
+                raise ValueError(
+                    "tool broker denied report_agent_turn: " f"{decision.reason}"
+                )
             recorded = _write_report(arguments)
         except (OSError, TypeError, ValueError) as exc:
             return _result(

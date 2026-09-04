@@ -134,11 +134,16 @@ CREDENTIAL_RELAY_ENV_VARS = (
     "APPLYPILOT_CREDENTIAL_APPLICATION_ID",
     "APPLYPILOT_CREDENTIAL_RELAY_AUTHORIZED",
     "APPLYPILOT_IDENTITY_RELAY_AUTHORIZED",
+    "APPLYPILOT_TOOL_BROKER_MODE",
 )
-APPLICATION_TOOL_ENV_VARS = ("APPLYPILOT_ATS_CONTEXT_PATH",)
+APPLICATION_TOOL_ENV_VARS = (
+    "APPLYPILOT_ATS_CONTEXT_PATH",
+    "APPLYPILOT_TOOL_BROKER_MODE",
+)
 CONTROL_REPORT_ENV_VARS = (
     "APPLYPILOT_AGENT_REPORT_PATH",
     "APPLYPILOT_AGENT_RUN_ID",
+    "APPLYPILOT_TOOL_BROKER_MODE",
 )
 DEFAULT_MAILBOX_BLOCKED_TOOLS = (
     "draft_email",
@@ -219,6 +224,20 @@ def make_mcp_config(
         ),
     )
     mailbox_spec = resolve_mailbox_mcp_spec(mailbox_mcp)
+    mailbox_tools = mailbox_spec.enabled_tools(
+        direct_email_send_authorized=direct_email_send_authorized
+    )
+    if not using_default_registry:
+        mailbox_tools = [name for name in mailbox_tools if registry.get(name) is not None]
+    credential_relay_authorized = bool(
+        credential_relay_authorized
+        and (using_default_registry or registry.get("fill_ats_credentials") is not None)
+    )
+    identity_relay_authorized = bool(
+        identity_relay_authorized
+        and (using_default_registry or registry.get("fill_protected_identifier") is not None)
+    )
+    effective_direct_email_send = mailbox_spec.send_tool in mailbox_tools
     servers: dict[str, dict[str, object]] = {
         "playwright": {
             "command": spec.command,
@@ -229,7 +248,7 @@ def make_mcp_config(
             ],
         },
     }
-    if mailbox_spec.enabled:
+    if mailbox_spec.enabled and mailbox_tools:
         servers[mailbox_spec.server_name] = {
             "command": mailbox_spec.command,
             "args": mailbox_spec.process_args(),
@@ -241,7 +260,7 @@ def make_mcp_config(
         }
     if runtime_metadata is not None:
         runtime_metadata["mailbox_mcp"] = mailbox_spec.metadata(
-            direct_email_send_authorized=direct_email_send_authorized
+            direct_email_send_authorized=effective_direct_email_send
         )
     if control_reporting:
         servers["applypilot_control"] = {
@@ -407,6 +426,20 @@ def build_agent_command(
     using_default_registry = capability_registry is None
     registry = capability_registry or compose_runtime_capabilities()
     mailbox_spec = resolve_mailbox_mcp_spec(mailbox_mcp)
+    mailbox_tools = mailbox_spec.enabled_tools(
+        direct_email_send_authorized=direct_email_send_authorized
+    )
+    if not using_default_registry:
+        mailbox_tools = [name for name in mailbox_tools if registry.get(name) is not None]
+    credential_relay_authorized = bool(
+        credential_relay_authorized
+        and (using_default_registry or registry.get("fill_ats_credentials") is not None)
+    )
+    identity_relay_authorized = bool(
+        identity_relay_authorized
+        and (using_default_registry or registry.get("fill_protected_identifier") is not None)
+    )
+    effective_direct_email_send = mailbox_spec.send_tool in mailbox_tools
     playwright_tools = _runtime_tool_names(
         registry, "playwright", default_browser_capabilities().names() if using_default_registry else []
     )
@@ -437,7 +470,7 @@ def build_agent_command(
             "tools": application_tool_names,
         }
         runtime_metadata["mailbox_mcp"] = mailbox_spec.metadata(
-            direct_email_send_authorized=direct_email_send_authorized
+            direct_email_send_authorized=effective_direct_email_send
         )
     if backend == "claude":
         allowed_mcp_tools = [
@@ -451,12 +484,10 @@ def build_agent_command(
             allowed_mcp_tools.append(
                 "mcp__credential_relay__fill_protected_identifier"
             )
-        if mailbox_spec.enabled:
+        if mailbox_spec.enabled and mailbox_tools:
             allowed_mcp_tools.extend(
                 f"mcp__{mailbox_spec.server_name}__{name}"
-                for name in mailbox_spec.enabled_tools(
-                    direct_email_send_authorized=direct_email_send_authorized
-                )
+                for name in mailbox_tools
             )
         disallowed_mailbox_tools = []
         if mailbox_spec.enabled:
@@ -464,7 +495,7 @@ def build_agent_command(
                 f"mcp__{mailbox_spec.server_name}__{name}"
                 for name in DEFAULT_MAILBOX_BLOCKED_TOOLS
             )
-            if not direct_email_send_authorized:
+            if not effective_direct_email_send:
                 disallowed_mailbox_tools.append(
                     f"mcp__{mailbox_spec.server_name}__{mailbox_spec.send_tool}"
                 )
@@ -547,7 +578,7 @@ def build_agent_command(
         "-c", f"mcp_servers.playwright.enabled_tools={_toml_value(enabled_tools)}",
         "-c", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
     ])
-    if mailbox_spec.enabled:
+    if mailbox_spec.enabled and mailbox_tools:
         if mailbox_spec.command == "npx" and platform.system() == "Windows":
             mailbox_command = os.environ.get("COMSPEC", "cmd.exe")
             mailbox_args = ["/d", "/s", "/c", "npx", *mailbox_spec.process_args()]
@@ -568,7 +599,7 @@ def build_agent_command(
             "-c", f"{server_key}.tool_timeout_sec={mailbox_spec.tool_timeout_seconds}",
             "-c", (
                 f"{server_key}.enabled_tools="
-                f"{_toml_value(mailbox_spec.enabled_tools(direct_email_send_authorized=direct_email_send_authorized))}"
+                f"{_toml_value(mailbox_tools)}"
             ),
             "-c", f'{server_key}.default_tools_approval_mode="approve"',
         ])

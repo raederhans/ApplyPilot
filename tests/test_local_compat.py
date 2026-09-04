@@ -227,12 +227,13 @@ def test_codex_agent_command_isolated_to_review_browser_tools(monkeypatch, tmp_p
     ):
         assert name in rendered
     assert (
-        'mcp_servers.applypilot_ats.env_vars=["APPLYPILOT_ATS_CONTEXT_PATH"]'
+        'mcp_servers.applypilot_ats.env_vars=["APPLYPILOT_ATS_CONTEXT_PATH", "APPLYPILOT_TOOL_BROKER_MODE"]'
         in overrides
     )
     assert (
         "mcp_servers.applypilot_control.env_vars="
-        '["APPLYPILOT_AGENT_REPORT_PATH", "APPLYPILOT_AGENT_RUN_ID"]'
+        '["APPLYPILOT_AGENT_REPORT_PATH", "APPLYPILOT_AGENT_RUN_ID", '
+        '"APPLYPILOT_TOOL_BROKER_MODE"]'
         in overrides
     )
     ats_env = next(

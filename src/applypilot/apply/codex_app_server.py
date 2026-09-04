@@ -9,6 +9,7 @@ authority and never falls back to another runtime after a request is sent.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import re
@@ -16,7 +17,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -89,8 +90,277 @@ _READ_ONLY_MCP_TOOLS = frozenset(
     }
 )
 
+_DYNAMIC_TOOL_CALL_METHOD = "item/tool/call"
+_MAX_DYNAMIC_SCHEMA_BYTES = 16_384
+_MAX_DYNAMIC_SCHEMA_DEPTH = 8
+_FORBIDDEN_DYNAMIC_TOOL_NAME_PARTS = frozenset(
+    {"click", "create", "delete", "fill", "press", "send", "submit", "type", "update", "upload", "write"}
+)
 
-def app_server_item_starts_effect(item: Mapping[str, object]) -> bool:
+
+def _json_size(value: object) -> int:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("dynamic tool values must be JSON serializable") from exc
+    return len(encoded.encode("utf-8"))
+
+
+def _validate_bounded_schema(schema: Mapping[str, object], *, label: str) -> dict[str, object]:
+    rendered = dict(schema)
+    if rendered.get("type") != "object":
+        raise ValueError(f"{label} must be an object schema")
+    if rendered.get("additionalProperties") is not False:
+        raise ValueError(f"{label} must set additionalProperties=false")
+    if _json_size(rendered) > _MAX_DYNAMIC_SCHEMA_BYTES:
+        raise ValueError(f"{label} exceeds the schema byte limit")
+
+    def visit(value: object, depth: int) -> None:
+        if depth > _MAX_DYNAMIC_SCHEMA_DEPTH:
+            raise ValueError(f"{label} exceeds the schema depth limit")
+        if isinstance(value, Mapping):
+            if any(key in value for key in ("$ref", "allOf", "anyOf", "oneOf")):
+                raise ValueError(f"{label} contains an unbounded schema construct")
+            for nested in value.values():
+                visit(nested, depth + 1)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested, depth + 1)
+
+    visit(rendered, 0)
+    return rendered
+
+
+def _validate_json_object(value: object, schema: Mapping[str, object], *, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be an object")
+    rendered = dict(value)
+    properties = schema.get("properties", {})
+    if not isinstance(properties, Mapping):
+        raise TypeError(f"{label} schema properties must be an object")
+    required = schema.get("required", ())
+    if not isinstance(required, Sequence) or isinstance(required, (str, bytes)):
+        raise TypeError(f"{label} schema required must be an array")
+    missing = [name for name in required if isinstance(name, str) and name not in rendered]
+    unknown = set(rendered).difference(properties)
+    if missing:
+        raise ValueError(f"{label} is missing required fields: {', '.join(missing)}")
+    if unknown:
+        raise ValueError(f"{label} contains unknown fields: {', '.join(sorted(unknown))}")
+    for name, item in rendered.items():
+        field_schema = properties.get(name)
+        if not isinstance(field_schema, Mapping):
+            raise TypeError(f"{label} field {name!r} has no valid schema")
+        expected = field_schema.get("type")
+        matches = {
+            "string": isinstance(item, str),
+            "integer": isinstance(item, int) and not isinstance(item, bool),
+            "number": isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": isinstance(item, bool),
+            "object": isinstance(item, Mapping),
+            "array": isinstance(item, list),
+            "null": item is None,
+        }.get(expected, False)
+        if not matches:
+            raise ValueError(f"{label} field {name!r} does not match type {expected!r}")
+        if (
+            isinstance(item, str)
+            and isinstance(field_schema.get("maxLength"), int)
+            and len(item) > int(field_schema["maxLength"])
+        ):
+            raise ValueError(f"{label} field {name!r} exceeds maxLength")
+        if "enum" in field_schema and item not in field_schema["enum"]:
+            raise ValueError(f"{label} field {name!r} is outside enum")
+    return rendered
+
+
+DynamicToolHandler = Callable[[Mapping[str, object]], Mapping[str, object]]
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicToolSpec:
+    """One bounded, read-only dynamic tool exposed to App Server."""
+
+    name: str
+    description: str
+    input_schema: Mapping[str, object]
+    output_schema: Mapping[str, object]
+    handler: DynamicToolHandler
+    read_only: bool = True
+    defer_loading: bool = False
+    timeout: float = 2.0
+    max_input_bytes: int = 16_384
+    max_output_bytes: int = 65_536
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.name):
+            raise ValueError("dynamic tool name is invalid")
+        name_parts = frozenset(part for part in re.split(r"[_-]+", self.name.casefold()) if part)
+        if name_parts.intersection(_FORBIDDEN_DYNAMIC_TOOL_NAME_PARTS):
+            raise ValueError("dynamic tool name describes a forbidden effect")
+        if not self.description.strip() or len(self.description) > 500:
+            raise ValueError("dynamic tool description is invalid")
+        if not callable(self.handler):
+            raise TypeError("dynamic tool handler must be callable")
+        if self.read_only is not True:
+            raise ValueError("App Server dynamic tools must be read-only")
+        if self.defer_loading:
+            raise ValueError(
+                "deferred App Server functions require a namespace and are not enabled"
+            )
+        _validate_bounded_schema(self.input_schema, label="dynamic tool inputSchema")
+        _validate_bounded_schema(self.output_schema, label="dynamic tool outputSchema")
+        _validate_timeout(self.timeout, "dynamic tool timeout")
+        for value, label in (
+            (self.max_input_bytes, "max_input_bytes"),
+            (self.max_output_bytes, "max_output_bytes"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{label} must be a positive integer")
+
+    def descriptor(self) -> dict[str, object]:
+        return {
+            "type": "function",
+            "name": self.name,
+            "description": self.description.strip(),
+            "inputSchema": dict(self.input_schema),
+            "deferLoading": self.defer_loading,
+        }
+
+
+class DynamicToolSurface:
+    """Validated descriptors and bounded handlers for one App Server thread."""
+
+    def __init__(self, specs: Sequence[DynamicToolSpec]) -> None:
+        by_name: dict[str, DynamicToolSpec] = {}
+        for spec in specs:
+            if not isinstance(spec, DynamicToolSpec):
+                raise TypeError("dynamic tool surface entries must be DynamicToolSpec")
+            if spec.name in by_name:
+                raise ValueError(f"duplicate dynamic tool name: {spec.name}")
+            by_name[spec.name] = spec
+        if not by_name:
+            raise ValueError("dynamic tool surface must not be empty")
+        self._specs = by_name
+        descriptors = [spec.descriptor() for spec in by_name.values()]
+        self.descriptors = tuple(descriptors)
+        durable_manifest = [
+            {
+                "descriptor": spec.descriptor(),
+                "outputSchema": dict(spec.output_schema),
+                "readOnly": spec.read_only,
+                "timeout": spec.timeout,
+                "maxInputBytes": spec.max_input_bytes,
+                "maxOutputBytes": spec.max_output_bytes,
+            }
+            for spec in by_name.values()
+        ]
+        digest_input = json.dumps(
+            durable_manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        self.digest = "sha256:" + hashlib.sha256(digest_input).hexdigest()
+        self._responses: dict[
+            tuple[str, str, str], tuple[str, Mapping[str, object]]
+        ] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def names(self) -> frozenset[str]:
+        return frozenset(self._specs)
+
+    def dispatch(self, *, thread_id: str, turn_id: str, call_id: str, name: str, arguments: object) -> Mapping[str, object]:
+        key = (thread_id, turn_id, call_id)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"name": name, "arguments": arguments},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._lock:
+            cached = self._responses.get(key)
+        if cached is not None:
+            if cached[0] != fingerprint:
+                return _dynamic_tool_failure("callId replay changed tool name or arguments")
+            return cached[1]
+        spec = self._specs.get(name)
+        if spec is None:
+            return self._remember(
+                key, fingerprint, _dynamic_tool_failure("unknown or disabled dynamic tool")
+            )
+        try:
+            if _json_size(arguments) > spec.max_input_bytes:
+                raise ValueError("dynamic tool input exceeds byte limit")
+            validated = _validate_json_object(arguments, spec.input_schema, label="dynamic tool input")
+            outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+            def invoke_handler() -> None:
+                try:
+                    outcome.put((True, spec.handler(validated)))
+                except Exception as exc:  # noqa: BLE001 - cross the daemon boundary as data
+                    outcome.put((False, exc))
+
+            worker = threading.Thread(
+                target=invoke_handler,
+                name=f"applypilot-dynamic-tool-{spec.name}",
+                daemon=True,
+            )
+            worker.start()
+            try:
+                succeeded, raw_output = outcome.get(timeout=spec.timeout)
+            except queue.Empty as exc:
+                raise TimeoutError("dynamic tool handler timed out") from exc
+            if not succeeded:
+                assert isinstance(raw_output, Exception)
+                raise raw_output
+            output = raw_output
+            validated_output = _validate_json_object(
+                output, spec.output_schema, label="dynamic tool output"
+            )
+            if _json_size(validated_output) > spec.max_output_bytes:
+                raise ValueError("dynamic tool output exceeds byte limit")
+            response: Mapping[str, object] = {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": json.dumps(
+                            validated_output,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    }
+                ],
+                "success": True,
+            }
+        except Exception as exc:  # noqa: BLE001 - isolate untrusted dynamic handlers
+            response = _dynamic_tool_failure(str(exc))
+        return self._remember(key, fingerprint, response)
+
+    def _remember(
+        self,
+        key: tuple[str, str, str],
+        fingerprint: str,
+        response: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        with self._lock:
+            existing = self._responses.setdefault(key, (fingerprint, dict(response)))
+        return existing[1]
+
+
+def _dynamic_tool_failure(message: str) -> Mapping[str, object]:
+    return {
+        "contentItems": [{"type": "inputText", "text": message[:500]}],
+        "success": False,
+    }
+
+
+def app_server_item_starts_effect(
+    item: Mapping[str, object],
+    *,
+    read_only_dynamic_tools: frozenset[str] = frozenset(),
+) -> bool:
     """Classify provider items without treating read observations as effects."""
 
     item_type = item.get("type")
@@ -100,6 +370,8 @@ def app_server_item_starts_effect(item: Mapping[str, object]) -> bool:
         return False
     server = item.get("server")
     tool = item.get("tool", item.get("name"))
+    if item_type == "dynamic_tool_call" and tool in read_only_dynamic_tools:
+        return False
     return (server, tool) not in _READ_ONLY_MCP_TOOLS
 
 
@@ -140,6 +412,7 @@ class CodexAppServerStdioTransport:
         ):
             raise ValueError("subscription_queue_size must be a positive integer")
         self.subscription_queue_size = subscription_queue_size
+        self.experimental_api = False
         self._popen_factory = popen_factory
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
@@ -155,6 +428,19 @@ class CodexAppServerStdioTransport:
         self._ready = False
         self._shutting_down = False
         self._reader_failure: BaseException | None = None
+        self._server_request_handler: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None
+
+    def configure_dynamic_tool_handler(
+        self,
+        handler: Callable[[Mapping[str, object]], Mapping[str, object]] | None,
+    ) -> None:
+        """Opt into the experimental client API before the process handshake."""
+
+        with self._lifecycle_lock:
+            if self._process is not None:
+                raise CodexAppServerError("dynamic tools must be configured before App Server starts")
+            self._server_request_handler = handler
+            self.experimental_api = handler is not None
 
     @property
     def process(self) -> subprocess.Popen[str] | None:
@@ -214,7 +500,12 @@ class CodexAppServerStdioTransport:
                             "name": "applypilot",
                             "title": "ApplyPilot",
                             "version": "0.4.0",
-                        }
+                        },
+                        **(
+                            {"capabilities": {"experimentalApi": True}}
+                            if self.experimental_api
+                            else {}
+                        ),
                     },
                     timeout=self.startup_timeout,
                 )
@@ -403,7 +694,10 @@ class CodexAppServerStdioTransport:
         if not isinstance(method, str) or not method:
             raise CodexAppServerProtocolError("JSON-RPC message has no method")
         if request_id is not None:
-            self._reject_server_request(request_id)
+            if method == _DYNAMIC_TOOL_CALL_METHOD and self._server_request_handler is not None:
+                self._handle_server_request(request_id, message)
+            else:
+                self._reject_server_request(request_id)
             return
         with self._state_lock:
             subscriptions = tuple(self._subscriptions.values())
@@ -451,6 +745,23 @@ class CodexAppServerStdioTransport:
                 },
             }
         )
+
+    def _handle_server_request(
+        self,
+        request_id: object,
+        message: Mapping[str, object],
+    ) -> None:
+        handler = self._server_request_handler
+        if handler is None:
+            self._reject_server_request(request_id)
+            return
+        try:
+            result = handler(message)
+            if not isinstance(result, Mapping):
+                raise TypeError("dynamic tool dispatcher returned a non-object")
+        except Exception as exc:  # noqa: BLE001 - isolate the optional dispatcher
+            result = _dynamic_tool_failure(str(exc))
+        self._write_message({"id": request_id, "result": dict(result)})
 
     def _fail_waiters(self, error: BaseException) -> None:
         failure = _TransportFailure(error)
@@ -640,7 +951,49 @@ class CodexAppServerAdapter:
         self._thread_applications: dict[str, str] = {}
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._opening_applications: set[str] = set()
+        self._dynamic_surface: DynamicToolSurface | None = None
+        self._application_surface_digests: dict[str, str] = {}
         self._lock = threading.RLock()
+
+    def configure_dynamic_tools(self, surface: DynamicToolSurface | None) -> None:
+        """Configure a validated read-only surface while this worker is idle."""
+
+        with self._lock:
+            if self._active_turns or self._opening_applications:
+                raise CodexAppServerExecutionError(
+                    "dynamic tool surface cannot change during an active turn",
+                    execution_state=RuntimeCellExecutionState(
+                        request_accepted=True,
+                        tool_or_effect_started=False,
+                        submit_started=False,
+                        bound_backend="codex-app-server",
+                    ),
+                )
+            current_digest = self._dynamic_surface.digest if self._dynamic_surface is not None else None
+            next_digest = surface.digest if surface is not None else None
+            if current_digest == next_digest:
+                return
+            self.transport.configure_dynamic_tool_handler(
+                self._handle_dynamic_tool_request if surface is not None else None
+            )
+            self._dynamic_surface = surface
+
+    @property
+    def dynamic_surface_digest(self) -> str | None:
+        surface = self._dynamic_surface
+        return surface.digest if surface is not None else None
+
+    def bind_dynamic_surface_digest(self, actor_id: str, digest: str) -> None:
+        """Restore the durable surface identity before resuming a thread."""
+
+        if not actor_id or not digest.startswith("sha256:"):
+            raise ValueError("actor_id and dynamic surface digest are required")
+        with self._lock:
+            previous = self._application_surface_digests.setdefault(actor_id, digest)
+            if previous != digest:
+                raise CodexAppServerProtocolError(
+                    "dynamic tool surface digest changed for the application thread"
+                )
 
     def configure_thread(self, config: Mapping[str, object]) -> None:
         """Replace per-turn configuration only while this worker is idle.
@@ -765,6 +1118,8 @@ class CodexAppServerAdapter:
                     "serviceName": "applypilot",
                 }
             )
+            if self._dynamic_surface is not None:
+                thread_params["dynamicTools"] = list(self._dynamic_surface.descriptors)
         if self.thread_config:
             thread_params["config"] = dict(self.thread_config)
         if thread_id is not None:
@@ -788,6 +1143,16 @@ class CodexAppServerAdapter:
                     "thread/resume changed the application thread id",
                     method=thread_method,
                 )
+            surface_digest = self._dynamic_surface.digest if self._dynamic_surface is not None else None
+            with self._lock:
+                bound_digest = self._application_surface_digests.get(request.actor_id)
+                if resume and bound_digest != surface_digest:
+                    raise CodexAppServerProtocolError(
+                        "thread/resume dynamic tool surface digest does not match the durable binding",
+                        method=thread_method,
+                    )
+                if not resume and surface_digest is not None:
+                    self._application_surface_digests[request.actor_id] = surface_digest
             self._bind_application_thread(request.actor_id, returned_thread_id)
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             raise CodexAppServerExecutionError(
@@ -1052,7 +1417,13 @@ class CodexAppServerAdapter:
                     execution_state=state.execution_state(),
                 ) from exc
             item = event.get("item")
-            if isinstance(item, Mapping) and app_server_item_starts_effect(item):
+            dynamic_names = (
+                self._dynamic_surface.names if self._dynamic_surface is not None else frozenset()
+            )
+            if isinstance(item, Mapping) and app_server_item_starts_effect(
+                item,
+                read_only_dynamic_tools=dynamic_names,
+            ):
                 state.effect_started = True
             if event.get("type") == "turn.completed":
                 state.terminal = True
@@ -1064,6 +1435,38 @@ class CodexAppServerAdapter:
         with self._lock:
             if self._active_turns.get(state.turn_id) is state:
                 self._active_turns.pop(state.turn_id, None)
+
+    def _handle_dynamic_tool_request(
+        self,
+        message: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        surface = self._dynamic_surface
+        params = message.get("params")
+        if surface is None or not isinstance(params, Mapping):
+            return _dynamic_tool_failure("dynamic tool surface is unavailable")
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        call_id = params.get("callId")
+        name = params.get("tool", params.get("name"))
+        if not all(isinstance(value, str) and value for value in (thread_id, turn_id, call_id, name)):
+            return _dynamic_tool_failure("dynamic tool call identity is incomplete")
+        with self._lock:
+            state = self._active_turns.get(str(turn_id))
+            bound = bool(
+                state is not None
+                and not state.terminal
+                and state.thread_id == thread_id
+                and state.turn_id == turn_id
+            )
+        if not bound:
+            return _dynamic_tool_failure("dynamic tool call does not bind the active thread and turn")
+        return surface.dispatch(
+            thread_id=str(thread_id),
+            turn_id=str(turn_id),
+            call_id=str(call_id),
+            name=str(name),
+            arguments=params.get("arguments", {}),
+        )
 
     def close_application(self, provider_session_id: str) -> None:
         with self._lock:
@@ -1081,6 +1484,7 @@ class CodexAppServerAdapter:
             actor_id = self._thread_applications.pop(provider_session_id, None)
             if actor_id is not None:
                 self._application_threads.pop(actor_id, None)
+                self._application_surface_digests.pop(actor_id, None)
 
     def shutdown(self) -> None:
         """Interrupt and drain owned turns, then stop only the owned process."""
@@ -1122,5 +1526,8 @@ __all__ = [
     "CodexAppServerStdioTransport",
     "CodexAppServerTimeout",
     "CodexAppServerTransport",
+    "DynamicToolSpec",
+    "DynamicToolSurface",
+    "app_server_item_starts_effect",
     "normalize_app_server_event",
 ]

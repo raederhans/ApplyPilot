@@ -15,16 +15,73 @@ from applypilot.apply.app_server_runtime_wiring import (
     DurableAppServerStateStore,
     build_ref_only_request,
     build_thread_config,
+    dynamic_tools_from_registry,
     open_app_server_turn,
 )
 from applypilot.apply.application_plan import ApplicationPlan
+from applypilot.apply.capabilities import CapabilityRegistry
 from applypilot.apply.codex_app_server import (
     CodexAppServerAdapter,
     CodexAppServerExecutionError,
     CodexAppServerStdioTransport,
     CodexAppServerTimeout,
 )
+from applypilot.apply.contracts import ToolSpec
 from applypilot.apply.runtime_cell import RuntimeCellTurn, select_runtime_cell
+
+
+def test_dynamic_tools_bind_handlers_to_compiled_canonical_specs() -> None:
+    declaration = ToolSpec(
+        name="inspect_public_context",
+        description="Inspect public context",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        output_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": False,
+        },
+        effect_class="read",
+        idempotency="safe",
+        authority="observation",
+        sensitivity="normal",
+        timeout_seconds=1.0,
+    )
+    handler = lambda _arguments: {"status": "ok"}
+
+    tools = dynamic_tools_from_registry(
+        CapabilityRegistry((declaration,)),
+        {declaration.name: handler},
+        declarations=(declaration,),
+    )
+
+    assert [tool.name for tool in tools] == [declaration.name]
+    assert tools[0].input_schema == declaration.input_schema
+    assert tools[0].output_schema == declaration.output_schema
+    assert tools[0].handler({}) == {"status": "ok"}
+
+
+def test_dynamic_tools_cannot_bypass_compiled_surface_or_policy() -> None:
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    write_tool = ToolSpec(
+        name="inspect_then_write",
+        description="Unsafe implementation",
+        input_schema=schema,
+        output_schema=schema,
+        effect_class="write",
+        authority="browser_write",
+    )
+
+    with pytest.raises(ValueError, match="not present in the compiled surface"):
+        dynamic_tools_from_registry(
+            CapabilityRegistry(),
+            {"unknown": lambda _arguments: {}},
+        )
+    with pytest.raises(ValueError, match="not read-only"):
+        dynamic_tools_from_registry(
+            CapabilityRegistry((write_tool,)),
+            {write_tool.name: lambda _arguments: {}},
+        )
 
 FAKE_SERVER = r"""
 import json
@@ -465,6 +522,44 @@ def test_state_store_persists_effect_but_not_read_observation(tmp_path: Path) ->
     assert effected.tool_or_effect_started is True
 
 
+def test_state_store_preserves_dynamic_surface_digest_and_read_only_boundary(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "control.db")
+    digest = "sha256:" + "a" * 64
+    store.bind_dynamic_surface(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        surface_digest=digest,
+    )
+    store.record_accepted(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+    )
+
+    observed = store.record_event(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_turn_id="turn-1",
+        event={
+            "type": "item.completed",
+            "item": {"type": "dynamic_tool_call", "tool": "lookup_fact"},
+        },
+        read_only_dynamic_tools=frozenset({"lookup_fact"}),
+    )
+
+    assert store.dynamic_surface_digest("application:attempt-1", "attempt-1") == digest
+    assert observed.tool_or_effect_started is False
+    with pytest.raises(RuntimeError, match="surface changed"):
+        store.bind_dynamic_surface(
+            actor_id="application:attempt-1",
+            attempt_id="attempt-1",
+            surface_digest="sha256:" + "b" * 64,
+        )
+
+
 def test_pool_reuses_one_adapter_per_worker_and_shutdown_is_bounded() -> None:
     created: list[object] = []
 
@@ -487,6 +582,28 @@ def test_pool_reuses_one_adapter_per_worker_and_shutdown_is_bounded() -> None:
     assert len(created) == 2
     assert first.shutdown_calls == 1
     assert second.shutdown_calls == 1
+
+
+def test_pool_replaces_adapter_when_dynamic_surface_changes() -> None:
+    shutdown = threading.Event()
+
+    class SurfaceAdapter:
+        def __init__(self) -> None:
+            self.dynamic_surface_digest = None
+
+        def shutdown(self) -> None:
+            shutdown.set()
+
+    pool = AppServerRuntimePool(SurfaceAdapter)  # type: ignore[arg-type]
+    first = pool.adapter_for_worker_surface(0, None)
+    first.dynamic_surface_digest = "sha256:" + "a" * 64
+    reused = pool.adapter_for_worker_surface(0, first.dynamic_surface_digest)
+    replacement = pool.adapter_for_worker_surface(0, "sha256:" + "b" * 64)
+
+    assert reused is first
+    assert replacement is not first
+    assert shutdown.wait(timeout=1)
+    pool.shutdown()
 
 
 def test_pool_async_eviction_detaches_before_blocked_shutdown_completes() -> None:

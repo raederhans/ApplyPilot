@@ -93,3 +93,29 @@ finding.
 Next: introduce a canonical ToolBroker declaration/admission surface shared by
 CLI, internal MCP hosts, and App Server wiring; stage deferred namespaces and
 experimental dynamic tools without granting browser-write or submit authority.
+
+P4 completed locally. Tool declarations now carry explicit effect,
+idempotency, authority, provider, sensitivity, timeout/retry/rate,
+postcondition, namespace, and deferred-loading metadata. The ToolBroker compiles
+one phase/route/state/provider surface and stable hash for the CLI, MCP hosts,
+mailbox/credential transports, and App Server. Shadow preserves existing
+behavior; active requires explicit safe metadata and excludes browser writes,
+Submit, mailbox send, credential, protected-identifier, and sensitive reads.
+
+Internal ATS/report/credential MCP hosts derive tools/list and tools/call
+admission from the same declarations while retaining all pre-existing business,
+secret, and browser-binding checks. App Server Dynamic Tools remain default-off,
+negotiate `experimentalApi`, send descriptors only on thread/start, validate a
+durable digest on resume, and dispatch only exact bounded `item/tool/call`
+requests. The initial dynamic surface is the schema-complete `detect_ats` read;
+known ATS states correctly compile an empty dynamic surface. Worker adapters are
+reused only for an identical dynamic surface digest and asynchronously replaced
+when the surface changes.
+
+P4 verification: `290 passed in 13.64s`; independent final review returned PASS.
+Cross-phase focused union: `584 passed in 30.20s`. Full Ruff and diff check
+passed. Full repository suite: `2130 passed in 151.78s`.
+
+Next: build release artifacts, run the archive/clean-install smoke, complete a
+real App Server/CDP health smoke, then run at most one exact-URL real ATS dry-run
+with zero final Submit authority and reconcile database/log evidence.

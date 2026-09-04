@@ -224,6 +224,17 @@ class ToolSpec:
     output_schema: Mapping[str, object] = field(default_factory=dict)
     phases: tuple[str, ...] = ()
     side_effect: str = "read"
+    effect_class: str | None = None
+    idempotency: str = "unknown"
+    authority: str = "unknown"
+    providers: tuple[str, ...] = ()
+    sensitivity: str = "unknown"
+    timeout_seconds: float | None = None
+    retry_policy: Mapping[str, object] = field(default_factory=dict)
+    rate_limit: Mapping[str, object] = field(default_factory=dict)
+    postcondition: Mapping[str, object] = field(default_factory=dict)
+    namespace: str = "core"
+    defer_loading: bool = False
     concurrency_mode: str = "adaptive"
     tags: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
@@ -232,11 +243,30 @@ class ToolSpec:
         _required(self.name, "name")
         _required(self.description, "description")
         _required(self.side_effect, "side_effect")
+        normalized_effect = self.effect_class or self.side_effect
+        _required(normalized_effect, "effect_class")
+        if self.effect_class is not None and self.side_effect not in {"read", normalized_effect}:
+            raise ValueError("side_effect and effect_class must not conflict")
+        object.__setattr__(self, "effect_class", normalized_effect)
+        if self.effect_class != self.side_effect and self.side_effect == "read":
+            # New declarations use effect_class while legacy callers continue
+            # to observe the same classification through side_effect.
+            object.__setattr__(self, "side_effect", normalized_effect)
+        _required(self.idempotency, "idempotency")
+        _required(self.authority, "authority")
+        _required(self.sensitivity, "sensitivity")
+        _required(self.namespace, "namespace")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive when provided")
         _required(self.concurrency_mode, "concurrency_mode")
         ensure_json_safe(self.input_schema, path="$.input_schema")
         ensure_json_safe(self.output_schema, path="$.output_schema")
+        ensure_json_safe(self.retry_policy, path="$.retry_policy")
+        ensure_json_safe(self.rate_limit, path="$.rate_limit")
+        ensure_json_safe(self.postcondition, path="$.postcondition")
         ensure_json_safe(self.metadata, path="$.metadata")
         _strings(self.phases, "phases")
+        _strings(self.providers, "providers")
         _strings(self.tags, "tags")
 
 

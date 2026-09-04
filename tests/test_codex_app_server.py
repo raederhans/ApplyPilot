@@ -16,6 +16,8 @@ from applypilot.apply.codex_app_server import (
     CodexAppServerProtocolError,
     CodexAppServerStdioTransport,
     CodexAppServerTimeout,
+    DynamicToolSpec,
+    DynamicToolSurface,
 )
 from applypilot.apply.runtime_cell import (
     RuntimeCellExecutionState,
@@ -26,6 +28,7 @@ from applypilot.apply.runtime_cell import (
 FAKE_SERVER = r"""
 import json
 import sys
+import time
 
 log_path = sys.argv[1]
 mode = sys.argv[2]
@@ -62,6 +65,23 @@ for raw_line in sys.stdin:
     request_id = message.get("id")
     params = message.get("params", {})
 
+    if request_id == 900 and "result" in message:
+        emit({"method": "item/completed", "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "dynamic-1",
+                "type": "dynamicToolCall",
+                "tool": "lookup_fact",
+                "status": "completed",
+            },
+        }})
+        emit({"method": "turn/completed", "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "completed", "items": [], "error": None},
+        }})
+        continue
+
     if method == "initialize":
         emit({"id": request_id, "result": {
             "userAgent": "fake-codex-app-server",
@@ -96,7 +116,16 @@ for raw_line in sys.stdin:
         emit({"id": request_id, "result": {
             "turn": {"id": turn_id, "status": "inProgress", "items": []}
         }})
-        if mode in {"effect_hold", "read_hold"}:
+        if mode == "dynamic":
+            time.sleep(0.05)
+            emit({"method": "item/tool/call", "id": 900, "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "callId": "call-1",
+                "tool": "lookup_fact",
+                "arguments": {"key": "status"},
+            }})
+        elif mode in {"effect_hold", "read_hold"}:
             emit({"method": "item/started", "params": {
                 "threadId": thread_id,
                 "turnId": turn_id,
@@ -219,6 +248,34 @@ def _wire_messages(log_path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
 
+def _dynamic_surface(calls: list[dict[str, object]]) -> DynamicToolSurface:
+    def lookup(arguments: Mapping[str, object]) -> Mapping[str, object]:
+        calls.append(dict(arguments))
+        return {"value": "ready"}
+
+    return DynamicToolSurface(
+        (
+            DynamicToolSpec(
+                name="lookup_fact",
+                description="Read one bounded application fact.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"key": {"type": "string", "maxLength": 40}},
+                    "required": ["key"],
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string", "maxLength": 80}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                handler=lookup,
+            ),
+        )
+    )
+
+
 def _block_event_consumer(
     adapter: CodexAppServerAdapter,
     provider_turn_id: str,
@@ -286,8 +343,192 @@ def test_stdio_transport_handshake_turn_and_event_normalization(tmp_path: Path) 
     ]
     assert all("jsonrpc" not in message for message in wire)
     assert wire[0]["params"]["clientInfo"]["name"] == "applypilot"
+    assert "capabilities" not in wire[0]["params"]
+    assert "dynamicTools" not in wire[2]["params"]
     assert wire[2]["params"]["approvalPolicy"] == "never"
     assert wire[2]["params"]["sandbox"] == "read-only"
+
+
+def test_dynamic_tool_handshake_descriptor_dispatch_and_read_only_effect(tmp_path: Path) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode="dynamic")
+    adapter = CodexAppServerAdapter(transport)
+    calls: list[dict[str, object]] = []
+    surface = _dynamic_surface(calls)
+    adapter.configure_dynamic_tools(surface)
+
+    turn = adapter.start(_request(tmp_path))
+    events_iter = iter(turn.events)
+    events = [next(events_iter), next(events_iter)]
+    assert adapter.execution_state(turn.provider_turn_id).tool_or_effect_started is False
+    events.extend(events_iter)
+    adapter.shutdown()
+
+    wire = _wire_messages(log_path)
+    initialize = next(message for message in wire if message.get("method") == "initialize")
+    thread_start = next(message for message in wire if message.get("method") == "thread/start")
+    response = next(message for message in wire if message.get("id") == 900)
+    assert initialize["params"]["capabilities"] == {"experimentalApi": True}
+    assert thread_start["params"]["dynamicTools"] == [
+        {
+            "type": "function",
+            "name": "lookup_fact",
+            "description": "Read one bounded application fact.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"key": {"type": "string", "maxLength": 40}},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+            "deferLoading": False,
+        }
+    ]
+    assert response["result"]["success"] is True
+    assert json.loads(response["result"]["contentItems"][0]["text"]) == {"value": "ready"}
+    assert calls == [{"key": "status"}]
+    assert events[-2]["item"]["type"] == "dynamic_tool_call"
+    assert events[-1]["status"] == "completed"
+
+
+def test_dynamic_surface_caches_same_call_and_rejects_invalid_or_write_specs() -> None:
+    calls: list[dict[str, object]] = []
+    surface = _dynamic_surface(calls)
+    first = surface.dispatch(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        name="lookup_fact",
+        arguments={"key": "status"},
+    )
+    second = surface.dispatch(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        name="lookup_fact",
+        arguments={"key": "status"},
+    )
+
+    assert first == second
+    assert calls == [{"key": "status"}]
+    assert surface.dispatch(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        name="lookup_fact",
+        arguments={"key": "different"},
+    )["success"] is False
+    assert surface.dispatch(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        call_id="call-2",
+        name="lookup_fact",
+        arguments={"unknown": True},
+    )["success"] is False
+    with pytest.raises(ValueError, match="read-only"):
+        DynamicToolSpec(
+            name="unsafe_tool",
+            description="Forbidden writer.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=lambda _arguments: {},
+            read_only=False,
+        )
+    with pytest.raises(ValueError, match="forbidden effect"):
+        DynamicToolSpec(
+            name="submit_application",
+            description="Forbidden even if mislabeled as a read.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=lambda _arguments: {},
+        )
+    with pytest.raises(ValueError, match="require a namespace"):
+        DynamicToolSpec(
+            name="deferred_read",
+            description="Deferred without a namespace.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=lambda _arguments: {},
+            defer_loading=True,
+        )
+
+
+def test_dynamic_tool_handler_timeout_is_bounded() -> None:
+    def slow_handler(_arguments: Mapping[str, object]) -> Mapping[str, object]:
+        time.sleep(0.2)
+        return {}
+
+    surface = DynamicToolSurface(
+        (
+            DynamicToolSpec(
+                name="slow_read",
+                description="A deliberately slow read.",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=slow_handler,
+                timeout=0.01,
+            ),
+        )
+    )
+    started = time.monotonic()
+
+    response = surface.dispatch(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        name="slow_read",
+        arguments={},
+    )
+
+    assert response["success"] is False
+    assert "timed out" in response["contentItems"][0]["text"]
+    assert time.monotonic() - started < 0.1
+
+
+def test_dynamic_dispatch_rejects_a_call_outside_the_active_thread_and_turn() -> None:
+    adapter = CodexAppServerAdapter(command=["unused"])
+    adapter.configure_dynamic_tools(_dynamic_surface([]))
+
+    response = adapter._handle_dynamic_tool_request(
+        {
+            "method": "item/tool/call",
+            "id": 900,
+            "params": {
+                "threadId": "thread-stale",
+                "turnId": "turn-stale",
+                "callId": "call-1",
+                "tool": "lookup_fact",
+                "arguments": {"key": "status"},
+            },
+        }
+    )
+
+    assert response["success"] is False
+    assert "does not bind" in response["contentItems"][0]["text"]
+
+
+def test_dynamic_descriptors_are_omitted_on_resume_and_surface_digest_is_stable(
+    tmp_path: Path,
+) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode="complete")
+    adapter = CodexAppServerAdapter(transport)
+    surface = _dynamic_surface([])
+    adapter.configure_dynamic_tools(surface)
+
+    first = adapter.start(_request(tmp_path))
+    list(first.events)
+    adapter.bind_dynamic_surface_digest("application-1", surface.digest)
+    repair = adapter.resume(
+        _request(tmp_path, parent_provider_session_id=first.provider_session_id)
+    )
+    list(repair.events)
+    adapter.shutdown()
+
+    thread_messages = [
+        message
+        for message in _wire_messages(log_path)
+        if message.get("method") in {"thread/start", "thread/resume"}
+    ]
+    assert "dynamicTools" in thread_messages[0]["params"]
+    assert "dynamicTools" not in thread_messages[1]["params"]
 
 
 def test_transport_routes_notifications_to_matching_thread_and_turn_only(

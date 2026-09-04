@@ -12,7 +12,8 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -37,6 +38,9 @@ from applypilot.apply.ats import (
     detect_ats_site,
     propose_fill_plan,
 )
+from applypilot.apply.capabilities import CapabilityRegistry, default_auxiliary_capabilities
+from applypilot.apply.contracts import ToolSpec
+from applypilot.apply.tool_broker import ToolBroker, ToolSurface
 from applypilot.apply.workday_state import (
     evaluate_page_progress,
     observation_from_mapping,
@@ -47,6 +51,7 @@ MAX_CONTEXT_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 512 * 1024
 MAX_FACT_NAMES = 200
 MAX_RESOLUTION_OPTIONS = 50
+TOOL_BROKER_MODE_ENV = "APPLYPILOT_TOOL_BROKER_MODE"
 
 
 def _result(request_id: object, result: object) -> dict[str, object]:
@@ -78,7 +83,7 @@ def _content(payload: object, *, is_error: bool = False) -> dict[str, object]:
     }
 
 
-def _tools() -> list[dict[str, object]]:
+def _tool_definitions() -> list[dict[str, object]]:
     structural_field = {
         "type": "object",
         "properties": {
@@ -134,6 +139,19 @@ def _tools() -> list[dict[str, object]]:
                 "type": "object",
                 "properties": {"url": {"type": "string", "maxLength": 4000}},
                 "required": ["url"],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "schema_version": {"type": "string"},
+                    "adapter": {"type": "string"},
+                    "guidance": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["schema_version", "adapter", "guidance"],
                 "additionalProperties": False,
             },
         },
@@ -248,6 +266,95 @@ def _tools() -> list[dict[str, object]]:
             },
         },
     ]
+
+
+def _tool_specs() -> tuple[ToolSpec, ...]:
+    """Bind the MCP schemas to the same canonical capability contracts."""
+    canonical = default_auxiliary_capabilities()
+    specs: list[ToolSpec] = []
+    for definition in _tool_definitions():
+        name = str(definition["name"])
+        base = canonical.get(name)
+        if base is None:
+            raise ValueError(f"canonical ATS capability is missing: {name}")
+        specs.append(
+            replace(
+                base,
+                description=str(definition["description"]),
+                input_schema=definition["inputSchema"],
+                output_schema=definition.get("outputSchema", {}),
+            )
+        )
+    return tuple(specs)
+
+
+def _mcp_tool(spec: ToolSpec) -> dict[str, object]:
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "inputSchema": dict(spec.input_schema),
+    }
+
+
+def _broker_surface() -> tuple[ToolBroker, ToolSurface]:
+    broker = ToolBroker(
+        CapabilityRegistry(_tool_specs()),
+        mode=os.environ.get(TOOL_BROKER_MODE_ENV, "shadow"),
+    )
+    # This dedicated host historically exposes the complete read/proposal ATS
+    # surface. Include every host-valid discovery state so shadow remains
+    # byte-compatible while active mode still enforces effect/authority policy.
+    surface = broker.compile_surface(
+        phase="prepare",
+        state=("ats_unknown", "ats_workday"),
+    )
+    return broker, surface
+
+
+def _tools() -> list[dict[str, object]]:
+    _broker, surface = _broker_surface()
+    return [_mcp_tool(spec) for spec in surface.registry.values()]
+
+
+def dynamic_tool_specs() -> tuple[ToolSpec, ...]:
+    """Return the minimal schema-complete surface admitted for Dynamic Tools."""
+
+    candidates = tuple(spec for spec in _tool_specs() if spec.output_schema)
+    broker = ToolBroker(CapabilityRegistry(candidates), mode="active")
+    return broker.compile_surface(
+        phase="prepare",
+        state=("ats_unknown", "ats_workday"),
+    ).registry.values()
+
+
+def dynamic_tool_handlers() -> dict[
+    str, Callable[[Mapping[str, object]], Mapping[str, object]]
+]:
+    """Return bounded ATS read/proposal adapters for App Server reuse.
+
+    The map is intentionally sourced only from this credential-free ATS host;
+    each adapter delegates to the existing business handler instead of
+    creating a second implementation.
+    """
+
+    broker = ToolBroker(CapabilityRegistry(dynamic_tool_specs()), mode="active")
+    surface = broker.compile_surface(
+        phase="prepare",
+        state=("ats_unknown", "ats_workday"),
+    )
+
+    def adapter(
+        arguments: Mapping[str, object], *, _name: str
+    ) -> Mapping[str, object]:
+        if not broker.admit_call(_name):
+            decision = broker.classify_call(_name)
+            raise ValueError(f"tool broker denied {_name}: {decision.reason}")
+        return _call_tool(_name, dict(arguments))
+
+    return {
+        spec.name: lambda arguments, _name=spec.name: adapter(arguments, _name=_name)
+        for spec in surface.registry.values()
+    }
 
 
 def _read_context_payload() -> dict[str, object]:
@@ -574,6 +681,10 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
         arguments = params.get("arguments")
         arguments = arguments if isinstance(arguments, dict) else {}
         try:
+            broker, _surface = _broker_surface()
+            if not broker.admit_call(name):
+                decision = broker.classify_call(name)
+                raise ValueError(f"tool broker denied {name}: {decision.reason}")
             payload = _call_tool(name, arguments)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             return _result(request_id, _content(str(exc), is_error=True))

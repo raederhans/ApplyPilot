@@ -6,6 +6,8 @@ import json
 import os
 import sys
 
+from applypilot.apply.capabilities import CapabilityRegistry
+from applypilot.apply.contracts import ToolSpec
 from applypilot.apply.credential_relay import (
     CredentialRelayError,
     _credential_path,
@@ -17,6 +19,9 @@ from applypilot.apply.credential_relay import (
     _read_identity_record,
     _read_record,
 )
+from applypilot.apply.tool_broker import ToolBroker, ToolSurface
+
+TOOL_BROKER_MODE_ENV = "APPLYPILOT_TOOL_BROKER_MODE"
 
 
 def _result(request_id: object, result: object) -> dict[str, object]:
@@ -29,6 +34,73 @@ def _error(request_id: object, message: str) -> dict[str, object]:
         "id": request_id,
         "error": {"code": -32000, "message": message},
     }
+
+
+def _tool_specs() -> tuple[ToolSpec, ...]:
+    return (
+        ToolSpec(
+            name="fill_ats_credentials",
+            description=(
+                "Fill visible credential fields only in the bound application tab. "
+                "Never submits and never returns the password."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "enum": ["email", "password", "both"],
+                    }
+                },
+                "required": ["field"],
+                "additionalProperties": False,
+            },
+            phases=("prepare", "submit"),
+            effect_class="write",
+            idempotency="conditional",
+            authority="credential_relay",
+            sensitivity="high",
+            namespace="credential",
+            concurrency_mode="serial_per_page",
+        ),
+        ToolSpec(
+            name="fill_protected_identifier",
+            description=(
+                "Fill one required FIN/NRIC field in the bound application tab "
+                "from a local DPAPI record. Never returns the identifier and never submits."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"kind": {"type": "string", "enum": ["fin"]}},
+                "required": ["kind"],
+                "additionalProperties": False,
+            },
+            phases=("prepare", "submit"),
+            effect_class="write",
+            idempotency="conditional",
+            authority="protected_identifier_relay",
+            sensitivity="high",
+            namespace="credential",
+            concurrency_mode="serial_per_page",
+        ),
+    )
+
+
+def _mcp_tool(spec: ToolSpec) -> dict[str, object]:
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "inputSchema": dict(spec.input_schema),
+    }
+
+
+def _broker_surface() -> tuple[ToolBroker, ToolSurface]:
+    broker = ToolBroker(
+        CapabilityRegistry(_tool_specs()),
+        mode=os.environ.get(TOOL_BROKER_MODE_ENV, "shadow"),
+    )
+    surface = broker.compile_surface(phase="prepare")
+    return broker, surface
 
 
 def _handle(message: dict[str, object]) -> dict[str, object] | None:
@@ -46,48 +118,10 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
     if method.startswith("notifications/"):
         return None
     if method == "tools/list":
+        _broker, surface = _broker_surface()
         return _result(
             request_id,
-            {
-                "tools": [
-                    {
-                        "name": "fill_ats_credentials",
-                        "description": (
-                            "Fill visible credential fields only in the bound application tab. "
-                            "Never submits and never returns the password."
-                        ),
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "field": {
-                                    "type": "string",
-                                    "enum": ["email", "password", "both"],
-                                }
-                            },
-                            "required": ["field"],
-                            "additionalProperties": False,
-                        },
-                    },
-                    {
-                        "name": "fill_protected_identifier",
-                        "description": (
-                            "Fill one required FIN/NRIC field in the bound application tab "
-                            "from a local DPAPI record. Never returns the identifier and never submits."
-                        ),
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {
-                                    "type": "string",
-                                    "enum": ["fin"],
-                                }
-                            },
-                            "required": ["kind"],
-                            "additionalProperties": False,
-                        },
-                    }
-                ]
-            },
+            {"tools": [_mcp_tool(spec) for spec in surface.registry.values()]},
         )
     if method == "tools/call":
         params = message.get("params")
@@ -95,6 +129,21 @@ def _handle(message: dict[str, object]) -> dict[str, object] | None:
         tool_name = str(params.get("name") or "")
         if tool_name not in {"fill_ats_credentials", "fill_protected_identifier"}:
             return _error(request_id, "Unknown tool")
+        broker, _surface = _broker_surface()
+        if not broker.admit_call(tool_name):
+            decision = broker.classify_call(tool_name)
+            return _result(
+                request_id,
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"tool broker denied {tool_name}: {decision.reason}",
+                        }
+                    ],
+                    "isError": True,
+                },
+            )
         arguments = params.get("arguments")
         arguments = arguments if isinstance(arguments, dict) else {}
         if tool_name == "fill_protected_identifier":

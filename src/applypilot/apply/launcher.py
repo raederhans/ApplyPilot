@@ -45,6 +45,7 @@ from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import application_plan as application_plan_mod
 from applypilot.apply import application_supervisor_loop as supervisor_loop_mod
 from applypilot.apply import ats as ats_mod
+from applypilot.apply import ats_tools_mcp as ats_tools_mcp_mod
 from applypilot.apply import linkedin_page_observation as linkedin_page_observation_mod
 from applypilot.apply import orchestration as orchestration_mod
 from applypilot.apply import page_observation as page_observation_mod
@@ -87,7 +88,7 @@ from applypilot.apply.capabilities import (
     compose_runtime_capabilities,
     resolve_capability_registry,
     resolve_playwright_mcp_spec,
-    scope_capability_registry,
+    scope_capability_registry,  # noqa: F401 - compatibility re-export for callers/tests
 )
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
@@ -117,6 +118,7 @@ from applypilot.apply.contracts import (
     ResourceClaim,
     TaskResult,
     TaskSpec,
+    ToolSpec,
     application_actor_id,
     contract_json,
 )
@@ -213,6 +215,7 @@ from applypilot.apply.specialists import (
     run_durable_material_specialist,
     run_system_specialist,
 )
+from applypilot.apply.tool_broker import ToolBroker, ToolSurface
 from applypilot.database import get_connection
 from applypilot.runtime_settings import load_runtime_settings
 from applypilot.storage import semantic_browser_writes as semantic_write_journal
@@ -2291,6 +2294,153 @@ def _persist_supervisor_intervention(
     )
     append_agent_event(event)
     return occurred_at
+
+
+def _compile_agent_tool_surface(
+    profile: Mapping[str, object],
+    job: Mapping[str, object],
+    registry: CapabilityRegistry,
+    *,
+    phase: str,
+    route: str | None,
+    state: set[str],
+    provider: str | None = None,
+) -> ToolSurface:
+    """Resolve deferred namespaces, then freeze the surface used by the CLI."""
+    runtime_config = profile.get("agent_runtime", {})
+    if not isinstance(runtime_config, Mapping):
+        runtime_config = {}
+    broker_config = runtime_config.get("tool_broker", {})
+    if not isinstance(broker_config, Mapping):
+        broker_config = {}
+    broker_mode = str(job.get("_tool_broker_mode") or broker_config.get("mode") or "shadow")
+    configured_namespaces = broker_config.get("deferred_namespaces", ())
+    if isinstance(configured_namespaces, str):
+        configured_namespaces = (configured_namespaces,)
+    if not isinstance(configured_namespaces, (list, tuple)):
+        raise TypeError("agent_runtime.tool_broker.deferred_namespaces must be a list")
+    namespace_loaders = job.get("_agent_tool_namespace_loaders", {})
+    if not isinstance(namespace_loaders, Mapping):
+        raise TypeError("_agent_tool_namespace_loaders must be a mapping")
+    broker = ToolBroker(
+        compose_runtime_capabilities(registry),
+        mode=broker_mode,
+        namespace_loaders=namespace_loaders,
+    )
+    return broker.compile_surface(
+        phase=phase,
+        route=route,
+        provider=provider,
+        state=state,
+        deferred_namespaces=tuple(str(item) for item in configured_namespaces),
+    )
+
+
+def _with_external_tool_capabilities(
+    registry: CapabilityRegistry,
+    *,
+    mailbox_mcp: MailboxMcpSpec,
+    mailbox_read_authorized: bool,
+    direct_email_send_authorized: bool,
+    credential_relay_authorized: bool,
+    identity_relay_authorized: bool,
+) -> CapabilityRegistry:
+    """Declare separately launched MCP tools before ToolBroker compilation."""
+
+    resolved = CapabilityRegistry(registry.values())
+    external: list[ToolSpec] = []
+    if mailbox_mcp.enabled and mailbox_read_authorized:
+        for name, description in (
+            (mailbox_mcp.search_tool, "Search the authorized mailbox"),
+            (mailbox_mcp.read_tool, "Read one authorized mailbox message"),
+        ):
+            external.append(
+                ToolSpec(
+                    name=name,
+                    description=description,
+                    phases=("prepare", "submit"),
+                    effect_class="read",
+                    idempotency="safe",
+                    authority="read",
+                    providers=("claude", "codex"),
+                    sensitivity="medium",
+                    timeout_seconds=float(mailbox_mcp.tool_timeout_seconds),
+                    namespace="mailbox",
+                    metadata={
+                        "server": mailbox_mcp.server_name,
+                        "external_transport": True,
+                    },
+                )
+            )
+    if mailbox_mcp.enabled and direct_email_send_authorized:
+        external.append(
+            ToolSpec(
+                name=mailbox_mcp.send_tool,
+                description="Send one reserved direct-email application",
+                phases=("submit",),
+                effect_class="write",
+                idempotency="unsafe",
+                authority="mailbox_send",
+                providers=("claude", "codex"),
+                sensitivity="high",
+                timeout_seconds=float(mailbox_mcp.tool_timeout_seconds),
+                namespace="mailbox",
+                metadata={
+                    "server": mailbox_mcp.server_name,
+                    "external_transport": True,
+                },
+            )
+        )
+    for enabled, name, authority in (
+        (credential_relay_authorized, "fill_ats_credentials", "credential"),
+        (identity_relay_authorized, "fill_protected_identifier", "protected_identifier"),
+    ):
+        if enabled:
+            external.append(
+                ToolSpec(
+                    name=name,
+                    description="Fill one host-authorized protected field",
+                    phases=("prepare", "submit"),
+                    effect_class="write",
+                    idempotency="conditional",
+                    authority=authority,
+                    providers=("claude", "codex"),
+                    sensitivity="high",
+                    timeout_seconds=30.0,
+                    namespace="credential_relay",
+                    metadata={
+                        "server": "credential_relay",
+                        "external_transport": True,
+                    },
+                )
+            )
+    for tool in external:
+        resolved.register(tool, replace=resolved.get(tool.name) is not None)
+    return resolved
+
+
+def _compile_app_server_dynamic_tools(
+    job: Mapping[str, object],
+    runtime_capabilities: CapabilityRegistry,
+) -> tuple[object, ...]:
+    """Bind only handlers already admitted by the compiled ToolBroker surface."""
+
+    raw_handlers = job.get(
+        "_app_server_dynamic_tool_handlers",
+        ats_tools_mcp_mod.dynamic_tool_handlers(),
+    )
+    if not isinstance(raw_handlers, Mapping):
+        raise TypeError("_app_server_dynamic_tool_handlers must be a mapping")
+    compiled_handlers = {
+        str(name): handler
+        for name, handler in raw_handlers.items()
+        if runtime_capabilities.get(str(name)) is not None
+    }
+    return app_server_wiring_mod.dynamic_tools_from_registry(
+        runtime_capabilities,
+        compiled_handlers,
+        declarations=ats_tools_mcp_mod.dynamic_tool_specs(),
+    )
 
 
 def _supervisor_page_signature(payload: object) -> str:
@@ -5614,20 +5764,56 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
     if verification_child:
         mailbox_mcp = MailboxMcpSpec(package=None, enabled=False, source="audit_verification")
-    runtime_capabilities = scope_capability_registry(
-        compose_runtime_capabilities(capability_registry),
+    capability_registry = _with_external_tool_capabilities(
+        capability_registry,
+        mailbox_mcp=mailbox_mcp,
+        mailbox_read_authorized=mailbox_access_authorized,
+        direct_email_send_authorized=direct_email_send_authorized,
+        credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
+    )
+    tool_surface = _compile_agent_tool_surface(
+        profile,
+        job,
+        capability_registry,
         phase=submission_phase,
         route=runtime_route,
         state=runtime_state,
+        provider=agent_backend,
     )
+    runtime_capabilities = tool_surface.registry
     if verification_child:
         runtime_capabilities = audit_verification_capabilities(runtime_capabilities)
+        tool_surface = tool_surface.restrict_to(runtime_capabilities)
+    credential_relay_authorized = bool(
+        credential_relay_authorized
+        and runtime_capabilities.get("fill_ats_credentials") is not None
+    )
+    identity_relay_authorized = bool(
+        identity_relay_authorized
+        and runtime_capabilities.get("fill_protected_identifier") is not None
+    )
     semantic_email_tools: list[str] = []
-    if mailbox_mcp.enabled and mailbox_access_authorized:
+    if (
+        mailbox_mcp.enabled
+        and mailbox_access_authorized
+        and runtime_capabilities.get(mailbox_mcp.search_tool) is not None
+        and runtime_capabilities.get(mailbox_mcp.read_tool) is not None
+    ):
         semantic_email_tools.extend(("mailbox_search", "mailbox_get_message"))
-    if mailbox_mcp.enabled and direct_email_send_authorized:
+    direct_email_send_authorized = bool(
+        mailbox_mcp.enabled
+        and direct_email_send_authorized
+        and runtime_capabilities.get(mailbox_mcp.send_tool) is not None
+    )
+    if direct_email_send_authorized:
         semantic_email_tools.append("direct_email_send")
-    job["_available_tools"] = [*runtime_capabilities.names(), *semantic_email_tools]
+    prompt_runtime_tools = [
+        tool.name
+        for tool in runtime_capabilities.values()
+        if tool.metadata.get("external_transport") is not True
+    ]
+    job["_available_tools"] = [*prompt_runtime_tools, *semantic_email_tools]
     job["_agent_orchestration_available"] = callable(
         job.get("_agent_proposal_runner")
     )
@@ -5679,6 +5865,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             else "failed:runtime_route_changed"
         ), 0
     app_server_eligible = runtime_route == "browser" and submission_phase != "submit"
+    dynamic_tools_enabled = os.environ.get(
+        "APPLYPILOT_CODEX_DYNAMIC_TOOLS_ENABLED", ""
+    ).strip().casefold() in {"1", "true", "yes", "on"}
+    app_server_dynamic_tools = ()
+    if dynamic_tools_enabled:
+        app_server_dynamic_tools = _compile_app_server_dynamic_tools(
+            job,
+            runtime_capabilities,
+        )
+    dynamic_surface_digest = app_server_wiring_mod.dynamic_tool_surface_digest(
+        app_server_dynamic_tools
+    )
     app_server_adapter = None
     if (
         agent_backend.strip().casefold() == "codex"
@@ -5686,7 +5884,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         and app_server_eligible
         and not app_server_bound
     ):
-        app_server_adapter = _app_server_runtime_pool.adapter_for_worker(worker_id)
+        surface_adapter = getattr(
+            _app_server_runtime_pool, "adapter_for_worker_surface", None
+        )
+        app_server_adapter = (
+            surface_adapter(worker_id, dynamic_surface_digest)
+            if callable(surface_adapter)
+            else _app_server_runtime_pool.adapter_for_worker(worker_id)
+        )
     runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
         agent_backend,
         codex_app_server_enabled=(
@@ -5836,6 +6041,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     runtime_metadata: dict = {}
+    runtime_metadata["tool_broker"] = {
+        "schema_version": "1",
+        "mode": tool_surface.mode,
+        "phase": tool_surface.phase,
+        "route": tool_surface.route,
+        "provider": tool_surface.provider,
+        "state": list(tool_surface.state),
+        "surface_hash": tool_surface.surface_hash,
+        "loaded_namespaces": list(tool_surface.loaded_namespaces),
+        "enforced": tool_surface.mode == "active",
+    }
     runtime_metadata["runtime_cell"] = dict(job["_runtime_cell"])
     runtime_metadata["browser_broker"] = {
         "schema_version": "1",
@@ -5922,6 +6138,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env[REPORT_PATH_ENV] = str(report_path)
     env[RUN_ID_ENV] = run_id
     env[ATS_CONTEXT_PATH_ENV] = str(ats_context_path)
+    env["APPLYPILOT_TOOL_BROKER_MODE"] = tool_surface.mode
     env["APPLYPILOT_RUN_NAMESPACE_ID"] = runtime_namespace.run_id
     env["APPLYPILOT_SESSION_NAMESPACE_ID"] = runtime_namespace.session_id
     env["APPLYPILOT_PROFILE_NAMESPACE_ID"] = runtime_namespace.profile_id
@@ -6347,6 +6564,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         else None
                     ),
                     plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
+                    dynamic_tools=app_server_dynamic_tools,
                     on_transport_failure=lambda failed_adapter: _app_server_runtime_pool.evict_worker(
                         worker_id, failed_adapter
                     ),
@@ -6437,12 +6655,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             checkpoint_id=runtime_parent_checkpoint_id,
             model=model,
             recovery_authorization_id=runtime_authorization_id,
-            tool_surface_hash=_control_contract_digest(
-                {
-                    "schema_version": "1",
-                    "available_tools": sorted(agent_request.available_tools),
-                }
-            ),
+            tool_surface_hash=tool_surface.surface_hash,
             prompt_contract_hash=_control_contract_digest(
                 {
                     "schema_version": "1",

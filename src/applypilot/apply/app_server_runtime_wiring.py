@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,8 +33,11 @@ from applypilot.apply.codex_app_server import (
     CodexAppServerAdapter,
     CodexAppServerExecutionError,
     CodexAppServerTimeout,
+    DynamicToolSpec,
+    DynamicToolSurface,
     app_server_item_starts_effect,
 )
+from applypilot.apply.contracts import ToolSpec
 from applypilot.apply.runtime_cell import (
     RuntimeCellExecutionState,
     RuntimeCellRequest,
@@ -53,6 +57,62 @@ _READ_ONLY_PLAYWRIGHT_TOOLS = (
     "browser_network_requests",
 )
 _LOOPBACK_PLAYWRIGHT_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def dynamic_tools_from_registry(
+    registry: CapabilityRegistry,
+    handlers: Mapping[str, Callable[[Mapping[str, object]], Mapping[str, object]]],
+    *,
+    declarations: Iterable[ToolSpec] = (),
+) -> tuple[DynamicToolSpec, ...]:
+    """Bind canonical read-only declarations to explicit in-process handlers.
+
+    The registry remains the source of names, schemas, policy and timeouts.
+    Handlers only provide implementation; an extra handler cannot create a
+    capability that the compiled ToolBroker surface did not admit.
+    """
+
+    declared = {tool.name: tool for tool in registry.values()}
+    descriptor_source = {tool.name: tool for tool in declarations}
+    unknown = sorted(set(handlers).difference(declared))
+    if unknown:
+        raise ValueError(
+            "dynamic tool handlers are not present in the compiled surface: "
+            + ", ".join(unknown)
+        )
+    specs: list[DynamicToolSpec] = []
+    for name in sorted(handlers):
+        admitted_tool = declared[name]
+        tool = descriptor_source.get(name, admitted_tool)
+        if not isinstance(tool, ToolSpec) or not isinstance(admitted_tool, ToolSpec):
+            raise TypeError("dynamic tool declarations must be ToolSpec instances")
+        for field in ("effect_class", "authority", "sensitivity"):
+            if getattr(tool, field) != getattr(admitted_tool, field):
+                raise ValueError(f"dynamic tool {name} declaration does not match compiled policy")
+        if str(tool.effect_class).casefold() != "read":
+            raise ValueError(f"dynamic tool {name} is not read-only")
+        if tool.authority.casefold() not in {"none", "read", "observation", "advisory"}:
+            raise ValueError(f"dynamic tool {name} has unsupported authority")
+        if tool.sensitivity.casefold() not in {"normal", "low", "public"}:
+            raise ValueError(f"dynamic tool {name} has unsupported sensitivity")
+        specs.append(
+            DynamicToolSpec(
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
+                output_schema=tool.output_schema,
+                handler=handlers[name],
+                defer_loading=tool.defer_loading,
+                timeout=float(tool.timeout_seconds or 2.0),
+            )
+        )
+    return tuple(specs)
+
+
+def dynamic_tool_surface_digest(tools: tuple[DynamicToolSpec, ...]) -> str | None:
+    """Return the exact App Server descriptor digest without starting a process."""
+
+    return DynamicToolSurface(tools).digest if tools else None
 
 
 class DurableAppServerStateError(RuntimeError):
@@ -131,6 +191,16 @@ class DurableAppServerStateStore:
                     CHECK(tool_or_effect_started IN (0,1)),
                 submit_started INTEGER NOT NULL CHECK(submit_started IN (0,1)),
                 status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_server_dynamic_surfaces (
+                actor_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                surface_digest TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -283,6 +353,64 @@ class DurableAppServerStateStore:
         assert state is not None
         return state
 
+    def dynamic_surface_digest(self, actor_id: str, attempt_id: str) -> str | None:
+        self._prepare_write_connection()
+        connection = self._connection()
+        try:
+            self._ensure_schema(connection)
+            row = connection.execute(
+                "SELECT attempt_id, surface_digest FROM app_server_dynamic_surfaces WHERE actor_id=?",
+                (actor_id,),
+            ).fetchone()
+        finally:
+            self._release(connection)
+        if row is None:
+            return None
+        if row["attempt_id"] != attempt_id:
+            raise DurableAppServerStateError("dynamic tool surface belongs to a different attempt")
+        return str(row["surface_digest"])
+
+    def bind_dynamic_surface(
+        self,
+        *,
+        actor_id: str,
+        attempt_id: str,
+        surface_digest: str,
+    ) -> None:
+        if not surface_digest.startswith("sha256:"):
+            raise ValueError("dynamic tool surface digest is invalid")
+        self._prepare_write_connection()
+        connection = self._connection()
+        try:
+            self._ensure_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt_id, surface_digest FROM app_server_dynamic_surfaces WHERE actor_id=?",
+                (actor_id,),
+            ).fetchone()
+            if row is not None and (
+                row["attempt_id"] != attempt_id or row["surface_digest"] != surface_digest
+            ):
+                raise DurableAppServerStateError(
+                    "dynamic tool surface changed for the durable application thread"
+                )
+            connection.execute(
+                """
+                INSERT INTO app_server_dynamic_surfaces(
+                    actor_id, attempt_id, surface_digest, updated_at
+                ) VALUES(?,?,?,?)
+                ON CONFLICT(actor_id) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (actor_id, attempt_id, surface_digest, datetime.now(UTC).isoformat()),
+            )
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            self._release(connection)
+
     def record_submit_started(
         self,
         *,
@@ -423,9 +551,13 @@ class DurableAppServerStateStore:
         attempt_id: str,
         provider_turn_id: str,
         event: Mapping[str, object],
+        read_only_dynamic_tools: frozenset[str] = frozenset(),
     ) -> DurableAppServerState:
         item = event.get("item")
-        effect_started = isinstance(item, Mapping) and app_server_item_starts_effect(item)
+        effect_started = isinstance(item, Mapping) and app_server_item_starts_effect(
+            item,
+            read_only_dynamic_tools=read_only_dynamic_tools,
+        )
         terminal_status: str | None = None
         if event.get("type") == "turn.completed":
             raw_status = event.get("status")
@@ -506,6 +638,32 @@ class AppServerRuntimePool:
                 self._adapters[worker_id] = adapter
             return adapter
 
+    def adapter_for_worker_surface(
+        self,
+        worker_id: int,
+        dynamic_surface_digest: str | None,
+    ) -> CodexAppServerAdapter:
+        """Reuse only adapters initialized for the same Dynamic Tools surface."""
+
+        if isinstance(worker_id, bool) or not isinstance(worker_id, int) or worker_id < 0:
+            raise ValueError("worker_id must be a non-negative integer")
+        stale: CodexAppServerAdapter | None = None
+        with self._lock:
+            adapter = self._adapters.get(worker_id)
+            if (
+                adapter is not None
+                and getattr(adapter, "dynamic_surface_digest", None)
+                != dynamic_surface_digest
+            ):
+                stale = self._adapters.pop(worker_id)
+                adapter = None
+            if adapter is None:
+                adapter = self._adapter_factory()
+                self._adapters[worker_id] = adapter
+        if stale is not None:
+            self._schedule_shutdown(stale)
+        return adapter
+
     def shutdown(self) -> None:
         with self._lock:
             adapters = tuple(self._adapters.values())
@@ -547,6 +705,12 @@ class AppServerRuntimePool:
         if not self._detach_worker(worker_id, adapter):
             return None
 
+        return self._schedule_shutdown(adapter)
+
+    def _schedule_shutdown(
+        self,
+        adapter: CodexAppServerAdapter,
+    ) -> threading.Thread:
         def shutdown_detached_adapter() -> None:
             try:
                 self._shutdown_adapter(adapter)
@@ -556,7 +720,7 @@ class AppServerRuntimePool:
 
         cleanup_thread = threading.Thread(
             target=shutdown_detached_adapter,
-            name=f"applypilot-app-server-cleanup-worker-{worker_id}",
+            name=f"applypilot-app-server-cleanup-{id(adapter):x}",
             daemon=True,
         )
         with self._lock:
@@ -698,6 +862,7 @@ class AppServerTurnProcess:
         state_store: DurableAppServerStateStore,
         actor_id: str,
         attempt_id: str,
+        read_only_dynamic_tools: frozenset[str] = frozenset(),
         on_transport_failure: AdapterFailureCallback | None = None,
     ) -> None:
         self.adapter = adapter
@@ -705,6 +870,7 @@ class AppServerTurnProcess:
         self.state_store = state_store
         self.actor_id = actor_id
         self.attempt_id = attempt_id
+        self.read_only_dynamic_tools = read_only_dynamic_tools
         self.on_transport_failure = on_transport_failure
         process = adapter.transport.process
         self.pid = int(process.pid) if process is not None else 0
@@ -730,6 +896,7 @@ class AppServerTurnProcess:
                     attempt_id=self.attempt_id,
                     provider_turn_id=self.turn.provider_turn_id,
                     event=event,
+                    read_only_dynamic_tools=self.read_only_dynamic_tools,
                 )
                 self._stream.put(event)
         # Preserve every producer failure for the owning launcher thread;
@@ -853,6 +1020,7 @@ def open_app_server_turn(
     adapter: CodexAppServerAdapter,
     state_store: DurableAppServerStateStore,
     request: RuntimeCellRequest,
+    read_only_dynamic_tools: frozenset[str] = frozenset(),
     on_transport_failure: AdapterFailureCallback | None = None,
 ) -> AppServerTurnProcess:
     """Start or resume one durable application thread and persist acceptance."""
@@ -910,6 +1078,7 @@ def open_app_server_turn(
         state_store=state_store,
         actor_id=request.actor_id,
         attempt_id=request.attempt_id,
+        read_only_dynamic_tools=read_only_dynamic_tools,
         on_transport_failure=on_transport_failure,
     )
 
@@ -933,12 +1102,28 @@ def open_configured_app_server_turn(
     plan: ApplicationPlan | None,
     previous_plan: ApplicationPlan | None,
     plan_shadow_enabled: bool,
+    dynamic_tools: tuple[DynamicToolSpec, ...] = (),
     on_transport_failure: AdapterFailureCallback | None = None,
 ) -> AppServerTurnProcess:
     """Configure one worker adapter and open its durable application turn."""
 
     if phase == "submit":
         raise ValueError("submit phase is not supported by the App Server runtime")
+
+    dynamic_enabled = os.getenv("APPLYPILOT_CODEX_DYNAMIC_TOOLS_ENABLED", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    surface = DynamicToolSurface(dynamic_tools) if dynamic_enabled and dynamic_tools else None
+    configure_dynamic_tools = getattr(adapter, "configure_dynamic_tools", None)
+    if callable(configure_dynamic_tools):
+        configure_dynamic_tools(surface)
+    elif surface is not None:
+        raise DurableAppServerStateError(
+            "configured App Server adapter does not support dynamic tools"
+        )
 
     enabled_tools: dict[str, tuple[str, ...]] = {
         "playwright": tuple(capability_names_for_server(runtime_capabilities, "playwright"))
@@ -951,6 +1136,15 @@ def open_configured_app_server_turn(
         )
     )
     existing = state_store.load(actor_id, attempt_id)
+    if existing is not None and existing.provider_session_id is not None:
+        stored_digest = state_store.dynamic_surface_digest(actor_id, attempt_id)
+        expected_digest = surface.digest if surface is not None else None
+        if stored_digest != expected_digest:
+            raise DurableAppServerStateError(
+                "configured dynamic tool surface does not match the durable thread"
+            )
+        if stored_digest is not None:
+            adapter.bind_dynamic_surface_digest(actor_id, stored_digest)
     request = build_ref_only_request(
         run_id=run_id,
         actor_id=actor_id,
@@ -966,12 +1160,20 @@ def open_configured_app_server_turn(
         plan_shadow_enabled=plan_shadow_enabled,
         parent_provider_session_id=(existing.provider_session_id if existing is not None else None),
     )
-    return open_app_server_turn(
+    process = open_app_server_turn(
         adapter=adapter,
         state_store=state_store,
         request=request,
+        read_only_dynamic_tools=(surface.names if surface is not None else frozenset()),
         on_transport_failure=on_transport_failure,
     )
+    if surface is not None:
+        state_store.bind_dynamic_surface(
+            actor_id=actor_id,
+            attempt_id=attempt_id,
+            surface_digest=surface.digest,
+        )
+    return process
 
 
 __all__ = [
@@ -982,6 +1184,8 @@ __all__ = [
     "DurableAppServerStateStore",
     "build_ref_only_request",
     "build_thread_config",
+    "dynamic_tool_surface_digest",
+    "dynamic_tools_from_registry",
     "open_app_server_turn",
     "open_configured_app_server_turn",
 ]

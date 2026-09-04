@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from applypilot.apply import agent_runtime
+from applypilot.apply import agent_runtime, launcher
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
     McpPackageSpec,
@@ -14,6 +14,7 @@ from applypilot.apply.capabilities import (
     resolve_playwright_mcp_spec,
     scope_capability_registry,
 )
+from applypilot.apply.email_routing import MailboxMcpSpec
 
 
 def test_registry_is_extensible_and_metadata_is_advisory() -> None:
@@ -381,6 +382,149 @@ def test_configured_capabilities_can_extend_or_replace_defaults() -> None:
     assert extended.get("future_semantic_mapper").phases == ("future-phase",)
     assert replaced.names() == ["future_submitter"]
     assert replaced.get("future_submitter").side_effect == "plugin-defined"
+
+
+def test_launcher_compiles_one_broker_surface_before_command_assembly() -> None:
+    deferred = ToolCapability(
+        name="semantic_report",
+        description="Return a semantic proposal",
+        phases=("prepare",),
+        effect_class="proposal",
+        idempotency="safe",
+        authority="advisory",
+        sensitivity="normal",
+        namespace="semantic",
+        defer_loading=True,
+        metadata={"server": "applypilot_ats"},
+    )
+    profile = {
+        "agent_runtime": {
+            "tool_broker": {
+                "mode": "active",
+                "deferred_namespaces": ["semantic"],
+            }
+        }
+    }
+    job = {"_agent_tool_namespace_loaders": {"semantic": lambda: (deferred,)}}
+
+    surface = launcher._compile_agent_tool_surface(
+        profile,
+        job,
+        default_browser_capabilities(),
+        phase="prepare",
+        route="browser",
+        state={"ats_unknown"},
+    )
+
+    assert surface.mode == "active"
+    assert surface.names() == [
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_wait_for",
+        "detect_ats",
+        "get_application_context",
+        "build_fill_plan",
+        "build_answer_mapping",
+        "resolve_answer",
+        "report_agent_turn",
+        "semantic_report",
+    ]
+    metadata: dict = {
+        "tool_broker": {"surface_hash": surface.surface_hash}
+    }
+    command, _ = agent_runtime.build_agent_command(
+        "claude",
+        "model",
+        9432,
+        Path("worker"),
+        Path("mcp.json"),
+        resolve_claude=lambda: ["claude"],
+        capability_registry=surface.registry,
+        runtime_metadata=metadata,
+    )
+    allowed = command[command.index("--allowedTools") + 1]
+
+    assert "mcp__applypilot_ats__semantic_report" in allowed
+    assert "mcp__playwright__browser_click" not in allowed
+    assert metadata["tool_broker"]["surface_hash"] == surface.surface_hash
+
+
+def test_dynamic_tools_follow_the_compiled_ats_state() -> None:
+    profile = {"agent_runtime": {"tool_broker": {"mode": "shadow"}}}
+    generic = launcher._compile_agent_tool_surface(
+        profile,
+        {},
+        default_browser_capabilities(),
+        phase="prepare",
+        route="browser",
+        state={"ats_unknown"},
+        provider="codex",
+    )
+    workday = launcher._compile_agent_tool_surface(
+        profile,
+        {},
+        default_browser_capabilities(),
+        phase="prepare",
+        route="browser",
+        state={"ats_workday"},
+        provider="codex",
+    )
+
+    assert [tool.name for tool in launcher._compile_app_server_dynamic_tools({}, generic.registry)] == [
+        "detect_ats"
+    ]
+    assert launcher._compile_app_server_dynamic_tools({}, workday.registry) == ()
+
+
+def test_active_surface_excludes_mailbox_send_and_credential_relay() -> None:
+    mailbox = MailboxMcpSpec(
+        server_name="mailbox",
+        package=None,
+        command="mailbox-test",
+        search_tool="search_emails",
+        read_tool="read_email",
+        send_tool="send_email",
+    )
+    external = launcher._with_external_tool_capabilities(
+        default_browser_capabilities(),
+        mailbox_mcp=mailbox,
+        mailbox_read_authorized=True,
+        direct_email_send_authorized=True,
+        credential_relay_authorized=True,
+        identity_relay_authorized=True,
+    )
+    surface = launcher._compile_agent_tool_surface(
+        {"agent_runtime": {"tool_broker": {"mode": "active"}}},
+        {},
+        external,
+        phase="submit",
+        route="direct_email",
+        state={"submit", "reserved"},
+        provider="codex",
+    )
+
+    assert "send_email" not in surface.names()
+    assert "fill_ats_credentials" not in surface.names()
+    assert "fill_protected_identifier" not in surface.names()
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "model",
+        9432,
+        Path("worker"),
+        Path("unused.json"),
+        resolve_codex=lambda: ["codex"],
+        capability_registry=surface.registry,
+        mailbox_mcp=mailbox,
+        direct_email_send_authorized=True,
+        credential_relay_authorized=True,
+        identity_relay_authorized=True,
+    )
+    rendered = " ".join(command)
+
+    assert "mcp_servers.mailbox.command" not in rendered
+    assert "mcp_servers.credential_relay.command" not in rendered
 
 
 def test_claude_and_codex_share_the_same_resolved_mcp_surface(tmp_path: Path) -> None:

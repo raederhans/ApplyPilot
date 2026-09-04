@@ -114,6 +114,19 @@ def default_browser_capabilities() -> CapabilityRegistry:
                 ),
                 phases=phases,
                 side_effect="read" if read_only else "write",
+                idempotency="safe" if read_only else "conditional",
+                authority="observation" if read_only else "browser_write",
+                providers=("claude", "codex", "app_server"),
+                sensitivity="normal",
+                timeout_seconds=90,
+                retry_policy={"max_attempts": 1 if read_only else 0},
+                rate_limit={"scope": "page"},
+                postcondition=(
+                    {"kind": "observation"}
+                    if read_only
+                    else {"kind": "page_state_changed"}
+                ),
+                namespace="browser",
                 concurrency_mode="parallel_safe" if read_only else "serial_per_page",
                 tags=tuple(tags),
                 metadata={
@@ -152,6 +165,15 @@ def default_auxiliary_capabilities() -> CapabilityRegistry:
             description="Read/proposal-only application helper",
             phases=phases,
             side_effect="read" if name != "report_agent_turn" else "report",
+            idempotency="safe",
+            authority="report" if name == "report_agent_turn" else "advisory",
+            providers=("claude", "codex", "app_server"),
+            sensitivity="normal",
+            timeout_seconds=20,
+            retry_policy={"max_attempts": 1},
+            rate_limit={"scope": "turn"},
+            postcondition={"kind": "typed_result"},
+            namespace=("control" if name == "report_agent_turn" else "application"),
             concurrency_mode="parallel_safe",
             tags=tags,
             metadata={"schema_version": CAPABILITY_SCHEMA_VERSION, "server": server},
@@ -310,6 +332,25 @@ def resolve_capability_registry(
                 output_schema=dict(raw.get("output_schema") or {}),
                 phases=tuple(str(value) for value in (raw.get("phases") or ())),
                 side_effect=str(raw.get("side_effect") or "read"),
+                effect_class=(
+                    str(raw["effect_class"])
+                    if raw.get("effect_class") is not None
+                    else None
+                ),
+                idempotency=str(raw.get("idempotency") or "unknown"),
+                authority=str(raw.get("authority") or "unknown"),
+                providers=tuple(str(value) for value in (raw.get("providers") or ())),
+                sensitivity=str(raw.get("sensitivity") or "unknown"),
+                timeout_seconds=(
+                    float(raw["timeout_seconds"])
+                    if raw.get("timeout_seconds") is not None
+                    else None
+                ),
+                retry_policy=dict(raw.get("retry_policy") or {}),
+                rate_limit=dict(raw.get("rate_limit") or {}),
+                postcondition=dict(raw.get("postcondition") or {}),
+                namespace=str(raw.get("namespace") or "core"),
+                defer_loading=bool(raw.get("defer_loading", False)),
                 concurrency_mode=str(raw.get("concurrency_mode") or "adaptive"),
                 tags=tuple(str(value) for value in (raw.get("tags") or ())),
                 metadata=dict(raw.get("metadata") or {}),
@@ -449,6 +490,17 @@ def record_runtime_surface(
                 "name": item.name,
                 "phases": list(item.phases),
                 "side_effect": item.side_effect,
+                "effect_class": item.effect_class,
+                "idempotency": item.idempotency,
+                "authority": item.authority,
+                "providers": list(item.providers),
+                "sensitivity": item.sensitivity,
+                "timeout_seconds": item.timeout_seconds,
+                "retry_policy": dict(item.retry_policy),
+                "rate_limit": dict(item.rate_limit),
+                "postcondition": dict(item.postcondition),
+                "namespace": item.namespace,
+                "defer_loading": item.defer_loading,
                 "concurrency_mode": item.concurrency_mode,
                 "tags": list(item.tags),
                 "schema_version": str(
