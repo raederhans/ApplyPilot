@@ -43,6 +43,7 @@ from applypilot.apply import app_server_runtime_wiring as app_server_wiring_mod
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import application_plan as application_plan_mod
+from applypilot.apply import application_supervisor_loop as supervisor_loop_mod
 from applypilot.apply import ats as ats_mod
 from applypilot.apply import linkedin_page_observation as linkedin_page_observation_mod
 from applypilot.apply import orchestration as orchestration_mod
@@ -2221,6 +2222,86 @@ def _persist_agent_turn_progress(
     except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
         logger.warning("Could not persist Agent turn progress %s: %s", request.run_id, exc)
     return occurred_at
+
+
+def _persist_supervisor_intervention(
+    request: AgentRunRequest,
+    decision: supervisor_loop_mod.SupervisorDecision,
+    *,
+    sequence: int,
+    backend: str,
+    stage: str,
+    outcome: str | None = None,
+    occurred_after: datetime | None,
+) -> datetime:
+    """Durably persist control intent/outcome; failures must stop the action."""
+
+    from applypilot.database import append_agent_event
+
+    if stage not in {"intent", "outcome"}:
+        raise ValueError("supervisor intervention stage must be intent or outcome")
+    if stage == "outcome" and not outcome:
+        raise ValueError("supervisor intervention outcome is required")
+    occurred_at = _ordered_agent_event_time(occurred_after)
+    idempotency_key = (
+        f"agent-turn:v2:{request.actor_id}:{request.turn_id}:supervisor:{sequence}:{stage}"
+    )
+    event = ApplicationEvent(
+        event_id=idempotency_key,
+        attempt_id=request.attempt_id,
+        run_id=request.run_id,
+        phase=request.phase,
+        actor="application_supervisor",
+        event_type=f"agent.supervisor.intervention.{stage}",
+        payload={
+            "sequence": sequence,
+            "stage": stage,
+            "outcome": outcome,
+            "level": decision.level,
+            "action": decision.action,
+            "reason_code": decision.reason_code,
+            "backend": backend,
+            "expected_turn_id": decision.expected_turn_id,
+            "receipt_only": decision.receipt_only,
+            "signals": {
+                "meaningful_progress": decision.signals.meaningful_progress,
+                "no_progress_window": round(decision.signals.no_progress_window, 3),
+                "tool_repeat_count": decision.signals.tool_repeat_count,
+                "page_signature": decision.signals.page_signature,
+                "unresolved_control_delta": decision.signals.unresolved_control_delta,
+                "validation_delta": decision.signals.validation_delta,
+                "last_successful_effect": decision.signals.last_successful_effect,
+            },
+        },
+        idempotency_key=idempotency_key,
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        schema_version="2",
+        occurred_at=occurred_at,
+    )
+    append_agent_event(event)
+    return occurred_at
+
+
+def _supervisor_page_signature(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=lambda value: f"<{type(value).__name__}>",
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _apply_authoritative_supervisor_observation(
+    loop: supervisor_loop_mod.ApplicationSupervisorLoop,
+    controller: supervisor_loop_mod.AuthoritativeSupervisorController,
+    observation: supervisor_loop_mod.SupervisorObservation,
+) -> supervisor_loop_mod.SupervisorDecision:
+    """Shared launcher seam used for real and synthetic authoritative events."""
+
+    return controller.apply(loop.observe(observation))
 
 
 def _persist_agent_turn_completed(
@@ -5792,6 +5873,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     prepare_search_events: list[tuple[object, object]] = []
     progress_sequence = 0
     last_progress_persisted_at = time.monotonic()
+    online_supervisor: supervisor_loop_mod.ApplicationSupervisorLoop | None = None
+    supervisor_controller: supervisor_loop_mod.AuthoritativeSupervisorController | None = None
+    supervisor_watchdog: threading.Timer | None = None
+    supervisor_watchdog_generation = 0
+    supervisor_terminal = False
+    finalize_supervisor_runtime: Callable[[], None] | None = None
+    supervisor_control_lock = threading.RLock()
+    supervisor_intervention_sequence = 0
+    supervisor_authority_health_sequence = 0
+    supervisor_validation_state: bool | None = None
+    active_supervisor_intervention_sequence: int | None = None
+    pending_supervisor_tools: dict[str, tuple[str, dict[str, object]]] = {}
     if submission_phase == "prepare":
         job.pop("_mailbox_prepare_duplicate_receipt", None)
 
@@ -6142,6 +6235,256 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             else:
                 _app_server_turn_cancellations[worker_id] = proc.cancel
         agent_process_started = True
+
+        def interrupt_authoritative_runtime() -> None:
+            if app_server_turn_process is not None:
+                app_server_turn_process.cancel()
+            else:
+                _agent_subprocess_runtime.cancel(run_id)
+
+        expected_supervisor_browser_generation = (
+            application_supervisor.browser_worker.generation
+            if application_supervisor is not None
+            else None
+        )
+
+        def observe_authoritative_authority_health(
+            signals: supervisor_loop_mod.SupervisorSignals,
+        ) -> supervisor_loop_mod.AuthorityHealthObservation:
+            """Read exact generation/page authority health, not page state."""
+
+            nonlocal supervisor_authority_health_sequence
+            if application_supervisor is None:
+                raise RuntimeError("authoritative browser observer is unavailable")
+            expected_generation = expected_supervisor_browser_generation
+            if expected_generation is None:
+                raise RuntimeError("authoritative browser generation is unavailable")
+            endpoint = application_supervisor.browser_worker.heartbeat(
+                expected_generation=expected_generation
+            )
+            page_binding = _browser_broker.require_operation(
+                browser_lease_bundle.page_binding,
+                "read_page_identity",
+            )
+            supervisor_authority_health_sequence += 1
+            authority_signature = _supervisor_page_signature(
+                {
+                    "browser_generation": expected_generation,
+                    "endpoint_id": endpoint.endpoint_id,
+                    "endpoint_generation": endpoint.generation,
+                    "endpoint_transport": endpoint.transport,
+                    "endpoint_process_id": endpoint.process_id,
+                    "profile_lease_id": browser_lease_bundle.profile.lease_id,
+                    "page_lease_id": page_binding.page_lease_id,
+                    "page_lease_epoch": page_binding.page_lease_epoch,
+                }
+            )
+            request = {
+                "sequence": supervisor_authority_health_sequence,
+                "attempt_id": signals.attempt_id,
+                "turn_id": signals.turn_id,
+                "reason_code": "AUTHORITATIVE_AUTHORITY_HEALTH_OBSERVED",
+                "effect_allowed": False,
+                "new_turn_allowed": False,
+                "replay_allowed": False,
+                "authority_signature": authority_signature,
+            }
+            job.setdefault(
+                "_application_supervisor_authority_health_observations", []
+            ).append(request)
+            _record_worker_action(worker_id, "supervisor:authority_health_observed")
+            return supervisor_loop_mod.AuthorityHealthObservation(
+                observed_at=time.monotonic(),
+                authority_signature=authority_signature,
+            )
+
+        authoritative_supervisor_turn_id = (
+            app_server_turn_process.turn.provider_turn_id
+            if app_server_turn_process is not None
+            else turn_id
+        )
+        online_supervisor = supervisor_loop_mod.ApplicationSupervisorLoop(
+            attempt_id=attempt_id,
+            turn_id=authoritative_supervisor_turn_id,
+            stall_window_seconds=2.0,
+        )
+        supervisor_controller = supervisor_loop_mod.AuthoritativeSupervisorController(
+            loop=online_supervisor,
+            backend=runtime_backend,
+            interrupt=interrupt_authoritative_runtime,
+            observe_authority_health=(
+                observe_authoritative_authority_health
+                if application_supervisor is not None
+                else None
+            ),
+            steer=(
+                (
+                    lambda prompt, expected: app_server_turn_process.steer(
+                        prompt, expected_turn_id=expected
+                    )
+                )
+                if app_server_turn_process is not None
+                else None
+            ),
+            before_action=lambda decision: persist_supervisor_action_intent(decision),
+            after_action=lambda decision, outcome: persist_supervisor_action_outcome(
+                decision, outcome
+            ),
+        )
+        runtime_metadata["application_supervisor"] = {
+            "mode": "deterministic_online",
+            "stall_window_seconds": online_supervisor.stall_window_seconds,
+            "authoritative_backend": runtime_backend,
+            "extra_model_fast_path": False,
+        }
+        online_supervisor.start(observed_at=time.monotonic())
+
+        def persist_supervisor_action_intent(
+            decision: supervisor_loop_mod.SupervisorDecision,
+        ) -> None:
+            nonlocal active_supervisor_intervention_sequence
+            nonlocal last_agent_event_at, supervisor_intervention_sequence
+            if active_supervisor_intervention_sequence is not None:
+                raise RuntimeError("supervisor control intent is already active")
+            supervisor_intervention_sequence += 1
+            active_supervisor_intervention_sequence = supervisor_intervention_sequence
+            last_agent_event_at = _persist_supervisor_intervention(
+                agent_request,
+                decision,
+                sequence=supervisor_intervention_sequence,
+                backend=runtime_backend,
+                stage="intent",
+                occurred_after=last_agent_event_at,
+            )
+
+        def persist_supervisor_action_outcome(
+            decision: supervisor_loop_mod.SupervisorDecision,
+            outcome: str,
+        ) -> None:
+            nonlocal active_supervisor_intervention_sequence, last_agent_event_at
+            sequence = active_supervisor_intervention_sequence
+            if sequence is None:
+                raise RuntimeError("supervisor control outcome has no durable intent")
+            last_agent_event_at = _persist_supervisor_intervention(
+                agent_request,
+                decision,
+                sequence=sequence,
+                backend=runtime_backend,
+                stage="outcome",
+                outcome=outcome,
+                occurred_after=last_agent_event_at,
+            )
+            active_supervisor_intervention_sequence = None
+
+        def record_supervisor_decision(
+            decision: supervisor_loop_mod.SupervisorDecision,
+        ) -> supervisor_loop_mod.SupervisorDecision:
+            assert supervisor_controller is not None
+            job["_application_supervisor_interventions"] = list(
+                supervisor_controller.interventions
+            )
+            return decision
+
+        def check_supervisor_stall(generation: int) -> None:
+            nonlocal supervisor_watchdog
+            with supervisor_control_lock:
+                if generation != supervisor_watchdog_generation:
+                    return
+                if supervisor_terminal:
+                    return
+                if online_supervisor is None or supervisor_controller is None:
+                    return
+                if supervisor_controller.parked or proc is None or proc.poll() is not None:
+                    return
+                decision = record_supervisor_decision(
+                    supervisor_controller.apply(online_supervisor.tick())
+                )
+            if decision.level < 3 and not supervisor_controller.parked:
+                arm_supervisor_stall_watchdog()
+
+        def arm_supervisor_stall_watchdog() -> None:
+            nonlocal supervisor_watchdog, supervisor_watchdog_generation
+            with supervisor_control_lock:
+                if online_supervisor is None or supervisor_controller is None:
+                    return
+                if supervisor_terminal or supervisor_controller.parked:
+                    return
+                supervisor_watchdog_generation += 1
+                generation = supervisor_watchdog_generation
+                if supervisor_watchdog is not None:
+                    supervisor_watchdog.cancel()
+                supervisor_watchdog = threading.Timer(
+                    online_supervisor.stall_window_seconds,
+                    lambda: check_supervisor_stall(generation),
+                )
+                supervisor_watchdog.daemon = True
+                supervisor_watchdog.start()
+
+        def finalize_online_supervisor() -> None:
+            nonlocal supervisor_terminal
+            nonlocal supervisor_watchdog, supervisor_watchdog_generation
+            with supervisor_control_lock:
+                supervisor_terminal = True
+                supervisor_watchdog_generation += 1
+                if supervisor_watchdog is not None:
+                    supervisor_watchdog.cancel()
+                    supervisor_watchdog = None
+
+        finalize_supervisor_runtime = finalize_online_supervisor
+
+        def observe_authoritative_event(
+            *,
+            event_type: str,
+            meaningful_progress: bool = False,
+            tool_name: str | None = None,
+            tool_params: Mapping[str, object] | None = None,
+            page_signature: str | None = None,
+            validation_succeeded: bool | None = None,
+            last_successful_effect: str | None = None,
+            effect_started: bool = False,
+            effect_uncertain: bool = False,
+            arm_stall: bool = False,
+        ) -> supervisor_loop_mod.SupervisorDecision:
+            nonlocal supervisor_validation_state
+            assert online_supervisor is not None
+            validation_delta = 0
+            if validation_succeeded is not None:
+                if (
+                    supervisor_validation_state is None
+                    or validation_succeeded != supervisor_validation_state
+                ):
+                    validation_delta = 1 if validation_succeeded else -1
+                supervisor_validation_state = validation_succeeded
+            observation = supervisor_loop_mod.SupervisorObservation(
+                attempt_id=attempt_id,
+                turn_id=authoritative_supervisor_turn_id,
+                event_type=event_type,
+                observed_at=time.monotonic(),
+                meaningful_progress=meaningful_progress,
+                tool_name=tool_name,
+                tool_params=tool_params,
+                page_signature=page_signature,
+                unresolved_control_delta=0,
+                validation_delta=validation_delta,
+                last_successful_effect=last_successful_effect,
+                effect_started=effect_started,
+                submit_started=submission_phase == "submit" and not dry_run,
+                effect_uncertain=effect_uncertain,
+            )
+            with supervisor_control_lock:
+                decision = record_supervisor_decision(
+                    _apply_authoritative_supervisor_observation(
+                        online_supervisor,
+                        supervisor_controller,
+                        observation,
+                    )
+                )
+            if arm_stall and decision.level < 3:
+                arm_supervisor_stall_watchdog()
+            return decision
+
+        arm_supervisor_stall_watchdog()
+
         lease_heartbeat = LeaseHeartbeat(
             _browser_broker,
             browser_lease_bundle,
@@ -6229,6 +6572,23 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 tool_key = record_tool_call(
                                     block.get("id"), str(raw_name)
                                 )
+                                raw_supervisor_input = block.get("input")
+                                supervisor_input = (
+                                    dict(raw_supervisor_input)
+                                    if isinstance(raw_supervisor_input, Mapping)
+                                    else {}
+                                )
+                                raw_supervisor_id = str(block.get("id") or "")
+                                if raw_supervisor_id:
+                                    pending_supervisor_tools[raw_supervisor_id] = (
+                                        str(raw_name),
+                                        supervisor_input,
+                                    )
+                                observe_authoritative_event(
+                                    event_type="tool.proposed",
+                                    tool_name=str(raw_name),
+                                    tool_params=supervisor_input,
+                                )
                                 if str(raw_name).startswith("mcp__playwright__"):
                                     browser_tool_id = str(block.get("id") or "")
                                     browser_tool_name = str(raw_name).removeprefix(
@@ -6275,6 +6635,47 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if block.get("type") != "tool_result":
                                 continue
                             tool_use_id = str(block.get("tool_use_id") or "")
+                            supervisor_tool = pending_supervisor_tools.pop(
+                                tool_use_id, None
+                            )
+                            if supervisor_tool is not None:
+                                supervisor_name, supervisor_input = supervisor_tool
+                                supervisor_succeeded = _tool_result_succeeded(
+                                    block,
+                                    terminal_event=False,
+                                )
+                                supervisor_effect = not (
+                                    "playwright" in supervisor_name.casefold()
+                                    and any(
+                                        marker in supervisor_name.casefold()
+                                        for marker in (
+                                            "snapshot",
+                                            "screenshot",
+                                            "console_messages",
+                                            "network_requests",
+                                            "wait_for",
+                                        )
+                                    )
+                                )
+                                observe_authoritative_event(
+                                    event_type="tool.completed",
+                                    tool_name=supervisor_name,
+                                    tool_params=supervisor_input,
+                                    page_signature=_supervisor_page_signature(
+                                        block.get("content")
+                                    ),
+                                    validation_succeeded=supervisor_succeeded,
+                                    last_successful_effect=(
+                                        supervisor_name
+                                        if supervisor_succeeded and supervisor_effect
+                                        else None
+                                    ),
+                                    effect_started=supervisor_effect,
+                                    effect_uncertain=(
+                                        supervisor_effect and not supervisor_succeeded
+                                    ),
+                                    arm_stall=True,
+                                )
                             if tool_use_id in pending_browser_tools:
                                 browser_key = pending_browser_tools.pop(tool_use_id)
                                 settle_tool_outcome(
@@ -6311,6 +6712,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     tool_output=block.get("content"),
                                 )
                     elif msg_type == "result":
+                        finalize_online_supervisor()
                         stats = {
                             "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
                             "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
@@ -6358,6 +6760,54 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             last_tool_at = now_tool
                             tool_key = record_tool_call(
                                 item.get("id"), f"{server}:{tool}"
+                            )
+                            supervisor_name = f"{server}:{tool}"
+                            raw_supervisor_input = item.get(
+                                "input", item.get("arguments")
+                            )
+                            supervisor_input = (
+                                dict(raw_supervisor_input)
+                                if isinstance(raw_supervisor_input, Mapping)
+                                else {}
+                            )
+                            supervisor_succeeded = _tool_result_succeeded(
+                                item,
+                                terminal_event=True,
+                            )
+                            supervisor_effect = not (
+                                "playwright" in str(server).casefold()
+                                and any(
+                                    marker in str(tool).casefold()
+                                    for marker in (
+                                        "snapshot",
+                                        "screenshot",
+                                        "console_messages",
+                                        "network_requests",
+                                        "wait_for",
+                                    )
+                                )
+                            )
+                            observe_authoritative_event(
+                                event_type="tool.completed",
+                                tool_name=supervisor_name,
+                                tool_params=supervisor_input,
+                                page_signature=_supervisor_page_signature(
+                                    item.get(
+                                        "result",
+                                        item.get("output", item.get("content")),
+                                    )
+                                ),
+                                validation_succeeded=supervisor_succeeded,
+                                last_successful_effect=(
+                                    supervisor_name
+                                    if supervisor_succeeded and supervisor_effect
+                                    else None
+                                ),
+                                effect_started=supervisor_effect,
+                                effect_uncertain=(
+                                    supervisor_effect and not supervisor_succeeded
+                                ),
+                                arm_stall=True,
                             )
                             browser_tool = (
                                 "playwright" in str(server).casefold()
@@ -6428,6 +6878,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     ),
                                 )
                     elif msg_type == "turn.completed":
+                        finalize_online_supervisor()
                         usage = msg.get("usage", {})
                         stats = {
                             "input_tokens": usage.get("input_tokens", 0),
@@ -6441,8 +6892,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(_redacted_agent_log_line(line))
 
+        finalize_online_supervisor()
         if watchdog is not None:
             watchdog.cancel()
+        if supervisor_watchdog is not None:
+            supervisor_watchdog.cancel()
         proc.wait(timeout=5)
         if lease_heartbeat is not None:
             lease_heartbeat.raise_if_failed()
@@ -6458,6 +6912,31 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         browser_tool_success_count = sum(
             outcome is True for outcome in browser_tool_outcomes.values()
         )
+
+        if supervisor_controller is not None and supervisor_controller.parked:
+            duration_ms = int((time.time() - start) * 1000)
+            receipt_only = supervisor_controller.receipt_only
+            turn_application_status = (
+                "submission_uncertain"
+                if receipt_only or (submission_phase == "submit" and not dry_run)
+                else "failed:supervisor_parked_manual"
+            )
+            turn_duration_ms = duration_ms
+            turn_source = (
+                "supervisor_receipt_only" if receipt_only else "supervisor_parked_manual"
+            )
+            turn_result = AgentTurnResult(
+                run_id=run_id,
+                status=turn_application_status,
+                summary="Deterministic supervisor interrupted and parked the authoritative turn",
+                requested_human_input="Review the parked application before any new Agent turn.",
+            )
+            job["_application_supervisor_state"] = {
+                "status": "parked_manual",
+                "receipt_only": receipt_only,
+                "intervention_count": len(supervisor_controller.interventions),
+            }
+            return turn_application_status, duration_ms
 
         if timed_out.is_set():
             duration_ms = int((time.time() - start) * 1000)
@@ -6791,8 +7270,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         )
         return turn_application_status, duration_ms
     finally:
+        if finalize_supervisor_runtime is not None:
+            finalize_supervisor_runtime()
         if watchdog is not None:
             watchdog.cancel()
+        if supervisor_watchdog is not None:
+            supervisor_watchdog.cancel()
         if lease_heartbeat is not None:
             lease_heartbeat.stop()
             browser_lease_bundle = lease_heartbeat.bundle

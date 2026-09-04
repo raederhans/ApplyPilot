@@ -835,6 +835,15 @@ class AppServerTurnProcess:
         self._cancel_requested.set()
         self.adapter.cancel(self.turn.provider_turn_id)
 
+    def steer(self, prompt: str, *, expected_turn_id: str) -> None:
+        """Steer this exact provider turn; stale controller state fails closed."""
+
+        self.adapter.steer(
+            self.turn.provider_turn_id,
+            expected_turn_id=expected_turn_id,
+            prompt=prompt,
+        )
+
     def drain(self, *, timeout: float) -> None:
         self.adapter.drain(self.turn.provider_turn_id, timeout=timeout)
 

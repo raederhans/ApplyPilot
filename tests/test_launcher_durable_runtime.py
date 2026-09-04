@@ -14,6 +14,7 @@ import pytest
 from applypilot import config, database
 from applypilot.apply import agent_report_mcp, agent_runtime, launcher
 from applypilot.apply.application_plan import ApplicationPlan
+from applypilot.apply.application_sessions import EndpointDescriptor
 from applypilot.apply.contracts import (
     AgentCheckpoint,
     RecoveryCommand,
@@ -342,6 +343,287 @@ def test_run_job_durable_launch_attaches_before_prompt_and_advisory_start(
     assert job["_parent_agent_checkpoint_id"] == (
         f"agent-turn:v2:{application_actor_id('attempt-order')}:{turn['turn_id']}:completed:checkpoint"
     )
+
+
+def test_run_job_ingests_repeated_authoritative_events_and_parks_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    db_path = _configure_launcher(monkeypatch, tmp_path, events)
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        process = _FakeProcess(4901, events, kwargs["env"])
+        repeated_snapshot = {
+            "type": "item.completed",
+            "item": {
+                "id": "snapshot",
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_snapshot",
+                "arguments": {"ref": "same"},
+                "status": "completed",
+                "result": {"isError": False, "content": "same-page"},
+            },
+        }
+        assistant_text = {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "Still working."},
+        }
+        process.stdout = io.StringIO(
+            "\n".join(
+                json.dumps(message)
+                for message in (
+                    repeated_snapshot,
+                    assistant_text,
+                    repeated_snapshot,
+                    assistant_text,
+                    repeated_snapshot,
+                )
+            )
+        )
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    job = _job("attempt-supervised-stream")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "failed:supervisor_parked_manual"
+    assert job["_application_supervisor_state"] == {
+        "status": "parked_manual",
+        "receipt_only": False,
+        "intervention_count": 2,
+    }
+    assert "_application_supervisor_authority_health_observations" not in job
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT payload_json FROM agent_events "
+            "WHERE event_type LIKE 'agent.supervisor.intervention.%' ORDER BY occurred_at"
+        ).fetchall()
+        completed_row = connection.execute(
+            "SELECT payload_json FROM agent_events "
+            "WHERE event_type='agent.turn.completed' ORDER BY occurred_at DESC LIMIT 1"
+        ).fetchone()
+    payloads = [json.loads(row[0]) for row in rows]
+    assert [(payload["stage"], payload["level"]) for payload in payloads] == [
+        ("intent", 1),
+        ("outcome", 1),
+        ("intent", 3),
+        ("outcome", 3),
+    ]
+    assert payloads[0]["action"] == "audit_only_no_observer"
+    assert payloads[1]["outcome"] == "observer_unavailable"
+    assert payloads[2]["reason_code"] == "STEER_UNSUPPORTED"
+    assert payloads[3]["outcome"] == "runtime_interrupted"
+    assert completed_row is not None
+    assert json.loads(completed_row[0])["application_status"] == (
+        "failed:supervisor_parked_manual"
+    )
+
+
+def test_run_job_arms_silent_turn_watchdog_before_provider_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+
+    class CapturedTimer:
+        daemon = False
+
+        def __init__(self, interval: float, _callback) -> None:
+            assert interval <= 2
+
+        def start(self) -> None:
+            events.append("supervisor_watchdog_started")
+
+        def cancel(self) -> None:
+            return None
+
+    monkeypatch.setattr(launcher.threading, "Timer", CapturedTimer)
+
+    status, _ = launcher.run_job(
+        _job("attempt-silent-watchdog"),
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert events.index("popen") < events.index("supervisor_watchdog_started")
+    assert events.index("supervisor_watchdog_started") < events.index("advisory_started")
+
+
+def test_run_job_level_one_audits_exact_browser_authority_without_page_delta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    heartbeat_generations: list[int] = []
+    endpoint = EndpointDescriptor(
+        endpoint_id="stdio-per-turn:worker:0",
+        generation=7,
+        transport="stdio-per-turn",
+        address="agent-cli-owned",
+        reusable=False,
+    )
+
+    class FakeBrowserWorker:
+        generation = 7
+        worker_id = 0
+        browser_runtime = "edge"
+        active_targets = ("target-1",)
+
+        def heartbeat(self, *, expected_generation: int) -> EndpointDescriptor:
+            heartbeat_generations.append(expected_generation)
+            assert expected_generation == self.generation
+            return endpoint
+
+        def metrics(self) -> dict[str, object]:
+            return {"generation": self.generation}
+
+    class FakeApplicationSupervisor:
+        attempt_id = "attempt-observed-correction"
+        application_session_id = "application-observed-correction"
+        browser_worker = FakeBrowserWorker()
+
+        def bind_browser_authority(self, bundle) -> None:
+            self.bundle = bundle
+
+        def mark_submit_started(self) -> None:
+            raise AssertionError("prepare test must not mark submit")
+
+        def context_bundle(self, **_kwargs):
+            return SimpleNamespace(
+                endpoint=endpoint,
+                as_dict=lambda: {"endpoint": endpoint.as_dict()},
+            )
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        process = _FakeProcess(4902, events, kwargs["env"])
+        repeated_snapshot = {
+            "type": "item.completed",
+            "item": {
+                "id": "snapshot",
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_snapshot",
+                "arguments": {"ref": "same"},
+                "status": "completed",
+                "result": {"isError": False, "content": "same-page"},
+            },
+        }
+        process.stdout = io.StringIO(
+            "\n".join(json.dumps(repeated_snapshot) for _ in range(5))
+        )
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    supervisor = FakeApplicationSupervisor()
+    job = _job(supervisor.attempt_id)
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+        application_supervisor=supervisor,  # type: ignore[arg-type]
+    )
+
+    assert status == "failed:supervisor_parked_manual"
+    assert heartbeat_generations == [7]
+    requests = job["_application_supervisor_authority_health_observations"]
+    assert len(requests) == 1
+    assert "page_signature" not in requests[0]
+    assert requests[0]["authority_signature"].startswith("sha256:")
+    assert job["_application_supervisor_interventions"][0]["action"] == (
+        "audit_only_authority_health"
+    )
+    assert job["_application_supervisor_interventions"][0]["signals"][
+        "page_signature"
+    ] != requests[0]["authority_signature"]
+    assert len(job["_application_supervisor_interventions"]) == 2
+
+
+def test_run_job_terminal_invalidates_already_started_watchdog_callback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    db_path = _configure_launcher(monkeypatch, tmp_path, events)
+    timers: list[object] = []
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_finished = threading.Event()
+
+    class RacingTimer:
+        daemon = False
+
+        def __init__(self, _interval: float, callback) -> None:
+            self.callback = callback
+            timers.append(self)
+
+        def start(self) -> None:
+            return None
+
+        def cancel(self) -> None:
+            return None
+
+    monkeypatch.setattr(launcher.threading, "Timer", RacingTimer)
+
+    class RacingStream:
+        def __iter__(self):
+            assert timers
+
+            def run_callback() -> None:
+                callback_entered.set()
+                release_callback.wait(timeout=2)
+                timers[0].callback()  # type: ignore[attr-defined]
+                callback_finished.set()
+
+            callback_thread = threading.Thread(target=run_callback)
+            callback_thread.start()
+            assert callback_entered.wait(timeout=1)
+            yield json.dumps({"type": "turn.completed", "usage": {}})
+            release_callback.set()
+            callback_thread.join(timeout=1)
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        process = _FakeProcess(4903, events, kwargs["env"])
+        process.stdout = RacingStream()  # type: ignore[assignment]
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+
+    status, _ = launcher.run_job(
+        _job("attempt-terminal-race"),
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert callback_finished.is_set()
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM agent_events "
+            "WHERE event_type LIKE 'agent.supervisor.intervention.%'"
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(

@@ -915,6 +915,56 @@ class CodexAppServerAdapter:
 
         self.cancel(provider_turn_id)
 
+    def steer(
+        self,
+        provider_turn_id: str,
+        *,
+        expected_turn_id: str,
+        prompt: str,
+    ) -> None:
+        """Steer exactly the active turn, failing closed on stale identity."""
+
+        if not isinstance(expected_turn_id, str) or not expected_turn_id:
+            raise ValueError("expected_turn_id is required")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("steer prompt is required")
+        with self._lock:
+            state = self._active_turns.get(provider_turn_id)
+            if (
+                state is None
+                or state.terminal
+                or state.turn_id != expected_turn_id
+                or provider_turn_id != expected_turn_id
+            ):
+                raise CodexAppServerExecutionError(
+                    "turn/steer expectedTurnId does not bind the active turn",
+                    execution_state=(
+                        state.execution_state()
+                        if state is not None
+                        else RuntimeCellExecutionState(
+                            request_accepted=True,
+                            tool_or_effect_started=False,
+                            submit_started=False,
+                            bound_backend="codex-app-server",
+                        )
+                    ),
+                )
+            thread_id = state.thread_id
+        try:
+            self.transport.request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "expectedTurnId": expected_turn_id,
+                    "input": [{"type": "text", "text": prompt.strip()}],
+                },
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            raise CodexAppServerExecutionError(
+                "turn/steer failed after the turn was accepted",
+                execution_state=state.execution_state(),
+            ) from exc
+
     def drain(
         self,
         provider_turn_id: str | None = None,

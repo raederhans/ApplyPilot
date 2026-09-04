@@ -29,6 +29,21 @@ cancellation is signal-only; a detached adapter shuts down in the background.
 P0 verification: `289 passed in 14.48s` for the focused App Server, launcher,
 Runtime Cell, and runtime-settings union; target Ruff and `git diff --check` passed.
 
-Next: define a pure deterministic Supervisor signal/decision contract, then wire
-it to authoritative Agent progress and the App Server `turn/steer` /
-`turn/interrupt` surface without adding a model call to the normal path.
+P1 completed locally. The authoritative event stream now feeds a deterministic,
+model-free online Supervisor with a two-second silent-turn window, normalized
+repeat detection, exact-turn App Server steering, and durable intent/action/outcome
+control ordering. Assistant narration does not count as progress; confirmed page
+effects do not become submission uncertainty; terminal/watchdog races are closed.
+Unsupported page re-observation is reported as audit-only, and Level 3 truthfully
+parks rather than claiming automatic replacement.
+
+P1 verification: `286 passed in 17.95s` for the focused Supervisor, launcher,
+App Server, runtime-contract, and browser authority/broker union; target Ruff and
+`git diff --check` passed. Independent final review returned PASS with no material
+finding.
+
+Next: extend the existing production specialist allowlist into a staged
+`shadow -> advisory -> required` read-only contract with heartbeat, partial,
+cancellation, deadline, retry, and deterministic conflict reduction. No specialist
+receives browser-write, submit, mailbox-send, ledger-write, or ApplicationActor
+authority.

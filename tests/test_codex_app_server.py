@@ -165,6 +165,8 @@ for raw_line in sys.stdin:
                     "error": None,
                 },
             }})
+    elif method == "turn/steer":
+        emit({"id": request_id, "result": {}})
     elif method == "thread/unsubscribe":
         emit({"id": request_id, "result": {}})
     else:
@@ -576,3 +578,47 @@ def test_pristine_health_failure_preserves_cli_fallback() -> None:
     assert selection.health.reason_code == "CODEX_APP_SERVER_UNAVAILABLE"
     assert selection.health.fallback_used is True
     adapter.shutdown()
+
+
+def test_steer_sends_exact_thread_and_expected_turn(tmp_path: Path) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode="read_hold")
+    adapter = CodexAppServerAdapter(transport)
+    turn = adapter.start(_request(tmp_path))
+
+    adapter.steer(
+        turn.provider_turn_id,
+        expected_turn_id=turn.provider_turn_id,
+        prompt="Re-observe and choose another bounded action.",
+    )
+    adapter.cancel(turn.provider_turn_id)
+    tuple(turn.events)
+    adapter.shutdown()
+
+    steer = next(
+        message for message in _wire_messages(log_path) if message.get("method") == "turn/steer"
+    )
+    assert steer["params"] == {
+        "threadId": turn.provider_session_id,
+        "expectedTurnId": turn.provider_turn_id,
+        "input": [
+            {"type": "text", "text": "Re-observe and choose another bounded action."}
+        ],
+    }
+
+
+def test_steer_rejects_stale_expected_turn_before_transport_write(tmp_path: Path) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode="read_hold")
+    adapter = CodexAppServerAdapter(transport)
+    turn = adapter.start(_request(tmp_path))
+
+    with pytest.raises(CodexAppServerExecutionError, match="expectedTurnId"):
+        adapter.steer(
+            turn.provider_turn_id,
+            expected_turn_id="stale-turn",
+            prompt="Do something else.",
+        )
+    adapter.cancel(turn.provider_turn_id)
+    tuple(turn.events)
+    adapter.shutdown()
+
+    assert all(message.get("method") != "turn/steer" for message in _wire_messages(log_path))
