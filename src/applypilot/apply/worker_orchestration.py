@@ -125,6 +125,7 @@ class WorkerApplicationPorts:
     resolve_ats_application_binding: Callable[..., Any]
     run_read_only_preflight: Callable[..., Any]
     prepare_ats_fill_plan_repair: Callable[..., Any]
+    try_semantic_batch_fill: Callable[..., Any]
     try_semantic_pre_submit_repair: Callable[..., Any]
     record_ats_fill_plan_feedback: Callable[..., Any]
     prepare_runtime_cover_letter: Callable[..., Any]
@@ -428,6 +429,7 @@ def _worker_loop_with_port(
     _resolve_ats_application_binding = application.resolve_ats_application_binding
     _run_read_only_preflight = application.run_read_only_preflight
     _prepare_ats_fill_plan_repair = application.prepare_ats_fill_plan_repair
+    _try_semantic_batch_fill = application.try_semantic_batch_fill
     _try_semantic_pre_submit_repair = application.try_semantic_pre_submit_repair
     _record_ats_fill_plan_feedback = application.record_ats_fill_plan_feedback
     _prepare_runtime_cover_letter = application.prepare_runtime_cover_letter
@@ -473,7 +475,9 @@ def _worker_loop_with_port(
     restore_preview_state = jobs.restore_preview_state
     runtime_run_job = application.run_job
     update_state = jobs.update_state
-    application_lease_minutes = host.load_runtime_settings().application_lease_minutes
+    runtime_settings = host.load_runtime_settings()
+    application_lease_minutes = runtime_settings.application_lease_minutes
+    semantic_batch_mode = runtime_settings.semantic_batch_mode
 
     applied = 0
     failed = 0
@@ -2152,6 +2156,53 @@ def _worker_loop_with_port(
                                 result = (
                                     "failed:manual_review_required:"
                                     f"ats_fill_plan_specialist:{type(exc).__name__}"
+                                )
+                                break
+                        if specialist_repair is not None and semantic_batch_mode != "off":
+                            semantic_batch_context = specialist_repair.get("context")
+                            semantic_batch_feedback = specialist_repair.get("feedback")
+                            if not isinstance(
+                                semantic_batch_context, dict
+                            ) or not isinstance(semantic_batch_feedback, dict):
+                                result = (
+                                    "failed:manual_review_required:"
+                                    "ats_fill_plan_contract"
+                                )
+                                break
+                            semantic_batch = _try_semantic_batch_fill(
+                                port,
+                                worker_id,
+                                job,
+                                profile,
+                                audit_report,
+                                specialist_repair,
+                                mode=semantic_batch_mode,
+                                application_supervisor=application_supervisor,
+                            )
+                            semantic_batch_status = str(
+                                semantic_batch.get("status")
+                                if isinstance(semantic_batch, Mapping)
+                                else "invalid_result"
+                            )
+                            semantic_batch_safe = bool(
+                                isinstance(semantic_batch, Mapping)
+                                and semantic_batch.get("legacy_fallback_safe") is True
+                            )
+                            add_event(
+                                f"[W{worker_id}] Semantic batch {semantic_batch_mode}: "
+                                f"{semantic_batch_status[:40]}"
+                            )
+                            if semantic_batch_status in {"verified", "replayed"}:
+                                _record_ats_fill_plan_feedback(
+                                    semantic_batch_feedback,
+                                    event="consumed",
+                                )
+                                ats_fill_plan_feedback = semantic_batch_feedback
+                                continue
+                            if not semantic_batch_safe:
+                                result = (
+                                    "failed:manual_review_required:semantic_batch:"
+                                    f"{semantic_batch_status}"
                                 )
                                 break
                         repair_job = dict(job)

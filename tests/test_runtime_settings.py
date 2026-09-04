@@ -19,6 +19,7 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.resolve_interaction_mode() == "auto"
     assert settings.resolve_model("codex") == "gpt-5.6-sol"
     assert settings.codex_app_server_enabled is False
+    assert settings.semantic_batch_mode == "off"
     assert settings.agent_timeout_seconds == 300
     assert settings.application_lease_minutes == 45
 
@@ -42,19 +43,33 @@ def test_runtime_settings_enable_codex_app_server_only_explicitly(value: str) ->
 
 
 def test_runtime_settings_reject_invalid_codex_app_server_flag() -> None:
-    settings = load_runtime_settings(
-        {"APPLYPILOT_CODEX_APP_SERVER_ENABLED": "sometimes"}
-    )
+    settings = load_runtime_settings({"APPLYPILOT_CODEX_APP_SERVER_ENABLED": "sometimes"})
 
     with pytest.raises(ValueError, match="must be a boolean flag"):
         _ = settings.codex_app_server_enabled
 
 
+@pytest.mark.parametrize("value", ["off", "SHADOW", "canary"])
+def test_runtime_settings_accept_semantic_batch_rollout_modes(value: str) -> None:
+    settings = load_runtime_settings({"APPLYPILOT_SEMANTIC_BATCH_MODE": value})
+
+    assert settings.semantic_batch_mode == value.casefold()
+
+
+def test_runtime_settings_reject_invalid_semantic_batch_mode() -> None:
+    settings = load_runtime_settings({"APPLYPILOT_SEMANTIC_BATCH_MODE": "enabled"})
+
+    with pytest.raises(ValueError, match="must be off, shadow, or canary"):
+        _ = settings.semantic_batch_mode
+
+
 def test_runtime_settings_keep_backend_and_browser_validation_contracts() -> None:
-    settings = load_runtime_settings({
-        "APPLYPILOT_APPLY_BACKEND": "unsupported",
-        "APPLYPILOT_BROWSER_BACKEND": "unsupported",
-    })
+    settings = load_runtime_settings(
+        {
+            "APPLYPILOT_APPLY_BACKEND": "unsupported",
+            "APPLYPILOT_BROWSER_BACKEND": "unsupported",
+        }
+    )
 
     with pytest.raises(ValueError, match="must be codex or claude"):
         settings.resolve_apply_backend()
@@ -88,9 +103,7 @@ def test_auto_browser_backend_uses_cloak_when_edge_is_unavailable() -> None:
 
 
 def test_auto_browser_backend_preserves_fallback_when_both_are_available() -> None:
-    selected, unavailable = _select_runnable_browser_backend(
-        "auto", lambda backend: f"{backend}.exe"
-    )
+    selected, unavailable = _select_runnable_browser_backend("auto", lambda backend: f"{backend}.exe")
 
     assert selected == "auto"
     assert unavailable == {}

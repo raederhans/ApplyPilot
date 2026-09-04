@@ -71,6 +71,17 @@ class ApplyRuntimeSettings:
         )
 
     @property
+    def semantic_batch_mode(self) -> str:
+        """Return the routine-field batch rollout mode, defaulting fully off."""
+
+        mode = self.environ.get("APPLYPILOT_SEMANTIC_BATCH_MODE", "off").strip().casefold()
+        if mode not in {"off", "shadow", "canary"}:
+            raise ValueError(
+                "APPLYPILOT_SEMANTIC_BATCH_MODE must be off, shadow, or canary"
+            )
+        return mode
+
+    @property
     def agent_timeout_seconds(self) -> int:
         return int(self.environ.get("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "300"))
 

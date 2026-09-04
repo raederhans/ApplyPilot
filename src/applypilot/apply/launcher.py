@@ -53,6 +53,7 @@ from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import receipt_observer as receipt_observer_mod
 from applypilot.apply import resume_authorization as resume_authorization_mod
 from applypilot.apply import runtime_cell as runtime_cell_mod
+from applypilot.apply import semantic_batch_runtime as semantic_batch_runtime_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
@@ -61,7 +62,7 @@ from applypilot.apply.application_facts import (
     current_profile_facts,
     resolve_application_fact_ref,
 )
-from applypilot.apply.application_sessions import ApplicationSupervisor
+from applypilot.apply.application_sessions import ApplicationSupervisor, ContextBundle
 from applypilot.apply.ats_tools_mcp import ATS_CONTEXT_PATH_ENV
 from applypilot.apply.authentication_policy import authentication_capability
 from applypilot.apply.browser_authority import BrowserAuthorityHandle
@@ -92,6 +93,7 @@ from applypilot.apply.chrome import (
     release_cdp_port,
     reset_worker_dir,
     resolve_browser_backend,
+    resolve_worker_profile_path,
     restore_browser_session,
 )
 from applypilot.apply.chrome import (
@@ -157,6 +159,17 @@ from applypilot.apply.router import (
 )
 from applypilot.apply.run_progress import RunProgress
 from applypilot.apply.runtime_namespace import RuntimeNamespace
+from applypilot.apply.semantic_batch import (
+    BatchPageBinding,
+    BrowserResourceIdentity,
+    SemanticPatch,
+)
+from applypilot.apply.semantic_batch_adapter import (
+    ADAPTER_VERSION as SEMANTIC_BATCH_ADAPTER_VERSION,
+)
+from applypilot.apply.semantic_batch_adapter import (
+    PlaywrightProductionSemanticBatchAdapter,
+)
 from applypilot.apply.semantic_browser_ops import (
     SEMANTIC_WRITE_POLICY,
     SEMANTIC_WRITE_POLICY_DIGEST,
@@ -620,6 +633,7 @@ def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
             resolve_ats_application_binding=_resolve_ats_application_binding,
             run_read_only_preflight=_run_read_only_preflight,
             prepare_ats_fill_plan_repair=_prepare_ats_fill_plan_repair,
+            try_semantic_batch_fill=_try_semantic_batch_fill,
             try_semantic_pre_submit_repair=_try_semantic_pre_submit_repair,
             record_ats_fill_plan_feedback=_record_ats_fill_plan_feedback,
             prepare_runtime_cover_letter=_prepare_runtime_cover_letter,
@@ -684,6 +698,377 @@ _click_linkedin_main_apply_causally = (
 _verify_linkedin_post_login_state = (
     linkedin_page_observation_mod.verify_linkedin_post_login_state
 )
+
+
+_SEMANTIC_BATCH_PERSONAL_KEYS = {
+    "preferred_name": ("preferred_name", "preferred_display_name", "first_name"),
+    "email": ("email",),
+    "phone": ("phone", "phone_number"),
+    "portfolio_url": ("portfolio_url", "portfolio", "website", "github_url"),
+    "city": ("city",),
+    "country": ("country",),
+    "postal_code": ("postal_code", "postcode", "zip_code"),
+    "state": ("state", "province"),
+}
+
+
+def _semantic_batch_candidate_patches(
+    profile: Mapping[str, object],
+    audit_report: Mapping[str, object],
+    specialist_repair: Mapping[str, object],
+) -> tuple[SemanticPatch, ...]:
+    """Resolve an all-or-nothing routine repair set from host-owned state."""
+
+    repairable = audit_report.get("repairable_issues")
+    if not isinstance(repairable, list) or not repairable:
+        raise ValueError("semantic batch requires repairable empty fields")
+    issue_labels: list[str] = []
+    for issue in repairable:
+        text = str(issue or "")
+        if not text.startswith("required_field_empty:"):
+            raise ValueError("semantic batch repair scope contains a non-routine issue")
+        label = " ".join(text.partition(":")[2].casefold().split())
+        if not label:
+            raise ValueError("semantic batch empty-field label is missing")
+        issue_labels.append(label)
+    if len(issue_labels) != len(set(issue_labels)):
+        raise ValueError("semantic batch empty-field labels are ambiguous")
+
+    snapshot = audit_report.get("ats_fill_plan_snapshot")
+    context = specialist_repair.get("context")
+    plan = context.get("plan") if isinstance(context, Mapping) else None
+    if not isinstance(snapshot, Mapping) or not isinstance(plan, Mapping):
+        raise TypeError("semantic batch requires bound snapshot and specialist plan")
+    raw_fields = snapshot.get("form_fields")
+    plan_fields = plan.get("fields")
+    actions = plan.get("actions")
+    if not all(isinstance(value, list) for value in (raw_fields, plan_fields, actions)):
+        raise TypeError("semantic batch plan structure is incomplete")
+
+    snapshot_keys: dict[str, str] = {}
+    for field in raw_fields:
+        if not isinstance(field, Mapping):
+            continue
+        label = " ".join(
+            str(field.get("label") or field.get("aria_label") or "").casefold().split()
+        )
+        field_key = str(
+            field.get("field_key")
+            or field.get("id")
+            or field.get("name")
+            or field.get("selector")
+            or ""
+        ).strip()
+        if label in issue_labels and field_key:
+            if label in snapshot_keys:
+                raise ValueError("semantic batch snapshot field label is ambiguous")
+            snapshot_keys[label] = field_key
+    if set(snapshot_keys) != set(issue_labels):
+        raise ValueError("semantic batch issues do not bind exact snapshot fields")
+
+    fields_by_key = {
+        str(field.get("field_key") or ""): field
+        for field in plan_fields
+        if isinstance(field, Mapping)
+    }
+    actions_by_key = {
+        str(action.get("field_key") or ""): action
+        for action in actions
+        if isinstance(action, Mapping)
+    }
+    personal = profile.get("personal")
+    personal = personal if isinstance(personal, Mapping) else {}
+    patches: list[SemanticPatch] = []
+    for label in issue_labels:
+        field_key = snapshot_keys[label]
+        field = fields_by_key.get(field_key)
+        action = actions_by_key.get(field_key)
+        if not isinstance(field, Mapping) or not isinstance(action, Mapping):
+            raise TypeError("semantic batch field has no exact specialist action")
+        semantic = str(field.get("semantic") or "").strip().casefold()
+        source_key = str(action.get("source_key") or "").strip().casefold()
+        if (
+            semantic != source_key
+            or action.get("action") not in {"fill", "select"}
+            or action.get("requires_review") is not False
+            or field.get("writable") is not True
+            or semantic not in _SEMANTIC_BATCH_PERSONAL_KEYS
+        ):
+            raise ValueError("semantic batch action is not an admitted routine write")
+        values = [
+            str(personal.get(key) or "").strip()
+            for key in _SEMANTIC_BATCH_PERSONAL_KEYS[semantic]
+            if str(personal.get(key) or "").strip()
+        ]
+        if len(set(values)) != 1:
+            raise ValueError("semantic batch routine fact is missing or ambiguous")
+        patches.append(SemanticPatch(semantic, values[0]))
+    return tuple(patches)
+
+
+def _semantic_batch_context(
+    job: Mapping[str, object],
+    *,
+    worker_id: int,
+    application_supervisor: ApplicationSupervisor,
+    bundle: BrowserLeaseBundle,
+) -> ContextBundle:
+    """Rebuild a current P1 context around the exact job-held page lease."""
+
+    browser_worker = application_supervisor.browser_worker
+    generation = browser_worker.generation
+    endpoint = browser_worker.heartbeat(expected_generation=generation)
+    namespace = RuntimeNamespace(
+        root=config.APPLY_WORKER_DIR,
+        run_id=str(job.get("_run_namespace_id") or bundle.page.attempt_id),
+        session_id=f"semantic-batch:{bundle.page.attempt_id}",
+        profile_id=bundle.profile.resource_id,
+    )
+    return ContextBundle(
+        namespace=namespace,
+        worker_id=worker_id,
+        application_session_id=application_supervisor.application_session_id,
+        actor_id=bundle.page.owner_id,
+        attempt_id=bundle.page.attempt_id,
+        phase="prepare",
+        runtime_backend=str(job.get("_agent_backend") or "codex"),
+        browser_runtime=browser_worker.browser_runtime,
+        browser_profile_id=bundle.profile.resource_id,
+        browser_generation=generation,
+        endpoint=endpoint,
+        root_target_ids=browser_worker.active_targets,
+        page_binding=bundle.page_binding.as_dict(),
+    )
+
+
+def _record_semantic_batch_telemetry(
+    request: semantic_batch_runtime_mod.SemanticBatchRuntimeRequest | None,
+    result: Mapping[str, object],
+) -> None:
+    """Persist bounded, PII-free rollout telemetry as an advisory event."""
+
+    attempt_id = request.attempt_id if request is not None else str(result.get("attempt_id") or "")
+    if not attempt_id:
+        return
+    batch_id = str(result.get("batch_id") or "semantic-batch:unbound")
+    status = str(result.get("status") or "unknown")[:80]
+    from applypilot.database import append_agent_event
+
+    append_agent_event(
+        ApplicationEvent(
+            event_id=f"{batch_id}:{status}",
+            attempt_id=attempt_id,
+            run_id=f"{attempt_id}:semantic-batch",
+            phase="prepare",
+            actor=application_actor_id(attempt_id),
+            event_type="semantic_batch.observed",
+            payload={
+                "mode": str(result.get("mode") or "unknown")[:20],
+                "status": status,
+                "reason_code": str(result.get("reason_code") or "unknown")[:120],
+                "candidate_count": int(result.get("candidate_count") or 0),
+                "effect_count": int(result.get("effect_count") or 0),
+                "semantics": list(request.semantics) if request is not None else [],
+                "legacy_fallback_safe": result.get("legacy_fallback_safe") is True,
+                "submit_authority": False,
+            },
+            idempotency_key=f"{batch_id}:{status}",
+        )
+    )
+
+
+def _try_semantic_batch_fill(
+    port: int,
+    worker_id: int,
+    job: dict,
+    profile: Mapping[str, object],
+    audit_report: Mapping[str, object],
+    specialist_repair: Mapping[str, object],
+    *,
+    mode: str,
+    application_supervisor: ApplicationSupervisor | None,
+) -> dict[str, object]:
+    """Compare or execute one routine batch on the current ApplicationActor page."""
+
+    base = {
+        "status": "not_applicable",
+        "mode": mode,
+        "batch_id": None,
+        "candidate_count": 0,
+        "effect_count": 0,
+        "legacy_fallback_safe": True,
+        "reason_code": "precondition_not_admitted",
+        "submit_authority": False,
+        "attempt_id": str(job.get("_attempt_id") or ""),
+    }
+    if mode not in {"shadow", "canary"}:
+        return {**base, "status": "off", "reason_code": "feature_disabled"}
+    observations = job.get("_agent_observations")
+    if (
+        isinstance(observations, Mapping)
+        and isinstance(observations.get("email_application"), Mapping)
+    ):
+        result = {**base, "reason_code": "direct_email_route_forbidden"}
+        _record_semantic_batch_telemetry(None, result)
+        return result
+    if job.get("_submission_gate") or job.get("_submission_gate_binding"):
+        result = {
+            **base,
+            "status": "parked",
+            "legacy_fallback_safe": False,
+            "reason_code": "submit_or_final_action_started",
+        }
+        _record_semantic_batch_telemetry(None, result)
+        return result
+    if application_supervisor is None:
+        result = {**base, "reason_code": "application_supervisor_unavailable"}
+        _record_semantic_batch_telemetry(None, result)
+        return result
+    try:
+        patches = _semantic_batch_candidate_patches(profile, audit_report, specialist_repair)
+    except (TypeError, ValueError) as exc:
+        result = {**base, "reason_code": f"candidate_{type(exc).__name__.casefold()}"}
+        _record_semantic_batch_telemetry(None, result)
+        return result
+
+    playwright = None
+    connection = None
+    request = None
+    resources_closed = False
+    runtime_entered = False
+    try:
+        bundle = _refresh_semantic_browser_bundle(job)
+        context = _semantic_batch_context(
+            job,
+            worker_id=worker_id,
+            application_supervisor=application_supervisor,
+            bundle=bundle,
+        )
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        pages = [page for browser_context in browser.contexts for page in browser_context.pages]
+        pages = _bound_application_pages(browser, pages, job)
+        if not pages:
+            raise RuntimeError("bound_application_page_unavailable")
+        page = page_surfaces_mod.select_application_page(pages)
+        page.bring_to_front()
+        provider = provider_for_url(page.url)
+        if provider not in {"workday", "smartrecruiters"}:
+            raise RuntimeError("provider_not_admitted")
+        reported_provider = provider_for_url(audit_report.get("page_url"))
+        if reported_provider not in {None, provider}:
+            raise RuntimeError("provider_changed_after_audit")
+
+        def validate_authority() -> None:
+            current = BrowserAuthorityHandle.rebuild(job, broker=_browser_broker)
+            if current.bundle != bundle:
+                raise StalePageBinding("browser authority changed after batch binding")
+            _browser_broker.validate_page(bundle.page_binding)
+
+        values = {patch.field_semantic: patch.value for patch in patches}
+        adapter = PlaywrightProductionSemanticBatchAdapter(
+            page,
+            context,
+            provider=provider,
+            values=values,
+            validate_authority=validate_authority,
+        )
+        page_binding = BatchPageBinding(
+            page_url=str(page.url),
+            frame_path=(),
+            page_signature=adapter.page_signature,
+            page_epoch=bundle.page_binding.page_epoch,
+        )
+        request = semantic_batch_runtime_mod.SemanticBatchRuntimeRequest(
+            mode=mode,  # type: ignore[arg-type]
+            attempt_id=bundle.page.attempt_id,
+            actor_id=bundle.page.owner_id,
+            provider=provider,
+            adapter_version=SEMANTIC_BATCH_ADAPTER_VERSION,
+            page_binding=page_binding,
+            page_id=bundle.page.resource_id,
+            page_lease_id=bundle.page.lease_id,
+            page_lease_epoch=bundle.page.epoch,
+            resources=BrowserResourceIdentity(
+                sqlite_path=str(config.DB_PATH),
+                profile_path=str(
+                    resolve_worker_profile_path(
+                        worker_id,
+                        str(job.get("_browser_root_runtime") or "edge"),
+                    )
+                ),
+                debug_port=port,
+            ),
+            patches=patches,
+        )
+        connection = get_connection()
+
+        def close_resources() -> None:
+            nonlocal resources_closed
+            if resources_closed:
+                return
+            playwright.stop()
+            resources_closed = True
+
+        def advance_page(expected_page_epoch: int) -> int:
+            authority = BrowserAuthorityHandle.rebuild(job, broker=_browser_broker)
+            updated = authority.advance_page(expected_page_epoch=expected_page_epoch)
+            return updated.page_binding.page_epoch
+
+        runtime_entered = True
+        result = semantic_batch_runtime_mod.run_production_semantic_batch(
+            request,
+            adapter=adapter,
+            connection=connection,
+            close_resources=close_resources,
+            advance_page=advance_page,
+        ).as_dict()
+    except Exception as exc:  # noqa: BLE001 - unknown runtime state must fail closed
+        result = {
+            **base,
+            "status": "parked" if runtime_entered else "not_applicable",
+            "candidate_count": len(patches),
+            "legacy_fallback_safe": not runtime_entered,
+            "reason_code": (
+                f"runtime_unknown_{type(exc).__name__.casefold()}"
+                if runtime_entered
+                else f"adapter_setup_{type(exc).__name__.casefold()}"
+            ),
+        }
+    finally:
+        if playwright is not None and not resources_closed:
+            try:
+                playwright.stop()
+            except Exception:  # noqa: BLE001 - result already fails closed
+                result = {
+                    **result,
+                    "status": "parked",
+                    "legacy_fallback_safe": False,
+                    "reason_code": "adapter_teardown_unknown",
+                }
+        if connection is not None:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - durable state is now uncertain
+                    result = {
+                        **result,
+                        "status": "parked" if runtime_entered else result["status"],
+                        "legacy_fallback_safe": False
+                        if runtime_entered
+                        else result["legacy_fallback_safe"],
+                        "reason_code": "journal_teardown_unknown"
+                        if runtime_entered
+                        else result["reason_code"],
+                    }
+    try:
+        _record_semantic_batch_telemetry(request, result)
+    except Exception as exc:  # noqa: BLE001 - telemetry is advisory
+        logger.warning("Could not record semantic batch telemetry: %s", exc)
+    return result
 
 
 def _prepare_ats_fill_plan_repair(
