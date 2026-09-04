@@ -9,6 +9,7 @@ from applypilot.apply.session_aging_experiment import (
     MODES,
     compile_report,
     experiment_definition,
+    fixture_expected_cohort,
     load_fixture,
     run_session_aging_experiment,
 )
@@ -16,15 +17,20 @@ from applypilot.apply.session_aging_experiment import (
 FIXTURE = Path(__file__).parent / "fixtures" / "benchmarks" / "applypilot_session_aging_v1.json"
 
 
+def _expected_cohort() -> tuple[dict[str, object], ...]:
+    fixture, _ = load_fixture(FIXTURE)
+    return fixture_expected_cohort(fixture)
+
+
 def _samples() -> list[dict[str, object]]:
     return [
         {
             "mode": mode,
             "dimensions": {
-                "provider": "workday" if index == 1 else "smartrecruiters",
-                "domain": "tenant.myworkdayjobs.com" if index == 1 else "jobs.smartrecruiters.com",
+                "provider": cohort["provider"],
+                "domain": cohort["domain"],
                 "application_index": index,
-                "task_id": "wd-aging-01" if index == 1 else "sr-aging-01",
+                "task_id": cohort["task_id"],
             },
             "browser_instance": index if mode == "fresh_process" else 1,
             "context_instance": index if mode == "fresh_context" else 1,
@@ -35,7 +41,7 @@ def _samples() -> list[dict[str, object]]:
             "submit_attempts": 0,
         }
         for mode in MODES
-        for index in (1, 2)
+        for index, cohort in enumerate(_expected_cohort(), start=1)
     ]
 
 
@@ -51,7 +57,7 @@ def test_fixture_and_a_b_c_definitions_are_fixed() -> None:
 
 
 def test_report_keeps_missing_agent_mcp_and_recovery_attribution_unavailable() -> None:
-    report = compile_report(fixture_sha256="a" * 64, samples=_samples())
+    report = compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=_samples())
 
     assert report["diagnostic_only"] is True
     assert report["production_authority"] is False
@@ -63,7 +69,7 @@ def test_report_keeps_missing_agent_mcp_and_recovery_attribution_unavailable() -
     assert coverage["groups"]["mcp"]["status"] == "unavailable"
     assert coverage["groups"]["observation"]["status"] == "observed"
     assert coverage["groups"]["recovery"]["status"] == "unavailable"
-    assert all(report["modes"][mode]["sample_count"] == 2 for mode in MODES)
+    assert all(report["modes"][mode]["sample_count"] == 6 for mode in MODES)
 
 
 def test_report_rejects_provider_domain_drift() -> None:
@@ -71,7 +77,7 @@ def test_report_rejects_provider_domain_drift() -> None:
     samples[0]["dimensions"]["domain"] = "example.invalid"  # type: ignore[index]
 
     with pytest.raises(ValueError, match="provider/domain/application index"):
-        compile_report(fixture_sha256="a" * 64, samples=samples)
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
 
 
 def test_report_rejects_submit_or_lifetime_drift() -> None:
@@ -79,45 +85,62 @@ def test_report_rejects_submit_or_lifetime_drift() -> None:
     samples[0]["submit_attempts"] = 1
 
     with pytest.raises(ValueError, match="zero submit attempts"):
-        compile_report(fixture_sha256="a" * 64, samples=samples)
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
 
     samples = _samples()
     samples[1]["context_instance"] = 2
     with pytest.raises(ValueError, match="shared_context"):
-        compile_report(fixture_sha256="a" * 64, samples=samples)
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
 
     samples = _samples()
     samples[0]["end_to_end_ms"] = 2.0
     with pytest.raises(ValueError, match="lifecycle and observation"):
-        compile_report(fixture_sha256="a" * 64, samples=samples)
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
 
 
 def test_report_rejects_incomplete_or_cross_mode_cohort_matrix() -> None:
     samples = _samples()
     incomplete = [sample for sample in samples if sample["mode"] != "fresh_process"]
     with pytest.raises(ValueError, match="complete cohort"):
-        compile_report(fixture_sha256="a" * 64, samples=incomplete)
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=incomplete)
 
     samples = _samples()
     samples[-1]["dimensions"]["provider"] = "workday"  # type: ignore[index]
     samples[-1]["dimensions"]["domain"] = "tenant.myworkdayjobs.com"  # type: ignore[index]
-    with pytest.raises(ValueError, match="cohort matrices"):
-        compile_report(fixture_sha256="a" * 64, samples=samples)
+    with pytest.raises(ValueError, match="verified fixture"):
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
+
+    samples = [sample for sample in _samples() if sample["dimensions"]["application_index"] != 6]  # type: ignore[index]
+    with pytest.raises(ValueError, match="verified fixture"):
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
+
+    samples = _samples()
+    for sample in samples:
+        if sample["dimensions"]["application_index"] == 1:  # type: ignore[index]
+            sample["dimensions"]["task_id"] = "wd-aging-02"  # type: ignore[index]
+    with pytest.raises(ValueError, match="verified fixture"):
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
+
+    samples = _samples()
+    samples[1]["dimensions"]["application_index"] = 1  # type: ignore[index]
+    with pytest.raises(ValueError):
+        compile_report(fixture_sha256="a" * 64, expected_cohort=_expected_cohort(), samples=samples)
 
 
-def test_injected_clock_includes_lifecycle_cost_in_end_to_end_span() -> None:
+def test_injected_clock_includes_teardown_without_bias_from_run_setup() -> None:
     from applypilot.apply.session_aging_experiment import end_to_end_attribution
 
     report = end_to_end_attribution(
         started_at=10.0,
-        lifecycle_spans_ms={"browser_process_create_ms": 40.0, "context_create_ms": 30.0},
+        lifecycle_spans_ms={"context_create_ms": 30.0, "context_close_ms": 30.0},
         observation_ms=20.0,
         clock=lambda: 10.1,
     )
 
     assert report["end_to_end_ms"] == 100.0
-    assert report["lifecycle_spans_ms"]["browser_process_create_ms"] == 40.0
+    assert report["lifecycle_spans_ms"]["context_close_ms"] == 30.0
     assert report["observation_ms"] == 20.0
+    assert "playwright_driver_start_ms" not in report["lifecycle_spans_ms"]
 
 
 @pytest.mark.browser
@@ -149,6 +172,15 @@ def test_isolated_chromium_canary_distinguishes_a_b_and_c_lifetimes(tmp_path: Pa
         ["fresh_process", "shared_context", "fresh_context"],
     ]
     assert all(item["submit_attempts"] == 0 for mode in report["modes"].values() for item in mode["samples"])
+    assert "playwright_driver_start_ms" in report["timing_model"]["run_level_setup_excluded_from_application_end_to_end"]
+    assert all(
+        "context_close_ms" in sample["lifecycle_spans_ms"]
+        for sample in report["modes"]["fresh_context"]["samples"]
+    )
+    assert all(
+        "browser_process_and_profile_context_close_ms" in sample["lifecycle_spans_ms"]
+        for sample in report["modes"]["fresh_process"]["samples"]
+    )
     workspace = report["workspace"]
     assert Path(workspace["sqlite"]).is_file()
     assert Path(workspace["logs"]).is_file()
