@@ -131,12 +131,25 @@ def test_runtime_cell_migration_is_idempotent_and_newer_schema_fails_closed(
     tmp_path: Path,
 ) -> None:
     connection = _connection(tmp_path / "migration.sqlite3")
-    assert runtime_cells.ensure_schema(connection) == 2
-    assert runtime_cells.ensure_schema(connection) == 2
+    assert runtime_cells.ensure_schema(connection) == runtime_cells.RUNTIME_CELL_SCHEMA_VERSION
+    assert runtime_cells.ensure_schema(connection) == runtime_cells.RUNTIME_CELL_SCHEMA_VERSION
     connection.execute("UPDATE runtime_cell_schema_version SET version=99 WHERE component='runtime_cells'")
     connection.commit()
     with pytest.raises(RuntimeError, match="newer than supported"):
         runtime_cells.ensure_schema(connection)
+
+
+def test_runtime_cell_expiry_scan_uses_status_expiry_index(tmp_path: Path) -> None:
+    connection = _connection(tmp_path / "expiry-index.sqlite3")
+    runtime_cells.ensure_schema(connection)
+
+    plan = connection.execute(
+        "EXPLAIN QUERY PLAN SELECT DISTINCT cell_id,generation "
+        "FROM runtime_cell_leases WHERE status='open' AND expires_at<=?",
+        (datetime(2026, 9, 4, tzinfo=UTC).isoformat(),),
+    ).fetchall()
+
+    assert any("idx_runtime_cell_open_lease_expiry" in str(row[3]) for row in plan)
 
 
 def test_runtime_cell_schema_version_matches_fresh_and_upgrade_databases(
@@ -191,7 +204,7 @@ def test_v1_terminal_duplicate_process_identities_migrate_without_history_loss(
     connection.commit()
     monkeypatch.setattr(runtime_cells, "_MIGRATIONS", migrations)
 
-    assert runtime_cells.ensure_schema(connection) == 2
+    assert runtime_cells.ensure_schema(connection) == runtime_cells.RUNTIME_CELL_SCHEMA_VERSION
     assert (
         connection.execute(
             "SELECT COUNT(*) FROM runtime_cell_generations WHERE process_id=4242 AND process_birth_time=8675309"

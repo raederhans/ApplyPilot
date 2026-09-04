@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-RUNTIME_CELL_SCHEMA_VERSION = 2
+RUNTIME_CELL_SCHEMA_VERSION = 3
 _CELL_ACTIVE = {"active", "suspect", "draining"}
 _LEASE_ACTIVE = {"open", "suspect", "draining"}
 
@@ -200,9 +200,19 @@ def _migration_v2(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v3(connection: sqlite3.Connection) -> None:
+    """Index the global open-lease expiry scan by its filtering order."""
+
+    connection.execute(
+        """CREATE INDEX idx_runtime_cell_open_lease_expiry
+        ON runtime_cell_leases(status, expires_at, cell_id, generation)"""
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _migration_v1,
     _migration_v2,
+    _migration_v3,
 )
 
 
