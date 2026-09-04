@@ -14,6 +14,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -553,15 +554,18 @@ def cdp_endpoint_reachable(port: int) -> bool:
 def _wait_for_browser_stopped(
     port: int | None,
     process: subprocess.Popen | None,
+    actual_browser_stopped: Callable[[], bool] | None = None,
     *,
     timeout_seconds: float = 2.0,
 ) -> bool:
-    """Confirm both the owned process and its CDP endpoint have stopped.
+    """Confirm the launcher, CDP endpoint, and actual profile holder stopped.
 
     Edge can return a bootstrap ``Popen`` that exits while a child browser keeps
     serving the profile.  Profile maintenance is therefore allowed only when a
     process handle exists, that handle is stopped, and the known CDP endpoint is
-    no longer reachable.
+    no longer reachable.  The CDP endpoint can disappear shortly before the
+    real browser process exits, so a supplied holder probe is polled under the
+    same bounded shutdown deadline instead of being sampled only once.
     """
     if process is None:
         return False
@@ -569,7 +573,13 @@ def _wait_for_browser_stopped(
     while True:
         process_stopped = process.poll() is not None
         endpoint_stopped = port is None or not _cdp_endpoint_reachable(port)
-        if process_stopped and endpoint_stopped:
+        actual_stopped = actual_browser_stopped is None
+        if actual_browser_stopped is not None:
+            try:
+                actual_stopped = bool(actual_browser_stopped())
+            except ProfileLockError:
+                return False
+        if process_stopped and endpoint_stopped and actual_stopped:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -736,7 +746,11 @@ def launch_chrome(worker_id: int, port: int | None = None,
                 logger.debug("Unable to close failed browser launch via CDP", exc_info=True)
             if proc.poll() is None:
                 _kill_process_tree(proc.pid)
-            stopped = _wait_for_browser_stopped(port, proc)
+            stopped = _wait_for_browser_stopped(
+                port,
+                proc,
+                profile_lock.actual_browser_stopped,
+            )
             released = False
             if stopped:
                 try:
@@ -805,14 +819,19 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     owned_process = tracked_process or process
     if owned_process and owned_process.poll() is None:
         _kill_process_tree(owned_process.pid)
-    browser_is_stopped = _wait_for_browser_stopped(port, owned_process)
+    lock_is_owned = _profile_lock_owned_by_current_thread(profile_lock)
+    browser_is_stopped = _wait_for_browser_stopped(
+        port,
+        owned_process,
+        profile_lock.actual_browser_stopped if lock_is_owned else None,
+    )
     if not browser_is_stopped:
         logger.warning(
             "[worker-%d] Browser stop could not be confirmed; skipping profile pruning",
             worker_id,
         )
     actual_browser_stopped = False
-    if browser_is_stopped and _profile_lock_owned_by_current_thread(profile_lock):
+    if browser_is_stopped and lock_is_owned:
         try:
             actual_browser_stopped = profile_lock.actual_browser_stopped()
         except ProfileLockError:
@@ -932,7 +951,15 @@ def kill_all_chrome() -> None:
                 )
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
-        stopped = _wait_for_browser_stopped(port, proc)
+        stopped = _wait_for_browser_stopped(
+            port,
+            proc,
+            (
+                profile_lock.actual_browser_stopped
+                if _profile_lock_owned_by_current_thread(profile_lock)
+                else None
+            ),
+        )
         if (
             stopped
             and profile_lock is not None
@@ -1023,7 +1050,15 @@ def cleanup_on_exit() -> None:
                 )
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
-        stopped = _wait_for_browser_stopped(port, proc)
+        stopped = _wait_for_browser_stopped(
+            port,
+            proc,
+            (
+                profile_lock.actual_browser_stopped
+                if _profile_lock_owned_by_current_thread(profile_lock)
+                else None
+            ),
+        )
         if (
             stopped
             and profile_lock is not None

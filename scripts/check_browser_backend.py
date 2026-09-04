@@ -14,7 +14,8 @@ from playwright.sync_api import sync_playwright
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from applypilot.apply.chrome import cleanup_worker, launch_chrome
+from applypilot.apply import chrome
+from applypilot.apply.profile_lock import sidecar_path_for_profile
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -86,8 +87,9 @@ def main() -> int:
         "headless": args.headless,
         "pages": [],
     }
+    exit_code = 0
     try:
-        process = launch_chrome(
+        process = chrome.launch_chrome(
             args.worker_id,
             port=args.port,
             headless=args.headless,
@@ -103,14 +105,38 @@ def main() -> int:
         if args.hold_seconds > 0:
             report["heldForSeconds"] = args.hold_seconds
             time.sleep(args.hold_seconds)
-        return 0
     except Exception as exc:  # noqa: BLE001 - diagnostic must emit structured failure
         report["ok"] = False
         report["error"] = f"{type(exc).__name__}: {exc}"
-        return 1
+        exit_code = 1
     finally:
-        cleanup_worker(args.worker_id, process)
+        profile = chrome.resolve_worker_profile_path(args.worker_id, args.backend)
+        cleanup_error = None
+        try:
+            chrome.cleanup_worker(args.worker_id, process)
+        except Exception as exc:  # noqa: BLE001 - preserve diagnostic output
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+        sidecar_exists = sidecar_path_for_profile(profile).exists()
+        endpoint_reachable = chrome.cdp_endpoint_reachable(args.port)
+        bootstrap_stopped = process is None or process.poll() is not None
+        cleanup_report = {
+            "ok": not endpoint_reachable
+            and bootstrap_stopped
+            and not sidecar_exists
+            and cleanup_error is None,
+            "endpointReachable": endpoint_reachable,
+            "bootstrapStopped": bootstrap_stopped,
+            "sidecarExists": sidecar_exists,
+            "error": cleanup_error,
+            "profile": str(profile),
+        }
+        report["cleanup"] = cleanup_report
+        if not cleanup_report["ok"]:
+            report["ok"] = False
+            report["error"] = report.get("error") or "Browser cleanup was not confirmed"
+            exit_code = 1
         print(json.dumps(report, ensure_ascii=False, indent=2))
+    return exit_code
 
 
 if __name__ == "__main__":

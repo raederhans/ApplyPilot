@@ -116,6 +116,25 @@ P4 verification: `290 passed in 13.64s`; independent final review returned PASS.
 Cross-phase focused union: `584 passed in 30.20s`. Full Ruff and diff check
 passed. Full repository suite: `2130 passed in 151.78s`.
 
-Next: build release artifacts, run the archive/clean-install smoke, complete a
-real App Server/CDP health smoke, then run at most one exact-URL real ATS dry-run
-with zero final Submit authority and reconcile database/log evidence.
+Final closeout: release artifacts and a clean-install smoke passed. A real Codex
+App Server `0.149.0` Dynamic Tools turn exercised `experimentalApi`, start-only
+`detect_ats`, `item/tool/call`, a schema-valid read-only result, terminal
+completion, and process shutdown. A real Edge/CDP browser and Playwright MCP
+attach exposed 24 tools and the Web Form target. This live test also reproduced
+a shutdown race where the endpoint disappeared before the actual Edge profile
+holder; cleanup now polls all three identities under one bounded deadline and a
+new regression protects the behavior. The final full suite is `2131 passed in
+156.13s`; full Ruff and diff check pass.
+
+The one authorized exact-URL ATS dry-run targeted Workato's current Greenhouse
+job with `APPLYPILOT_AUTO_SUBMIT=0`, one worker, and App Server/Dynamic Tools
+shadow enabled. The current-profile material check rejected the old resume before
+browser launch because its GPA was `3.6` while the authoritative profile records
+`3.46`. The job is now truthfully `stale_profile_fact`; no new attempt, runtime
+turn, task, risk event, submit observation, or receipt was written. Five bounded
+alternate candidates were current but each failed at least one CAPTCHA,
+material, or coverage gate. Browser-level ATS delivery is therefore blocked on
+a fresh machine-validated material/candidate, not silently reported as passed.
+
+The branch remains local. P5 provider fast paths and multi-Cell production remain
+outside this round and are not admitted.

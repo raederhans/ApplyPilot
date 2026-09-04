@@ -516,6 +516,50 @@ def test_cleanup_does_not_prune_when_actual_child_is_still_alive(
     chrome._profile_paths.pop(worker_id)
 
 
+def test_cleanup_waits_for_actual_holder_after_cdp_disappears(
+    monkeypatch, tmp_path: Path
+) -> None:
+    worker_id = 731
+    profile = tmp_path / "edge" / f"worker-{worker_id}"
+    released: list[bool] = []
+    holder_states = iter((False, True, True))
+
+    class Process:
+        pid = 7310
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class Lock:
+        owned_by_current_thread = True
+
+        @staticmethod
+        def actual_browser_stopped():
+            return next(holder_states)
+
+        @staticmethod
+        def release_after_stop(*, profile_path: Path, browser_stopped: bool):
+            assert profile_path == profile
+            released.append(browser_stopped)
+
+    process = Process()
+    chrome._chrome_procs[worker_id] = process
+    chrome._chrome_ports[worker_id] = 9781
+    chrome._profile_locks[worker_id] = Lock()
+    chrome._profile_paths[worker_id] = profile
+    monkeypatch.setattr(chrome, "_close_browser_via_cdp", lambda _port: None)
+    monkeypatch.setattr(chrome, "_cdp_endpoint_reachable", lambda _port: False)
+
+    chrome.cleanup_worker(worker_id, process)
+
+    assert released == [True]
+    assert worker_id not in chrome._profile_locks
+    assert worker_id not in chrome._profile_paths
+    assert worker_id not in chrome._chrome_procs
+    assert worker_id not in chrome._chrome_ports
+
+
 def test_unresolved_generation_retains_cdp_claim_and_rejects_reallocate(
     monkeypatch, tmp_path: Path
 ) -> None:

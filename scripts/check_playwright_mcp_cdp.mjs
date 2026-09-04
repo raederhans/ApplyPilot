@@ -21,7 +21,7 @@ if (
   throw new Error("usage: check_playwright_mcp_cdp.mjs http://127.0.0.1:<port>");
 }
 
-const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+const npx = "npx";
 const child = spawn(npx, [
   "-y",
   "@playwright/mcp@latest",
@@ -29,6 +29,10 @@ const child = spawn(npx, [
   "--viewport-size=1024x768",
 ], {
   stdio: ["pipe", "pipe", "pipe"],
+  // Windows cannot execute the npm-generated npx.cmd shim directly through
+  // CreateProcess. The endpoint is strictly validated above and every other
+  // argument is static, so using the platform shell here does not widen input.
+  shell: process.platform === "win32",
 });
 const pending = new Map();
 let nextId = 1;
