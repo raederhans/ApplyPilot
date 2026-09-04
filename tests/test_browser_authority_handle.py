@@ -178,6 +178,93 @@ def test_process_change_fails_closed_without_rewriting_job_binding(tmp_path) -> 
     assert job["_browser_lease_binding"] == before
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda record: record.update({"schema_version": "2"}),
+        lambda record: record.update(
+            {"schema_version": "2", "attempt_id": "attempt-1"}
+        ),
+    ],
+    ids=("all_identity_missing", "partial_identity"),
+)
+def test_v2_requires_every_identity_field(tmp_path, mutation) -> None:
+    clock = Clock()
+    source_job: dict[str, object] = {"_attempt_id": "attempt-1"}
+    bundle = _acquire(_handle(source_job, _broker(tmp_path / "v2.db", clock)))
+    record = bundle.as_dict()
+    mutation(record)
+    job: dict[str, object] = {
+        "_attempt_id": "attempt-1",
+        "_browser_lease_binding": record,
+    }
+
+    with pytest.raises(BrowserContinuityError, match="identity is incomplete"):
+        BrowserAuthorityHandle.rebuild(job)
+
+
+def test_unknown_schema_version_is_rejected(tmp_path) -> None:
+    clock = Clock()
+    source_job: dict[str, object] = {"_attempt_id": "attempt-1"}
+    bundle = _acquire(_handle(source_job, _broker(tmp_path / "unknown.db", clock)))
+    record = bundle.as_dict()
+    record["schema_version"] = "99"
+
+    with pytest.raises(BrowserContinuityError, match="unsupported.*schema"):
+        BrowserAuthorityHandle.rebuild(
+            {
+                "_attempt_id": "attempt-1",
+                "_browser_lease_binding": record,
+            }
+        )
+
+
+def test_legacy_bundle_cannot_rebind_to_new_session_or_generation(tmp_path) -> None:
+    clock = Clock()
+    source_job: dict[str, object] = {"_attempt_id": "attempt-1"}
+    broker = _broker(tmp_path / "legacy-rebind.db", clock)
+    bundle = _acquire(_handle(source_job, broker))
+    legacy_job: dict[str, object] = {
+        "_attempt_id": "attempt-1",
+        "_application_context_bundle": {
+            "browser_generation": 4,
+            "application_session_id": "old-session",
+            "actor_id": application_actor_id("attempt-1"),
+            "attempt_id": "attempt-1",
+        },
+        "_browser_lease_binding": bundle.as_dict(),
+    }
+
+    with pytest.raises(BrowserContinuityError, match="generation.*session"):
+        BrowserAuthorityHandle.create(
+            legacy_job,
+            broker=broker,
+            browser_generation=5,
+            application_session_id="new-session",
+            actor_id=application_actor_id("attempt-1"),
+            attempt_id="attempt-1",
+        )
+
+
+def test_legacy_context_actor_and_attempt_must_match_bundle(tmp_path) -> None:
+    clock = Clock()
+    source_job: dict[str, object] = {"_attempt_id": "attempt-1"}
+    bundle = _acquire(
+        _handle(source_job, _broker(tmp_path / "legacy-context.db", clock))
+    )
+    legacy_job: dict[str, object] = {
+        "_attempt_id": "attempt-1",
+        "_application_context_bundle": {
+            "actor_id": application_actor_id("attempt-2"),
+            "attempt_id": "attempt-2",
+        },
+        "_browser_lease_binding": bundle.as_dict(),
+    }
+
+    with pytest.raises(BrowserContinuityError, match="legacy context actor_id"):
+        BrowserAuthorityHandle.rebuild(legacy_job)
+
+
 def test_new_process_rebuilds_only_after_old_process_lease_expires(tmp_path) -> None:
     path = tmp_path / "process-recovery.db"
     clock = Clock()
@@ -216,6 +303,8 @@ def test_legacy_bundle_rebuilds_and_upgrades_on_next_heartbeat(tmp_path) -> None
         "_application_context_bundle": {
             "browser_generation": 4,
             "application_session_id": "recovered-session",
+            "actor_id": application_actor_id("attempt-1"),
+            "attempt_id": "attempt-1",
         },
         "_browser_lease_binding": bundle.as_dict(),
     }
@@ -229,6 +318,27 @@ def test_legacy_bundle_rebuilds_and_upgrades_on_next_heartbeat(tmp_path) -> None
     assert record["schema_version"] == "2"
     assert record["browser_generation"] == 4
     assert record["application_session_id"] == "recovered-session"
+
+
+def test_missing_legacy_schema_version_is_compatibly_upgraded(tmp_path) -> None:
+    path = tmp_path / "legacy-missing-version.db"
+    clock = Clock()
+    broker = _broker(path, clock)
+    source_job: dict[str, object] = {"_attempt_id": "attempt-1"}
+    bundle = _acquire(_handle(source_job, broker))
+    record = bundle.as_dict()
+    record.pop("schema_version")
+    legacy_job: dict[str, object] = {
+        "_attempt_id": "attempt-1",
+        "_browser_lease_binding": record,
+    }
+
+    BrowserAuthorityHandle.rebuild(legacy_job, broker=broker).heartbeat()
+
+    upgraded = legacy_job["_browser_lease_binding"]
+    assert isinstance(upgraded, dict)
+    assert upgraded["schema_version"] == "2"
+    assert upgraded["application_session_id"] == "legacy:attempt-1"
 
 
 def test_exact_release_removes_only_owned_binding(tmp_path) -> None:

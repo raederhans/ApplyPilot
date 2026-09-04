@@ -123,12 +123,40 @@ def _legacy_identity(
     """Derive the minimum truthful identity for a legacy version-1 mapping."""
 
     raw_context = job.get("_application_context_bundle")
+    if raw_context is not None and not isinstance(raw_context, Mapping):
+        raise BrowserContinuityError("legacy application context is invalid")
     context = raw_context if isinstance(raw_context, Mapping) else {}
-    session_id = str(
-        context.get("application_session_id")
-        or job.get("_application_session_id")
+    for name, expected in (
+        ("actor_id", bundle.profile.owner_id),
+        ("attempt_id", bundle.profile.attempt_id),
+    ):
+        if name in context and _required(context[name], name) != expected:
+            raise BrowserContinuityError(
+                f"legacy context {name} does not match browser lease"
+            )
+    context_session = (
+        _required(context["application_session_id"], "application_session_id")
+        if "application_session_id" in context
+        else None
+    )
+    job_session = (
+        _required(job["_application_session_id"], "application_session_id")
+        if "_application_session_id" in job
+        else None
+    )
+    if (
+        context_session is not None
+        and job_session is not None
+        and context_session != job_session
+    ):
+        raise BrowserContinuityError(
+            "legacy application session identities conflict"
+        )
+    session_id = (
+        context_session
+        or job_session
         or f"legacy:{bundle.profile.attempt_id}"
-    ).strip()
+    )
     generation = _generation(context.get("browser_generation", 1))
     return BrowserAuthorityIdentity(
         browser_generation=generation,
@@ -143,6 +171,12 @@ def _serialized_identity(
     raw: Mapping[str, object],
     bundle: BrowserLeaseBundle,
 ) -> BrowserAuthorityIdentity:
+    raw_version = raw.get("schema_version") if "schema_version" in raw else None
+    version_missing = "schema_version" not in raw
+    if not version_missing and (
+        not isinstance(raw_version, str) or raw_version not in {"1", "2"}
+    ):
+        raise BrowserContinuityError("unsupported browser authority schema version")
     names = (
         "browser_generation",
         "application_session_id",
@@ -150,18 +184,24 @@ def _serialized_identity(
         "attempt_id",
     )
     present = tuple(name in raw for name in names)
-    if not any(present):
+    if raw_version == "2":
+        if not all(present):
+            raise BrowserContinuityError("browser authority identity is incomplete")
+        return BrowserAuthorityIdentity(
+            browser_generation=_generation(raw["browser_generation"]),
+            application_session_id=_required(
+                raw["application_session_id"], "application_session_id"
+            ),
+            actor_id=_required(raw["actor_id"], "actor_id"),
+            attempt_id=_required(raw["attempt_id"], "attempt_id"),
+        )
+    if any(present):
+        raise BrowserContinuityError(
+            "legacy browser authority cannot contain v2 identity fields"
+        )
+    if raw_version == "1" or version_missing:
         return _legacy_identity(job, bundle)
-    if not all(present):
-        raise BrowserContinuityError("browser authority identity is incomplete")
-    return BrowserAuthorityIdentity(
-        browser_generation=_generation(raw["browser_generation"]),
-        application_session_id=_required(
-            raw["application_session_id"], "application_session_id"
-        ),
-        actor_id=_required(raw["actor_id"], "actor_id"),
-        attempt_id=_required(raw["attempt_id"], "attempt_id"),
-    )
+    raise BrowserContinuityError("unsupported browser authority schema version")
 
 
 def _fixed_bundle_identity(bundle: BrowserLeaseBundle) -> tuple[object, ...]:
