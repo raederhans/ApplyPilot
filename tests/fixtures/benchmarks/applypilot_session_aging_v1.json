@@ -3,7 +3,11 @@
   "fixture_id": "applypilot-session-aging-minimal-v1",
   "claim_boundary": "local intercepted Workday and SmartRecruiters fixtures only; no provider network or submit authority",
   "tasks": [
-    {"task_id": "wd-aging-01", "provider": "workday"},
-    {"task_id": "sr-aging-01", "provider": "smartrecruiters"}
+    {"task_id": "wd-aging-01", "provider": "workday", "pair_id": "pair-01"},
+    {"task_id": "sr-aging-01", "provider": "smartrecruiters", "pair_id": "pair-01"},
+    {"task_id": "wd-aging-02", "provider": "workday", "pair_id": "pair-02"},
+    {"task_id": "sr-aging-02", "provider": "smartrecruiters", "pair_id": "pair-02"},
+    {"task_id": "wd-aging-03", "provider": "workday", "pair_id": "pair-03"},
+    {"task_id": "sr-aging-03", "provider": "smartrecruiters", "pair_id": "pair-03"}
   ]
 }

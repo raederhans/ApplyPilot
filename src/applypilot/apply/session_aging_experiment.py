@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -65,6 +66,23 @@ def experiment_definition() -> dict[str, object]:
     }
 
 
+def counterbalanced_mode_order(application_index: int) -> tuple[str, str, str]:
+    """Rotate A/B/C per paired application so each mode occupies every position."""
+
+    if isinstance(application_index, bool) or not isinstance(application_index, int) or application_index < 1:
+        raise ValueError("application index must be a positive integer")
+    rotation = (application_index - 1) % len(MODES)
+    return MODES[rotation:] + MODES[:rotation]
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[min(rank - 1, len(ordered) - 1)]
+
+
 def load_fixture(path: Path | str) -> tuple[dict[str, Any], str]:
     """Load a small provider-balanced fixture without accepting live URLs."""
 
@@ -78,6 +96,7 @@ def load_fixture(path: Path | str) -> tuple[dict[str, Any], str]:
         raise ValueError("session-aging fixture requires at least two tasks")
     task_ids: list[str] = []
     providers: set[str] = set()
+    pairs: dict[str, set[str]] = {}
     for task in tasks:
         if not isinstance(task, Mapping):
             raise TypeError("session-aging task must be an object")
@@ -87,12 +106,18 @@ def load_fixture(path: Path | str) -> tuple[dict[str, Any], str]:
             raise ValueError("session-aging task_id must be non-empty ASCII alphanumeric text")
         if provider not in _PROVIDER_DOMAINS:
             raise ValueError("session-aging provider is unsupported")
+        pair_id = task.get("pair_id")
+        if not isinstance(pair_id, str) or not pair_id or not pair_id.isascii() or not pair_id.replace("-", "").isalnum():
+            raise ValueError("session-aging pair_id must be non-empty ASCII alphanumeric text")
         task_ids.append(task_id)
         providers.add(str(provider))
+        pairs.setdefault(pair_id, set()).add(str(provider))
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("session-aging task ids must be unique")
     if providers != set(_PROVIDER_DOMAINS):
         raise ValueError("session-aging fixture must include both supported providers")
+    if len(pairs) < 3 or any(pair_providers != set(_PROVIDER_DOMAINS) for pair_providers in pairs.values()):
+        raise ValueError("session-aging fixture requires at least three Workday/SmartRecruiters pairs")
     return raw, hashlib.sha256(raw_bytes).hexdigest()
 
 
@@ -161,6 +186,7 @@ def compile_report(
         provider = dimensions.get("provider")
         domain = dimensions.get("domain")
         index = dimensions.get("application_index")
+        task_id = dimensions.get("task_id")
         if (
             provider not in _PROVIDER_DOMAINS
             or domain != _PROVIDER_DOMAINS[provider]
@@ -169,11 +195,26 @@ def compile_report(
             or index < 1
         ):
             raise ValueError("sample provider/domain/application index is invalid")
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("sample task_id is required")
         observation_ms = sample.get("observation_ms")
         if isinstance(observation_ms, bool) or not isinstance(observation_ms, (int, float)) or observation_ms < 0:
             raise ValueError("sample observation duration is invalid")
         if sample.get("submit_attempts") != 0:
             raise ValueError("session-aging samples must record zero submit attempts")
+        end_to_end_ms = sample.get("end_to_end_ms")
+        if isinstance(end_to_end_ms, bool) or not isinstance(end_to_end_ms, (int, float)) or end_to_end_ms < 0:
+            raise ValueError("sample end-to-end duration is invalid")
+        lifecycle = sample.get("lifecycle_spans_ms")
+        if not isinstance(lifecycle, Mapping):
+            raise TypeError("sample lifecycle spans are required")
+        lifecycle_total = 0.0
+        for name, value in lifecycle.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"sample lifecycle span is invalid: {name}")
+            lifecycle_total += float(value)
+        if lifecycle_total + float(observation_ms) > float(end_to_end_ms) + 0.01:
+            raise ValueError("sample lifecycle and observation spans exceed end-to-end duration")
         browser_instance = sample.get("browser_instance")
         context_instance = sample.get("context_instance")
         if (
@@ -185,8 +226,29 @@ def compile_report(
             or context_instance < 1
         ):
             raise ValueError("sample browser/context instances are invalid")
+        execution_position = sample.get("execution_position")
+        if execution_position != counterbalanced_mode_order(index).index(str(mode)) + 1:
+            raise ValueError("sample does not match counterbalanced execution order")
         by_mode[str(mode)].append(dict(sample))
+    expected_matrix: set[tuple[int, str, str, str]] | None = None
     for mode, mode_samples in by_mode.items():
+        if not mode_samples:
+            raise ValueError("every session-aging mode requires a complete cohort")
+        matrix = {
+            (
+                int(sample["dimensions"]["application_index"]),  # type: ignore[index]
+                str(sample["dimensions"]["task_id"]),  # type: ignore[index]
+                str(sample["dimensions"]["provider"]),  # type: ignore[index]
+                str(sample["dimensions"]["domain"]),  # type: ignore[index]
+            )
+            for sample in mode_samples
+        }
+        if len(matrix) != len(mode_samples):
+            raise ValueError("every mode must contain each cohort sample exactly once")
+        if expected_matrix is None:
+            expected_matrix = matrix
+        elif matrix != expected_matrix:
+            raise ValueError("session-aging mode cohort matrices must match exactly")
         pairs = {(int(sample["browser_instance"]), int(sample["context_instance"])) for sample in mode_samples}
         if mode == "shared_context" and len(pairs) > 1:
             raise ValueError("shared_context must use one browser and one context")
@@ -198,6 +260,17 @@ def compile_report(
             raise ValueError("fresh_process must create one context in each process")
         if mode == "fresh_process" and len({browser for browser, _context in pairs}) != len(mode_samples):
             raise ValueError("fresh_process must launch one process per application")
+    assert expected_matrix is not None
+    execution_schedule = [
+        {
+            "application_index": index,
+            "task_id": task_id,
+            "provider": provider,
+            "domain": domain,
+            "mode_order": list(counterbalanced_mode_order(index)),
+        }
+        for index, task_id, provider, domain in sorted(expected_matrix)
+    ]
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "diagnostic_only": True,
@@ -206,11 +279,16 @@ def compile_report(
         "fixture_sha256": fixture_sha256,
         "definitions": experiment_definition(),
         "attribution_coverage": _coverage(),
+        "execution_schedule": execution_schedule,
         "modes": {
             mode: {
                 "sample_count": len(mode_samples),
-                "samples": mode_samples,
+                "samples": sorted(mode_samples, key=lambda sample: int(sample["dimensions"]["application_index"])),  # type: ignore[index]
                 "coverage": _coverage(),
+                "end_to_end_ms": {
+                    "p50": round(_percentile([float(sample["end_to_end_ms"]) for sample in mode_samples], 0.50), 3),
+                    "p95": round(_percentile([float(sample["end_to_end_ms"]) for sample in mode_samples], 0.95), 3),
+                },
             }
             for mode, mode_samples in by_mode.items()
         },
@@ -239,30 +317,64 @@ def _prepare_workspace(root: Path) -> tuple[Path, Path]:
     return db_path, logs / "events.jsonl"
 
 
-def _measure_application(*, context: object, task: Mapping[str, object], index: int) -> tuple[float, int]:
+def end_to_end_attribution(
+    *,
+    started_at: float,
+    lifecycle_spans_ms: Mapping[str, float],
+    observation_ms: float,
+    clock: Any = time.perf_counter,
+) -> dict[str, object]:
+    """Close one application span after lifecycle and observation have both completed."""
+
+    end_to_end_ms = (float(clock()) - float(started_at)) * 1000
+    accounted_ms = sum(float(value) for value in lifecycle_spans_ms.values()) + float(observation_ms)
+    if end_to_end_ms < 0 or accounted_ms > end_to_end_ms + 0.01:
+        raise ValueError("lifecycle and observation spans must fit within end-to-end time")
+    return {
+        "end_to_end_ms": round(end_to_end_ms, 3),
+        "lifecycle_spans_ms": {name: round(value, 3) for name, value in sorted(lifecycle_spans_ms.items())},
+        "observation_ms": round(observation_ms, 3),
+    }
+
+
+def _measure_application(*, context: object, task: Mapping[str, object]) -> tuple[float, int, dict[str, float]]:
     provider = str(task["provider"])
     domain = _PROVIDER_DOMAINS[provider]
+    started = time.perf_counter()
     page = context.new_page()  # type: ignore[attr-defined]
     try:
+        page_create_ms = (time.perf_counter() - started) * 1000
         started = time.perf_counter()
         page.goto(f"https://{domain}/local-fixture/{task['task_id']}", wait_until="load")
+        navigation_ms = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
         form_count = page.locator("#application").count()
         submit_count = page.locator("#submit").count()
         submit_attempts = page.evaluate("window.__submissionAttempts")
         observation_ms = (time.perf_counter() - started) * 1000
         if form_count != 1 or submit_count != 1 or submit_attempts != 0:
             raise AssertionError("no-submit fixture invariant failed")
-        return observation_ms, int(submit_attempts)
+        return observation_ms, int(submit_attempts), {
+            "page_create_ms": page_create_ms,
+            "page_navigation_ms": navigation_ms,
+        }
     finally:
         page.close()
 
 
-def _new_context(browser: object) -> object:
+def _new_context(browser: object) -> tuple[object, float]:
+    started = time.perf_counter()
     context = browser.new_context(service_workers="block")  # type: ignore[attr-defined]
+    _install_local_fixture_route(context)
+    return context, (time.perf_counter() - started) * 1000
+
+
+def _install_local_fixture_route(context: object) -> float:
+    started = time.perf_counter()
     context.route(  # type: ignore[attr-defined]
         "**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=_HTML)
     )
-    return context
+    return (time.perf_counter() - started) * 1000
 
 
 def run_session_aging_experiment(
@@ -284,20 +396,73 @@ def run_session_aging_experiment(
 
     samples: list[dict[str, object]] = []
     with sqlite3.connect(db_path) as connection, event_log.open("x", encoding="utf-8") as log:
-        def record(mode: str, task: Mapping[str, object], index: int, browser_instance: int, context_instance: int, context: object) -> None:
-            observation_ms, submit_attempts = _measure_application(context=context, task=task, index=index)
+        hot_states: dict[str, dict[str, object]] = {
+            "shared_context": {},
+            "fresh_context": {},
+        }
+        playwright_state: dict[str, object] = {}
+
+        def start_browser(*, mode: str, browser_instance: int) -> tuple[dict[str, object], dict[str, float]]:
+            lifecycle: dict[str, float] = {}
+            playwright = playwright_state.get("playwright")
+            if playwright is None:
+                started = time.perf_counter()
+                playwright = sync_playwright().start()
+                lifecycle["playwright_start_ms"] = (time.perf_counter() - started) * 1000
+                playwright_state["playwright"] = playwright
+            profile = root / "profiles" / f"{mode}-{browser_instance}"
+            profile.mkdir()
+            started = time.perf_counter()
+            bootstrap_context = playwright.chromium.launch_persistent_context(str(profile), headless=True)
+            lifecycle["browser_process_and_profile_context_create_ms"] = (time.perf_counter() - started) * 1000
+            browser = bootstrap_context.browser
+            if browser is None:
+                raise RuntimeError("persistent Chromium context did not expose its browser")
+            return {
+                "browser": browser,
+                "bootstrap_context": bootstrap_context,
+                "profile": profile,
+            }, lifecycle
+
+        def finish_browser(state: Mapping[str, object]) -> None:
+            bootstrap_context = state.get("bootstrap_context")
+            if bootstrap_context is not None:
+                bootstrap_context.close()  # type: ignore[attr-defined]
+
+        def save_sample(
+            *,
+            mode: str,
+            task: Mapping[str, object],
+            index: int,
+            execution_position: int,
+            browser_instance: int,
+            context_instance: int,
+            profile: Path,
+            lifecycle: Mapping[str, float],
+            observation_ms: float,
+            submit_attempts: int,
+            started_at: float,
+        ) -> None:
             provider = str(task["provider"])
+            timing = end_to_end_attribution(
+                started_at=started_at,
+                lifecycle_spans_ms=lifecycle,
+                observation_ms=observation_ms,
+            )
             sample = {
                 "mode": mode,
                 "dimensions": {
                     "provider": provider,
                     "domain": _PROVIDER_DOMAINS[provider],
                     "application_index": index,
+                    "task_id": str(task["task_id"]),
                 },
                 "browser_instance": browser_instance,
                 "context_instance": context_instance,
-                "observation_ms": round(observation_ms, 3),
+                "execution_position": execution_position,
+                "profile": str(profile),
                 "submit_attempts": submit_attempts,
+                **timing,
             }
             samples.append(sample)
             connection.execute(
@@ -305,35 +470,80 @@ def run_session_aging_experiment(
                 (mode, index, provider, _PROVIDER_DOMAINS[provider], observation_ms),
             )
             log.write(json.dumps(sample, sort_keys=True) + "\n")
-
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            try:
-                context = _new_context(browser)
-                try:
-                    for index, task in enumerate(tasks, start=1):
-                        record("shared_context", task, index, 1, 1, context)
-                finally:
-                    context.close()
-                for index, task in enumerate(tasks, start=1):
-                    context = _new_context(browser)
+        try:
+            for index, task in enumerate(tasks, start=1):
+                for execution_position, mode in enumerate(counterbalanced_mode_order(index), start=1):
+                    started_at = time.perf_counter()
+                    lifecycle: dict[str, float] = {}
+                    if mode == "fresh_process":
+                        state, lifecycle = start_browser(mode=mode, browser_instance=index)
+                        context = state["bootstrap_context"]
+                        lifecycle["route_install_ms"] = _install_local_fixture_route(context)
+                        try:
+                            observation_ms, submit_attempts, page_lifecycle = _measure_application(context=context, task=task)
+                            lifecycle.update(page_lifecycle)
+                            save_sample(
+                                mode=mode,
+                                task=task,
+                                index=index,
+                                execution_position=execution_position,
+                                browser_instance=index,
+                                context_instance=1,
+                                profile=state["profile"],
+                                lifecycle=lifecycle,
+                                observation_ms=observation_ms,
+                                submit_attempts=submit_attempts,
+                                started_at=started_at,
+                            )
+                        finally:
+                            context.close()
+                            finish_browser(state)
+                        continue
+                    state = hot_states[mode]
+                    if not state:
+                        state, lifecycle = start_browser(mode=mode, browser_instance=1)
+                        hot_states[mode] = state
+                    context = state.get("context")
+                    context_instance = 1
+                    if mode == "fresh_context" or context is None:
+                        if mode == "fresh_context":
+                            context, context_ms = _new_context(state["browser"])
+                            lifecycle["context_create_ms"] = context_ms
+                        else:
+                            context = state["bootstrap_context"]
+                            lifecycle["route_install_ms"] = _install_local_fixture_route(context)
+                        context_instance = index if mode == "fresh_context" else 1
+                        if mode == "shared_context":
+                            state["context"] = context
                     try:
-                        record("fresh_context", task, index, 1, index, context)
+                        observation_ms, submit_attempts, page_lifecycle = _measure_application(context=context, task=task)
+                        lifecycle.update(page_lifecycle)
+                        save_sample(
+                            mode=mode,
+                            task=task,
+                            index=index,
+                            execution_position=execution_position,
+                            browser_instance=1,
+                            context_instance=context_instance,
+                            profile=state["profile"],
+                            lifecycle=lifecycle,
+                            observation_ms=observation_ms,
+                            submit_attempts=submit_attempts,
+                            started_at=started_at,
+                        )
                     finally:
-                        context.close()
-            finally:
-                browser.close()
-        for index, task in enumerate(tasks, start=1):
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                try:
-                    context = _new_context(browser)
-                    try:
-                        record("fresh_process", task, index, index, 1, context)
-                    finally:
-                        context.close()
-                finally:
-                    browser.close()
+                        if mode == "fresh_context":
+                            context.close()
+        finally:
+            shared_context = hot_states["shared_context"].get("context")
+            if shared_context is not None:
+                shared_context.close()  # type: ignore[attr-defined]
+            for state in hot_states.values():
+                if state:
+                    finish_browser(state)
+            playwright = playwright_state.get("playwright")
+            if playwright is not None:
+                playwright.stop()  # type: ignore[attr-defined]
         connection.commit()
     report = compile_report(fixture_sha256=fixture_sha256, samples=samples)
     report["workspace"] = {
@@ -351,6 +561,8 @@ __all__ = [
     "MODES",
     "REPORT_SCHEMA_VERSION",
     "compile_report",
+    "counterbalanced_mode_order",
+    "end_to_end_attribution",
     "experiment_definition",
     "load_fixture",
     "run_session_aging_experiment",
