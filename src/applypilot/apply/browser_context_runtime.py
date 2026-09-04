@@ -428,9 +428,10 @@ class HotBrowserContextRuntime:
         try:
             pages = tuple(context.pages)
             return len(pages), sum(len(page.frames) for page in pages), len(tuple(context.service_workers))
-        except Exception:
-            # An unreadable post-close object is not evidence of a live residual.
-            return (0, 0, 0)
+        except Exception:  # noqa: BLE001 - native Playwright/protocol objects have no shared error base.
+            # Resource-observation uncertainty is treated as residual state so
+            # the caller terminally drains the owned browser process.
+            return (1, 1, 1)
 
     def _drain_locked(self) -> None:
         if self._drained:
@@ -442,7 +443,7 @@ class HotBrowserContextRuntime:
                 self._close_active(active, raise_on_failure=False)
             if self._browser is not None:
                 self._browser.close()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - terminal containment must survive native close errors.
             close_error = exc
         finally:
             # A terminal drain always revokes all capabilities even if native

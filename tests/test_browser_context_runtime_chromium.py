@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterator
 
 import pytest
 
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.browser
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 - required stdlib handler name
+    def do_GET(self) -> None:
         if self.path == "/sw.js":
             body = b"self.addEventListener('install', event => self.skipWaiting());"
             content_type = "application/javascript"

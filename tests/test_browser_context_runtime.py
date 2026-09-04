@@ -68,6 +68,40 @@ class ResidualBrowser(FakeBrowser):
         return context
 
 
+class UnreadableAfterCloseContext:
+    def __init__(self) -> None:
+        self._pages: list[FakePage] = []
+        self._service_workers: list[object] = []
+        self.closed = False
+
+    @property
+    def pages(self) -> list[FakePage]:
+        if self.closed:
+            raise RuntimeError("synthetic unreadable pages after close")
+        return self._pages
+
+    @property
+    def service_workers(self) -> list[object]:
+        if self.closed:
+            raise RuntimeError("synthetic unreadable workers after close")
+        return self._service_workers
+
+    def new_page(self) -> FakePage:
+        page = FakePage()
+        self._pages.append(page)
+        return page
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class UnreadableAfterCloseBrowser(FakeBrowser):
+    def new_context(self, **_kwargs: object) -> UnreadableAfterCloseContext:
+        context = UnreadableAfterCloseContext()
+        self.contexts.append(context)  # type: ignore[arg-type]
+        return context
+
+
 class FailingCloseBrowser(FakeBrowser):
     def close(self) -> None:
         self.closed = True
@@ -227,6 +261,26 @@ def test_browser_close_failure_still_terminally_drains_and_rejects_future_applic
 
     with pytest.raises(BrowserContextRuntimeError, match="browser process close failed; runtime drained"):
         runtime.close()
+
+    assert browser.closed is True
+    assert runtime.metrics.drained is True
+    assert runtime.metrics.closed is True
+    assert runtime.metrics.active_contexts == 0
+    with pytest.raises(BrowserContextDrained):
+        runtime.open_application(application_id="application-2", scope=_scope(), state=_state())
+
+
+def test_unreadable_post_close_resources_are_treated_as_residual_and_drained() -> None:
+    browser = UnreadableAfterCloseBrowser()
+    runtime = HotBrowserContextRuntime(
+        feature=BrowserContextFeature(True),
+        launch_browser=lambda: browser,
+    )
+    lease = runtime.open_application(application_id="application-1", scope=_scope(), state=_state())
+    runtime.new_page(lease)
+
+    with pytest.raises(BrowserContextRuntimeError, match="residual resources; runtime drained"):
+        runtime.close_application(lease)
 
     assert browser.closed is True
     assert runtime.metrics.drained is True
