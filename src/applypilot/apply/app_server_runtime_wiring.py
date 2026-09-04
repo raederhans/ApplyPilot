@@ -32,6 +32,7 @@ from applypilot.apply.codex_app_server import (
     CodexAppServerAdapter,
     CodexAppServerExecutionError,
     CodexAppServerTimeout,
+    app_server_item_starts_effect,
 )
 from applypilot.apply.runtime_cell import (
     RuntimeCellExecutionState,
@@ -40,18 +41,9 @@ from applypilot.apply.runtime_cell import (
 )
 
 ConnectionProvider = Callable[[], sqlite3.Connection]
+DatabasePathProvider = Callable[[], Path]
 AdapterFactory = Callable[[], CodexAppServerAdapter]
 AdapterFailureCallback = Callable[[CodexAppServerAdapter], None]
-
-_EFFECT_ITEM_TYPES = frozenset(
-    {
-        "command_execution",
-        "dynamic_tool_call",
-        "file_change",
-        "mcp_tool_call",
-        "tool_call",
-    }
-)
 
 _READ_ONLY_PLAYWRIGHT_TOOLS = (
     "browser_snapshot",
@@ -101,9 +93,11 @@ class DurableAppServerStateStore:
         connection_provider: ConnectionProvider,
         *,
         close_connections: bool = False,
+        database_path_provider: DatabasePathProvider | None = None,
     ) -> None:
         self._connection_provider = connection_provider
         self._close_connections = close_connections
+        self._database_path_provider = database_path_provider
 
     def _connection(self) -> sqlite3.Connection:
         connection = self._connection_provider()
@@ -116,6 +110,12 @@ class DurableAppServerStateStore:
     def _release(self, connection: sqlite3.Connection) -> None:
         if self._close_connections:
             connection.close()
+
+    def _prepare_write_connection(self) -> None:
+        if self._database_path_provider is None:
+            return
+        database_path = Path(self._database_path_provider())
+        database_path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _ensure_schema(connection: sqlite3.Connection) -> None:
@@ -152,6 +152,7 @@ class DurableAppServerStateStore:
         )
 
     def load(self, actor_id: str, attempt_id: str) -> DurableAppServerState | None:
+        self._prepare_write_connection()
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -169,6 +170,10 @@ class DurableAppServerStateStore:
     def peek(self, actor_id: str, attempt_id: str) -> DurableAppServerState | None:
         """Read an existing binding without creating schema while feature-off."""
 
+        if self._database_path_provider is not None:
+            database_path = Path(self._database_path_provider())
+            if not database_path.exists():
+                return None
         connection = self._connection()
         try:
             exists = connection.execute(
@@ -213,6 +218,7 @@ class DurableAppServerStateStore:
             for value in (actor_id, attempt_id, provider_session_id, provider_turn_id)
         ):
             raise ValueError("accepted App Server identity fields are required")
+        self._prepare_write_connection()
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -286,6 +292,7 @@ class DurableAppServerStateStore:
     ) -> DurableAppServerState:
         """Persist only an explicit host-observed Submit effect, irreversibly."""
 
+        self._prepare_write_connection()
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -347,6 +354,7 @@ class DurableAppServerStateStore:
             raise ValueError("uncertain App Server acceptance must stay bound")
         if execution_state.submit_started:
             raise ValueError("submit_started requires an explicit durable host observation")
+        self._prepare_write_connection()
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -417,7 +425,7 @@ class DurableAppServerStateStore:
         event: Mapping[str, object],
     ) -> DurableAppServerState:
         item = event.get("item")
-        effect_started = isinstance(item, Mapping) and item.get("type") in _EFFECT_ITEM_TYPES
+        effect_started = isinstance(item, Mapping) and app_server_item_starts_effect(item)
         terminal_status: str | None = None
         if event.get("type") == "turn.completed":
             raw_status = event.get("status")
@@ -426,6 +434,7 @@ class DurableAppServerStateStore:
                     "terminal App Server event has no valid provider status"
                 )
             terminal_status = str(raw_status)
+        self._prepare_write_connection()
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -484,6 +493,7 @@ class AppServerRuntimePool:
     def __init__(self, adapter_factory: AdapterFactory = CodexAppServerAdapter) -> None:
         self._adapter_factory = adapter_factory
         self._adapters: dict[int, CodexAppServerAdapter] = {}
+        self._cleanup_threads: set[threading.Thread] = set()
         self._lock = threading.RLock()
 
     def adapter_for_worker(self, worker_id: int) -> CodexAppServerAdapter:
@@ -500,24 +510,59 @@ class AppServerRuntimePool:
         with self._lock:
             adapters = tuple(self._adapters.values())
             self._adapters.clear()
+            cleanup_threads = tuple(self._cleanup_threads)
         for adapter in adapters:
-            try:
-                adapter.shutdown()
-            except (OSError, RuntimeError, TimeoutError, ValueError):
-                # Each adapter performs bounded transport containment itself.
-                pass
+            self._shutdown_adapter(adapter)
+        for cleanup_thread in cleanup_threads:
+            cleanup_thread.join(timeout=5)
+
+    @staticmethod
+    def _shutdown_adapter(adapter: CodexAppServerAdapter) -> None:
+        try:
+            adapter.shutdown()
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            # Each adapter performs bounded transport containment itself.
+            pass
+
+    def _detach_worker(self, worker_id: int, adapter: CodexAppServerAdapter) -> bool:
+        with self._lock:
+            if self._adapters.get(worker_id) is not adapter:
+                return False
+            self._adapters.pop(worker_id, None)
+            return True
 
     def evict_worker(self, worker_id: int, adapter: CodexAppServerAdapter) -> None:
         """Remove and close a worker transport after a non-terminal anomaly."""
 
+        if self._detach_worker(worker_id, adapter):
+            self._shutdown_adapter(adapter)
+
+    def evict_worker_async(
+        self,
+        worker_id: int,
+        adapter: CodexAppServerAdapter,
+    ) -> threading.Thread | None:
+        """Detach immediately; contain the old transport outside the caller path."""
+
+        if not self._detach_worker(worker_id, adapter):
+            return None
+
+        def shutdown_detached_adapter() -> None:
+            try:
+                self._shutdown_adapter(adapter)
+            finally:
+                with self._lock:
+                    self._cleanup_threads.discard(threading.current_thread())
+
+        cleanup_thread = threading.Thread(
+            target=shutdown_detached_adapter,
+            name=f"applypilot-app-server-cleanup-worker-{worker_id}",
+            daemon=True,
+        )
         with self._lock:
-            if self._adapters.get(worker_id) is adapter:
-                self._adapters.pop(worker_id, None)
-        try:
-            adapter.shutdown()
-        except (OSError, RuntimeError, TimeoutError, ValueError):
-            # The adapter shutdown path is bounded and owns final containment.
-            pass
+            self._cleanup_threads.add(cleanup_thread)
+        cleanup_thread.start()
+        return cleanup_thread
 
 
 def _content_ref(value: object) -> str:

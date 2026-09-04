@@ -96,7 +96,7 @@ for raw_line in sys.stdin:
         emit({"id": request_id, "result": {
             "turn": {"id": turn_id, "status": "inProgress", "items": []}
         }})
-        if mode == "effect_hold":
+        if mode in {"effect_hold", "read_hold"}:
             emit({"method": "item/started", "params": {
                 "threadId": thread_id,
                 "turnId": turn_id,
@@ -105,7 +105,7 @@ for raw_line in sys.stdin:
                     "id": "tool-1",
                     "type": "mcpToolCall",
                     "server": "playwright",
-                    "tool": "browser_snapshot",
+                    "tool": "browser_click" if mode == "effect_hold" else "browser_snapshot",
                     "status": "inProgress",
                     "arguments": {},
                 },
@@ -288,6 +288,54 @@ def test_stdio_transport_handshake_turn_and_event_normalization(tmp_path: Path) 
     assert wire[2]["params"]["sandbox"] == "read-only"
 
 
+def test_transport_routes_notifications_to_matching_thread_and_turn_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = CodexAppServerStdioTransport(["unused"], subscription_queue_size=2)
+    monkeypatch.setattr(transport, "start", lambda: None)
+    first = transport.subscribe(thread_id="thread-1", turn_id="turn-1")
+    second = transport.subscribe(thread_id="thread-2", turn_id="turn-2")
+
+    transport._dispatch_message(
+        {
+            "method": "item/completed",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "item": {}},
+        }
+    )
+
+    assert transport.receive(first, timeout=0.01)["params"]["threadId"] == "thread-1"
+    with pytest.raises(CodexAppServerTimeout):
+        transport.receive(second, timeout=0.01)
+
+
+def test_transport_queue_overflow_isolates_only_the_slow_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = CodexAppServerStdioTransport(["unused"], subscription_queue_size=1)
+    monkeypatch.setattr(transport, "start", lambda: None)
+    slow = transport.subscribe(thread_id="thread-1", turn_id="turn-1")
+    healthy = transport.subscribe(thread_id="thread-2", turn_id="turn-2")
+    first = {
+        "method": "item/completed",
+        "params": {"threadId": "thread-1", "turnId": "turn-1", "item": {}},
+    }
+
+    transport._dispatch_message(first)
+    transport._dispatch_message(first)
+    transport._dispatch_message(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-2", "turn": {"id": "turn-2"}},
+        }
+    )
+
+    with pytest.raises(CodexAppServerError, match="event queue overflow"):
+        transport.receive(slow, timeout=0.01)
+    assert transport.receive(healthy, timeout=0.01)["params"]["threadId"] == "thread-2"
+    assert slow.token not in transport._subscriptions
+    assert healthy.token in transport._subscriptions
+
+
 @pytest.mark.parametrize(
     ("method", "params"),
     [
@@ -391,6 +439,21 @@ def test_runtime_state_never_allows_cli_fallback_after_acceptance_or_effect(
     assert drained[-1]["status"] == "interrupted"
     with pytest.raises(KeyError):
         adapter.execution_state(turn.provider_turn_id)
+    adapter.shutdown()
+
+
+def test_read_only_observation_does_not_mark_effect_started(tmp_path: Path) -> None:
+    transport, _ = _fake_transport(tmp_path, mode="read_hold")
+    adapter = CodexAppServerAdapter(transport)
+    turn = adapter.start(_request(tmp_path))
+    events = iter(turn.events)
+
+    assert next(events)["type"] == "turn.started"
+    assert next(events)["item"]["tool"] == "browser_snapshot"
+    assert adapter.execution_state(turn.provider_turn_id).tool_or_effect_started is False
+
+    adapter.interrupt(turn.provider_turn_id)
+    adapter.drain(turn.provider_turn_id, timeout=5)
     adapter.shutdown()
 
 

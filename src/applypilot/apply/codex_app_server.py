@@ -75,6 +75,32 @@ class _TransportFailure:
 class _Subscription:
     token: int
     messages: queue.Queue[Mapping[str, object] | _TransportFailure]
+    thread_id: str
+    turn_id: str | None = None
+
+
+_READ_ONLY_MCP_TOOLS = frozenset(
+    {
+        ("playwright", "browser_console_messages"),
+        ("playwright", "browser_network_requests"),
+        ("playwright", "browser_snapshot"),
+        ("playwright", "browser_take_screenshot"),
+        ("playwright", "browser_wait_for"),
+    }
+)
+
+
+def app_server_item_starts_effect(item: Mapping[str, object]) -> bool:
+    """Classify provider items without treating read observations as effects."""
+
+    item_type = item.get("type")
+    if item_type in {"command_execution", "file_change"}:
+        return True
+    if item_type not in {"dynamic_tool_call", "mcp_tool_call", "tool_call"}:
+        return False
+    server = item.get("server")
+    tool = item.get("tool", item.get("name"))
+    return (server, tool) not in _READ_ONLY_MCP_TOOLS
 
 
 def _validate_timeout(value: float, name: str) -> float:
@@ -95,6 +121,7 @@ class CodexAppServerStdioTransport:
         startup_timeout: float = 15.0,
         request_timeout: float = 30.0,
         shutdown_timeout: float = 5.0,
+        subscription_queue_size: int = 256,
         popen_factory: Any = subprocess.Popen,
     ) -> None:
         resolved = tuple(command or (*resolve_codex_command(), "app-server", "--stdio"))
@@ -106,6 +133,13 @@ class CodexAppServerStdioTransport:
         self.startup_timeout = _validate_timeout(startup_timeout, "startup_timeout")
         self.request_timeout = _validate_timeout(request_timeout, "request_timeout")
         self.shutdown_timeout = _validate_timeout(shutdown_timeout, "shutdown_timeout")
+        if (
+            isinstance(subscription_queue_size, bool)
+            or not isinstance(subscription_queue_size, int)
+            or subscription_queue_size < 1
+        ):
+            raise ValueError("subscription_queue_size must be a positive integer")
+        self.subscription_queue_size = subscription_queue_size
         self._popen_factory = popen_factory
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
@@ -214,13 +248,30 @@ class CodexAppServerStdioTransport:
         self.start()
         self._notify_raw(method, params or {})
 
-    def subscribe(self) -> _Subscription:
+    def subscribe(self, *, thread_id: str, turn_id: str | None = None) -> _Subscription:
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError("subscription thread_id is required")
+        if turn_id is not None and (not isinstance(turn_id, str) or not turn_id):
+            raise ValueError("subscription turn_id must be a non-empty string")
         self.start()
         token = next(self._subscription_ids)
-        subscription = _Subscription(token=token, messages=queue.Queue())
+        subscription = _Subscription(
+            token=token,
+            messages=queue.Queue(maxsize=self.subscription_queue_size),
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
         with self._state_lock:
             self._subscriptions[token] = subscription
         return subscription
+
+    def bind_subscription_turn(self, subscription: _Subscription, turn_id: str) -> None:
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("subscription turn_id is required")
+        with self._state_lock:
+            if self._subscriptions.get(subscription.token) is not subscription:
+                raise CodexAppServerError("Codex App Server subscription is no longer active")
+            subscription.turn_id = turn_id
 
     def unsubscribe(self, subscription: _Subscription) -> None:
         with self._state_lock:
@@ -237,6 +288,8 @@ class CodexAppServerStdioTransport:
         except queue.Empty as exc:
             raise CodexAppServerTimeout("Codex App Server event drain timed out") from exc
         if isinstance(item, _TransportFailure):
+            if isinstance(item.error, CodexAppServerError):
+                raise item.error
             raise CodexAppServerError("Codex App Server event stream closed") from item.error
         return item
 
@@ -355,7 +408,35 @@ class CodexAppServerStdioTransport:
         with self._state_lock:
             subscriptions = tuple(self._subscriptions.values())
         for subscription in subscriptions:
-            subscription.messages.put(message)
+            params = message.get("params")
+            if not isinstance(params, Mapping):
+                continue
+            thread_id = _notification_thread_id(params)
+            turn_id = _notification_turn_id(params)
+            if thread_id != subscription.thread_id:
+                continue
+            if subscription.turn_id is not None and turn_id != subscription.turn_id:
+                continue
+            try:
+                subscription.messages.put_nowait(message)
+            except queue.Full:
+                self._fail_subscription_overflow(subscription)
+
+    def _fail_subscription_overflow(self, subscription: _Subscription) -> None:
+        failure = _TransportFailure(
+            CodexAppServerError("Codex App Server subscription event queue overflow")
+        )
+        with self._state_lock:
+            if self._subscriptions.get(subscription.token) is subscription:
+                self._subscriptions.pop(subscription.token, None)
+        try:
+            subscription.messages.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            subscription.messages.put_nowait(failure)
+        except queue.Full:
+            pass
 
     def _reject_server_request(self, request_id: object) -> None:
         # ApplyPilot does not delegate approval or elicitation authority to the
@@ -382,7 +463,10 @@ class CodexAppServerStdioTransport:
             except queue.Full:
                 pass
         for subscription in subscriptions:
-            subscription.messages.put(failure)
+            try:
+                subscription.messages.put_nowait(failure)
+            except queue.Full:
+                self._fail_subscription_overflow(subscription)
 
     def shutdown(self) -> None:
         """Close stdin, then terminate only this owned child if it does not exit."""
@@ -716,7 +800,7 @@ class CodexAppServerAdapter:
                 ),
             ) from exc
 
-        subscription = self.transport.subscribe()
+        subscription = self.transport.subscribe(thread_id=returned_thread_id)
         try:
             turn_result = self.transport.request(
                 "turn/start",
@@ -744,6 +828,7 @@ class CodexAppServerAdapter:
                     "turn/start returned an invalid turn id",
                     method="turn/start",
                 )
+            self.transport.bind_subscription_turn(subscription, turn_id_value)
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             self.transport.unsubscribe(subscription)
             raise CodexAppServerExecutionError(
@@ -917,12 +1002,7 @@ class CodexAppServerAdapter:
                     execution_state=state.execution_state(),
                 ) from exc
             item = event.get("item")
-            if isinstance(item, Mapping) and item.get("type") in {
-                "mcp_tool_call",
-                "dynamic_tool_call",
-                "command_execution",
-                "file_change",
-            }:
+            if isinstance(item, Mapping) and app_server_item_starts_effect(item):
                 state.effect_started = True
             if event.get("type") == "turn.completed":
                 state.terminal = True

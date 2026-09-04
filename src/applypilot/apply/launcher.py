@@ -208,6 +208,12 @@ from applypilot.runtime_settings import load_runtime_settings
 from applypilot.storage import semantic_browser_writes as semantic_write_journal
 
 
+def _durable_control_database_path() -> Path:
+    from applypilot import database as database_mod
+
+    return Path(database_mod.DB_PATH)
+
+
 def _open_durable_control_connection() -> sqlite3.Connection:
     """Open a fresh control-plane connection exclusively owned by its caller."""
     from applypilot import database as database_mod
@@ -525,6 +531,7 @@ _app_server_runtime_pool = app_server_wiring_mod.AppServerRuntimePool()
 _app_server_state_store = app_server_wiring_mod.DurableAppServerStateStore(
     _open_durable_control_connection,
     close_connections=True,
+    database_path_provider=_durable_control_database_path,
 )
 atexit.register(_browser_broker.close)
 atexit.register(_agent_subprocess_runtime.close)
@@ -5738,6 +5745,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     stats: dict = {}
     proc = None
     app_server_turn_process: app_server_wiring_mod.AppServerTurnProcess | None = None
+    app_server_shadow_thread: threading.Thread | None = None
+    app_server_shadow_process: app_server_wiring_mod.AppServerTurnProcess | None = None
+    app_server_shadow_cancel_requested = threading.Event()
+    app_server_shadow_process_lock = threading.Lock()
     durable_handle: DurableRunHandle | None = None
     watchdog: threading.Timer | None = None
     lease_heartbeat: LeaseHeartbeat | None = None
@@ -5919,21 +5930,37 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             if isinstance(raw_control_contract, Mapping)
             else {}
         )
-        if app_server_shadow_should_run:
+        def request_app_server_shadow_cancel() -> None:
+            app_server_shadow_cancel_requested.set()
+
+        def interrupt_app_server_shadow() -> None:
+            app_server_shadow_cancel_requested.set()
+            with app_server_shadow_process_lock:
+                shadow_process = app_server_shadow_process
+            if shadow_process is not None and shadow_process.poll() is None:
+                try:
+                    shadow_process.cancel()
+                except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                    pass
+
+        def run_app_server_shadow() -> None:
+            nonlocal app_server_shadow_process
             assert app_server_adapter is not None
             plan = job.get("_application_plan")
             previous_plan = job.get("_previous_application_plan")
             shadow_watchdog: threading.Timer | None = None
             shadow_timed_out = threading.Event()
+            shadow_worker_dir = worker_dir / ".app-server-shadow"
+            shadow_worker_dir.mkdir(parents=True, exist_ok=True)
             try:
-                app_server_turn_process = app_server_wiring_mod.open_configured_app_server_turn(
+                shadow_process = app_server_wiring_mod.open_configured_app_server_turn(
                     adapter=app_server_adapter,
                     state_store=_app_server_state_store,
                     run_id=run_id,
                     actor_id=actor_id,
                     attempt_id=attempt_id,
                     phase=submission_phase,
-                    cwd=worker_dir,
+                    cwd=shadow_worker_dir,
                     model=model,
                     mcp_config=mcp_config,
                     runtime_capabilities=runtime_capabilities,
@@ -5971,42 +5998,37 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         worker_id, failed_adapter
                     ),
                 )
+                with app_server_shadow_process_lock:
+                    app_server_shadow_process = shadow_process
                 runtime_metadata["app_server_shadow"] = {
                     "status": "running",
-                    "provider_session_id": app_server_turn_process.turn.provider_session_id,
-                    "provider_turn_id": app_server_turn_process.turn.provider_turn_id,
+                    "provider_session_id": shadow_process.turn.provider_session_id,
+                    "provider_turn_id": shadow_process.turn.provider_turn_id,
                     "authoritative": False,
                 }
-                with _claude_lock:
-                    _app_server_turn_cancellations[worker_id] = app_server_turn_process.cancel
+                if app_server_shadow_cancel_requested.is_set():
+                    interrupt_app_server_shadow()
 
                 def cancel_shadow_on_timeout() -> None:
-                    if (
-                        app_server_turn_process is not None
-                        and app_server_turn_process.poll() is None
-                    ):
-                        shadow_timed_out.set()
-                        try:
-                            app_server_turn_process.cancel()
-                        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
-                            pass
+                    shadow_timed_out.set()
+                    interrupt_app_server_shadow()
 
                 shadow_watchdog = threading.Timer(
                     min(agent_timeout_seconds, 60), cancel_shadow_on_timeout
                 )
                 shadow_watchdog.daemon = True
                 shadow_watchdog.start()
-                for _shadow_line in app_server_turn_process.stdout:
+                for _shadow_line in shadow_process.stdout:
                     pass
-                app_server_turn_process.wait(timeout=5)
+                shadow_process.wait(timeout=5)
                 runtime_metadata["app_server_shadow"].update(
                     {
                         "status": (
                             "timed_out"
                             if shadow_timed_out.is_set()
-                            else app_server_turn_process.terminal_status or "failed"
+                            else shadow_process.terminal_status or "failed"
                         ),
-                        "returncode": app_server_turn_process.returncode,
+                        "returncode": shadow_process.returncode,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -6015,28 +6037,30 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "failure_code": type(exc).__name__,
                     "authoritative": False,
                 }
-                if app_server_turn_process is None:
+                with app_server_shadow_process_lock:
+                    shadow_process = app_server_shadow_process
+                if shadow_process is None:
                     _app_server_runtime_pool.evict_worker(worker_id, app_server_adapter)
             finally:
                 if shadow_watchdog is not None:
                     shadow_watchdog.cancel()
-                with _claude_lock:
-                    _app_server_turn_cancellations.pop(worker_id, None)
-                if (
-                    app_server_turn_process is not None
-                    and app_server_turn_process.poll() is None
-                ):
+                with app_server_shadow_process_lock:
+                    shadow_process = app_server_shadow_process
+                if shadow_process is not None and shadow_process.poll() is None:
                     try:
-                        app_server_turn_process.cancel()
-                        app_server_turn_process.drain(timeout=5)
+                        shadow_process.cancel()
+                        shadow_process.drain(timeout=5)
                     except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
                         _app_server_runtime_pool.evict_worker(worker_id, app_server_adapter)
-                app_server_turn_process = None
-                # Shadow output is never an authoritative report or checkpoint.
-                if report_path.exists():
-                    report_path.unlink()
-                if final_message_path and final_message_path.exists():
-                    final_message_path.unlink()
+                # Shadow artifacts are isolated from authoritative RESULT/report files.
+                for shadow_artifact in (
+                    shadow_worker_dir / "agent-turn-report.json",
+                    shadow_worker_dir / "final-message.txt",
+                ):
+                    try:
+                        shadow_artifact.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         process_spawn_started = time.perf_counter()
         launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
@@ -6088,6 +6112,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
         proc = durable_handle.process
         process_spawned_at = time.perf_counter()
+        if app_server_shadow_should_run:
+            runtime_metadata["app_server_shadow"] = {
+                "status": "scheduled",
+                "authoritative": False,
+            }
+            app_server_shadow_thread = threading.Thread(
+                target=run_app_server_shadow,
+                name=f"applypilot-app-server-shadow-worker-{worker_id}",
+                daemon=True,
+            )
+            with _claude_lock:
+                _app_server_turn_cancellations[worker_id] = request_app_server_shadow_cancel
+            app_server_shadow_thread.start()
         performance_attribution_mod.safe_record(
             performance_trace,
             "agent.startup",
@@ -6763,6 +6800,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
             _app_server_turn_cancellations.pop(worker_id, None)
+        if app_server_shadow_thread is not None:
+            request_app_server_shadow_cancel()
+            app_server_shadow_thread.join(timeout=0.01)
+            if app_server_shadow_thread.is_alive() and app_server_adapter is not None:
+                _app_server_runtime_pool.evict_worker_async(worker_id, app_server_adapter)
         if app_server_turn_process is not None and proc is not None and proc.poll() is None:
             try:
                 proc.cancel()

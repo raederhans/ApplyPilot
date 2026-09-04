@@ -439,6 +439,8 @@ def test_run_job_app_server_is_non_authoritative_shadow_and_cli_owns_result(
             self.thread_config = config
 
         def _turn(self, kind: str, request: RuntimeCellRequest) -> RuntimeCellTurn:
+            assert "popen" in events, "authoritative CLI must launch before shadow work"
+            events.append("shadow_started")
             self.requests.append((kind, request))
             number = len(self.requests)
             report_path = request.cwd / "agent-turn-report.json"
@@ -598,6 +600,135 @@ def test_run_job_keeps_direct_email_on_cli_mailbox_route_when_app_server_enabled
 
     assert job["_runtime_cell"]["active_backend"] == "codex-cli"
     assert job["_runtime_cell"]["reason_code"] == "CODEX_APP_SERVER_FEATURE_DISABLED"
+
+
+def test_blocked_app_server_shadow_does_not_delay_authoritative_cli_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+    shadow_entered = threading.Event()
+    release_shadow = threading.Event()
+    shutdown_started = threading.Event()
+    cancel_started = threading.Event()
+    adapter_detached = threading.Event()
+
+    class BlockingAdapter:
+        backend = "codex-app-server"
+        drain_timeout = 0.1
+
+        def __init__(self) -> None:
+            self.transport = SimpleNamespace(process=SimpleNamespace(pid=4002))
+
+        def health(self) -> RuntimeAdapterHealth:
+            return RuntimeAdapterHealth(
+                backend="codex-app-server",
+                status="ready",
+                reason_code="CODEX_APP_SERVER_READY",
+                capabilities=CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
+            )
+
+        def configure_thread(self, _config: dict[str, object]) -> None:
+            return None
+
+        def start(self, _request: RuntimeCellRequest) -> RuntimeCellTurn:
+            def blocked_events():
+                shadow_entered.set()
+                release_shadow.wait(timeout=2)
+                yield {
+                    "type": "turn.completed",
+                    "status": "interrupted",
+                    "usage": {},
+                }
+
+            return RuntimeCellTurn(
+                backend="codex-app-server",
+                provider_session_id="blocked-thread",
+                provider_turn_id="blocked-turn",
+                events=blocked_events(),
+            )
+
+        def resume(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+            return self.start(request)
+
+        def cancel(self, _provider_turn_id: str) -> None:
+            cancel_started.set()
+            release_shadow.wait(timeout=2)
+
+        def drain(
+            self,
+            _provider_turn_id: str | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> tuple[dict[str, object], ...]:
+            del timeout
+            return ()
+
+        def shutdown(self) -> None:
+            shutdown_started.set()
+            self.cancel("blocked-turn")
+
+    adapter = BlockingAdapter()
+
+    class BlockingPool:
+        def adapter_for_worker(self, worker_id: int) -> BlockingAdapter:
+            assert worker_id == 0
+            return adapter
+
+        def evict_worker(self, _worker_id: int, _adapter: object) -> None:
+            return None
+
+        def evict_worker_async(
+            self, worker_id: int, failed_adapter: object
+        ) -> threading.Thread:
+            assert worker_id == 0
+            assert failed_adapter is adapter
+            adapter_detached.set()
+            cleanup = threading.Thread(target=adapter.shutdown, daemon=True)
+            cleanup.start()
+            return cleanup
+
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", BlockingPool())
+    pid = 5000
+
+    def popen(_command, **kwargs):
+        nonlocal pid
+        pid += 1
+        events.append("popen")
+        process = _FakeProcess(pid, events, kwargs["env"])
+        authoritative_lines = tuple(process.stdout)
+
+        def output():
+            assert shadow_entered.wait(timeout=1)
+            with launcher._claude_lock:
+                request_cancel = launcher._app_server_turn_cancellations[0]
+            request_cancel()
+            assert not cancel_started.is_set()
+            yield from authoritative_lines
+
+        process.stdout = output()  # type: ignore[assignment]
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+
+    try:
+        status, _ = launcher.run_job(
+            _job("attempt-blocked-shadow"),
+            port=9432,
+            worker_id=0,
+            model="model",
+            agent_backend="codex",
+            submission_phase="prepare",
+        )
+
+        assert status == "ready_to_submit"
+        assert adapter_detached.is_set()
+        assert shutdown_started.wait(timeout=1)
+        assert cancel_started.wait(timeout=1)
+        assert not release_shadow.is_set()
+    finally:
+        release_shadow.set()
 
 
 def test_checkpoint_write_failure_keeps_durable_turn_unknown_and_no_parent_continuation(

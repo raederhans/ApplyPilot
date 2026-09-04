@@ -95,7 +95,11 @@ def _store(path: Path) -> DurableAppServerStateStore:
     def connect() -> sqlite3.Connection:
         return sqlite3.connect(path)
 
-    return DurableAppServerStateStore(connect, close_connections=True)
+    return DurableAppServerStateStore(
+        connect,
+        close_connections=True,
+        database_path_provider=lambda: path,
+    )
 
 
 def _plan() -> ApplicationPlan:
@@ -121,6 +125,28 @@ def test_feature_off_peek_does_not_create_durable_schema(tmp_path: Path) -> None
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='app_server_runtime_bindings'"
         ).fetchone() is None
+
+
+def test_feature_off_peek_does_not_create_missing_database_parent(tmp_path: Path) -> None:
+    database_path = tmp_path / "missing" / "nested" / "control.db"
+    store = _store(database_path)
+
+    assert store.peek("application:attempt-1", "attempt-1") is None
+    assert not database_path.parent.exists()
+    assert not database_path.exists()
+
+
+def test_feature_on_load_creates_missing_database_parent_and_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "missing" / "nested" / "control.db"
+    store = _store(database_path)
+
+    assert store.load("application:attempt-1", "attempt-1") is None
+    assert database_path.exists()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='app_server_runtime_bindings'"
+        ).fetchone() is not None
 
 
 def test_ref_only_request_adds_optional_plan_delta_without_raw_inputs(tmp_path: Path) -> None:
@@ -267,7 +293,7 @@ def test_thread_config_without_trusted_endpoint_exposes_no_browser_mcp() -> None
     assert config["mcp_servers"] == {}
 
 
-def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: Path) -> None:
+def test_fake_server_turn_persists_observation_and_repairs_on_same_thread(tmp_path: Path) -> None:
     script = tmp_path / "fake_app_server.py"
     script.write_text(FAKE_SERVER, encoding="utf-8")
     transport = CodexAppServerStdioTransport(
@@ -298,7 +324,7 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
         first_state = store.load("application:attempt-1", "attempt-1")
         assert first_state is not None
         assert first_state.provider_session_id == "thread-1"
-        assert first_state.tool_or_effect_started is True
+        assert first_state.tool_or_effect_started is False
         assert first_state.status == "completed"
         parked = select_runtime_cell(
             "codex",
@@ -399,6 +425,46 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
     assert transport.process.poll() is not None
 
 
+def test_state_store_persists_effect_but_not_read_observation(tmp_path: Path) -> None:
+    store = _store(tmp_path / "control.db")
+    store.record_accepted(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+    )
+
+    observed = store.record_event(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_turn_id="turn-1",
+        event={
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_snapshot",
+            },
+        },
+    )
+    effected = store.record_event(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_turn_id="turn-1",
+        event={
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_click",
+            },
+        },
+    )
+
+    assert observed.tool_or_effect_started is False
+    assert effected.tool_or_effect_started is True
+
+
 def test_pool_reuses_one_adapter_per_worker_and_shutdown_is_bounded() -> None:
     created: list[object] = []
 
@@ -421,6 +487,31 @@ def test_pool_reuses_one_adapter_per_worker_and_shutdown_is_bounded() -> None:
     assert len(created) == 2
     assert first.shutdown_calls == 1
     assert second.shutdown_calls == 1
+
+
+def test_pool_async_eviction_detaches_before_blocked_shutdown_completes() -> None:
+    shutdown_started = threading.Event()
+    release_shutdown = threading.Event()
+
+    class BlockingAdapter:
+        def shutdown(self) -> None:
+            shutdown_started.set()
+            release_shutdown.wait(timeout=2)
+
+    pool = AppServerRuntimePool(BlockingAdapter)  # type: ignore[arg-type]
+    first = pool.adapter_for_worker(0)
+
+    cleanup_thread = pool.evict_worker_async(0, first)
+    assert cleanup_thread is not None
+    assert shutdown_started.wait(timeout=1)
+    second = pool.adapter_for_worker(0)
+
+    assert second is not first
+    assert cleanup_thread.is_alive()
+    release_shutdown.set()
+    cleanup_thread.join(timeout=1)
+    assert not cleanup_thread.is_alive()
+    pool.shutdown()
 
 
 def test_turn_facade_stops_waiting_when_cancel_cannot_reach_server(tmp_path: Path) -> None:
