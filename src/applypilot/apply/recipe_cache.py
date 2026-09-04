@@ -203,6 +203,31 @@ class RecipeCacheKey:
         return canonical_digest(self.as_dict())
 
     @property
+    def template_identity_digest(self) -> str:
+        """Identify reusable structure without carrying stale page authority.
+
+        Page, target, lease, generation, and epoch bindings are intentionally
+        excluded. A cache hit is rebuilt around the caller's fresh key after
+        mandatory live validation, so none of those authority dimensions can
+        be replayed from the cached recipe.
+        """
+
+        return canonical_digest(
+            {
+                "provider": self.provider,
+                "domain": self.domain,
+                "adapter_version": self.adapter_version,
+                "page_signature": self.page_signature,
+                "schema_policy_digest": self.schema_policy_digest,
+                "frame_digest": self.frame_digest,
+                "option_digest": self.option_digest,
+                "required_writable_digest": self.required_writable_digest,
+                "locator_digest": self.locator_digest,
+                "taint_digest": self.taint_digest,
+            }
+        )
+
+    @property
     def clean(self) -> bool:
         return hmac.compare_digest(self.taint_digest, private_binding_digest("taint", ""))
 
@@ -363,7 +388,7 @@ class ValueFreeRecipeCache:
             raise ValueError("tainted page observations cannot enter the recipe cache")
         if not payload_is_value_free(recipe.as_dict()):
             raise ValueError("recipe payload is not value-free")
-        identity = recipe.key.identity_digest
+        identity = recipe.key.template_identity_digest
         with self._lock:
             self._items[identity] = recipe
             self._items.move_to_end(identity)
@@ -378,26 +403,35 @@ class ValueFreeRecipeCache:
     ) -> CachedProviderRecipe | None:
         if not isinstance(key, RecipeCacheKey) or not key.clean:
             return None
-        identity = key.identity_digest
+        identity = key.template_identity_digest
         with self._lock:
             recipe = self._items.get(identity)
-        if recipe is None or recipe.key != key or validate_live is None:
+        if (
+            recipe is None
+            or recipe.key.template_identity_digest != identity
+            or validate_live is None
+        ):
             return None
         try:
             valid = validate_live(key) is True
         except Exception:  # noqa: BLE001 - missing live proof is a cache miss
             valid = False
         if not valid:
+            with self._lock:
+                if self._items.get(identity) is recipe:
+                    self._items.pop(identity, None)
             return None
         with self._lock:
             if self._items.get(identity) is not recipe:
                 return None
             self._items.move_to_end(identity)
-            return recipe
+            if recipe.key == key:
+                return recipe
+            return CachedProviderRecipe.build(key, recipe.controls)
 
     def invalidate(self, key: RecipeCacheKey) -> bool:
         with self._lock:
-            return self._items.pop(key.identity_digest, None) is not None
+            return self._items.pop(key.template_identity_digest, None) is not None
 
     def clear(self) -> None:
         with self._lock:

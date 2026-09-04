@@ -268,7 +268,10 @@ class ProviderSemanticRecipeAdapter:
                 "frame",
                 {
                     "frame_path": observation.frame_path,
-                    "frame_url": observation.frame_url or observation.page_url,
+                    "frame_domain": (
+                        urlsplit(observation.frame_url or observation.page_url).hostname
+                        or ""
+                    ).casefold(),
                 },
             ),
             option_digest=private_binding_digest(

@@ -66,12 +66,32 @@ def test_ten_sequential_applications_leave_no_page_frame_storage_or_service_work
     sync_playwright = playwright_sync_api.sync_playwright
     with _fixture_server() as fixture_url, sync_playwright() as playwright:
         browser = playwright.chromium.launch()
+        launches = 0
+
+        def launch_browser():
+            nonlocal launches
+            launches += 1
+            return browser
+
         runtime = HotBrowserContextRuntime(
             feature=BrowserContextFeature(True),
-            launch_browser=lambda: browser,
+            launch_browser=launch_browser,
         )
         scope = BrowserStateScope("synthetic", "127.0.0.1", "synthetic-account")
-        state = ScopedBrowserState(scope, {"cookies": [], "origins": []})
+        state = ScopedBrowserState(
+            scope,
+            {
+                "cookies": [
+                    {
+                        "name": "auth_seed",
+                        "value": "authenticated",
+                        "domain": "127.0.0.1",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+        )
 
         for index in range(10):
             lease = runtime.open_application(
@@ -81,8 +101,21 @@ def test_ten_sequential_applications_leave_no_page_frame_storage_or_service_work
             )
             page = runtime.new_page(lease)
             page.goto(f"{fixture_url}/blank")
+            cookies = {cookie["name"]: cookie["value"] for cookie in page.context.cookies()}
+            assert cookies["auth_seed"] == "authenticated"
+            assert "application_mutation" not in cookies
             assert page.evaluate("localStorage.getItem('application')") is None
             assert page.evaluate("navigator.serviceWorker.getRegistrations().then(items => items.length)") == 0
+            page.context.add_cookies(
+                [
+                    {
+                        "name": "application_mutation",
+                        "value": f"application-{index}",
+                        "domain": "127.0.0.1",
+                        "path": "/",
+                    }
+                ]
+            )
             page.evaluate(f"localStorage.setItem('application', 'application-{index}')")
             page.goto(f"{fixture_url}/application")
             page.wait_for_function("document.title === 'application-ready'")
@@ -90,8 +123,10 @@ def test_ten_sequential_applications_leave_no_page_frame_storage_or_service_work
 
             runtime.close_application(lease)
             assert browser.contexts == []
+            assert browser.is_connected()
 
         metrics = runtime.metrics
+        assert launches == 1
         assert metrics.contexts_created == 10
         assert metrics.contexts_closed == 10
         assert metrics.active_contexts == 0
@@ -104,3 +139,4 @@ def test_ten_sequential_applications_leave_no_page_frame_storage_or_service_work
             metrics.service_workers_after_close,
         ) == (0, 0, 0)
         runtime.close()
+        assert not browser.is_connected()

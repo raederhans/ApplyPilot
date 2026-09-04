@@ -119,13 +119,13 @@ def test_fixture_providers_have_exact_value_free_recipe_cache_hits(provider: str
     assert validations == 1
 
 
-def test_every_authority_or_structure_key_dimension_misses() -> None:
+def test_structure_dimensions_miss_and_fresh_authority_dimensions_rebind() -> None:
     registry = default_provider_semantic_recipe_registry()
     recipe = registry.normalize(_observation("lever", "https://jobs.lever.co/example/1002"))
     cache = ValueFreeRecipeCache()
     cache.put(recipe)
     other = "f" * 64
-    mismatches = (
+    structural_mismatches = (
         replace(
             recipe.key,
             provider="ashby",
@@ -136,12 +136,14 @@ def test_every_authority_or_structure_key_dimension_misses() -> None:
         replace(recipe.key, adapter_version="lever-semantic-recipe/v2"),
         replace(recipe.key, page_signature=other),
         replace(recipe.key, schema_policy_digest=other),
-        replace(recipe.key, page_digest=other),
         replace(recipe.key, frame_digest=other),
         replace(recipe.key, option_digest=other),
         replace(recipe.key, required_writable_digest=other),
         replace(recipe.key, locator_digest=other),
         replace(recipe.key, taint_digest=other),
+    )
+    authority_variants = (
+        replace(recipe.key, page_digest=other),
         replace(recipe.key, lease_digest=other),
         replace(recipe.key, tenant_digest=other),
         replace(recipe.key, requisition_digest=other),
@@ -150,9 +152,24 @@ def test_every_authority_or_structure_key_dimension_misses() -> None:
         replace(recipe.key, browser_generation=recipe.key.browser_generation + 1),
     )
 
-    assert all(cache.get(key, validate_live=lambda _key: True) is None for key in mismatches)
+    assert all(
+        cache.get(key, validate_live=lambda _key: True) is None
+        for key in structural_mismatches
+    )
+    rebound = []
+    for key in authority_variants:
+        rebound.append(
+            cache.get(
+                key,
+                validate_live=lambda fresh, expected=key: fresh == expected,
+            )
+        )
+    assert all(item is not None for item in rebound)
+    assert [item.key for item in rebound if item is not None] == list(authority_variants)
+    assert all(item.controls == recipe.controls for item in rebound if item is not None)
     assert cache.get(recipe.key, validate_live=None) is None
     assert cache.get(recipe.key, validate_live=lambda _key: False) is None
+    assert len(cache) == 0
     tainted_key = replace(recipe.key, taint_digest=other)
     with pytest.raises(ValueError, match="tainted"):
         cache.put(type(recipe).build(tainted_key, recipe.controls))
