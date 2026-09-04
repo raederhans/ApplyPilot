@@ -23,7 +23,7 @@ from applypilot.apply.semantic_batch import (
 )
 
 ADAPTER_VERSION = "playwright-semantic-batch/v1"
-_ROUTINE_KINDS = frozenset({"text", "textarea", "native_select", "custom_combobox"})
+_ROUTINE_KINDS = frozenset({"text", "native_select", "custom_combobox"})
 
 
 def inspection_signature(inspection: FormInspection) -> str:
@@ -223,7 +223,7 @@ class PlaywrightProductionSemanticBatchAdapter:
 
     @staticmethod
     def _request(descriptor: ControlDescriptor, value: str) -> SemanticControlRequest:
-        if descriptor.kind in {"text", "textarea"}:
+        if descriptor.kind == "text":
             operation = "set_text"
         elif descriptor.kind in {"native_select", "custom_combobox"}:
             operation = "select_option"

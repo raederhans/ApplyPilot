@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from applypilot.apply import semantic_batch_runtime as runtime_mod
 from applypilot.apply.semantic_batch import (
     BatchControlDescriptor,
     BatchPageBinding,
@@ -33,10 +36,14 @@ class FakeProductionAdapter:
         classification: str = "routine",
         fail_at: int | None = None,
         drift_at_observation: int | None = None,
+        page_url: str = URL,
+        page_epoch: int = 4,
     ) -> None:
         self.classification = classification
         self.fail_at = fail_at
         self.drift_at_observation = drift_at_observation
+        self.page_url = page_url
+        self.page_epoch = page_epoch
         self.apply_calls: list[str] = []
         self._effect_count = 0
         self._sink = lambda: None
@@ -52,14 +59,19 @@ class FakeProductionAdapter:
     def observe_page(self) -> BrowserPageObservation:
         self._observation_count += 1
         signature = "b" * 64 if self.drift_at_observation == self._observation_count else SIGNATURE
-        return BrowserPageObservation(URL, (), signature, 4)
+        return BrowserPageObservation(self.page_url, (), signature, self.page_epoch)
 
     def control_for(self, field_semantic: str) -> BatchControlDescriptor:
         return BatchControlDescriptor(
             control_id=f"control:{field_semantic}",
             field_semantic=field_semantic,
             classification=self.classification,
-            page=BrowserPageObservation(URL, (), SIGNATURE, 4),
+            page=BrowserPageObservation(
+                self.page_url,
+                (),
+                SIGNATURE,
+                self.page_epoch,
+            ),
         )
 
     def apply_routine_control(self, control, _value: str) -> None:
@@ -144,7 +156,7 @@ def test_canary_applies_routine_fields_once_and_replays_without_writes(tmp_path:
         close_resources=lambda: None,
         advance_page=lambda epoch: advanced.append(epoch) or epoch + 1,
     )
-    replay_adapter = FakeProductionAdapter()
+    replay_adapter = FakeProductionAdapter(page_epoch=5)
     replay = run_production_semantic_batch(
         replace(
             request,
@@ -163,6 +175,15 @@ def test_canary_applies_routine_fields_once_and_replays_without_writes(tmp_path:
     assert replay_adapter.apply_calls == []
     record = journal.get_batch(connection, request.batch_id)
     assert record is not None and record.state == "verified" and record.effect_count == 2
+    bare_payload_digest = hashlib.sha256(
+        json.dumps(
+            [{"semantic": patch.field_semantic, "value": patch.value} for patch in request.patches],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert record.patch_payload_digest != bare_payload_digest
     durable_dump = " ".join(
         str(value) for row in connection.execute("SELECT * FROM semantic_patch_batches") for value in row
     )
@@ -199,8 +220,225 @@ def test_same_semantics_on_different_page_authority_park_without_writes(
     )
 
     assert result.status == "parked"
-    assert result.reason_code == "prior_semantics_different_page_authority"
+    assert result.reason_code == "prior_semantics_replay_identity_mismatch"
     assert result.legacy_fallback_safe is False
+    assert adapter.apply_calls == []
+
+
+def test_same_lease_and_signature_on_different_url_never_replays(tmp_path: Path) -> None:
+    connection = sqlite3.connect(":memory:")
+    request = _request(tmp_path)
+    run_production_semantic_batch(
+        request,
+        adapter=FakeProductionAdapter(),
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda epoch: epoch + 1,
+    )
+    other_url = "https://tenant.wd5.myworkdayjobs.com/apply/REQ-2"
+    adapter = FakeProductionAdapter(page_url=other_url, page_epoch=5)
+
+    result = run_production_semantic_batch(
+        replace(
+            request,
+            page_binding=BatchPageBinding(other_url, (), SIGNATURE, 5),
+        ),
+        adapter=adapter,
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda _epoch: (_ for _ in ()).throw(AssertionError("advanced")),
+    )
+
+    assert result.status == "parked"
+    assert result.reason_code == "prior_semantics_replay_identity_mismatch"
+    assert adapter.apply_calls == []
+
+
+def test_same_page_authority_with_different_values_never_replays(tmp_path: Path) -> None:
+    connection = sqlite3.connect(":memory:")
+    request = _request(tmp_path)
+    run_production_semantic_batch(
+        request,
+        adapter=FakeProductionAdapter(),
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda epoch: epoch + 1,
+    )
+    adapter = FakeProductionAdapter(page_epoch=5)
+
+    result = run_production_semantic_batch(
+        replace(
+            request,
+            page_binding=replace(request.page_binding, page_epoch=5),
+            patches=(
+                SemanticPatch("email", "changed@example.test"),
+                SemanticPatch("phone", "90000000"),
+            ),
+        ),
+        adapter=adapter,
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda _epoch: (_ for _ in ()).throw(AssertionError("advanced")),
+    )
+
+    assert result.status == "parked"
+    assert result.reason_code == "prior_semantics_replay_identity_mismatch"
+    assert adapter.apply_calls == []
+
+
+def test_process_replay_key_change_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    request = _request(tmp_path)
+    run_production_semantic_batch(
+        request,
+        adapter=FakeProductionAdapter(),
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda epoch: epoch + 1,
+    )
+    monkeypatch.setattr(runtime_mod, "_REPLAY_DIGEST_KEY", b"replacement-process-key" * 2)
+    replay_request = replace(
+        request,
+        page_binding=replace(request.page_binding, page_epoch=5),
+    )
+    adapter = FakeProductionAdapter(page_epoch=5)
+
+    result = run_production_semantic_batch(
+        replay_request,
+        adapter=adapter,
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda _epoch: (_ for _ in ()).throw(AssertionError("advanced")),
+    )
+
+    assert result.status == "parked"
+    assert result.reason_code == "prior_semantics_replay_identity_mismatch"
+    assert adapter.apply_calls == []
+
+
+def test_v1_journal_record_migrates_but_cannot_replay(tmp_path: Path) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE semantic_patch_batch_schema (
+            component TEXT PRIMARY KEY,
+            version INTEGER NOT NULL
+        );
+        INSERT INTO semantic_patch_batch_schema VALUES('semantic_patch_batches', 1);
+        CREATE TABLE semantic_patch_batches (
+            batch_id TEXT PRIMARY KEY,
+            claims_digest TEXT NOT NULL UNIQUE,
+            attempt_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            adapter_version TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            page_lease_id TEXT NOT NULL,
+            page_lease_epoch INTEGER NOT NULL,
+            expected_page_epoch INTEGER NOT NULL,
+            page_signature TEXT NOT NULL,
+            semantics_digest TEXT NOT NULL,
+            semantic_count INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            dispatch_count INTEGER NOT NULL,
+            effect_count INTEGER NOT NULL,
+            resulting_page_epoch INTEGER,
+            reason_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    request = _request(tmp_path)
+    semantics_digest = hashlib.sha256(
+        json.dumps(
+            request.semantics,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    connection.execute(
+        "INSERT INTO semantic_patch_batches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "semantic-batch:v1",
+            "c" * 64,
+            request.attempt_id,
+            request.actor_id,
+            request.provider,
+            request.adapter_version,
+            request.page_id,
+            request.page_lease_id,
+            request.page_lease_epoch,
+            4,
+            SIGNATURE,
+            semantics_digest,
+            2,
+            "verified",
+            1,
+            2,
+            5,
+            "verified",
+            "2026-09-04T00:00:00+00:00",
+            "2026-09-04T00:00:01+00:00",
+        ),
+    )
+    connection.commit()
+    adapter = FakeProductionAdapter(page_epoch=5)
+
+    result = run_production_semantic_batch(
+        replace(
+            request,
+            page_binding=replace(request.page_binding, page_epoch=5),
+        ),
+        adapter=adapter,
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda _epoch: (_ for _ in ()).throw(AssertionError("advanced")),
+    )
+
+    assert result.status == "parked"
+    assert result.reason_code == "prior_semantics_replay_identity_mismatch"
+    assert adapter.apply_calls == []
+    assert connection.execute(
+        "SELECT version FROM semantic_patch_batch_schema WHERE component=?",
+        ("semantic_patch_batches",),
+    ).fetchone() == (2,)
+    migrated = connection.execute(
+        "SELECT replay_key_id,page_identity_digest,patch_payload_digest FROM semantic_patch_batches WHERE batch_id=?",
+        ("semantic-batch:v1",),
+    ).fetchone()
+    assert migrated == (None, None, None)
+
+
+def test_verified_replay_reconfirms_live_page_binding(tmp_path: Path) -> None:
+    connection = sqlite3.connect(":memory:")
+    request = _request(tmp_path)
+    run_production_semantic_batch(
+        request,
+        adapter=FakeProductionAdapter(),
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda epoch: epoch + 1,
+    )
+    adapter = FakeProductionAdapter(
+        drift_at_observation=1,
+        page_epoch=5,
+    )
+
+    result = run_production_semantic_batch(
+        replace(
+            request,
+            page_binding=replace(request.page_binding, page_epoch=5),
+        ),
+        adapter=adapter,
+        connection=connection,
+        close_resources=lambda: None,
+        advance_page=lambda _epoch: (_ for _ in ()).throw(AssertionError("advanced")),
+    )
+
+    assert result.status == "parked"
+    assert result.reason_code == "replay_page_authority_unconfirmed"
     assert adapter.apply_calls == []
 
 

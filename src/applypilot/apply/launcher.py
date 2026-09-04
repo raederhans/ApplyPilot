@@ -786,9 +786,11 @@ def _semantic_batch_candidate_patches(
         if not isinstance(field, Mapping) or not isinstance(action, Mapping):
             raise TypeError("semantic batch field has no exact specialist action")
         semantic = str(field.get("semantic") or "").strip().casefold()
+        control = str(field.get("control") or "").strip().casefold()
         source_key = str(action.get("source_key") or "").strip().casefold()
         if (
             semantic != source_key
+            or control == "textarea"
             or action.get("action") not in {"fill", "select"}
             or action.get("requires_review") is not False
             or field.get("writable") is not True

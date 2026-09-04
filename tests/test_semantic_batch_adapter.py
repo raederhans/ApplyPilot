@@ -16,7 +16,11 @@ from applypilot.apply.control_descriptors import (
     FormSurface,
 )
 from applypilot.apply.runtime_namespace import RuntimeNamespace
-from applypilot.apply.semantic_batch import BatchControlDescriptor, BrowserPageObservation
+from applypilot.apply.semantic_batch import (
+    BatchControlDescriptor,
+    BrowserPageObservation,
+    SemanticBatchDenied,
+)
 
 URL = "https://tenant.wd5.myworkdayjobs.com/apply/REQ-1"
 
@@ -61,8 +65,8 @@ def _context_and_inspection(tmp_path: Path, *, kind: str = "text"):
         shadow_path=(),
         locator="#email",
         kind=kind,  # type: ignore[arg-type]
-        semantic="email" if kind == "text" else "page_progress",
-        label="Email" if kind == "text" else "Next",
+        semantic="email" if kind in {"text", "textarea"} else "page_progress",
+        label="Email" if kind in {"text", "textarea"} else "Next",
         required=True,
         writable=True,
         stateful=False,
@@ -85,6 +89,7 @@ class _Page:
 
 class _Driver:
     values: ClassVar[dict[str, str]] = {}
+    perform_calls: ClassVar[int] = 0
 
     def __init__(self, _page, inspection) -> None:
         self.inspection = inspection
@@ -96,6 +101,7 @@ class _Driver:
         )
 
     def perform(self, request) -> ControlObservation:
+        type(self).perform_calls += 1
         self.values[request.descriptor.descriptor_id] = str(request.value)
         return self.observe(request)
 
@@ -106,6 +112,7 @@ def test_playwright_adapter_executes_verified_routine_control_once(
 ) -> None:
     context, inspection = _context_and_inspection(tmp_path)
     _Driver.values = {}
+    _Driver.perform_calls = 0
     monkeypatch.setattr(adapter_mod, "inspect_form_surfaces", lambda *_a, **_k: inspection)
     monkeypatch.setattr(adapter_mod, "PlaywrightSemanticControlDriver", _Driver)
     effects: list[bool] = []
@@ -125,6 +132,33 @@ def test_playwright_adapter_executes_verified_routine_control_once(
     assert adapter.effect_count == 1
     assert effects == [True]
     assert adapter.pristine() is False
+    assert _Driver.perform_calls == 1
+
+
+def test_playwright_adapter_denies_email_textarea_without_driver_write(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, inspection = _context_and_inspection(tmp_path, kind="textarea")
+    _Driver.values = {}
+    _Driver.perform_calls = 0
+    monkeypatch.setattr(adapter_mod, "inspect_form_surfaces", lambda *_a, **_k: inspection)
+    monkeypatch.setattr(adapter_mod, "PlaywrightSemanticControlDriver", _Driver)
+    adapter = adapter_mod.PlaywrightProductionSemanticBatchAdapter(
+        _Page(),
+        context,
+        provider="workday",
+        values={"email": "private@example.test"},
+        validate_authority=lambda: None,
+    )
+
+    control = adapter.control_for("email")
+
+    assert control.classification == "sensitive"
+    with pytest.raises(SemanticBatchDenied, match="not routine"):
+        adapter.apply_routine_control(control, "private@example.test")
+    assert adapter.effect_count == 0
+    assert _Driver.perform_calls == 0
 
 
 def test_playwright_adapter_never_exposes_navigation_as_routine(

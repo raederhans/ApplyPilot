@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _STATES = {
     "shadow",
     "started",
@@ -55,6 +55,9 @@ class SemanticPatchBatchClaims:
     page_lease_epoch: int
     expected_page_epoch: int
     page_signature: str
+    replay_key_id: str
+    page_identity_digest: str
+    patch_payload_digest: str
     semantics: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -77,6 +80,13 @@ class SemanticPatchBatchClaims:
             raise ValueError("expected_page_epoch must be non-negative")
         if not _DIGEST_RE.fullmatch(self.page_signature):
             raise ValueError("page_signature must be a SHA-256 digest")
+        for name in (
+            "replay_key_id",
+            "page_identity_digest",
+            "patch_payload_digest",
+        ):
+            if not _DIGEST_RE.fullmatch(str(getattr(self, name) or "")):
+                raise ValueError(f"{name} must be a keyed SHA-256 digest")
         if not self.semantics or tuple(sorted(set(self.semantics))) != self.semantics:
             raise ValueError("semantics must be a non-empty sorted unique tuple")
 
@@ -99,6 +109,9 @@ class SemanticPatchBatchClaims:
                     "page_lease_epoch": self.page_lease_epoch,
                     "expected_page_epoch": self.expected_page_epoch,
                     "page_signature": self.page_signature,
+                    "replay_key_id": self.replay_key_id,
+                    "page_identity_digest": self.page_identity_digest,
+                    "patch_payload_digest": self.patch_payload_digest,
                     "semantics_digest": self.semantics_digest,
                     "semantic_count": len(self.semantics),
                     "submit_authority": False,
@@ -120,6 +133,9 @@ class SemanticPatchBatchRecord:
     page_lease_epoch: int
     expected_page_epoch: int
     page_signature: str
+    replay_key_id: str | None
+    page_identity_digest: str | None
+    patch_payload_digest: str | None
     semantics_digest: str
     semantic_count: int
     state: str
@@ -134,7 +150,8 @@ class SemanticPatchBatchRecord:
 _COLUMNS = (
     "batch_id,claims_digest,attempt_id,actor_id,provider,adapter_version,"
     "page_id,page_lease_id,page_lease_epoch,expected_page_epoch,page_signature,"
-    "semantics_digest,semantic_count,state,dispatch_count,effect_count,"
+    "replay_key_id,page_identity_digest,patch_payload_digest,semantics_digest,"
+    "semantic_count,state,dispatch_count,effect_count,"
     "resulting_page_epoch,reason_code,created_at,updated_at"
 )
 
@@ -200,7 +217,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "SELECT version FROM semantic_patch_batch_schema WHERE component=?",
             ("semantic_patch_batches",),
         ).fetchone()
-        if row is not None and int(row[0]) != SCHEMA_VERSION:
+        version = int(row[0]) if row is not None else None
+        if version not in {None, 1, SCHEMA_VERSION}:
             raise RuntimeError(f"unsupported semantic patch batch schema version: {row[0]}")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS semantic_patch_batches (
@@ -215,6 +233,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                 page_lease_epoch INTEGER NOT NULL CHECK(page_lease_epoch > 0),
                 expected_page_epoch INTEGER NOT NULL CHECK(expected_page_epoch >= 0),
                 page_signature TEXT NOT NULL,
+                replay_key_id TEXT NOT NULL,
+                page_identity_digest TEXT NOT NULL,
+                patch_payload_digest TEXT NOT NULL,
                 semantics_digest TEXT NOT NULL,
                 semantic_count INTEGER NOT NULL CHECK(semantic_count > 0),
                 state TEXT NOT NULL CHECK(state IN (
@@ -232,15 +253,32 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                 CHECK(resulting_page_epoch IS NULL OR resulting_page_epoch >= 0)
             )"""
         )
+        columns = {str(column[1]) for column in connection.execute("PRAGMA table_info(semantic_patch_batches)")}
+        replay_columns = {
+            "replay_key_id",
+            "page_identity_digest",
+            "patch_payload_digest",
+        }
+        missing_replay_columns = replay_columns - columns
+        if missing_replay_columns and version == SCHEMA_VERSION:
+            raise RuntimeError("semantic patch batch replay digest columns are missing")
+        for name in sorted(missing_replay_columns):
+            connection.execute(f"ALTER TABLE semantic_patch_batches ADD COLUMN {name} TEXT")
         connection.execute(
             """CREATE INDEX IF NOT EXISTS idx_semantic_patch_batches_attempt
             ON semantic_patch_batches(attempt_id,semantics_digest,created_at)"""
         )
-        connection.execute(
-            """INSERT OR IGNORE INTO semantic_patch_batch_schema(component,version)
-            VALUES('semantic_patch_batches', ?)""",
-            (SCHEMA_VERSION,),
-        )
+        if version is None:
+            connection.execute(
+                """INSERT INTO semantic_patch_batch_schema(component,version)
+                VALUES('semantic_patch_batches', ?)""",
+                (SCHEMA_VERSION,),
+            )
+        elif version == 1:
+            connection.execute(
+                "UPDATE semantic_patch_batch_schema SET version=? WHERE component=?",
+                (SCHEMA_VERSION, "semantic_patch_batches"),
+            )
 
 
 def get_batch(connection: sqlite3.Connection, batch_id: str) -> SemanticPatchBatchRecord | None:
@@ -283,7 +321,7 @@ def begin_batch(
     with _write(connection, "semantic_patch_batch_begin"):
         try:
             connection.execute(
-                f"INSERT INTO semantic_patch_batches({_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,NULL,NULL,?,?)",
+                f"INSERT INTO semantic_patch_batches({_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,NULL,NULL,?,?)",
                 (
                     claims.batch_id,
                     claims.claims_digest,
@@ -296,6 +334,9 @@ def begin_batch(
                     claims.page_lease_epoch,
                     claims.expected_page_epoch,
                     claims.page_signature,
+                    claims.replay_key_id,
+                    claims.page_identity_digest,
+                    claims.patch_payload_digest,
                     claims.semantics_digest,
                     len(claims.semantics),
                     state,

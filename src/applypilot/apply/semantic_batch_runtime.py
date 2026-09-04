@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from applypilot.apply.semantic_batch import (
@@ -25,6 +27,33 @@ from applypilot.apply.semantic_batch import (
 from applypilot.storage import semantic_patch_batches as journal
 
 SemanticBatchMode = Literal["off", "shadow", "canary"]
+
+# The repository has no cross-process durable authority secret.  Keeping this
+# key process-local makes same-process retries comparable while guaranteeing
+# that records from a previous process cannot be admitted as replay.
+_REPLAY_DIGEST_KEY = secrets.token_bytes(32)
+
+
+def _replay_key_id() -> str:
+    return hmac.new(
+        _REPLAY_DIGEST_KEY,
+        b"applypilot.semantic-batch.replay-key-id/v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _keyed_replay_digest(label: str, value: object) -> str:
+    payload = (
+        label.encode("ascii")
+        + b"\0"
+        + json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    return hmac.new(_REPLAY_DIGEST_KEY, payload, hashlib.sha256).hexdigest()
 
 
 class ProductionSemanticPatchAdapter(ProviderSemanticPatchAdapter, Protocol):
@@ -51,6 +80,9 @@ class SemanticBatchRuntimeRequest:
     page_lease_epoch: int
     resources: BrowserResourceIdentity
     patches: tuple[SemanticPatch, ...]
+    replay_key_id: str = field(init=False, repr=False)
+    page_identity_digest: str = field(init=False, repr=False)
+    patch_payload_digest: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.mode not in {"off", "shadow", "canary"}:
@@ -65,6 +97,32 @@ class SemanticBatchRuntimeRequest:
             raise ValueError("semantic batch page lease is incomplete")
         if not self.patches:
             raise ValueError("semantic batch runtime requires patches")
+        object.__setattr__(self, "replay_key_id", _replay_key_id())
+        object.__setattr__(
+            self,
+            "page_identity_digest",
+            _keyed_replay_digest(
+                "page-identity/v1",
+                {
+                    "page_url": self.page_binding.page_url,
+                    "frame_path": self.page_binding.frame_path,
+                },
+            ),
+        )
+        object.__setattr__(
+            self,
+            "patch_payload_digest",
+            _keyed_replay_digest(
+                "patch-payload/v1",
+                [
+                    {
+                        "semantic": patch.field_semantic,
+                        "value": patch.value,
+                    }
+                    for patch in self.patches
+                ],
+            ),
+        )
 
     @property
     def semantics(self) -> tuple[str, ...]:
@@ -82,6 +140,9 @@ class SemanticBatchRuntimeRequest:
             "page_lease_epoch": self.page_lease_epoch,
             "page_epoch": self.page_binding.page_epoch,
             "page_signature": self.page_binding.page_signature,
+            "replay_key_id": self.replay_key_id,
+            "page_identity_digest": self.page_identity_digest,
+            "patch_payload_digest": self.patch_payload_digest,
             "semantics": self.semantics,
             "submit_authority": False,
         }
@@ -149,6 +210,9 @@ def _claims(request: SemanticBatchRuntimeRequest) -> journal.SemanticPatchBatchC
         page_lease_epoch=request.page_lease_epoch,
         expected_page_epoch=request.page_binding.page_epoch,
         page_signature=request.page_binding.page_signature,
+        replay_key_id=request.replay_key_id,
+        page_identity_digest=request.page_identity_digest,
+        patch_payload_digest=request.patch_payload_digest,
         semantics=request.semantics,
     )
 
@@ -194,8 +258,31 @@ def _same_replay_authority(
         request.page_binding.page_signature,
     ):
         return False
+    for stored, current in (
+        (prior.replay_key_id, request.replay_key_id),
+        (prior.page_identity_digest, request.page_identity_digest),
+        (prior.patch_payload_digest, request.patch_payload_digest),
+    ):
+        if not isinstance(stored, str) or not hmac.compare_digest(stored, current):
+            return False
     expected_epoch = prior.resulting_page_epoch if prior.state == "verified" else prior.expected_page_epoch
     return expected_epoch == request.page_binding.page_epoch
+
+
+def _confirm_replay_page(
+    request: SemanticBatchRuntimeRequest,
+    batch: SemanticPatchBatch,
+    adapter: ProductionSemanticPatchAdapter,
+) -> None:
+    if (adapter.provider.casefold(), adapter.adapter_version) != (
+        batch.recipe.provider,
+        batch.recipe.adapter_version,
+    ):
+        raise ValueError("semantic batch replay adapter mismatch")
+    SemanticPatchBatchRunner._validate_page(
+        request.page_binding,
+        adapter.observe_page(),
+    )
 
 
 def _shadow_compare(
@@ -284,21 +371,33 @@ def run_production_semantic_batch(
         semantics_digest=claims.semantics_digest,
     )
     if prior is not None:
-        release()
         if not _same_replay_authority(request, prior):
+            release()
             return _result(
                 request,
                 "parked",
                 effect_count=prior.effect_count,
-                reason="prior_semantics_different_page_authority",
+                reason="prior_semantics_replay_identity_mismatch",
             )
         if prior.state == "verified":
+            try:
+                _confirm_replay_page(request, batch, adapter)
+            except Exception:  # noqa: BLE001 - replay requires current live proof
+                release()
+                return _result(
+                    request,
+                    "parked",
+                    effect_count=prior.effect_count,
+                    reason="replay_page_authority_unconfirmed",
+                )
+            release()
             return _result(
                 request,
                 "replayed",
                 effect_count=prior.effect_count,
                 reason="durable_verified_replay",
             )
+        release()
         if prior.state == "failed_no_effect":
             return _result(
                 request,

@@ -117,6 +117,18 @@ def test_candidate_builder_rejects_sensitive_file_navigation_and_final_actions(
         )
 
 
+def test_candidate_builder_rejects_email_textarea_before_runtime() -> None:
+    audit, specialist = _repair_contract(semantics=("email",))
+    specialist["context"]["plan"]["fields"][0]["control"] = "textarea"
+
+    with pytest.raises(ValueError, match="not an admitted routine write"):
+        launcher._semantic_batch_candidate_patches(
+            {"personal": {"email": "private@example.test"}},
+            audit,
+            specialist,
+        )
+
+
 def test_direct_email_and_started_submit_are_rejected_before_browser_access(
     monkeypatch,
 ) -> None:
