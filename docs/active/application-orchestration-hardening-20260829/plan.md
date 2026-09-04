@@ -186,3 +186,37 @@ The integration audit keeps the P0-P4 measurements and isolated mechanisms, but 
 - Loopback HTTP MCP remains default-off and 2/4-worker production promotion remains `NOT_ADMITTED`.
 
 Focused post-audit validation passed `282` tests plus scoped Ruff. Final full-suite, clean-wheel, exact remote CI, merge, push, and cleanup evidence is recorded only after those gates actually complete.
+
+## 2026-09-04 remaining-architecture wave
+
+Baseline `2d1323e1e93cedf50f5214711e42ffacc0aa74db` has completed the P0-P4
+runtime-control wave and is verified on `fork/main`. Continue the original
+architecture roadmap through explicit canary modes without weakening the
+single-writer, SubmissionGate, CAPTCHA, assessment, identity/financial,
+material-freshness, or uncertain-receipt stops.
+
+- [x] R0: fast-forward P0-P4 to local `main` and `fork/main`; verify exact SHA
+  and the complete remote CI matrix.
+- [ ] R1: make Codex App Server an authoritative prepare-only canary with a
+  fail-closed durable handoff; CLI remains the submit executor and the fallback
+  only before App Server request acceptance. `off|shadow|canary` configuration
+  is landed, but canary intentionally remains observational until a separately
+  reviewed non-Submit browser-write surface exists.
+- [x] R2: consume host-owned `ApplicationPlan` and `SemanticPatchBatch` on the
+  ordinary supported-provider path while retaining deterministic verification
+  and lease-bound replay protection.
+- [ ] R3: activate fresh per-application browser contexts and value-free
+  provider recipes for admitted Greenhouse/Workday/SmartRecruiters paths. The
+  context isolation contract and Greenhouse recipe seam are locally green, but
+  production recipe replay and Workday/SmartRecruiters admission remain off.
+- [ ] R4: rerun matched no-submit cohorts after R1-R3 and admit a second Runtime
+  Cell only when the existing performance, isolation, latency, and zero-effect
+  gates all pass. Four Cells remain outside this wave unless independently
+  admitted. The expiry scan is indexed in schema v3; production capacity remains
+  one because the available browser-free cohorts do not prove the required gate.
+- [x] R5: run focused gates after every slice, then the full suite, release and
+  clean-install checks, a real App Server/CDP smoke, and one exact no-submit or
+  submission delivery test only when current material and provider gates admit
+  it. A safe pre-browser block is reported as blocked, never as a successful
+  browser delivery. Local qualification completed; the exact Workato replay was
+  correctly blocked by stale material before browser launch.

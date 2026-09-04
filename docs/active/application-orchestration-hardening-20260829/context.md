@@ -195,3 +195,65 @@ Obtain explicit commit/push authority for the frozen P6 candidate, create one `a
 - Exact-head GitHub Actions run `33708579050` completed successfully with four real jobs: Python 3.11, 3.12, 3.13, and Windows 3.12 core tests plus clean-install smoke.
 - The Happy/P0-P4, CapyPilot-brand, and integration local branches and both isolated worktrees were removed. The merged remote `agent/application-orchestration-hardening-20260901` branch was also removed; `fork/dev` was retained because it is not merged.
 - Stash `027f5756c73174acc7d3b7603f7540740e9f9ed4` remains as a recovery snapshot. Byte comparison found 26 non-temporary paths that are not identical to final `main`, so deleting it would discard unproven WIP. The primary worktree itself is clean.
+
+## 2026-09-04 remaining-architecture handoff
+
+- Integration owner: `/root`.
+- Integration branch/worktree: `codex/remaining-architecture` at
+  `C:\Users\raede\.codex\worktrees\applypilot-remaining-architecture`.
+- Baseline and verified personal remote: `2d1323e1e93cedf50f5214711e42ffacc0aa74db`.
+- Exact-head CI: run `33887079096`, success in Core Python 3.12, Browser
+  Chromium 3.12, Compatibility Python 3.11 and 3.13, and Windows 3.12 tests
+  plus clean-install smoke.
+- User-visible implementation tasks own the existing M4 production-wiring, M5
+  browser-context, and M6 provider-recipe worktrees. Internal subagents are
+  read-only and may not edit, commit, push, start long/shared processes, or use
+  live provider state.
+- `/root` alone owns combined/full tests, builds, browser/CDP/App Server smoke,
+  the live database/profile, Submit, receipt reconciliation, integration
+  commits, and pushes.
+- Long-test contract: run serially from the integration worktree with isolated
+  `APPLYPILOT_DIR`; stable logs live under
+  `.artifacts/remaining-architecture/`. Success requires exit code zero and the
+  expected assertions. Stop at the first deterministic failure and inspect it
+  before retrying.
+- No Runtime Cell capacity increase or real ATS action is admitted until its
+  stage-specific gates pass. `submission_uncertain` is never retried.
+
+### Remaining-architecture local qualification
+
+- R1 adds `APPLYPILOT_CODEX_APP_SERVER_MODE=off|shadow|canary`. Independent
+  review found that the reused App Server request and Playwright surface are
+  explicitly read-only, so canary now runs only as a real-traffic observation
+  and cannot replace the authoritative CLI result. Direct email, Submit and
+  receipt verification remain outside it. Authoritative prepare takeover stays
+  blocked until a separately reviewed non-Submit browser-write surface exists.
+- R2 installs a host-generated ApplicationPlan after provenance resolution and
+  issues a host audit at reservation. Pre-existing injected non-host plans are
+  preserved for compatibility. The established SemanticPatchBatch authority is
+  unchanged.
+- R3 proves one persistent browser with ten fresh application contexts retains
+  only the seeded login state and leaks no application cookie, local storage or
+  service worker state. The Greenhouse recipe seam rebinds every cache hit to
+  current page/lease authority after live validation. It is not yet a production
+  browser writer, and Workday/SmartRecruiters recipe execution is not admitted.
+- Runtime Cell schema v3 adds
+  `idx_runtime_cell_open_lease_expiry(status, expires_at, cell_id, generation)`;
+  an `EXPLAIN QUERY PLAN` regression proves the global expiry scan uses it.
+- Combined focused tests passed `212`; the final isolated full repository suite
+  passed `2157` in `156.11s`. Scoped Ruff and `git diff --check` passed. The repository's
+  optional full-format check still reports historical formatting drift outside
+  this wave and was not used as an acceptance claim.
+- Release build produced `applypilot_local-0.4.0` wheel and sdist. A fresh venv
+  installed the wheel and passed the module CLI and installed `resume-route`
+  help smoke. Real Codex App Server `0.149.0` initialized and shut down with exit
+  zero. Real Edge/CDP loaded and edited Selenium's public web form, then cleanup
+  confirmed no endpoint, bootstrap process or profile sidecar remained.
+- The exact Workato Greenhouse dry-run ran with one worker, final Submit disabled,
+  App Server canary and ApplicationPlan shadow enabled. Its already-retired
+  `stale_profile_fact` material produced an empty manifest before browser launch.
+  State remained two historical attempts, zero runtime turns and zero receipts;
+  this is a correct safe block, not a browser-level delivery success.
+- Production Runtime Cell capacity remains one. Historical synthetic evidence is
+  not source-current and does not exercise the App Server/browser/safety path, so
+  two Cells and provider recipe replay remain `NOT_ADMITTED`.

@@ -212,3 +212,28 @@ P4 accepted delivery is the concurrency evidence/governor mechanism, not a highe
 - [x] Final combined CapyPilot/P0-P4 gate: `1721 passed in 116.40s`; full Ruff and `git diff --check` passed; audited release build produced wheel, sdist, bundle, and checksums; clean-wheel smoke passed install, `resume-route --help`, `CapyPilot 0.4.0`, init, doctor, and dashboard generation.
 - [x] Ordinary push to `fork/main`; exact-head CI run `33708579050` scheduled four non-empty jobs and all passed on `cc14585` (Python 3.11/3.12/3.13 and Windows 3.12 clean-install smoke).
 - [x] Fast-forward local `main`; remove the two isolated worktrees, their three local integration/source branches, and the merged remote hardening branch. Preserve stash `027f5756` because 26 non-temporary paths are not byte-identical to final `main` and therefore are not safe to discard as redundant WIP.
+
+## 2026-09-04 remaining-architecture status
+
+- [x] Merge and push the round-two P0-P4 branch to `fork/main` at `2d1323e`.
+- [x] Verify local HEAD, tracking ref, remote ref, and GitHub Actions exact-head
+  success across five non-empty jobs.
+- [x] Create the isolated `codex/remaining-architecture` integration worktree.
+- [ ] R1 authoritative App Server prepare canary: `off|shadow|canary` is
+  configured and canary runs against real traffic as a bounded observation,
+  but CLI remains authoritative because the current App Server request and
+  Playwright surface are read-only. Production takeover is not admitted.
+- [x] R2 host-owned ApplicationPlan plus deterministic host audit; the existing
+  lease-bound SemanticPatchBatch path remains authoritative.
+- [ ] R3 fresh BrowserContext and Provider recipe cutover: isolation and the
+  Greenhouse value-free recipe seam are green, but production replay and the
+  Workday/SmartRecruiters recipe paths remain disabled.
+- [ ] R4 matched cohort and Runtime Cell admission decision: schema v3 now uses
+  a status/expiry index, but no qualifying real-browser matched cohort exists;
+  effective production capacity remains one (`NOT_ADMITTED`).
+- [x] R5 local combined/full/release/no-submit qualification: `212` focused and
+  `2157` full tests passed; scoped Ruff and diff checks passed; wheel/sdist and
+  clean-wheel CLI smoke passed; real App Server and Edge/CDP smokes passed with
+  clean shutdown. The exact Workato dry-run stayed at two historical attempts,
+  zero runtime turns and zero receipts because stale material blocked it before
+  browser launch.
