@@ -1,0 +1,401 @@
+{
+  "schema_version": "applypilot-runtime-cell-scheduler-microbenchmark/v1",
+  "label": "runtime_cell_sqlite_scheduler_microbenchmark",
+  "generated_at": "2026-09-04T09:38:42.351918+00:00",
+  "fixture_sha256": "8b8804fb16a98934886d0a32788d6c5e0a2a899efb7821dedbe7e6d21939c6c4",
+  "source_identity": "55c00edfed9e4983b5e95191cba785269d43b1f44bf63b3011081029a123d073",
+  "measured_blocks": 10,
+  "warmup_blocks": 2,
+  "paired_blocks": [
+    {
+      "block": 0,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.38373589999901014,
+        "throughput_per_second": 31.271507304974474,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2193260999993072,
+        "throughput_per_second": 54.71305056734199,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.749613475095861
+    },
+    {
+      "block": 1,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3820021999999881,
+        "throughput_per_second": 31.413431650394617,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21497610000005807,
+        "throughput_per_second": 55.82015861296562,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.7769519495417625
+    },
+    {
+      "block": 2,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.39720130000205245,
+        "throughput_per_second": 30.211381483237826,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.20797790000142413,
+        "throughput_per_second": 57.69843815096618,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.9098245534709823
+    },
+    {
+      "block": 3,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.40177050000056624,
+        "throughput_per_second": 29.867797660562655,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2072541999987152,
+        "throughput_per_second": 57.899912281991824,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.9385397256270651
+    },
+    {
+      "block": 4,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3973112999992736,
+        "throughput_per_second": 30.20301713045146,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.20911179999893648,
+        "throughput_per_second": 57.3855707810895,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8999946440195834
+    },
+    {
+      "block": 5,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.3978705000008631,
+        "throughput_per_second": 30.160567320205868,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.22100750000026892,
+        "throughput_per_second": 54.29679988229086,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.800257909801156
+    },
+    {
+      "block": 6,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.41676969999753055,
+        "throughput_per_second": 28.792880096780316,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21973500000240165,
+        "throughput_per_second": 54.61123626126399,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8966923794251047
+    },
+    {
+      "block": 7,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.39034499999979744,
+        "throughput_per_second": 30.742035891342855,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21585849999974016,
+        "throughput_per_second": 55.59197344563427,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8083374062187374
+    },
+    {
+      "block": 8,
+      "order": [
+        1,
+        2
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.39922410000144737,
+        "throughput_per_second": 30.0583055981753,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.2163247999997111,
+        "throughput_per_second": 55.47214189041675,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8454846601128512
+    },
+    {
+      "block": 9,
+      "order": [
+        2,
+        1
+      ],
+      "one_cell": {
+        "cells": 1,
+        "elapsed_seconds": 0.390434599998116,
+        "throughput_per_second": 30.73498096751134,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 1,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "two_cells": {
+        "cells": 2,
+        "elapsed_seconds": 0.21619509999800357,
+        "throughput_per_second": 55.50542079867126,
+        "completed_tasks": 12,
+        "overall_concurrency_peak": 2,
+        "same_domain_peak": 1,
+        "domain_peaks": {
+          "alpha.example.test": 1,
+          "beta.example.test": 1,
+          "gamma.example.test": 1
+        },
+        "cell_cross_writes": 0
+      },
+      "paired_speedup": 1.8059363972713602
+    }
+  ],
+  "paired_speedup_mean": 1.8431633100584464,
+  "paired_bootstrap_95_lower_bound": 1.8062231272936617,
+  "threshold": {
+    "paired_bootstrap_95_lower_bound_min": 1.6
+  },
+  "gates": {
+    "speedup": true,
+    "same_domain_serial": true,
+    "different_domain_parallel": true,
+    "scheduler_cross_writes_zero": true
+  },
+  "diagnostic": {
+    "status": "QUALIFIED",
+    "admission_evidence": false,
+    "reasons": [
+      "scheduler_microbenchmark_is_not_admission_evidence"
+    ]
+  },
+  "unavailable_observations": {
+    "app_server_lifecycle": "unavailable_not_exercised",
+    "browser_context_lifecycle": "unavailable_not_exercised",
+    "submit_attempts": "unavailable_not_instrumented",
+    "effect_attempts": "unavailable_not_instrumented",
+    "duplicate_submit_attempts": "unavailable_not_instrumented",
+    "submission_gate_attempts": "unavailable_not_instrumented",
+    "reservation_attempts": "unavailable_not_instrumented",
+    "receipt_attempts": "unavailable_not_instrumented"
+  },
+  "authority_boundary": "fixed local SQLite and sleep workload only; proves scheduler exclusion/concurrency only and cannot produce a Runtime Cell admission gate receipt",
+  "report_sha256": "7cd14a5318b642797dca759454ec7a775f3bdde21d8ee9c272bd3464ef3068c6"
+}

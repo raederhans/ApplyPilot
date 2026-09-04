@@ -182,12 +182,21 @@ def _migration_v1(connection: sqlite3.Connection) -> None:
 
 
 def _migration_v2(connection: sqlite3.Connection) -> None:
-    """Permanently fence a process identity after any Cell generation used it."""
+    """Backfill a permanent identity registry without rewriting v1 history."""
 
-    connection.execute("DROP INDEX idx_runtime_cell_process_identity")
     connection.execute(
-        """CREATE UNIQUE INDEX idx_runtime_cell_process_identity
-        ON runtime_cell_generations(process_id, process_birth_time)"""
+        """CREATE TABLE runtime_cell_process_identities (
+            process_id INTEGER NOT NULL CHECK(process_id > 0),
+            process_birth_time INTEGER NOT NULL CHECK(process_birth_time > 0),
+            first_seen_at TEXT NOT NULL,
+            PRIMARY KEY(process_id, process_birth_time))"""
+    )
+    connection.execute(
+        """INSERT INTO runtime_cell_process_identities(
+            process_id,process_birth_time,first_seen_at)
+        SELECT process_id,process_birth_time,MIN(created_at)
+        FROM runtime_cell_generations
+        GROUP BY process_id,process_birth_time"""
     )
 
 
@@ -289,6 +298,14 @@ def register_generation(
             if existing.status not in _CELL_ACTIVE:
                 raise RuntimeCellQuarantinedError("runtime cell generation is terminal")
             return existing
+        try:
+            connection.execute(
+                "INSERT INTO runtime_cell_process_identities "
+                "(process_id,process_birth_time,first_seen_at) VALUES(?,?,?)",
+                (process_id, process_birth_time, instant),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeCellConflictError("runtime process identity was already used by a Cell generation") from exc
         try:
             connection.execute(
                 f"INSERT INTO runtime_cell_generations({_GEN_COLUMNS}) VALUES(?,?,?,?,?,?,'active',?,?,NULL)",

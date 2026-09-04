@@ -139,6 +139,104 @@ def test_runtime_cell_migration_is_idempotent_and_newer_schema_fails_closed(
         runtime_cells.ensure_schema(connection)
 
 
+def test_v1_terminal_duplicate_process_identities_migrate_without_history_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _connection(tmp_path / "v1-history.sqlite3")
+    migrations = runtime_cells._MIGRATIONS
+    monkeypatch.setattr(runtime_cells, "_MIGRATIONS", (runtime_cells._migration_v1,))
+    assert runtime_cells.ensure_schema(connection) == 1
+    now = datetime(2026, 9, 4, tzinfo=UTC).isoformat()
+    for index, status in enumerate(("quarantined", "closed"), start=1):
+        connection.execute(
+            "INSERT INTO runtime_cell_generations("
+            "cell_id,generation,runtime_id,source_identity,process_id,"
+            "process_birth_time,status,created_at,updated_at,quarantine_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"runtime-cell-{index}",
+                1,
+                f"historical-runtime-{index}",
+                SOURCE,
+                4242,
+                8675309,
+                status,
+                now,
+                now,
+                "historical" if status == "quarantined" else None,
+            ),
+        )
+    connection.commit()
+    monkeypatch.setattr(runtime_cells, "_MIGRATIONS", migrations)
+
+    assert runtime_cells.ensure_schema(connection) == 2
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM runtime_cell_generations WHERE process_id=4242 AND process_birth_time=8675309"
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM runtime_cell_process_identities WHERE process_id=4242 AND process_birth_time=8675309"
+        ).fetchone()[0]
+        == 1
+    )
+    with pytest.raises(runtime_cells.RuntimeCellConflictError):
+        runtime_cells.register_generation(
+            connection,
+            cell_id="runtime-cell-new",
+            generation=1,
+            runtime_id="new-runtime-on-historical-process",
+            source_identity=SOURCE,
+            process_id=4242,
+            process_birth_time=8675309,
+        )
+
+
+def test_fresh_database_concurrent_process_identity_registration_has_one_winner(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "concurrent-process-identity.sqlite3"
+    setup = _connection(path)
+    runtime_cells.ensure_schema(setup)
+    setup.close()
+    barrier = threading.Barrier(16)
+    lock = threading.Lock()
+    outcomes: list[str] = []
+
+    def register(index: int) -> None:
+        connection = _connection(path)
+        try:
+            barrier.wait()
+            try:
+                runtime_cells.register_generation(
+                    connection,
+                    cell_id=f"runtime-cell-{index}",
+                    generation=1,
+                    runtime_id=f"concurrent-runtime-{index}",
+                    source_identity=SOURCE,
+                    process_id=7777,
+                    process_birth_time=8888,
+                )
+            except runtime_cells.RuntimeCellConflictError:
+                outcome = "conflict"
+            else:
+                outcome = "registered"
+            with lock:
+                outcomes.append(outcome)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=register, args=(index,)) for index in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert outcomes.count("registered") == 1
+    assert outcomes.count("conflict") == 15
+
+
 def test_scheduler_microbenchmark_schema_is_rejected_as_admission_receipt() -> None:
     receipts = {name: receipt.as_dict() for name, receipt in RECEIPTS.items()}
     receipts["runtime_cell_host_lifecycle_benchmark"] = {
