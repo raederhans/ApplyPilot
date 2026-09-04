@@ -910,13 +910,22 @@ def _worker_loop_with_port(
             if isinstance(ats_binding, Mapping)
             else job.get("application_url") or job.get("url")
         )
-        performance_attribution_mod.safe_bind_attempt_route(
-            job,
-            provider=admitted_provider,
-            target_url=admitted_target_url,
-            worker_application_index=worker_application_index,
-            worker_id=worker_id,
-        )
+        def bind_attribution_target(
+            target_url: object = admitted_target_url,
+            current_job=job,
+            current_provider=admitted_provider,
+            current_index=worker_application_index,
+            current_worker_id=worker_id,
+        ) -> None:
+            performance_attribution_mod.safe_bind_attempt_route(
+                current_job,
+                provider=current_provider,
+                target_url=target_url,
+                worker_application_index=current_index,
+                worker_id=current_worker_id,
+            )
+
+        bind_attribution_target()
         if read_only_preflight.get("provider") == "smartrecruiters" and not (
             isinstance(ats_binding, dict)
             and ats_binding.get("provider") == "smartrecruiters"
@@ -1677,6 +1686,7 @@ def _worker_loop_with_port(
                     audit_signal, audit_report = _enforce_stateful_control_coverage(
                         audit_signal, audit_report
                     )
+                    bind_attribution_target(audit_report.get("page_url") or admitted_target_url)
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
                     performance_attribution_mod.safe_record_job_span(
@@ -2001,6 +2011,7 @@ def _worker_loop_with_port(
                                 "disposition": "block",
                                 "blocking_issues": ["page_drift"],
                             }
+                    bind_attribution_target(audit_report.get("page_url") or admitted_target_url)
                     audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                     orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
                     performance_attribution_mod.safe_record_job_span(
@@ -2295,6 +2306,9 @@ def _worker_loop_with_port(
                             )
                             audit_signal, audit_report = _enforce_stateful_control_coverage(
                                 audit_signal, audit_report
+                            )
+                            bind_attribution_target(
+                                audit_report.get("page_url") or admitted_target_url
                             )
                             audit_duration_ms = (time.perf_counter() - audit_started) * 1000
                             orchestration_metrics["pre_submit_audit_ms"] += audit_duration_ms
