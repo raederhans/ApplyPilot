@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from applypilot.apply.performance_attribution import safe_normalize_attribution
+from applypilot.apply.performance_attribution import attribution_for_attempt
 
 
 def _json_text(value: object) -> str:
@@ -882,17 +882,19 @@ def record_attempt_performance(
                 if math.isfinite(numeric) and numeric >= 0:
                     values[key] = round(min(numeric, 86_400_000.0), 3)
         bounded[section] = values
-    attribution = safe_normalize_attribution(performance.get("attribution"))
-    if attribution is not None:
-        bounded["attribution"] = attribution
     ensure_schema(connection)
     row = connection.execute(
-        "SELECT evidence_json FROM application_attempts "
+        "SELECT evidence_json, worker_id, job_url FROM application_attempts "
         "WHERE attempt_id=? AND status!='in_progress'",
         (attempt_id,),
     ).fetchone()
     if row is None:
         return False
+    attribution = attribution_for_attempt(
+        performance.get("attribution"), worker_id=row[1], job_url=row[2]
+    )
+    if attribution is not None:
+        bounded["attribution"] = attribution
     try:
         existing = json.loads(row[0]) if row[0] else {}
     except (TypeError, json.JSONDecodeError):

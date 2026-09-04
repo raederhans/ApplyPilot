@@ -504,7 +504,7 @@ def test_manifest_queue_claims_only_authorized_job_and_is_idempotent(
     _insert_ready_job(conn, unrelated, resume_path)
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
 
-    claimed = launcher.acquire_job(worker_id=0, authorization_manifest=manifest)
+    claimed = launcher.acquire_job(worker_id="worker-1", authorization_manifest=manifest)
     second_claim = launcher.acquire_job(worker_id=1, authorization_manifest=manifest)
 
     assert claimed is not None
@@ -537,7 +537,7 @@ def test_manifest_queue_preserves_fallback_application_url_for_material_binding(
 
     claimed = launcher.acquire_job(
         target_url=job["url"],
-        worker_id=0,
+        worker_id="worker-1",
         authorization_manifest=manifest,
     )
 
@@ -562,7 +562,7 @@ def test_manifest_queue_uses_profile_attempt_ceiling(
         lambda: {"submission_policy": {"maximum_apply_attempts": 1}},
     )
 
-    assert launcher.acquire_job(worker_id=0, authorization_manifest=manifest) is None
+    assert launcher.acquire_job(worker_id="worker-1", authorization_manifest=manifest) is None
 
 
 def test_optional_unanswered_question_does_not_block_authorized_acquisition(
@@ -586,7 +586,7 @@ def test_optional_unanswered_question_does_not_block_authorized_acquisition(
     )
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
 
-    claimed = launcher.acquire_job(worker_id=0, authorization_manifest=manifest)
+    claimed = launcher.acquire_job(worker_id="worker-1", authorization_manifest=manifest)
 
     assert claimed is not None
     assert claimed["url"] == job["url"]
@@ -609,7 +609,7 @@ def test_batch_exclusion_prevents_retrying_one_deferred_job_in_the_same_run(
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
 
     claimed = launcher.acquire_job(
-        worker_id=0,
+        worker_id="worker-1",
         authorization_manifest=manifest,
         exclude_urls={job["url"]},
     )
@@ -642,7 +642,7 @@ def test_manifest_queue_never_auto_retries_human_or_submission_stops(
         )
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
 
-    assert launcher.acquire_job(worker_id=0, authorization_manifest=manifest) is None
+    assert launcher.acquire_job(worker_id="worker-1", authorization_manifest=manifest) is None
 
 
 @pytest.mark.parametrize(("limit", "continuous"), [(2, False), (1, True)])
@@ -1101,7 +1101,9 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
     tmp_path: Path,
 ) -> None:
     conn = init_db(tmp_path / "attempt-performance.db")
-    attempt_id = start_application_attempt("job:performance", "worker-1", conn=conn)
+    attempt_id = start_application_attempt(
+        "https://acme.myworkdayjobs.com/job/123", "worker-1", conn=conn
+    )
     assert finalize_application_attempt(
         attempt_id,
         "applied",
@@ -1109,14 +1111,14 @@ def test_terminal_attempt_performance_merge_is_bounded_and_preserves_evidence(
         conn=conn,
     )
     attribution_job = {
-        "application_url": "https://careers.example.test/jobs/123",
+        "application_url": "https://acme.myworkdayjobs.com/job/123",
     }
     bind_attempt_route(
         attribution_job,
         provider="workday",
         target_url=attribution_job["application_url"],
         worker_application_index=1,
-        worker_id=0,
+        worker_id="worker-1",
     )
     safe_record_job_span(attribution_job, "agent.turn", 120)
     safe_record_job_span(attribution_job, "browser.prepare", 120)

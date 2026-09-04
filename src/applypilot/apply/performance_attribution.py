@@ -13,6 +13,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from applypilot.apply.provider_registry import provider_for_url, provider_names
+
 SCHEMA_VERSION = "applypilot-performance-attribution/v2"
 TRACE_JOB_KEY = "_performance_attribution_trace"
 ROUTE_JOB_KEY = "_performance_attribution_route"
@@ -21,15 +23,13 @@ MAX_SPANS = 32
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$"
 )
-_PROVIDERS = frozenset(
-    {"workday", "smartrecruiters", "greenhouse", "lever", "linkedin", "direct_email"}
-)
+_PROVIDERS = provider_names("detection") | {"direct_email"}
 
 SPAN_GROUPS = {
     "agent.turn": "agent",
     "agent.startup": "agent",
-    "mcp.first_tool_ready": "mcp",
-    "model.first_output": "agent",
+    "mcp.first_tool_request": "mcp",
+    "model.first_text_output": "agent",
     "model.first_tool_decision": "agent",
     "browser.prepare": "browser",
     "audit.pre_submit": "observation",
@@ -39,7 +39,9 @@ SPAN_GROUPS = {
 }
 _GROUP_ROOT_SPANS = {
     "agent": frozenset({"agent.turn"}),
-    "mcp": frozenset({"mcp.first_tool_ready"}),
+    "mcp": frozenset({"mcp.first_tool_request"}),
+    "browser": frozenset({"browser.prepare"}),
+    "submission": frozenset({"submit.agent"}),
     "observation": frozenset({"audit.pre_submit", "receipt.reconciliation"}),
     "recovery": frozenset({"recovery.agent"}),
 }
@@ -91,11 +93,7 @@ def _route_dimensions(job: Mapping[str, object]) -> dict[str, int | str]:
         "worker_application_index": (
             index if isinstance(index, int) and not isinstance(index, bool) and index > 0 else "unavailable"
         ),
-        "worker_id": (
-            worker_id
-            if isinstance(worker_id, int) and not isinstance(worker_id, bool) and worker_id >= 0
-            else "unavailable"
-        ),
+        "worker_id": worker_id if isinstance(worker_id, str) and re.fullmatch(r"worker-[0-9]+", worker_id) else "unavailable",
     }
 
 
@@ -109,18 +107,22 @@ def bind_attempt_route(
 ) -> None:
     """Bind dimensions only from admitted ATS/authorization route facts."""
 
-    candidate_provider = str(provider or "").strip().casefold()
-    parsed = urlparse(str(target_url or ""))
+    declared_provider = str(provider or "").strip().casefold()
+    raw_target = str(target_url or "")
+    parsed = urlparse(raw_target)
     hostname = _safe_hostname(parsed.hostname or "")
+    detected_provider = provider_for_url(raw_target, "detection")
+    candidate_provider = (
+        "direct_email" if declared_provider == "direct_email" and detected_provider is None else detected_provider
+    )
     if candidate_provider not in _PROVIDERS or hostname is None:
         return
     if (
         isinstance(worker_application_index, bool)
         or not isinstance(worker_application_index, int)
         or worker_application_index <= 0
-        or isinstance(worker_id, bool)
-        or not isinstance(worker_id, int)
-        or worker_id < 0
+        or not isinstance(worker_id, str)
+        or re.fullmatch(r"worker-[0-9]+", worker_id) is None
     ):
         return
     job[ROUTE_JOB_KEY] = {
@@ -241,9 +243,8 @@ def normalize_attribution(value: object) -> dict[str, object] | None:
         or isinstance(index, bool)
         or not isinstance(index, int)
         or index <= 0
-        or isinstance(worker_id, bool)
-        or not isinstance(worker_id, int)
-        or worker_id < 0
+        or not isinstance(worker_id, str)
+        or re.fullmatch(r"worker-[0-9]+", worker_id) is None
     ):
         return None
     normalized_dimensions: dict[str, int | str] = {
@@ -294,6 +295,24 @@ def safe_normalize_attribution(value: object) -> dict[str, object] | None:
         return normalize_attribution(value)
     except Exception:  # noqa: BLE001 - telemetry must never affect terminal state
         return None
+
+
+def attribution_for_attempt(value: object, *, worker_id: object, job_url: object) -> dict[str, object] | None:
+    normalized = safe_normalize_attribution(value)
+    if normalized is None:
+        return None
+    provider = provider_for_url(job_url, "detection")
+    hostname = _safe_hostname(urlparse(str(job_url or "")).hostname or "")
+    dimensions = normalized["dimensions"]
+    if (
+        provider is None
+        or hostname is None
+        or dimensions.get("provider") != provider
+        or dimensions.get("domain") != hostname
+        or dimensions.get("worker_id") != worker_id
+    ):
+        return None
+    return normalized
 
 
 def summarize_amplification(samples: Iterable[object]) -> dict[str, object]:

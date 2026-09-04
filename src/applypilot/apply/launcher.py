@@ -5526,7 +5526,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     first_output_at = time.perf_counter()
                                     performance_attribution_mod.safe_record(
                                         performance_trace,
-                                        "model.first_output",
+                                        "model.first_text_output",
                                         (first_output_at - process_spawned_at) * 1000,
                                     )
                                 text_parts.append(block["text"])
@@ -5548,7 +5548,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     first_mcp_ready_at = now_tool
                                     performance_attribution_mod.safe_record(
                                         performance_trace,
-                                        "mcp.first_tool_ready",
+                                        "mcp.first_tool_request",
                                         (first_mcp_ready_at - process_spawned_at) * 1000,
                                     )
                                 last_tool_at = now_tool
@@ -5656,7 +5656,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     first_output_at = time.perf_counter()
                                     performance_attribution_mod.safe_record(
                                         performance_trace,
-                                        "model.first_output",
+                                        "model.first_text_output",
                                         (first_output_at - process_spawned_at) * 1000,
                                     )
                                 text_parts.append(text)
@@ -5676,7 +5676,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 first_mcp_ready_at = now_tool
                                 performance_attribution_mod.safe_record(
                                     performance_trace,
-                                    "mcp.first_tool_ready",
+                                    "mcp.first_tool_request",
                                     (first_mcp_ready_at - process_spawned_at) * 1000,
                                 )
                             last_tool_at = now_tool

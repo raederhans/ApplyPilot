@@ -14,9 +14,9 @@ def _bound_job() -> dict[str, object]:
     attribution_mod.bind_attempt_route(
         job,
         provider="workday",
-        target_url="https://careers.example.test/job/123",
+        target_url="https://acme.myworkdayjobs.com/job/123",
         worker_application_index=3,
-        worker_id=1,
+        worker_id="worker-1",
     )
     return job
 
@@ -26,8 +26,8 @@ def test_no_submit_baseline_reports_only_observed_non_additive_groups() -> None:
     for name, duration in (
         ("agent.turn", 100),
         ("agent.startup", 15),
-        ("mcp.first_tool_ready", 20),
-        ("model.first_output", 30),
+        ("mcp.first_tool_request", 20),
+        ("model.first_text_output", 30),
         ("model.first_tool_decision", 45),
         ("browser.prepare", 100),
         ("audit.pre_submit", 10),
@@ -41,14 +41,19 @@ def test_no_submit_baseline_reports_only_observed_non_additive_groups() -> None:
     assert snapshot["schema_version"] == attribution_mod.SCHEMA_VERSION
     assert snapshot["dimensions"] == {
         "provider": "workday",
-        "domain": "careers.example.test",
+        "domain": "acme.myworkdayjobs.com",
         "worker_application_index": 3,
-        "worker_id": 1,
+        "worker_id": "worker-1",
     }
     summary = attribution_mod.summarize_amplification([snapshot])
     assert summary["primary_turn_ms"] == 100.0
     assert summary["groups"] == {
         "agent": {
+            "duration_ms": 100.0,
+            "observed_span_count": 1,
+            "ratio_to_primary_turn": 1.0,
+        },
+        "browser": {
             "duration_ms": 100.0,
             "observed_span_count": 1,
             "ratio_to_primary_turn": 1.0,
@@ -146,3 +151,16 @@ def test_unbound_or_invalid_attribution_is_unavailable_not_zero_filled() -> None
         attribution_mod.trace_for_job(job).record("submission.authority", 1)
     with pytest.raises(ValueError, match="finite and non-negative"):
         attribution_mod.trace_for_job(job).record("agent.turn", math.nan)
+
+
+def test_attempt_route_mismatch_is_rejected_even_when_shape_is_valid() -> None:
+    job = _bound_job()
+    attribution_mod.safe_record_job_span(job, "agent.turn", 1)
+    snapshot = attribution_mod.safe_attribution_snapshot(job)
+    assert snapshot is not None
+
+    assert attribution_mod.attribution_for_attempt(
+        snapshot,
+        worker_id="worker-1",
+        job_url="https://jane-doe.example.test/apply",
+    ) is None

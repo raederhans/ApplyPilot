@@ -922,7 +922,7 @@ def _worker_loop_with_port(
                 provider=current_provider,
                 target_url=target_url,
                 worker_application_index=current_index,
-                worker_id=current_worker_id,
+                worker_id=f"worker-{current_worker_id}",
             )
 
         bind_attribution_target()
