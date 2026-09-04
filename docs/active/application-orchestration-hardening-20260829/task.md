@@ -221,19 +221,24 @@ P4 accepted delivery is the concurrency evidence/governor mechanism, not a highe
 - [x] Create the isolated `codex/remaining-architecture` integration worktree.
 - [ ] R1 authoritative App Server prepare canary: `off|shadow|canary` is
   configured and canary runs against real traffic as a bounded observation,
-  but CLI remains authoritative because the current App Server request and
-  Playwright surface are read-only. Production takeover is not admitted.
+  while a separate one-shot prepare-only capability contract is now reviewed
+  and green. CLI remains authoritative because no production browser-write
+  adapter or durable takeover handoff is admitted.
 - [x] R2 host-owned ApplicationPlan plus deterministic host audit; the existing
   lease-bound SemanticPatchBatch path remains authoritative.
-- [ ] R3 fresh BrowserContext and Provider recipe cutover: isolation and the
-  Greenhouse value-free recipe seam are green, but production replay and the
-  Workday/SmartRecruiters recipe paths remain disabled.
-- [ ] R4 matched cohort and Runtime Cell admission decision: schema v3 now uses
-  a status/expiry index, but no qualifying real-browser matched cohort exists;
-  effective production capacity remains one (`NOT_ADMITTED`).
-- [x] R5 local combined/full/release/no-submit qualification: `212` focused and
-  `2157` full tests passed; scoped Ruff and diff checks passed; wheel/sdist and
-  clean-wheel CLI smoke passed; real App Server and Edge/CDP smokes passed with
-  clean shutdown. The exact Workato dry-run stayed at two historical attempts,
-  zero runtime turns and zero receipts because stale material blocked it before
+- [ ] R3 fresh BrowserContext and Provider recipe cutover: context isolation and
+  separate Greenhouse/Workday/SmartRecruiters shadow observations are green,
+  but production browser writes and recipe replay remain disabled.
+- [x] R4 matched cohort and Runtime Cell admission decision: schema v3 uses the
+  status/expiry index and the current-source Playwright A/B/C cohort completed.
+  All cleanup and zero-effect gates passed, but A/B/C wall time was
+  `2812/3360/4100 ms`; effective production capacity remains one
+  (`NOT_ADMITTED`). Application acquisition still performs two candidate passes;
+  the new counters measure this blocker but do not claim it is fixed.
+- [x] R5 local combined/full/release/no-submit qualification: Runtime focused
+  union passed `213`; final full suite passed `2211`; full Ruff and diff checks
+  passed; wheel/sdist and clean-wheel CLI smoke passed; real App Server and
+  Edge/CDP smokes passed with clean shutdown. The exact Workato dry-run again
+  stayed at two historical attempts, zero submit-started attempts, zero runtime
+  turns and zero receipts because stale material exhausted the manifest before
   browser launch.

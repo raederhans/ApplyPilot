@@ -257,3 +257,47 @@ Obtain explicit commit/push authority for the frozen P6 candidate, create one `a
 - Production Runtime Cell capacity remains one. Historical synthetic evidence is
   not source-current and does not exercise the App Server/browser/safety path, so
   two Cells and provider recipe replay remain `NOT_ADMITTED`.
+
+### Remaining-architecture final local closeout
+
+- App Server `canary` remains an observation lane whose authoritative backend is
+  the CLI. A separate one-shot, value-free prepare capability contract passed its
+  focused union, but it is deliberately not wired to the production App Server
+  because the current dynamic-tool surface is read-only and no durable
+  browser-write handoff has been admitted.
+- Provider recipe shadow observation is independently configurable for
+  Greenhouse, Workday, and SmartRecruiters. Cache hits require current live
+  validation and fresh page/lease authority; iframe, cross-origin, complex,
+  upload, legal, CAPTCHA, assessment, verification, and Submit cases fail closed.
+  The offline provider cohort observed miss-to-hit behavior for all three while
+  preserving fallback and recording zero Submit attempts. Production recipe
+  execution remains disabled.
+- The production worker now exercises a single logical no-I/O Runtime Cell
+  lifecycle in shadow: attempt and lease are atomically claimed, the preclaimed
+  token is rebound to exact application/actor/attempt/host identity, the agent is
+  stopped before context cleanup, and the lease is released only after
+  zero-residual verification. Uncertain cleanup quarantines the lease/generation.
+  Production authority is false and effective capacity is hard-gated to one.
+- Current-source local Playwright A/B/C evidence used six matched Workday and
+  SmartRecruiters fixture observations. Wall times were `2811.999`, `3359.940`,
+  and `4100.270 ms`; median observations were `50.517`, `50.953`, and
+  `79.167 ms`. Every context reported zero residual pages/frames/service workers,
+  and Submit, SubmissionGate, reservation, receipt, mailbox and external-effect
+  counters were all zero. The second Cell is `NOT_ADMITTED` because it did not
+  improve the matched workload. The existing two-pass candidate acquisition is
+  still a measured performance blocker, not a completed optimization.
+- Final verification on the integrated local branch passed the Runtime focused
+  union (`213 passed`), the complete suite (`2211 passed in 340.78s`), full Ruff,
+  `git diff --check`, wheel/sdist build, and a clean-wheel install with module CLI
+  and installed `resume-route` smoke. A real Codex App Server handshake returned
+  ready and shut down with exit code zero. A real Edge/CDP run loaded Selenium's
+  public web form with HTTP 200, filled a non-submit input, reported
+  `navigator.webdriver=false`, and confirmed endpoint/process/sidecar cleanup.
+- The exact Workato Greenhouse dry-run used the live data root, one worker,
+  final Submit disabled, and all new lanes in shadow/observation mode. The
+  manifest remained exhausted by `stale_profile_fact`; before and after were two
+  historical attempts, zero `submit_started`, zero runtime turns and zero
+  receipts. This is a verified safe block, not a browser-level delivery success.
+- Commits after the verified `fork/main@2d1323e` remain local on
+  `codex/remaining-architecture`. Remote CI has not run for this local series and
+  no second push is part of this closeout.

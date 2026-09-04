@@ -200,23 +200,28 @@ material-freshness, or uncertain-receipt stops.
 - [ ] R1: make Codex App Server an authoritative prepare-only canary with a
   fail-closed durable handoff; CLI remains the submit executor and the fallback
   only before App Server request acceptance. `off|shadow|canary` configuration
-  is landed, but canary intentionally remains observational until a separately
-  reviewed non-Submit browser-write surface exists.
+  is landed, and a separately reviewed one-shot prepare-only capability contract
+  now exists. Canary intentionally remains observational until that contract has
+  a production browser-write adapter and durable handoff.
 - [x] R2: consume host-owned `ApplicationPlan` and `SemanticPatchBatch` on the
   ordinary supported-provider path while retaining deterministic verification
   and lease-bound replay protection.
 - [ ] R3: activate fresh per-application browser contexts and value-free
   provider recipes for admitted Greenhouse/Workday/SmartRecruiters paths. The
-  context isolation contract and Greenhouse recipe seam are locally green, but
-  production recipe replay and Workday/SmartRecruiters admission remain off.
-- [ ] R4: rerun matched no-submit cohorts after R1-R3 and admit a second Runtime
+  context isolation contract and per-provider shadow observations are locally
+  green, but production browser writes and recipe replay remain disabled.
+- [x] R4: rerun matched no-submit cohorts after R1-R3 and admit a second Runtime
   Cell only when the existing performance, isolation, latency, and zero-effect
   gates all pass. Four Cells remain outside this wave unless independently
-  admitted. The expiry scan is indexed in schema v3; production capacity remains
-  one because the available browser-free cohorts do not prove the required gate.
+  admitted. The current-source Playwright A/B/C cohort completed with zero
+  residual resources and zero safety effects, but A/B/C wall time was
+  `2812/3360/4100 ms`; production capacity therefore remains one
+  (`NOT_ADMITTED`).
 - [x] R5: run focused gates after every slice, then the full suite, release and
   clean-install checks, a real App Server/CDP smoke, and one exact no-submit or
   submission delivery test only when current material and provider gates admit
   it. A safe pre-browser block is reported as blocked, never as a successful
   browser delivery. Local qualification completed; the exact Workato replay was
-  correctly blocked by stale material before browser launch.
+  correctly blocked by stale material before browser launch. Final qualification
+  after all remaining slices passed `2211` tests, full Ruff, wheel/sdist build,
+  clean-wheel install, real App Server handshake, and real Edge/CDP smoke.
