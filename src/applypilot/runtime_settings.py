@@ -58,18 +58,34 @@ class ApplyRuntimeSettings:
         return self.environ.get("APPLYPILOT_CLAUDE_MODEL", "opus")
 
     @property
-    def codex_app_server_enabled(self) -> bool:
-        """Return the explicit App Server feature flag, defaulting off."""
+    def codex_app_server_mode(self) -> str:
+        """Return the App Server rollout mode with legacy boolean compatibility."""
+
+        raw_mode = self.environ.get("APPLYPILOT_CODEX_APP_SERVER_MODE")
+        if raw_mode is not None:
+            mode = raw_mode.strip().casefold()
+            if mode not in {"off", "shadow", "canary"}:
+                raise ValueError(
+                    "APPLYPILOT_CODEX_APP_SERVER_MODE must be off, shadow, or canary"
+                )
+            return mode
+
         raw = self.environ.get(
             "APPLYPILOT_CODEX_APP_SERVER_ENABLED", "0"
         ).strip().casefold()
         if raw in {"1", "true", "yes", "on"}:
-            return True
+            return "shadow"
         if raw in {"0", "false", "no", "off", ""}:
-            return False
+            return "off"
         raise ValueError(
             "APPLYPILOT_CODEX_APP_SERVER_ENABLED must be a boolean flag"
         )
+
+    @property
+    def codex_app_server_enabled(self) -> bool:
+        """Return whether either additive App Server rollout lane is enabled."""
+
+        return self.codex_app_server_mode != "off"
 
     @property
     def runtime_cell_mode(self) -> str:

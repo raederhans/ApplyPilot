@@ -39,6 +39,7 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.resolve_browser_backend() == "edge"
     assert settings.resolve_interaction_mode() == "auto"
     assert settings.resolve_model("codex") == "gpt-5.6-sol"
+    assert settings.codex_app_server_mode == "off"
     assert settings.codex_app_server_enabled is False
     assert settings.semantic_batch_mode == "off"
     assert settings.application_plan_shadow_enabled is False
@@ -61,6 +62,7 @@ def test_runtime_settings_are_snapshotted_per_command() -> None:
 def test_runtime_settings_enable_codex_app_server_only_explicitly(value: str) -> None:
     settings = load_runtime_settings({"APPLYPILOT_CODEX_APP_SERVER_ENABLED": value})
 
+    assert settings.codex_app_server_mode == "shadow"
     assert settings.codex_app_server_enabled is True
 
 
@@ -69,6 +71,33 @@ def test_runtime_settings_reject_invalid_codex_app_server_flag() -> None:
 
     with pytest.raises(ValueError, match="must be a boolean flag"):
         _ = settings.codex_app_server_enabled
+
+
+@pytest.mark.parametrize("value", ["off", "SHADOW", "canary"])
+def test_runtime_settings_accept_codex_app_server_rollout_modes(value: str) -> None:
+    settings = load_runtime_settings({"APPLYPILOT_CODEX_APP_SERVER_MODE": value})
+
+    assert settings.codex_app_server_mode == value.casefold()
+    assert settings.codex_app_server_enabled is (value.casefold() != "off")
+
+
+def test_runtime_settings_app_server_mode_overrides_legacy_boolean() -> None:
+    settings = load_runtime_settings(
+        {
+            "APPLYPILOT_CODEX_APP_SERVER_MODE": "off",
+            "APPLYPILOT_CODEX_APP_SERVER_ENABLED": "1",
+        }
+    )
+
+    assert settings.codex_app_server_mode == "off"
+    assert settings.codex_app_server_enabled is False
+
+
+def test_runtime_settings_reject_invalid_codex_app_server_mode() -> None:
+    settings = load_runtime_settings({"APPLYPILOT_CODEX_APP_SERVER_MODE": "enabled"})
+
+    with pytest.raises(ValueError, match="must be off, shadow, or canary"):
+        _ = settings.codex_app_server_mode
 
 
 @pytest.mark.parametrize("value", ["off", "SHADOW", "canary"])

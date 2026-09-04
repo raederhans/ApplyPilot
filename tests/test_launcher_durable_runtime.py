@@ -692,6 +692,189 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
     assert events[:5] == ["reserve", "popen", "attach", "prompt", "advisory_started"]
 
 
+class _CanaryAdapter:
+    backend = "codex-app-server"
+    drain_timeout = 0.1
+
+    def __init__(
+        self,
+        *,
+        configure_error: Exception | None = None,
+        start_error: Exception | None = None,
+    ) -> None:
+        self.transport = SimpleNamespace(process=SimpleNamespace(pid=4002))
+        self.configure_error = configure_error
+        self.start_error = start_error
+        self.requests: list[RuntimeCellRequest] = []
+
+    def health(self) -> RuntimeAdapterHealth:
+        return RuntimeAdapterHealth(
+            backend="codex-app-server",
+            status="ready",
+            reason_code="CODEX_APP_SERVER_READY",
+            capabilities=CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
+        )
+
+    def configure_thread(self, _config: dict[str, object]) -> None:
+        if self.configure_error is not None:
+            raise self.configure_error
+
+    def start(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+        self.requests.append(request)
+        if self.start_error is not None:
+            raise self.start_error
+        report = {
+            "schema_version": "future-compatible",
+            "run_id": request.run_id,
+            "status": "ready_to_submit",
+            "summary": "Synthetic observational App Server result",
+            "observations": _ready_answer_mapping_observations(),
+        }
+        (request.cwd / "agent-turn-report.json").write_text(
+            json.dumps(report), encoding="utf-8"
+        )
+        return RuntimeCellTurn(
+            backend="codex-app-server",
+            provider_session_id="canary-thread",
+            provider_turn_id="canary-turn",
+            events=iter(
+                (
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "RESULT:READY_TO_SUBMIT",
+                        },
+                    },
+                    {"type": "turn.completed", "status": "completed", "usage": {}},
+                )
+            ),
+        )
+
+    def resume(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+        return self.start(request)
+
+    def cancel(self, _provider_turn_id: str) -> None:
+        return None
+
+    def drain(
+        self,
+        _provider_turn_id: str | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        del timeout
+        return ()
+
+    def shutdown(self) -> None:
+        return None
+
+
+class _CanaryPool:
+    def __init__(self, adapter: _CanaryAdapter) -> None:
+        self.adapter = adapter
+        self.evictions = 0
+
+    def adapter_for_worker(self, worker_id: int) -> _CanaryAdapter:
+        assert worker_id == 0
+        return self.adapter
+
+    def evict_worker(self, worker_id: int, adapter: object) -> None:
+        assert worker_id == 0
+        assert adapter is self.adapter
+        self.evictions += 1
+
+
+def test_run_job_canary_remains_observational_and_cli_owns_prepare_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
+    adapter = _CanaryAdapter()
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", _CanaryPool(adapter))
+    job = _job("attempt-app-server-canary")
+
+    first_status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+    second_status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+        resume_existing_page=True,
+    )
+
+    assert (first_status, second_status) == ("ready_to_submit", "ready_to_submit")
+    assert len(adapter.requests) == 1
+    assert events.count("popen") == 2
+    assert job["_runtime_cell"]["mode"] == "canary_observation"
+    assert job["_runtime_cell"]["authoritative_backend"] == "codex-cli"
+
+
+def test_run_job_canary_shadow_configuration_failure_does_not_block_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
+    adapter = _CanaryAdapter(configure_error=RuntimeError("transport unavailable"))
+    pool = _CanaryPool(adapter)
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", pool)
+    job = _job("attempt-app-server-pre-accept-fallback")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert events.count("popen") == 1
+    assert pool.evictions == 1
+    assert job["_runtime_cell"]["mode"] == "canary_observation"
+    assert job["_runtime_cell"]["authoritative_backend"] == "codex-cli"
+
+
+def test_run_job_canary_accepted_shadow_failure_does_not_replace_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
+    adapter = _CanaryAdapter(start_error=RuntimeError("response lost after dispatch"))
+    pool = _CanaryPool(adapter)
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", pool)
+    job = _job("attempt-app-server-accepted-failure")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert len(adapter.requests) == 1
+    assert events.count("popen") == 1
+    assert pool.evictions == 1
+    assert job["_runtime_cell"]["mode"] == "canary_observation"
+    assert job["_runtime_cell"]["authoritative_backend"] == "codex-cli"
+
+
 def test_run_job_app_server_is_non_authoritative_shadow_and_cli_owns_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -801,6 +984,10 @@ def test_run_job_app_server_is_non_authoritative_shadow_and_cli_owns_result(
             assert worker_id == 0
             return adapter
 
+        def evict_worker_async(self, worker_id: int, failed_adapter: object) -> None:
+            assert worker_id == 0
+            assert failed_adapter is adapter
+
     monkeypatch.setattr(launcher, "_app_server_runtime_pool", FakePool())
     job = _job(
         "attempt-runtime-cell-app-server",
@@ -859,7 +1046,7 @@ def test_run_job_keeps_direct_email_on_cli_mailbox_route_when_app_server_enabled
 ) -> None:
     events: list[str] = []
     _configure_launcher(monkeypatch, tmp_path, events)
-    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
 
     class RejectingPool:
         def adapter_for_worker(self, _worker_id: int) -> object:
@@ -880,6 +1067,47 @@ def test_run_job_keeps_direct_email_on_cli_mailbox_route_when_app_server_enabled
         submission_phase="prepare",
     )
 
+    assert job["_runtime_cell"]["active_backend"] == "codex-cli"
+    assert job["_runtime_cell"]["reason_code"] == "CODEX_APP_SERVER_FEATURE_DISABLED"
+
+
+@pytest.mark.parametrize(
+    ("submission_phase", "job_extra"),
+    [
+        ("submit", {}),
+        ("prepare", {"_answer_provenance_verification_child": True}),
+    ],
+)
+def test_run_job_excludes_submit_and_verification_child_from_app_server_canary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    submission_phase: str,
+    job_extra: dict[str, object],
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
+
+    class RejectingPool:
+        def adapter_for_worker(self, _worker_id: int) -> object:
+            raise AssertionError("excluded route must not enter App Server")
+
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", RejectingPool())
+    job = _job(
+        f"attempt-runtime-cell-excluded-{submission_phase}",
+        **job_extra,
+    )
+
+    launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase=submission_phase,
+    )
+
+    assert events.count("popen") == 1
     assert job["_runtime_cell"]["active_backend"] == "codex-cli"
     assert job["_runtime_cell"]["reason_code"] == "CODEX_APP_SERVER_FEATURE_DISABLED"
 
