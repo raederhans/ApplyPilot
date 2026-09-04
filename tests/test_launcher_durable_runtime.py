@@ -354,13 +354,20 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
 
     assert status == "ready_to_submit"
     assert job["_runtime_cell"] == {
-        "schema_version": "1",
+        "schema_version": "2",
         "status": "degraded",
+        "disposition": "fallback",
         "requested_backend": "codex-app-server",
         "active_backend": "codex-cli",
         "reason_code": "CODEX_APP_SERVER_ADAPTER_UNAVAILABLE",
         "feature_enabled": True,
         "fallback_used": True,
+        "execution_state": {
+            "request_accepted": False,
+            "tool_or_effect_started": False,
+            "submit_started": False,
+            "bound_backend": None,
+        },
         "missing_capabilities": [
             "initialize",
             "thread/resume",
@@ -685,6 +692,16 @@ def test_submit_scope_creates_parent_linked_submit_child_and_consumes_gate(
     )
     assert turn["submit_started"] == 1
     assert events[:4] == ["reserve", "popen", "attach", "prompt"]
+    # Runtime host selection precedes request acceptance/tool effects.  The
+    # submit phase alone must not be mistaken for an already-clicked Submit,
+    # while the durable turn records submit_started for recovery admission.
+    assert submit_job["_runtime_cell"]["execution_state"] == {
+        "request_accepted": False,
+        "tool_or_effect_started": False,
+        "submit_started": False,
+        "bound_backend": None,
+    }
+    assert submit_job["_runtime_cell"]["disposition"] == "execute"
 
 
 @pytest.mark.parametrize(

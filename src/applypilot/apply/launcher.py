@@ -4785,9 +4785,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ),
         )
     profile = config.load_profile()
+    # This selection happens before a runtime request is accepted and before
+    # the first tool/effect.  Merely entering the submit phase is not evidence
+    # that the final Submit control has been activated.
+    runtime_cell_execution_state = runtime_cell_mod.RuntimeCellExecutionState(
+        request_accepted=False,
+        tool_or_effect_started=False,
+        submit_started=False,
+        bound_backend=None,
+    )
     runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
         agent_backend,
         codex_app_server_enabled=runtime_settings.codex_app_server_enabled,
+        execution_state=runtime_cell_execution_state,
     )
     # This slice defines and consumes the host-selection seam, while the only
     # installed production executor remains the existing CLI subprocess.  A
@@ -4795,6 +4805,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     # through RuntimeCellAdapter before it can become active here.
     if runtime_cell_selection.adapter is not None:
         raise RuntimeError("Codex App Server execution adapter is not installed")
+    if not runtime_cell_selection.can_start:
+        raise RuntimeError("Runtime Cell did not authorize a new Agent turn")
     runtime_backend = runtime_cell_selection.active_backend
     job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
     authentication = profile.get("authentication", {})
