@@ -56,6 +56,24 @@ class FailingBrowser(FakeBrowser):
         raise RuntimeError("synthetic new_context failure")
 
 
+class ResidualContext(FakeContext):
+    def close(self) -> None:
+        self.closed = True
+
+
+class ResidualBrowser(FakeBrowser):
+    def new_context(self, **_kwargs: object) -> ResidualContext:
+        context = ResidualContext()
+        self.contexts.append(context)
+        return context
+
+
+class FailingCloseBrowser(FakeBrowser):
+    def close(self) -> None:
+        self.closed = True
+        raise RuntimeError("synthetic browser close failure")
+
+
 def _scope() -> BrowserStateScope:
     return BrowserStateScope("workday", "tenant.myworkdayjobs.com", "candidate-1")
 
@@ -172,6 +190,50 @@ def test_context_creation_failure_drains_the_owned_hot_process() -> None:
 
     assert browser.closed is True
     assert runtime.metrics.drained is True
+
+
+def test_close_residuals_terminally_drain_and_revoke_every_context_capability() -> None:
+    browser = ResidualBrowser()
+    runtime = HotBrowserContextRuntime(
+        feature=BrowserContextFeature(True),
+        launch_browser=lambda: browser,
+    )
+    lease = runtime.open_application(application_id="application-1", scope=_scope(), state=_state())
+    runtime.new_page(lease)
+    browser.contexts[0].service_workers.append(object())
+
+    with pytest.raises(BrowserContextRuntimeError, match="residual resources; runtime drained"):
+        runtime.close_application(lease)
+
+    assert browser.closed is True
+    assert runtime.metrics.drained is True
+    assert runtime.metrics.closed is True
+    assert runtime.metrics.active_contexts == 0
+    assert runtime.metrics.pages_after_close == 1
+    assert runtime.metrics.service_workers_after_close == 1
+    with pytest.raises(BrowserContextLeaseError, match="released"):
+        runtime.new_page(lease)
+    with pytest.raises(BrowserContextDrained):
+        runtime.open_application(application_id="application-2", scope=_scope(), state=_state())
+
+
+def test_browser_close_failure_still_terminally_drains_and_rejects_future_application() -> None:
+    browser = FailingCloseBrowser()
+    runtime = HotBrowserContextRuntime(
+        feature=BrowserContextFeature(True),
+        launch_browser=lambda: browser,
+    )
+    runtime.open_application(application_id="application-1", scope=_scope(), state=_state())
+
+    with pytest.raises(BrowserContextRuntimeError, match="browser process close failed; runtime drained"):
+        runtime.close()
+
+    assert browser.closed is True
+    assert runtime.metrics.drained is True
+    assert runtime.metrics.closed is True
+    assert runtime.metrics.active_contexts == 0
+    with pytest.raises(BrowserContextDrained):
+        runtime.open_application(application_id="application-2", scope=_scope(), state=_state())
 
 
 def test_taint_score_closes_the_tainted_context_then_drains_hot_process() -> None:

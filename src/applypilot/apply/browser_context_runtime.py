@@ -199,6 +199,7 @@ class BrowserContextMetrics:
     service_workers_after_close: int
     taint_score: int
     drained: bool
+    closed: bool
 
 
 class _PlaywrightContext(Protocol):
@@ -346,17 +347,12 @@ class HotBrowserContextRuntime:
             self._drain_locked()
 
     def close(self) -> None:
-        """Close this owned process; an already-drained runtime stays drained."""
+        """Terminally close this owned process and revoke every context lease."""
 
         with self._lock:
             if self._closed:
                 return
-            for active in tuple(self._active.values()):
-                self._close_active(active, raise_on_failure=False)
-            if self._browser is not None:
-                self._browser.close()
-                self._browser = None
-            self._closed = True
+            self._drain_locked()
 
     @property
     def metrics(self) -> BrowserContextMetrics:
@@ -373,6 +369,7 @@ class HotBrowserContextRuntime:
                 service_workers_after_close=self._service_workers_after_close,
                 taint_score=self._taint_score,
                 drained=self._drained,
+                closed=self._closed,
             )
 
     def _active_for(self, lease: ApplicationContextLease) -> _ActiveContext:
@@ -407,8 +404,24 @@ class HotBrowserContextRuntime:
         self._pages_after_close += after[0]
         self._frames_after_close += after[1]
         self._service_workers_after_close += after[2]
-        self._contexts_closed += 1
         self._active.pop(active.lease.context_id, None)
+        if any(after):
+            # ``close()`` returning is insufficient evidence that this context
+            # has released its resources.  The exact lease is already revoked;
+            # terminally drain the process so no later application can inherit
+            # a residual page, frame, storage partition, or service worker.
+            try:
+                self._drain_locked()
+            except BrowserContextRuntimeError as drain_error:
+                if raise_on_failure:
+                    raise BrowserContextRuntimeError(
+                        "browser context close left residual resources; runtime drained with cleanup failure"
+                    ) from drain_error
+                return
+            if raise_on_failure:
+                raise BrowserContextRuntimeError("browser context close left residual resources; runtime drained")
+            return
+        self._contexts_closed += 1
 
     @staticmethod
     def _resource_counts(context: _PlaywrightContext) -> tuple[int, int, int]:
@@ -423,14 +436,22 @@ class HotBrowserContextRuntime:
         if self._drained:
             return
         self._drained = True
-        for active in tuple(self._active.values()):
-            self._close_active(active, raise_on_failure=False)
-        if self._browser is not None:
-            try:
+        close_error: Exception | None = None
+        try:
+            for active in tuple(self._active.values()):
+                self._close_active(active, raise_on_failure=False)
+            if self._browser is not None:
                 self._browser.close()
-            finally:
-                self._browser = None
-        self._closed = True
+        except Exception as exc:
+            close_error = exc
+        finally:
+            # A terminal drain always revokes all capabilities even if native
+            # cleanup is uncertain or its final browser close raised.
+            self._active.clear()
+            self._browser = None
+            self._closed = True
+        if close_error is not None:
+            raise BrowserContextRuntimeError("browser process close failed; runtime drained") from close_error
 
     def _sign(self, lease: ApplicationContextLease) -> str:
         payload = json.dumps(
