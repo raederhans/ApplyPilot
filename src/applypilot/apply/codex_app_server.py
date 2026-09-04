@@ -558,6 +558,29 @@ class CodexAppServerAdapter:
         self._opening_applications: set[str] = set()
         self._lock = threading.RLock()
 
+    def configure_thread(self, config: Mapping[str, object]) -> None:
+        """Replace per-turn configuration only while this worker is idle.
+
+        The launcher owns tool scoping and per-turn MCP environment bindings.
+        Keeping this mutation behind the adapter lock prevents one application
+        from observing another application's paths or tool surface.
+        """
+
+        if not isinstance(config, Mapping):
+            raise TypeError("App Server thread config must be a mapping")
+        with self._lock:
+            if self._active_turns or self._opening_applications:
+                raise CodexAppServerExecutionError(
+                    "App Server thread config cannot change during an active turn",
+                    execution_state=RuntimeCellExecutionState(
+                        request_accepted=True,
+                        tool_or_effect_started=False,
+                        submit_started=False,
+                        bound_backend="codex-app-server",
+                    ),
+                )
+            self.thread_config = dict(config)
+
     def health(self) -> RuntimeAdapterHealth:
         try:
             self.transport.start()

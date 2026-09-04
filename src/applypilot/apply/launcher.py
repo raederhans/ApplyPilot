@@ -25,7 +25,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -39,8 +39,10 @@ from applypilot import config
 from applypilot.apply import agent_output as agent_output_mod
 from applypilot.apply import agent_runtime as agent_runtime_mod
 from applypilot.apply import answer_provenance as answer_provenance_mod
+from applypilot.apply import app_server_runtime_wiring as app_server_wiring_mod
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
+from applypilot.apply import application_plan as application_plan_mod
 from applypilot.apply import ats as ats_mod
 from applypilot.apply import linkedin_page_observation as linkedin_page_observation_mod
 from applypilot.apply import orchestration as orchestration_mod
@@ -518,8 +520,14 @@ _durable_agent_runtime = DurableAgentRuntime(
     resume_authorizer=_consume_runtime_recovery_authorization,
     close_connections=True,
 )
+_app_server_runtime_pool = app_server_wiring_mod.AppServerRuntimePool()
+_app_server_state_store = app_server_wiring_mod.DurableAppServerStateStore(
+    _open_durable_control_connection,
+    close_connections=True,
+)
 atexit.register(_browser_broker.close)
 atexit.register(_agent_subprocess_runtime.close)
+atexit.register(_app_server_runtime_pool.shutdown)
 
 
 def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
@@ -3262,6 +3270,7 @@ _submit_writer_lane = threading.Semaphore(1)
 
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
+_app_server_turn_cancellations: dict[int, Callable[[], None]] = {}
 _claude_lock = threading.Lock()
 
 
@@ -5172,30 +5181,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ),
         )
     profile = config.load_profile()
-    # This selection happens before a runtime request is accepted and before
-    # the first tool/effect.  Merely entering the submit phase is not evidence
-    # that the final Submit control has been activated.
-    runtime_cell_execution_state = runtime_cell_mod.RuntimeCellExecutionState(
-        request_accepted=False,
-        tool_or_effect_started=False,
-        submit_started=False,
-        bound_backend=None,
-    )
-    runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
-        agent_backend,
-        codex_app_server_enabled=runtime_settings.codex_app_server_enabled,
-        execution_state=runtime_cell_execution_state,
-    )
-    # This slice defines and consumes the host-selection seam, while the only
-    # installed production executor remains the existing CLI subprocess.  A
-    # future App Server transport must inject a concrete adapter and execute
-    # through RuntimeCellAdapter before it can become active here.
-    if runtime_cell_selection.adapter is not None:
-        raise RuntimeError("Codex App Server execution adapter is not installed")
-    if not runtime_cell_selection.can_start:
-        raise RuntimeError("Runtime Cell did not authorize a new Agent turn")
-    runtime_backend = runtime_cell_selection.active_backend
-    job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
     authentication = profile.get("authentication", {})
     credential_relay_authorized = _credential_relay_allowed(profile, job)
     identity_relay_authorized = _identity_relay_allowed(profile, job)
@@ -5289,6 +5274,59 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     job["_agent_orchestration_available"] = callable(
         job.get("_agent_proposal_runner")
     )
+    app_server_state = (
+        _app_server_state_store.load(actor_id, attempt_id)
+        if runtime_settings.codex_app_server_enabled
+        else _app_server_state_store.peek(actor_id, attempt_id)
+    )
+    runtime_cell_execution_state = (
+        app_server_state.execution_state
+        if app_server_state is not None
+        else runtime_cell_mod.RuntimeCellExecutionState(
+            request_accepted=False,
+            tool_or_effect_started=False,
+            submit_started=False,
+            bound_backend=None,
+        )
+    )
+    app_server_bound = runtime_cell_execution_state.bound_backend == "codex-app-server"
+    if app_server_bound and runtime_route != "browser":
+        route_selection = runtime_cell_mod.select_runtime_cell(
+            agent_backend,
+            codex_app_server_enabled=False,
+            execution_state=runtime_cell_execution_state,
+        )
+        job["_runtime_cell"] = route_selection.health.as_dict()
+        return (
+            "submission_uncertain"
+            if route_selection.health.disposition == "receipt_only"
+            else "failed:runtime_route_changed"
+        ), 0
+    app_server_eligible = runtime_route == "browser"
+    app_server_adapter = None
+    if app_server_bound or (
+        runtime_settings.codex_app_server_enabled and app_server_eligible
+    ):
+        app_server_adapter = _app_server_runtime_pool.adapter_for_worker(worker_id)
+    runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
+        agent_backend,
+        codex_app_server_enabled=(
+            runtime_settings.codex_app_server_enabled and app_server_eligible
+        ),
+        execution_state=runtime_cell_execution_state,
+        codex_app_server_adapter=app_server_adapter,
+    )
+    job["_runtime_cell"] = runtime_cell_selection.health.as_dict()
+    if runtime_cell_selection.health.disposition == "receipt_only":
+        return "submission_uncertain", 0
+    if runtime_cell_selection.health.disposition == "park":
+        return "failed:runtime_parked", 0
+    if not runtime_cell_selection.can_start and not (
+        runtime_cell_selection.health.disposition == "continue"
+        and runtime_cell_selection.active_backend == "codex-app-server"
+    ):
+        raise RuntimeError("Runtime Cell did not authorize an Agent turn")
+    runtime_backend = runtime_cell_selection.active_backend
     setup_metrics["exposed_tool_count"] = len(job["_available_tools"])
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
@@ -5413,19 +5451,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         "authority": "observation_only",
     }
     mcp_config_path = runtime_namespace.path("mcp-config.json")
+    mcp_config = _make_mcp_config(
+        port,
+        playwright_mcp=playwright_mcp,
+        capability_registry=runtime_capabilities,
+        runtime_metadata=runtime_metadata,
+        mailbox_mcp=mailbox_mcp,
+        direct_email_send_authorized=direct_email_send_authorized,
+        credential_relay_authorized=credential_relay_authorized,
+        identity_relay_authorized=identity_relay_authorized,
+    )
     mcp_config_path.write_text(
-        json.dumps(
-            _make_mcp_config(
-                port,
-                playwright_mcp=playwright_mcp,
-                capability_registry=runtime_capabilities,
-                runtime_metadata=runtime_metadata,
-                mailbox_mcp=mailbox_mcp,
-                direct_email_send_authorized=direct_email_send_authorized,
-                credential_relay_authorized=credential_relay_authorized,
-                identity_relay_authorized=identity_relay_authorized,
-            )
-        ),
+        json.dumps(mcp_config),
         encoding="utf-8",
     )
 
@@ -5651,6 +5688,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
     stats: dict = {}
     proc = None
+    app_server_turn_process: app_server_wiring_mod.AppServerTurnProcess | None = None
     durable_handle: DurableRunHandle | None = None
     watchdog: threading.Timer | None = None
     lease_heartbeat: LeaseHeartbeat | None = None
@@ -5698,6 +5736,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job.pop("_mailbox_prepare_duplicate_receipt", None)
 
     def cancel_runtime_on_lease_failure(_exc: Exception) -> None:
+        if app_server_turn_process is not None:
+            try:
+                app_server_turn_process.cancel()
+            except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                pass
+            return
         try:
             _agent_subprocess_runtime.cancel(run_id)
         except KeyError:
@@ -5820,62 +5864,113 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     try:
         process_spawn_started = time.perf_counter()
-        launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
-            run_id=run_id,
-            attempt_id=attempt_id,
-            actor_id=actor_id,
-            turn_id=turn_id,
-            command=tuple(cmd),
-            prompt=agent_prompt,
-            cwd=worker_dir,
-            env=env,
-            runtime_id=browser_lease_bundle.profile.runtime_id,
-            profile_id=browser_lease_bundle.profile.resource_id,
-            parent_run_id=runtime_parent_turn_id,
-            submit_started=submission_phase == "submit" and not dry_run,
-        )
         raw_control_contract = job.get("_control_contract")
         prompt_contract = (
             dict(raw_control_contract)
             if isinstance(raw_control_contract, Mapping)
             else {}
         )
-        durable_intent = DurableLaunchIntent(
-            spec=launch_spec,
-            runtime_backend=runtime_backend,
-            resume_mode="resume" if runtime_parent_turn_id else "root",
-            checkpoint_id=runtime_parent_checkpoint_id,
-            model=model,
-            recovery_authorization_id=(
-                runtime_authorization_id
-            ),
-            tool_surface_hash=_control_contract_digest(
-                {
-                    "schema_version": "1",
-                    "available_tools": sorted(agent_request.available_tools),
-                }
-            ),
-            prompt_contract_hash=_control_contract_digest(
-                {
+        if runtime_backend == "codex-app-server":
+            assert app_server_adapter is not None
+            plan = job.get("_application_plan")
+            previous_plan = job.get("_previous_application_plan")
+            app_server_turn_process = app_server_wiring_mod.open_configured_app_server_turn(
+                adapter=app_server_adapter,
+                state_store=_app_server_state_store,
+                run_id=run_id,
+                actor_id=actor_id,
+                attempt_id=attempt_id,
+                phase=submission_phase,
+                cwd=worker_dir,
+                model=model,
+                mcp_config=mcp_config,
+                process_env=env,
+                runtime_capabilities=runtime_capabilities,
+                playwright_env=playwright_mcp.env,
+                mailbox_server_name=(mailbox_mcp.server_name if mailbox_mcp.enabled else None),
+                mailbox_env=mailbox_mcp.env,
+                credential_relay_authorized=credential_relay_authorized,
+                identity_relay_authorized=identity_relay_authorized,
+                playwright_url=(
+                    application_context.endpoint.address
+                    if application_context is not None
+                    and application_context.endpoint.transport == "streamable-http"
+                    and application_context.endpoint.reusable
+                    else None
+                ),
+                prompt_contract={
                     "schema_version": "1",
                     "phase": submission_phase,
                     "dry_run": dry_run,
                     "control_contract": prompt_contract,
-                }
-            ),
-            idempotency_key=f"agent-turn:v2:{actor_id}:{turn_id}:spawn",
-        )
-        if runtime_parent_turn_id:
-            durable_handle = _durable_agent_runtime.resume(
-                durable_intent,
-                popen_factory=subprocess.Popen,
+                },
+                ats_context=ats_context,
+                application_context=(
+                    application_context.as_dict()
+                    if application_context is not None
+                    else None
+                ),
+                plan=(plan if isinstance(plan, application_plan_mod.ApplicationPlan) else None),
+                previous_plan=(
+                    previous_plan
+                    if isinstance(previous_plan, application_plan_mod.ApplicationPlan)
+                    else None
+                ),
+                plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
+                submit_started=submission_phase == "submit" and not dry_run,
             )
+            proc = app_server_turn_process
+            runtime_metadata["provider_session_id"] = proc.turn.provider_session_id
+            runtime_metadata["provider_turn_id"] = proc.turn.provider_turn_id
         else:
-            durable_handle = _durable_agent_runtime.start(
-                durable_intent,
-                popen_factory=subprocess.Popen,
+            launch_spec = agent_runtime_mod.SubprocessLaunchSpec(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                actor_id=actor_id,
+                turn_id=turn_id,
+                command=tuple(cmd),
+                prompt=agent_prompt,
+                cwd=worker_dir,
+                env=env,
+                runtime_id=browser_lease_bundle.profile.runtime_id,
+                profile_id=browser_lease_bundle.profile.resource_id,
+                parent_run_id=runtime_parent_turn_id,
+                submit_started=submission_phase == "submit" and not dry_run,
             )
-        proc = durable_handle.process
+            durable_intent = DurableLaunchIntent(
+                spec=launch_spec,
+                runtime_backend=runtime_backend,
+                resume_mode="resume" if runtime_parent_turn_id else "root",
+                checkpoint_id=runtime_parent_checkpoint_id,
+                model=model,
+                recovery_authorization_id=runtime_authorization_id,
+                tool_surface_hash=_control_contract_digest(
+                    {
+                        "schema_version": "1",
+                        "available_tools": sorted(agent_request.available_tools),
+                    }
+                ),
+                prompt_contract_hash=_control_contract_digest(
+                    {
+                        "schema_version": "1",
+                        "phase": submission_phase,
+                        "dry_run": dry_run,
+                        "control_contract": prompt_contract,
+                    }
+                ),
+                idempotency_key=f"agent-turn:v2:{actor_id}:{turn_id}:spawn",
+            )
+            if runtime_parent_turn_id:
+                durable_handle = _durable_agent_runtime.resume(
+                    durable_intent,
+                    popen_factory=subprocess.Popen,
+                )
+            else:
+                durable_handle = _durable_agent_runtime.start(
+                    durable_intent,
+                    popen_factory=subprocess.Popen,
+                )
+            proc = durable_handle.process
         process_spawned_at = time.perf_counter()
         performance_attribution_mod.safe_record(
             performance_trace,
@@ -5889,7 +5984,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             3,
         )
         with _claude_lock:
-            _claude_procs[worker_id] = proc
+            if app_server_turn_process is None:
+                _claude_procs[worker_id] = proc
+            else:
+                _app_server_turn_cancellations[worker_id] = proc.cancel
         agent_process_started = True
         lease_heartbeat = LeaseHeartbeat(
             _browser_broker,
@@ -5897,7 +5995,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             interval_seconds=30.0,
             on_failure=cancel_runtime_on_lease_failure,
         ).start()
-        timed_out, watchdog = _start_timeout_watchdog(proc, agent_timeout_seconds)
+        if app_server_turn_process is None:
+            timed_out, watchdog = _start_timeout_watchdog(proc, agent_timeout_seconds)
+        else:
+            timed_app_server_turn = app_server_turn_process
+
+            def cancel_app_server_turn_on_timeout() -> None:
+                if timed_app_server_turn.poll() is None:
+                    timed_out.set()
+                    try:
+                        timed_app_server_turn.cancel()
+                    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                        pass
+
+            watchdog = threading.Timer(agent_timeout_seconds, cancel_app_server_turn_on_timeout)
+            watchdog.daemon = True
+            watchdog.start()
         last_agent_event_at = _persist_agent_turn_started(
             agent_request,
             backend=agent_backend,
@@ -6509,7 +6622,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             _install_browser_authority(job, browser_lease_bundle)
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
+            _app_server_turn_cancellations.pop(worker_id, None)
+        if app_server_turn_process is not None and proc is not None and proc.poll() is None:
+            try:
+                proc.cancel()
+                proc.drain(timeout=5)
+            except (KeyError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                logger.warning(
+                    "Could not prove App Server turn termination %s: %s",
+                    run_id,
+                    type(exc).__name__,
+                )
+        elif proc is not None and proc.poll() is None:
             try:
                 _kill_process_tree(proc.pid)
                 proc.wait(timeout=5)
@@ -6519,7 +6643,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     run_id,
                     type(exc).__name__,
                 )
-        if agent_process_started and durable_handle is not None:
+        if agent_process_started and (
+            durable_handle is not None or app_server_turn_process is not None
+        ):
             job.pop("_parent_agent_run_id", None)
             job.pop("_parent_agent_checkpoint_id", None)
             final_duration_ms = turn_duration_ms or int((time.time() - start) * 1000)
@@ -6557,7 +6683,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 observations=final_result.observations,
             )
             job["_agent_turn_source"] = turn_source
-            process_returncode = durable_handle.process.poll()
+            runtime_process = (
+                durable_handle.process
+                if durable_handle is not None
+                else app_server_turn_process
+            )
+            assert runtime_process is not None
+            process_returncode = runtime_process.poll()
             if process_returncode is not None:
                 _persist_agent_turn_completed(
                     agent_request,
@@ -6609,51 +6741,66 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     },
                 )
                 checkpoint_id = _confirmed_agent_checkpoint_id(agent_request)
-                if checkpoint_id is None:
-                    durable_status = "unknown"
-                    durable_failure = "CONTROL_CHECKPOINT_UNCONFIRMED"
-                elif final_status == "submission_uncertain":
-                    durable_status = "unknown"
-                    durable_failure = "SUBMISSION_RESULT_UNKNOWN"
-                elif timed_out.is_set():
-                    durable_status = "timed_out"
-                    durable_failure = "AGENT_RUNTIME_TIMEOUT"
-                elif process_returncode == 0:
-                    durable_status = "completed"
-                    durable_failure = None
+                if durable_handle is None:
+                    if (
+                        checkpoint_id is not None
+                        and final_status != "submission_uncertain"
+                        and not timed_out.is_set()
+                        and process_returncode == 0
+                    ):
+                        job["_parent_agent_run_id"] = run_id
+                        job["_parent_agent_checkpoint_id"] = checkpoint_id
                 else:
-                    durable_status = "failed"
-                    durable_failure = f"PROCESS_EXIT_{process_returncode}"
+                    if checkpoint_id is None:
+                        durable_status = "unknown"
+                        durable_failure = "CONTROL_CHECKPOINT_UNCONFIRMED"
+                    elif final_status == "submission_uncertain":
+                        durable_status = "unknown"
+                        durable_failure = "SUBMISSION_RESULT_UNKNOWN"
+                    elif timed_out.is_set():
+                        durable_status = "timed_out"
+                        durable_failure = "AGENT_RUNTIME_TIMEOUT"
+                    elif process_returncode == 0:
+                        durable_status = "completed"
+                        durable_failure = None
+                    else:
+                        durable_status = "failed"
+                        durable_failure = f"PROCESS_EXIT_{process_returncode}"
+                    try:
+                        terminal_turn = _durable_agent_runtime.terminal(
+                            durable_handle,
+                            status=durable_status,
+                            failure_code=durable_failure,
+                            exit_code=process_returncode,
+                        )
+                    except (KeyError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                        logger.warning(
+                            "Could not terminalize durable Agent turn %s: %s",
+                            run_id,
+                            type(exc).__name__,
+                        )
+                    else:
+                        if checkpoint_id is not None and terminal_turn.status != "unknown":
+                            job["_parent_agent_run_id"] = run_id
+                            job["_parent_agent_checkpoint_id"] = checkpoint_id
+            else:
+                logger.error(
+                    (
+                        "Agent subprocess remains live after cleanup; durable turn %s stays running"
+                        if durable_handle is not None
+                        else "App Server turn remains live after cleanup; turn %s stays running"
+                    ),
+                    run_id,
+                )
+            if durable_handle is not None:
                 try:
-                    terminal_turn = _durable_agent_runtime.terminal(
-                        durable_handle,
-                        status=durable_status,
-                        failure_code=durable_failure,
-                        exit_code=process_returncode,
-                    )
-                except (KeyError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                    _durable_agent_runtime.close_local(run_id)
+                except (KeyError, agent_runtime_mod.SubprocessRuntimeError) as exc:
                     logger.warning(
-                        "Could not terminalize durable Agent turn %s: %s",
+                        "Could not close local Agent runtime handle %s: %s",
                         run_id,
                         type(exc).__name__,
                     )
-                else:
-                    if checkpoint_id is not None and terminal_turn.status != "unknown":
-                        job["_parent_agent_run_id"] = run_id
-                        job["_parent_agent_checkpoint_id"] = checkpoint_id
-            else:
-                logger.error(
-                    "Agent subprocess remains live after cleanup; durable turn %s stays running",
-                    run_id,
-                )
-            try:
-                _durable_agent_runtime.close_local(run_id)
-            except (KeyError, agent_runtime_mod.SubprocessRuntimeError) as exc:
-                logger.warning(
-                    "Could not close local Agent runtime handle %s: %s",
-                    run_id,
-                    type(exc).__name__,
-                )
         if not broker_session_persistent:
             _release_application_browser_authority(job)
         if report_path.exists():
@@ -6884,6 +7031,11 @@ def main(limit: int = 1, target_url: str | None = None,
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
+                for cancel in tuple(_app_server_turn_cancellations.values()):
+                    try:
+                        cancel()
+                    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                        pass
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
@@ -6891,6 +7043,11 @@ def main(limit: int = 1, target_url: str | None = None,
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
+                for cancel in tuple(_app_server_turn_cancellations.values()):
+                    try:
+                        cancel()
+                    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+                        pass
             kill_all_chrome()
             raise KeyboardInterrupt
 
@@ -7041,4 +7198,5 @@ def main(limit: int = 1, target_url: str | None = None,
         pass
     finally:
         _stop_event.set()
+        _app_server_runtime_pool.shutdown()
         kill_all_chrome()

@@ -82,6 +82,20 @@ class ApplyRuntimeSettings:
         return mode
 
     @property
+    def application_plan_shadow_enabled(self) -> bool:
+        """Return the ref-only ApplicationPlan canary flag, defaulting off."""
+        raw = self.environ.get(
+            "APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED", "0"
+        ).strip().casefold()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off", ""}:
+            return False
+        raise ValueError(
+            "APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED must be a boolean flag"
+        )
+
+    @property
     def agent_timeout_seconds(self) -> int:
         return int(self.environ.get("APPLYPILOT_AGENT_TIMEOUT_SECONDS", "300"))
 

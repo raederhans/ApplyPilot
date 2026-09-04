@@ -7,11 +7,13 @@ import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from applypilot import config, database
 from applypilot.apply import agent_report_mcp, agent_runtime, launcher
+from applypilot.apply.application_plan import ApplicationPlan
 from applypilot.apply.contracts import (
     AgentCheckpoint,
     RecoveryCommand,
@@ -24,6 +26,13 @@ from applypilot.apply.durable_agent_runtime import (
 )
 from applypilot.apply.durable_browser_broker import DurableBrowserBroker
 from applypilot.apply.operator_commands import OperatorCommand
+from applypilot.apply.runtime_cell import (
+    CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
+    RuntimeAdapterHealth,
+    RuntimeCellExecutionState,
+    RuntimeCellRequest,
+    RuntimeCellTurn,
+)
 from applypilot.storage import agent_control, runtime_control
 
 
@@ -341,6 +350,22 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
     events: list[str] = []
     db_path = _configure_launcher(monkeypatch, tmp_path, events)
     monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+
+    class UnavailableAdapter:
+        backend = "codex-app-server"
+
+        def health(self) -> RuntimeAdapterHealth:
+            return RuntimeAdapterHealth(
+                backend="codex-app-server",
+                status="unavailable",
+                reason_code="CODEX_APP_SERVER_UNAVAILABLE",
+            )
+
+    class UnavailablePool:
+        def adapter_for_worker(self, _worker_id: int) -> UnavailableAdapter:
+            return UnavailableAdapter()
+
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", UnavailablePool())
     job = _job("attempt-runtime-cell-fallback")
 
     status, _ = launcher.run_job(
@@ -359,7 +384,7 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
         "disposition": "fallback",
         "requested_backend": "codex-app-server",
         "active_backend": "codex-cli",
-        "reason_code": "CODEX_APP_SERVER_ADAPTER_UNAVAILABLE",
+        "reason_code": "CODEX_APP_SERVER_CAPABILITIES_INCOMPLETE",
         "feature_enabled": True,
         "fallback_used": True,
         "execution_state": {
@@ -379,6 +404,181 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
     turn = _durable_turn(db_path, "attempt-runtime-cell-fallback")
     assert turn["runtime_backend"] == "codex-cli"
     assert events[:5] == ["reserve", "popen", "attach", "prompt", "advisory_started"]
+
+
+def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+    monkeypatch.setenv("APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED", "1")
+
+    class FakeAdapter:
+        backend = "codex-app-server"
+
+        def __init__(self) -> None:
+            self.transport = SimpleNamespace(process=SimpleNamespace(pid=4002))
+            self.requests: list[tuple[str, RuntimeCellRequest]] = []
+            self.thread_config: dict[str, object] = {}
+
+        def health(self) -> RuntimeAdapterHealth:
+            return RuntimeAdapterHealth(
+                backend="codex-app-server",
+                status="ready",
+                reason_code="CODEX_APP_SERVER_READY",
+                capabilities=CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
+            )
+
+        def configure_thread(self, config: dict[str, object]) -> None:
+            self.thread_config = config
+
+        def _turn(self, kind: str, request: RuntimeCellRequest) -> RuntimeCellTurn:
+            self.requests.append((kind, request))
+            number = len(self.requests)
+            control_config = self.thread_config["mcp_servers"]["applypilot_control"]
+            report_path = Path(control_config["env"][agent_report_mcp.REPORT_PATH_ENV])
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "future-compatible",
+                        "run_id": request.run_id,
+                        "status": "ready_to_submit",
+                        "summary": "Synthetic App Server result",
+                        "observations": _ready_answer_mapping_observations(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return RuntimeCellTurn(
+                backend="codex-app-server",
+                provider_session_id="provider-thread-1",
+                provider_turn_id=f"provider-turn-{number}",
+                events=iter(
+                    (
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": f"tool-{number}",
+                                "type": "mcp_tool_call",
+                                "server": "playwright",
+                                "tool": "browser_snapshot",
+                                "result": {"isError": False},
+                            },
+                        },
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "RESULT:READY_TO_SUBMIT",
+                            },
+                        },
+                        {"type": "turn.completed", "usage": {}},
+                    )
+                ),
+            )
+
+        def start(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+            return self._turn("start", request)
+
+        def resume(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+            return self._turn("resume", request)
+
+        def mark_submit_started(self, _provider_turn_id: str) -> RuntimeCellExecutionState:
+            raise AssertionError("prepare turns cannot mark Submit started")
+
+        def cancel(self, _provider_turn_id: str) -> None:
+            return None
+
+        def drain(
+            self,
+            _provider_turn_id: str | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> tuple[dict[str, object], ...]:
+            del timeout
+            return ()
+
+        def shutdown(self) -> None:
+            return None
+
+    adapter = FakeAdapter()
+
+    class FakePool:
+        def adapter_for_worker(self, worker_id: int) -> FakeAdapter:
+            assert worker_id == 0
+            return adapter
+
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", FakePool())
+    job = _job(
+        "attempt-runtime-cell-app-server",
+        _application_plan=ApplicationPlan(
+            plan_id="plan-1",
+            attempt_id="attempt-runtime-cell-app-server",
+            revision=1,
+            route="browser_form",
+            provider="generic",
+            target_semantic_code="application_form",
+            target_binding_ref="sha256:" + "a" * 64,
+        ),
+    )
+
+    first_status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+    second_status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+        resume_existing_page=True,
+    )
+
+    assert (first_status, second_status) == ("ready_to_submit", "ready_to_submit")
+    assert [kind for kind, _request in adapter.requests] == ["start", "resume"]
+    assert adapter.requests[1][1].parent_provider_session_id == "provider-thread-1"
+    assert all(job["url"] not in request.prompt for _kind, request in adapter.requests)
+    assert all(str(tmp_path) not in request.prompt for _kind, request in adapter.requests)
+    assert all("APPLICATION_PLAN_DELTA_V1" in request.prompt for _kind, request in adapter.requests)
+    assert "mcp_servers" in adapter.thread_config
+    assert job["_runtime_cell"]["active_backend"] == "codex-app-server"
+
+
+def test_run_job_keeps_direct_email_on_cli_mailbox_route_when_app_server_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+
+    class RejectingPool:
+        def adapter_for_worker(self, _worker_id: int) -> object:
+            raise AssertionError("direct email must not enter App Server")
+
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", RejectingPool())
+    job = _job(
+        "attempt-runtime-cell-direct-email",
+        _email_application={"route": "direct_email"},
+    )
+
+    launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert job["_runtime_cell"]["active_backend"] == "codex-cli"
+    assert job["_runtime_cell"]["reason_code"] == "CODEX_APP_SERVER_FEATURE_DISABLED"
 
 
 def test_checkpoint_write_failure_keeps_durable_turn_unknown_and_no_parent_continuation(

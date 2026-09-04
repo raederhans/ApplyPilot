@@ -20,6 +20,7 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.resolve_model("codex") == "gpt-5.6-sol"
     assert settings.codex_app_server_enabled is False
     assert settings.semantic_batch_mode == "off"
+    assert settings.application_plan_shadow_enabled is False
     assert settings.agent_timeout_seconds == 300
     assert settings.application_lease_minutes == 45
 
@@ -61,6 +62,22 @@ def test_runtime_settings_reject_invalid_semantic_batch_mode() -> None:
 
     with pytest.raises(ValueError, match="must be off, shadow, or canary"):
         _ = settings.semantic_batch_mode
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_runtime_settings_enable_application_plan_shadow_only_explicitly(value: str) -> None:
+    settings = load_runtime_settings({"APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED": value})
+
+    assert settings.application_plan_shadow_enabled is True
+
+
+def test_runtime_settings_reject_invalid_application_plan_shadow_flag() -> None:
+    settings = load_runtime_settings(
+        {"APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED": "sometimes"}
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean flag"):
+        _ = settings.application_plan_shadow_enabled
 
 
 def test_runtime_settings_keep_backend_and_browser_validation_contracts() -> None:
