@@ -84,6 +84,12 @@ from applypilot.apply.failure_taxonomy import classify_failure
             "submission_uncertain",
             False,
         ),
+        (
+            "failed:conflicting_agent_results",
+            "agent_result_conflict",
+            "retry_same_application",
+            False,
+        ),
     ],
 )
 def test_failure_taxonomy_separates_policy_material_runtime_and_receipt_states(

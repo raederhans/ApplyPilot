@@ -245,11 +245,38 @@ _INSPECT_SCRIPT = r"""() => {
       : null;
     const wrapping = element.closest('label');
     const legend = element.closest('fieldset')?.querySelector('legend');
-    return String(
+    const direct = String(
       (explicit && explicit.innerText) || element.getAttribute('aria-label') ||
       (wrapping && wrapping.innerText) || (legend && legend.innerText) ||
       element.placeholder || element.innerText || element.value || element.name || element.id || ''
-    ).replace(/\s+/g, ' ').trim().slice(0, 240);
+    ).replace(/\s+/g, ' ').trim();
+    const normalizedDirect = direct.toLowerCase();
+    const statefulInput = ['checkbox', 'radio'].includes(
+      String(element.type || '').toLowerCase()
+    );
+    const machineToken = !direct.replace(/[✱*]/g, '').trim() ||
+      (statefulInput && (
+        ['on', 'true', 'false'].includes(normalizedDirect) ||
+        [element.id, element.name].some((value) =>
+          value && String(value).trim().toLowerCase() === normalizedDirect
+        )
+      ));
+    if (
+      location.protocol === 'https:' &&
+      location.hostname.toLowerCase() === 'jobs.smartrecruiters.com' &&
+      machineToken
+    ) {
+      for (let ancestor = element.parentElement, depth = 0;
+        ancestor && ancestor !== document.body && depth < 6;
+        ancestor = ancestor.parentElement, depth += 1) {
+        const candidate = String(ancestor.innerText || ancestor.textContent || '')
+          .replace(/\s+/g, ' ').trim();
+        if (candidate.replace(/[✱*]/g, '').trim() && candidate.length <= 500) {
+          return candidate.slice(0, 240);
+        }
+      }
+    }
+    return direct.slice(0, 240);
   };
   const semantic = (element, label, kind) => {
     const text = `${label} ${element.name || ''} ${element.id || ''} ${element.autocomplete || ''}`.toLowerCase();
@@ -278,7 +305,7 @@ _INSPECT_SCRIPT = r"""() => {
         /^(next|continue|review|review application)$/i.test(action)) return 'navigation';
     if (tag === 'TEXTAREA') return 'textarea';
     if (tag === 'SELECT') return 'native_select';
-    if (role === 'combobox' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) return 'custom_combobox';
+    if (role === 'combobox' && tag !== 'SELECT') return 'custom_combobox';
     if (role === 'switch') return 'switch';
     if (role === 'checkbox' || type === 'checkbox') return 'checkbox';
     if (role === 'radio' || type === 'radio') return 'radio';
@@ -328,16 +355,27 @@ _INSPECT_SCRIPT = r"""() => {
           String(option.textContent || '').replace(/\s+/g, ' ').trim()
         );
       } else if (kind === 'custom_combobox') {
-        const controlledId = String(element.getAttribute('aria-controls') || '').trim();
-        let container = null;
-        if (controlledId) {
+        const controlledIds = String(
+          element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || ''
+        ).trim().split(/\s+/).filter(Boolean);
+        let containers = [];
+        for (const controlledId of controlledIds) {
           try {
-            container = root.querySelector(`#${CSS.escape(controlledId)}`) ||
+            const candidate = root.querySelector(`#${CSS.escape(controlledId)}`) ||
               document.querySelector(`#${CSS.escape(controlledId)}`);
+            if (candidate) containers.push(candidate);
           } catch (_error) {}
         }
+        if (!containers.length && String(element.getAttribute('aria-expanded')).toLowerCase() === 'true') {
+          containers = [...document.querySelectorAll('[role="listbox"],[role="tree"],[role="menu"]')]
+            .filter(rendered);
+        }
+        if (containers.length > 1) blocked.push('custom_combobox_popup_ambiguous');
+        const container = containers.length === 1 ? containers[0] : null;
         rawOptions = container
-          ? [...container.querySelectorAll('[role="option"]')].map((option) =>
+          ? [...container.querySelectorAll(
+              '[role="option"],[role="treeitem"],[role="menuitemradio"],[role="menuitemcheckbox"]'
+            )].map((option) =>
               String(option.innerText || option.textContent || '').replace(/\s+/g, ' ').trim()
             ).filter(Boolean)
           : [];
@@ -966,7 +1004,14 @@ _CONTROL_SCRIPT = r"""(request) => {
     const aria = String(element.getAttribute('aria-checked') || '').toLowerCase();
     const selected = element.tagName === 'SELECT' && element.selectedOptions[0]
       ? String(element.selectedOptions[0].textContent || '').replace(/\s+/g, ' ').trim()
-      : String(element.getAttribute('aria-valuetext') || element.value || '')
+      : String(
+          element.getAttribute('aria-valuetext') ||
+          element.value ||
+          (element.getAttribute('role') === 'combobox'
+            ? (element.innerText || element.textContent || '')
+            : '') ||
+          ''
+        )
           .replace(/\s+/g, ' ').trim();
     const signature = JSON.stringify({
       url: location.href,
@@ -1005,8 +1050,9 @@ _CONTROL_SCRIPT = r"""(request) => {
       element.dispatchEvent(new Event('change', {bubbles: true}));
     } else {
       element.click();
+      const optionRoles = new Set(['option', 'treeitem', 'menuitemradio', 'menuitemcheckbox']);
       const options = deepElements().filter((candidate) =>
-        candidate.getAttribute('role') === 'option' &&
+        optionRoles.has(candidate.getAttribute('role')) &&
         String(candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim() === request.value
       );
       if (options.length !== 1) throw new Error('custom_option_ambiguous_or_absent');

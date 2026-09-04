@@ -186,6 +186,69 @@ def test_custom_aria_disabled_state_cannot_escape_through_hidden_payload() -> No
 
 
 @pytest.mark.browser
+def test_smartrecruiters_unique_visible_label_proxy_is_classified() -> None:
+    from playwright.sync_api import sync_playwright
+
+    body = (
+        '<input id="privacy" name="privacy" type="checkbox" checked style="display:none">'
+        '<label for="privacy">I have read the privacy notice</label>'
+    )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.route(
+                "https://jobs.smartrecruiters.com/**",
+                lambda route: route.fulfill(status=200, content_type="text/html", body=body),
+            )
+            page.goto("https://jobs.smartrecruiters.com/example/role")
+            coverage = page.evaluate(page_observation._STATEFUL_CONTROL_COVERAGE_SCRIPT)
+        finally:
+            browser.close()
+
+    assert coverage["discovered_count"] == 1
+    assert coverage["classified_visible_native_count"] == 1
+    assert coverage["unclassified_count"] == 0
+    assert coverage["selected_or_filled_count"] == 1
+    assert coverage["proof_complete"] is True
+
+
+@pytest.mark.browser
+def test_smartrecruiters_labelled_aria_state_controls_are_classified() -> None:
+    from playwright.sync_api import sync_playwright
+
+    body = (
+        '<div role="radio" aria-checked="true" aria-label="Yes"></div>'
+        '<div>No<div role="presentation radio" aria-checked="false"></div></div>'
+        '<div role="checkbox" aria-checked="true">Privacy notice</div>'
+    )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.route(
+                "https://jobs.smartrecruiters.com/**",
+                lambda route: route.fulfill(
+                    status=200, content_type="text/html", body=body
+                ),
+            )
+            page.goto("https://jobs.smartrecruiters.com/example/role")
+            coverage = page.evaluate(
+                page_observation._STATEFUL_CONTROL_COVERAGE_SCRIPT
+            )
+        finally:
+            browser.close()
+
+    assert coverage["discovered_count"] == 3
+    assert coverage["classified_visible_native_count"] == 3
+    assert coverage["unclassified_count"] == 0
+    assert coverage["selected_or_filled_count"] == 2
+    assert coverage["proof_complete"] is True
+
+
+@pytest.mark.browser
 def test_html_disabled_native_controls_remain_excluded_from_coverage() -> None:
     from playwright.sync_api import sync_playwright
 

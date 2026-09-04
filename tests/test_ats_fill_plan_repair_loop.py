@@ -67,6 +67,9 @@ def _provenance_job_overrides() -> dict[str, object]:
 
 def test_launcher_owned_snapshot_strips_values_and_rejects_linkedin_carrier() -> None:
     raw = _system_snapshot()
+    raw["form_fields"][0]["protected_identifier"] = False
+    raw["form_fields"][0]["option_count"] = 0
+    raw["form_fields"][0]["options_truncated"] = False
     job = {"_ats_adapter_context": {"available_fact_names": ["email"]}}
 
     frozen = page_observation._build_ats_fill_plan_snapshot(
@@ -86,6 +89,8 @@ def test_launcher_owned_snapshot_strips_values_and_rejects_linkedin_carrier() ->
 
     assert frozen is not None
     assert "private-current-value" not in json.dumps(frozen)
+    assert "protected_identifier" not in json.dumps(frozen)
+    assert "options_truncated" not in json.dumps(frozen)
     assert linkedin is None
 
 

@@ -216,6 +216,15 @@ def test_fin_field_matching_does_not_match_financial_fields() -> None:
     assert credential_relay.FIN_FIELD_RE.search("NRIC / FIN identification number")
     assert credential_relay.FIN_FIELD_RE.search("FIN Number (required)")
     assert credential_relay.FIN_FIELD_RE.search("Financial information") is None
+    assert not credential_relay._is_fin_field_descriptor(
+        "As in NRIC/Passport First Name"
+    )
+    assert not credential_relay._is_fin_field_descriptor(
+        "Last Name As shown in your passport"
+    )
+    assert credential_relay._is_fin_field_descriptor(
+        "Required NRIC / FIN identification number"
+    )
 
 
 def test_protected_identifier_values_are_redacted_and_rejected_from_reports() -> None:

@@ -60,7 +60,13 @@ class CapabilityRegistry:
 
 def default_browser_capabilities() -> CapabilityRegistry:
     """Return the current portable Playwright surface with advisory metadata."""
-    read_tools = {"browser_snapshot", "browser_take_screenshot", "browser_wait_for"}
+    read_tools = {
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_wait_for",
+        "browser_console_messages",
+        "browser_network_requests",
+    }
     ordered_names = (
         "browser_navigate",
         "browser_snapshot",
@@ -69,8 +75,11 @@ def default_browser_capabilities() -> CapabilityRegistry:
         "browser_file_upload",
         "browser_tabs",
         "browser_take_screenshot",
+        "browser_console_messages",
+        "browser_network_requests",
         "browser_select_option",
         "browser_type",
+        "browser_press_key",
         "browser_wait_for",
     )
     capabilities = []
@@ -86,6 +95,7 @@ def default_browser_capabilities() -> CapabilityRegistry:
             "browser_fill_form",
             "browser_select_option",
             "browser_type",
+            "browser_press_key",
         }:
             tags.append(
                 "phase_requires_any_state:submit:repair|preview"

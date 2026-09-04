@@ -51,6 +51,9 @@ FIN_FIELD_RE = re.compile(
     r"(?:\s+(?:identification\s+)?(?:no\.?|number))?(?:\b|$)",
     re.IGNORECASE,
 )
+_NAME_FIELD_RE = re.compile(
+    r"\b(?:first|last|full|legal|preferred)\s+name\b", re.IGNORECASE
+)
 VOLATILE_QUERY_KEYS = {
     "gh_src",
     "li_fat_id",
@@ -65,6 +68,18 @@ VOLATILE_QUERY_KEYS = {
     "utm_term",
 }
 _IDENTITY_DECRYPTED_ATTEMPTS: set[str] = set()
+
+
+def _is_fin_field_descriptor(value: object) -> bool:
+    """Exclude name fields whose placeholder merely references an ID document."""
+    text = " ".join(str(value or "").split())
+    if _NAME_FIELD_RE.search(text) and re.search(
+        r"\bas\s+(?:shown\s+)?in\s+(?:your\s+)?(?:nric|passport)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return FIN_FIELD_RE.search(text) is not None
 
 
 class CredentialRelayError(RuntimeError):
@@ -573,7 +588,7 @@ def _assert_identity_page_preflight(
                     (PROTECTED_IDENTIFIER_INPUT_SELECTOR,),
                 ):
                     descriptor = _protected_identifier_descriptor(locator)
-                    if FIN_FIELD_RE.search(str(descriptor["text"])):
+                    if _is_fin_field_descriptor(descriptor["text"]):
                         matching_fields.append(descriptor)
         if (
             len(matching_target_ids) != 1
@@ -697,7 +712,7 @@ def _protected_identifier_descriptor(locator: Locator) -> dict[str, object]:
           const explicit = id ? document.querySelector(`label[for="${escaped}"]`) : null;
           const wrapping = element.closest('label');
           const container = element.closest(
-            '[role="group"], [role="radiogroup"], .form-group, .field, [data-automation-id]'
+            '[role="group"], [role="radiogroup"], .form-group, .field, [class*="form-item"], [data-automation-id]'
           );
           const text = [
             explicit?.innerText,
@@ -819,7 +834,7 @@ def _fill_protected_identifier(cdp_port: int, kind: str, value: str) -> dict[str
                     (PROTECTED_IDENTIFIER_INPUT_SELECTOR,),
                 ):
                     descriptor = _protected_identifier_descriptor(locator)
-                    if FIN_FIELD_RE.search(str(descriptor["text"])):
+                    if _is_fin_field_descriptor(descriptor["text"]):
                         matching.append((locator, descriptor))
                 if len(matching) != 1:
                     continue

@@ -36,6 +36,17 @@ def test_registry_is_extensible_and_metadata_is_advisory() -> None:
     assert registry.names()[-1] == "inspect_custom_form"
 
 
+def test_post_submit_diagnostics_are_read_only_browser_capabilities() -> None:
+    registry = default_browser_capabilities()
+
+    for name in ("browser_console_messages", "browser_network_requests"):
+        capability = registry.get(name)
+        assert capability is not None
+        assert capability.side_effect == "read"
+        assert capability.concurrency_mode == "parallel_safe"
+        assert "submit" in capability.phases
+
+
 def test_mcp_spec_resolution_allows_environment_configuration_without_locking_version() -> None:
     spec = resolve_playwright_mcp_spec(
         environ={
@@ -136,10 +147,12 @@ def test_runtime_capabilities_are_phase_scoped_from_one_registry() -> None:
     assert "browser_fill_form" not in submit.names()
     assert "browser_select_option" not in submit.names()
     assert "browser_type" not in submit.names()
+    assert "browser_press_key" not in submit.names()
     assert "browser_file_upload" not in submit.names()
     assert "browser_fill_form" in preview.names()
     assert "browser_select_option" in preview.names()
     assert "browser_type" in preview.names()
+    assert "browser_press_key" in preview.names()
     assert "browser_file_upload" in preview.names()
     assert "report_agent_turn" in preview.names()
     assert "browser_file_upload" not in ordinary_repair.names()

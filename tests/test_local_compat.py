@@ -1123,7 +1123,8 @@ def test_routine_form_defaults_are_not_escalated_to_manual_review() -> None:
 
     assert "Country/Region of Birth -> China" in defaults
     assert "Use the actual discovery source when it is available" in defaults
-    assert 'Otherwise prefer "Other"' in defaults
+    assert 'Otherwise choose "Other", then "Company website"' in defaults
+    assert "choose the simplest truthful option and continue without pausing" in defaults
     assert "Do not stop" in defaults
 
 
@@ -2584,9 +2585,17 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "RESULT:FAILED:resume_upload for this job so the batch can continue" in built
     assert "Browser upload boundary" in built
     assert "must not stop unrelated jobs in the batch" in built
+    assert "File upload recovery and verification" in built
+    assert "provider itself offers `Enter manually`" in built
+    assert "optional and all automated paths fail, leave it blank and continue" in built
+    assert "Embedded ATS iframe" in built
+    assert "hidden/background CAPTCHA iframe, badge, script" in built
+    assert "interactive verification challenge is actually visible" in built
+    assert "choose the simplest truthful option and continue without pausing" in built
+    assert "A registered alias may be selected" in built
     assert "Required document preflight" in built
     assert "manual_review_required:required_document" in built
-    assert "A filename or remove/replace control under Cover letter" in built
+    assert "A filename under another attachment field is not proof" in built
     assert "FAILURE_CONTEXT" in built
     assert "LinkedIn/SmartRecruiters city autocomplete" in built
     assert "launcher exclusively owns" in built
@@ -2700,6 +2709,7 @@ def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
     assert "Do not use a manual-entry fallback when an exact confirmed option is visible" in built
     assert "Personal information City only" in built
     assert "Cannot find your city? Click here to fill in manually" in built
+    assert "city and country are the same place name" in built
     assert "no selectable exact city/country option" in built
     assert "click that provider-owned fallback at most once" in built
     assert "the exact confirmed value persists" in built
@@ -2770,6 +2780,21 @@ def test_apply_prompt_resumes_manual_verification_without_exposing_codes() -> No
     assert "click the final control at most once" in section
 
 
+def test_apply_prompt_reconciles_result_conflict_on_the_same_page_once() -> None:
+    section = prompt._build_browser_observation_section({
+        "_browser_observation": {
+            "recovery_mode": "same_application",
+            "signal": "agent_result_conflict",
+        },
+    })
+
+    assert "ONE-TIME SAME-PAGE RESULT RECONCILIATION" in section
+    assert "not as permission to restart the browser" in section
+    assert "Do not repeat a resume upload" in section
+    assert "Do not click a final submission control during prepare reconciliation" in section
+    assert "report_agent_turn exactly once" in section
+
+
 def test_apply_prompt_rejects_unapproved_cover_letter(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_profile", _application_profile)
     monkeypatch.setattr(config, "load_search_config", lambda: {"locations": []})
@@ -2811,7 +2836,8 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "RESULT:PREVIEWED" in built
     assert "PREVIEW_AUDIT" in built
     assert "submission_attempted must be false" in built
-    assert "hidden/background CAPTCHA iframe is only a page signal" in built
+    assert "hidden/background CAPTCHA iframe, badge, script" in built
+    assert "passive page infrastructure, not a blocker" in built
     assert "Do not click, solve, inject tokens" in built
     assert "Output RESULT:CAPTCHA immediately" in built
     assert "If a CAPTCHA is found, solve it before continuing" not in built
@@ -2970,7 +2996,8 @@ def test_submit_prompt_uses_bound_authorization_without_reconfirmation(
 
     assert "binding authorization to this exact job and submission materials" in built
     assert "do not ask the user for another confirmation" in built
-    assert "visible CAPTCHA, assessment, missing resume after repair" in built
+    assert "genuinely visible blocking CAPTCHA challenge" in built
+    assert "missing required resume after all configured fallbacks" in built
     assert "click the final submission control exactly once" in built
     assert "Otherwise output RESULT:SUBMISSION_UNCERTAIN" in built
 
@@ -3116,6 +3143,48 @@ def test_pre_submit_snapshot_validates_reusable_legal_answers() -> None:
             else "No"
         )
 
+    assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
+
+
+def test_combined_current_or_future_sponsorship_uses_post_graduation_branch() -> None:
+    profile = _application_profile()
+    job = {
+        "url": "https://jobs.ashbyhq.com/simular/example/application",
+        "application_url": "https://jobs.ashbyhq.com/simular/example/application",
+        "title": "Product Intern",
+        "company_name": "Example",
+        "full_description": "Full-time credit-bearing internship in Singapore.",
+        "application_readiness_reason": "Confirmed internship.",
+    }
+    snapshot = {
+        "url": job["application_url"],
+        "required_unfilled": [],
+        "sensitive_required_unknown": [],
+        "resume_field_present": True,
+        "resume_uploaded": True,
+        "full_name_values": ["Taylor Chen"],
+        "email_values": ["applicant@example.com"],
+        "current_location_values": ["Singapore"],
+        "select_fields": [],
+        "text_fields": [],
+        "radio_questions": [
+            {
+                "text": (
+                    "Do you need, or will you need in the future, any immigration-related "
+                    "support or sponsorship from us to legally work in Singapore?"
+                ),
+                "selected": "No",
+            }
+        ],
+        "submit_control_count": 1,
+        "assessment_visible": False,
+        "captcha_visible": False,
+    }
+
+    assert "hard_answer_mismatch:requires_sponsorship" in (
+        launcher._validate_pre_submit_snapshot(snapshot, profile, job)
+    )
+    snapshot["radio_questions"][0]["selected"] = "Yes"
     assert launcher._validate_pre_submit_snapshot(snapshot, profile, job) == []
 
 
@@ -3552,6 +3621,93 @@ def test_workday_review_url_rejects_another_job_on_the_same_tenant() -> None:
     assert "unexpected_application_url" in issues
 
 
+@pytest.mark.parametrize(
+    ("expected_url", "actual_url"),
+    [
+        (
+            "https://careers.shopee.sg/job-detail/J02115564/1?channel=10001",
+            "https://careers.shopee.sg/apply?id=J02115564&application_form_id=17",
+        ),
+        (
+            "https://www.workato.com/careers?gh_jid=8731177002#open-roles",
+            "https://www.workato.com/careers/intern-data-engineering-8731177002?gh_jid=8731177002#open-roles",
+        ),
+    ],
+)
+def test_exact_same_host_careers_rewrites_remain_bound(
+    expected_url: str, actual_url: str
+) -> None:
+    assert page_observation._same_bound_application_flow(
+        expected_url,
+        actual_url,
+        {"submit_control_count": 1},
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_url", "actual_url"),
+    [
+        (
+            "https://careers.shopee.sg/job-detail/J02115564/1?channel=10001",
+            "https://careers.shopee.sg/apply?id=J99999999&application_form_id=17",
+        ),
+        (
+            "https://www.workato.com/careers?gh_jid=8731177002#open-roles",
+            "https://www.workato.com/careers/other-role-9999999999?gh_jid=9999999999",
+        ),
+    ],
+)
+def test_same_host_careers_rewrites_reject_another_job(
+    expected_url: str, actual_url: str
+) -> None:
+    assert not page_observation._same_bound_application_flow(
+        expected_url,
+        actual_url,
+        {"submit_control_count": 1},
+    )
+
+
+def test_workato_exact_greenhouse_iframe_is_an_allowed_application_surface() -> None:
+    main = SimpleNamespace(
+        url=(
+            "https://www.workato.com/careers/intern-data-engineering-8731177002"
+            "?gh_jid=8731177002#open-roles"
+        )
+    )
+    page = SimpleNamespace(url=main.url, main_frame=main)
+    exact = SimpleNamespace(
+        url=(
+            "https://job-boards.greenhouse.io/embed/job_app"
+            "?for=workato&token=8731177002&validityToken=opaque"
+        )
+    )
+    another_job = SimpleNamespace(
+        url=(
+            "https://job-boards.greenhouse.io/embed/job_app"
+            "?for=workato&token=9999999999&validityToken=opaque"
+        )
+    )
+    tokenless_current_embed = SimpleNamespace(
+        url=(
+            "https://job-boards.greenhouse.io/embed/job_app"
+            "?for=workato&validityToken=opaque-validity-token"
+        )
+    )
+    tokenless_unbound_page = SimpleNamespace(
+        url="https://www.workato.com/careers?gh_jid=8731177002#open-roles",
+        main_frame=SimpleNamespace(
+            url="https://www.workato.com/careers?gh_jid=8731177002#open-roles"
+        ),
+    )
+
+    assert page_observation._application_surface_is_allowed(page, exact)
+    assert page_observation._application_surface_is_allowed(page, tokenless_current_embed)
+    assert not page_observation._application_surface_is_allowed(page, another_job)
+    assert not page_observation._application_surface_is_allowed(
+        tokenless_unbound_page, tokenless_current_embed
+    )
+
+
 def test_bound_job_path_normalizes_percent_encoded_punctuation() -> None:
     profile = _application_profile()
     job = {
@@ -3566,7 +3722,7 @@ def test_bound_job_path_normalizes_percent_encoded_punctuation() -> None:
             "Singapore%2C-Singapore/AI-Intern_JR123/apply"
         ),
         "required_unfilled": [],
-        "resume_field_present": False,
+        "resume_field_present": True,
         "resume_uploaded": False,
         "full_name_values": ["Taylor Chen"],
         "current_location_values": ["Singapore"],
@@ -3730,6 +3886,7 @@ def test_smartrecruiters_final_page_uses_same_turn_resume_upload_proof() -> None
 
     assert "unexpected_application_url" not in issues
     assert "resume_state_unconfirmed" not in issues
+    assert "resume_not_uploaded" not in issues
 
 
 @pytest.mark.parametrize(

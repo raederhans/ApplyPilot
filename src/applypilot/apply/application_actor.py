@@ -447,6 +447,14 @@ def decision_for_turn(
         actor_id=request.actor_id,
         turn_id=request.turn_id,
     )
+    if typed_failure is not None and status == "failed:conflicting_agent_results":
+        typed_descriptor = classify_failure_observation(typed_failure)
+        if typed_descriptor.recoverability in {
+            "requires_human_boundary",
+            "submission_uncertain",
+            "do_not_retry",
+        }:
+            return decide_recovery(state, typed_failure)
     if typed_failure is not None and status == typed_application_status:
         return decide_recovery(state, typed_failure)
     return decision_for_status(state, status)

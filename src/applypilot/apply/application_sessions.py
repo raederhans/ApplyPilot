@@ -714,6 +714,7 @@ class BrowserWorkerProcess:
         open_target: Callable[[int, str], set[str]],
         close_targets: Callable[[int, set[str]], None],
         endpoint_manager: EndpointManager,
+        browser_health_probe: Callable[[], bool] | None = None,
         rss_reader: Callable[[int], int] | None = None,
         max_applications: int = 8,
         max_rss_bytes: int = 1_500_000_000,
@@ -727,6 +728,7 @@ class BrowserWorkerProcess:
         self._open_target = open_target
         self._close_targets = close_targets
         self._endpoint_manager = endpoint_manager
+        self._browser_health_probe = browser_health_probe
         self._rss_reader = rss_reader or (lambda _pid: 0)
         self._max_applications = _positive(max_applications, "max_applications")
         self._max_rss_bytes = _positive(max_rss_bytes, "max_rss_bytes")
@@ -780,11 +782,19 @@ class BrowserWorkerProcess:
                 "browser_reuses": self._browser_reuses_total,
             }
 
-    def _healthy(self) -> bool:
-        if self._process is None:
+    def _process_healthy(self, process: subprocess.Popen[object]) -> bool:
+        poll = getattr(process, "poll", None)
+        if not callable(poll) or poll() is None:
+            return True
+        if self._browser_health_probe is None:
             return False
-        poll = getattr(self._process, "poll", None)
-        return not callable(poll) or poll() is None
+        try:
+            return bool(self._browser_health_probe())
+        except Exception:  # noqa: BLE001 - a broken health probe must fail closed
+            return False
+
+    def _healthy(self) -> bool:
+        return self._process is not None and self._process_healthy(self._process)
 
     def _roll_required(self) -> bool:
         if not self._healthy():
@@ -808,8 +818,7 @@ class BrowserWorkerProcess:
             start_url=None,
             browser_backend=browser_runtime,
         )
-        poll = getattr(process, "poll", None)
-        if callable(poll) and poll() is not None:
+        if not self._process_healthy(process):
             self._cleanup_browser(self.worker_id, process)
             raise PersistentSessionError("browser process exited during startup")
         try:

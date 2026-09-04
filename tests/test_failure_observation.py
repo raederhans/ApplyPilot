@@ -237,7 +237,7 @@ def test_typed_hard_stops_remain_human_only(
     assert decision.human_interruption.interruption_type == expected_interruption
 
 
-def test_unknown_allowlisted_failure_parks_and_typed_legacy_conflict_fails_closed() -> None:
+def test_unknown_failure_parks_and_typed_captcha_wins_over_legacy_conflict() -> None:
     unknown = AgentTurnResult(
         run_id="run-failure-1",
         status="failed:unknown",
@@ -265,7 +265,9 @@ def test_unknown_allowlisted_failure_parks_and_typed_legacy_conflict_fails_close
         _request(), captcha, application_status=conflict[0]
     )
     assert conflict_decision.recovery_action is not None
-    assert conflict_decision.recovery_action.action == "park"
+    assert conflict_decision.recovery_action.action == "human_only"
+    assert conflict_decision.human_interruption is not None
+    assert conflict_decision.human_interruption.interruption_type == "captcha"
 
 
 def test_failure_phase_mismatch_fails_closed() -> None:
@@ -310,7 +312,7 @@ def test_present_but_non_unique_or_malformed_result_marker_conflicts(
 
     assert reconciled == ("failed:conflicting_agent_results", None, "conflict")
     assert decision.recovery_action is not None
-    assert decision.recovery_action.action == "park"
+    assert decision.recovery_action.action == "retry_same_application"
 
 
 def test_diagnostics_classifies_invalid_legacy_result_without_contract_text() -> None:

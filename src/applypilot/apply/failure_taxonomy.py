@@ -186,6 +186,13 @@ def classify_failure(result: str) -> FailureDescriptor:
             "repair_or_attach_playwright_mcp_before_retry",
             missing_capability="playwright_mcp",
         )
+    if "conflicting_agent_results" in reason:
+        return FailureDescriptor(
+            "agent_result_conflict",
+            "retry_same_application",
+            "reobserve_same_page_and_emit_one_consistent_turn_result",
+            missing_capability="consistent_structured_and_legacy_turn_reporting",
+        )
     if any(
         token in reason
         for token in (

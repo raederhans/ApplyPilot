@@ -85,6 +85,15 @@ def test_form_ir_is_provider_neutral_bounded_and_discards_values() -> None:
     assert "C:/private/resume.pdf" not in rendered
 
 
+def test_privacy_notice_is_classified_as_consent() -> None:
+    form = build_form_ir(
+        "https://jobs.smartrecruiters.com/example/role",
+        [{"id": "privacy", "label": "I have read the job applications privacy notice", "type": "checkbox"}],
+    )
+
+    assert form.fields[0].semantic == "consent"
+
+
 def test_semantic_fill_plan_only_proposes_source_references() -> None:
     form = build_form_ir(
         "https://jobs.ashbyhq.com/example/role",

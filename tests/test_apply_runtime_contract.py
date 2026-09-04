@@ -513,6 +513,59 @@ def test_browser_mcp_failure_stays_unavailable_without_a_successful_call() -> No
     assert context == {"category": "browser_mcp_unavailable"}
 
 
+def test_prepare_contract_conflict_keeps_bounded_browser_failure_diagnostics() -> None:
+    status, context = launcher._normalize_browser_runtime_failure(
+        "failed:conflicting_agent_results",
+        browser_tool_call_count=50,
+        browser_tool_success_count=40,
+        browser_failure_summary={
+            "actionability_intercepted": 5,
+            "file_chooser_unavailable": 2,
+        },
+        failure_context=None,
+    )
+
+    assert status == "failed:conflicting_agent_results"
+    assert context == {
+        "category": "agent_result_conflict",
+        "recoverability": "retry_same_application",
+        "next_action": "reobserve_same_page_and_emit_one_consistent_turn_result",
+        "browser_tool_failures": {
+            "actionability_intercepted": 5,
+            "file_chooser_unavailable": 2,
+        },
+        "attempts": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "status": "failed",
+                "error": "locator.click: element intercepts pointer events",
+            },
+            "actionability_intercepted",
+        ),
+        (
+            {"status": "failed", "error": "frame was detached"},
+            "stale_frame",
+        ),
+        (
+            {"status": "failed", "result": "file chooser unavailable"},
+            "file_chooser_unavailable",
+        ),
+        (
+            {"status": "failed", "error": "strict mode violation"},
+            "ambiguous_locator",
+        ),
+    ],
+)
+def test_browser_tool_failures_are_reduced_to_safe_categories(payload, expected) -> None:
+    assert launcher._classify_browser_tool_failure(payload) == expected
+
+
 def test_auto_keeps_edge_workers_parallel_while_explicit_cloak_is_bounded() -> None:
     auto_workers, auto_reduced = launcher._resolve_worker_count(
         3,
@@ -3030,6 +3083,27 @@ def test_same_application_recovery_repairs_once_then_continues(monkeypatch) -> N
     ]
     assert lifecycle[1].details["same_application_retry"] is True
     assert lifecycle[1].details["submit_started"] is False
+    assert marked[0][0][1] == "applied"
+
+
+def test_prepare_result_conflict_reobserves_same_page_once_then_continues(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["failed:conflicting_agent_results", "ready_to_submit"],
+        control_connection=connection,
+    )
+
+    lifecycle = list_recovery_execution_results(
+        attempt_id="https://jobs.example.test/role",
+        conn=connection,
+    )
+    assert result == (1, 0)
+    assert phases == ["prepare", "prepare", "submit"]
+    assert lifecycle[1].details["previous_category"] == "agent_result_conflict"
     assert marked[0][0][1] == "applied"
 
 

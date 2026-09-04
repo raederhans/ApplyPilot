@@ -79,6 +79,7 @@ class WorkerBrowserPorts:
     release_cdp_port: Callable[..., Any]
     launch_chrome: Callable[..., Any]
     cleanup_worker: Callable[..., Any]
+    cdp_endpoint_reachable: Callable[[int], bool]
     open_bound_application_target: Callable[..., Any]
     close_bound_application_targets: Callable[..., Any]
     release_application_browser_authority: Callable[..., Any]
@@ -3201,6 +3202,7 @@ def worker_loop(
             namespace_root=host.config.APPLY_WORKER_DIR,
             launch_browser=browser.launch_chrome,
             cleanup_browser=browser.cleanup_worker,
+            browser_health_probe=lambda: browser.cdp_endpoint_reachable(port),
             open_target=browser.open_bound_application_target,
             close_targets=browser.close_bound_application_targets,
             endpoint_manager=endpoint_manager,

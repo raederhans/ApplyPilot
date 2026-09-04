@@ -332,6 +332,7 @@ def _build_work_authorization_section(profile: dict) -> str:
         ))
     lines.extend((
         "- Classify the role before answering. Never reuse an internship answer for post-graduation full-time employment or the reverse.",
+        "- If one question asks whether sponsorship is needed now OR will be needed in the future, answer from the future/post-graduation branch; a future sponsorship need makes the combined answer Yes even when this qualifying internship itself needs no sponsorship.",
         "- A job-level citizenship, sponsorship, or work-right requirement is a fit signal, not permission to abandon the application. Answer the live form truthfully and let the employer decide.",
         "- If one ATS option collapses several legal states, prefer an exact option, then Other, then the closest non-contradictory category supported by the role-specific branch and record the lossy mapping. Stop only when a required legal declaration has no answer that avoids a false claim.",
     ))
@@ -506,11 +507,27 @@ def _build_routine_form_defaults_section(profile: dict) -> str:
     education_country_policy = str(
         profile.get("education_country_answer_policy") or ""
     ).strip()
+    education_aliases = "; ".join(
+        f"{item['institution']} -> {', '.join(str(alias) for alias in item.get('ats_option_aliases', []) if str(alias).strip())}"
+        for item in education
+        if item.get("ats_option_aliases")
+    )
+    consent = profile.get("data_consent_policy", {})
+    project_refs = [
+        item for item in profile.get("project_references", [])
+        if isinstance(item, dict) and item.get("name") and item.get("url")
+    ]
+    rendered_projects = "; ".join(
+        f"{item['name']} -> {item['url']}" for item in project_refs
+    )
     return f"""== ROUTINE FORM DEFAULTS ==
 - Country/Region of Birth -> {country_of_birth or 'not available'} (configured reference). Use only through a current typed high-sensitivity fact with exact identity scope, source, and freshness; otherwise leave blank or review when required.
 - Education countries -> configured references: {education_countries or 'not available'}. Use only the country from a current typed fact bound to the matching education record.
 - Education-country answer policy -> {education_country_policy or 'Use the country attached to the matching education record; never substitute nationality or country of birth.'}
-- "How did you hear about us?" / application-source fields are non-material. Use the actual discovery source when it is available as a visible option. Otherwise prefer "{preferred_source}" only when an adapter/version/semantic/context-bound registered safe-default rule authorizes it; the same binding is required for "{fallback_source}", and the first visible option is never a generic fallback. Do not stop the whole application merely for this field; leave it blank when optional or request policy review when required and no bound rule matches.
+- Education option aliases -> {education_aliases or 'none registered'}. A registered alias may be selected when it is the provider's closest recognizable spelling, while the canonical profile institution remains unchanged. Never rewrite the profile from a lossy ATS label.
+- "How did you hear about us?" / application-source fields are non-material. Use the actual discovery source when it is available as a visible option. Otherwise choose "{preferred_source}", then "{fallback_source}", then another truthful non-referral option. Leave it blank when optional; when required, choose the simplest truthful option and continue without pausing. Do not stop the application for this field.
+- Routine data consent -> default action: {consent.get('default_action', 'decline optional consent')}; required recruitment-processing action: {consent.get('required_recruitment_processing_action', 'accept when required to submit')}; exclusions: {consent.get('exclusions', 'identity, financial, medical, security, and marketing permissions remain outside routine consent')}.
+- Project references -> {rendered_projects or 'use the configured GitHub and LinkedIn profile URLs'}. When a form asks for projects, choose only one or two role-relevant links and a short factual description; do not dump every project.
 - Never claim a named employee referral, agency referral, or former-employer relationship unless it is explicitly confirmed for this employer."""
 
 
@@ -1050,10 +1067,10 @@ def _build_captcha_section() -> str:
 
 
 def _build_captcha_check_section() -> str:
-    """Describe the fail-closed CAPTCHA pause used by application runs."""
+    """Distinguish passive/invisible protection from a blocking challenge."""
     return """== CAPTCHA CHECK AND VERIFY ==
-A hidden/background CAPTCHA iframe is only a page signal; do not treat it as proof that the form is blocked.
-When a visible verification control blocks the ordinary application flow:
+A hidden/background CAPTCHA iframe, badge, script, or protected-by-reCAPTCHA notice is passive page infrastructure, not a blocker. Continue normal form entry and allow one ordinary final-button click to invoke the site's own invisible verification callback. Do not pre-emptively stop, click the badge, or use Submit merely to probe for a challenge.
+Only when an interactive verification challenge is actually visible and prevents the next ordinary form action:
 1. Snapshot the page and save captcha-blocked.png.
 2. Do not click, solve, inject tokens, call a solver service, or use Submit to probe it.
 3. Output RESULT:CAPTCHA immediately so the application is blocked for manual review."""
@@ -1070,6 +1087,12 @@ def _build_browser_observation_section(job: dict) -> str:
     if observation.get("verification_resume") is True:
         return """== MANUAL VERIFICATION RESUME ==
 The applicant was handed the visible CAPTCHA/email-verification gate and the launcher observed that the gate cleared. Do not read, retrieve, repeat, or log any verification code. Snapshot the current page and independently confirm that no verification gate remains. If the ordinary application form is visible, preserve all existing answers, re-scan any newly revealed conditional fields, and click the final control at most once only after every hard gate passes. If the gate remains or the page state is ambiguous, output RESULT:CAPTCHA without another submit click."""
+    if (
+        observation.get("recovery_mode") == "same_application"
+        and observation.get("signal") == "agent_result_conflict"
+    ):
+        return """== ONE-TIME SAME-PAGE RESULT RECONCILIATION ==
+The prior turn emitted contradictory structured and legacy results. Treat this as a reporting-contract failure, not as evidence that the application page failed and not as permission to restart the browser or repeat prior side effects. Keep the current page lease, snapshot the current page again, preserve all visible values, and re-observe the actual page state. Do not repeat a resume upload when the bound prepared-state proof or the visible filename confirms it is still attached. Do not click a final submission control during prepare reconciliation. Call report_agent_turn exactly once with one internally consistent status and then emit exactly one matching RESULT line. If the page itself is ambiguous, fail closed with the truthful observed state rather than inventing success."""
     if observation.get("repair_mode") is True:
         validation_errors = observation.get("validation_errors")
         if not isinstance(validation_errors, list):
@@ -1648,22 +1671,23 @@ RESULT:FAILED:reason -- any other failure (brief reason)"""
                 "the launcher will generate a validated job-specific artifact from the JD and selected resume, "
                 "then resume this same page."
             )
-        final_steps = """10. BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Resolve ordinary required fields in the configured answer order; truthful negative and closest non-contradictory options may proceed. A missing resume after the bounded repair, assessment, visible CAPTCHA, directly false identity/legal/credential answer, or required direct-impact question with no non-contradictory option is a hard pause. Record only those unresolved material questions in UNANSWERED_QUESTIONS JSON and stop without submitting.
-11. Only after every hard gate is clear, click the final submission control exactly once, then snapshot and check new tabs. Never click Submit a second time merely because the receipt is absent.
-12. Output RESULT:APPLIED only when a visible receipt/success page or platform Applied marker exists. On the next line output `SUBMISSION_EVIDENCE: {\"receipt_visible\": true_or_false, \"applied_badge_visible\": true_or_false, \"confirmation_text\": \"exact visible confirmation text\", \"confirmation_url\": \"current confirmation URL\"}` without a Markdown code fence. confirmation_text must be non-empty. If decisive evidence is absent, output RESULT:SUBMISSION_UNCERTAIN."""
+        final_steps = """10. BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Resolve ordinary required fields in the configured answer order; truthful negative and closest non-contradictory options may proceed. A missing required resume after all browser-native and provider-manual-text fallbacks, assessment, genuinely visible blocking CAPTCHA challenge, directly false identity/legal/credential answer, or required direct-impact question with no non-contradictory option is a hard pause for this job only. An optional attachment failure is not a blocker. Record only those unresolved material questions in UNANSWERED_QUESTIONS JSON and stop without submitting.
+11. Only after every hard gate is clear, bind the current URL and final control, click that control exactly once, then wait for the site's normal response and inspect the current page, any unique application iframe, and new tabs. Treat a success URL, receipt text, platform Applied marker, disappeared/replaced form, and specific still-visible validation error as distinct observations. Never click Submit a second time merely because the receipt or navigation is absent.
+11a. Only when the post-click page evidence is indecisive, inspect the browser console and the relevant post-click network requests if those read-only tools are available. A matching 4xx/5xx response or explicit application-form exception is auxiliary rejection evidence; a 2xx response or redirect is only auxiliary request-delivery evidence and is never a receipt by itself. Never report request bodies, cookies, tokens, headers, or unrelated console/network data.
+12. Output RESULT:APPLIED only when a visible receipt/success page or platform Applied marker exists. On the next line output `SUBMISSION_EVIDENCE: {\"receipt_visible\": true_or_false, \"applied_badge_visible\": true_or_false, \"confirmation_text\": \"exact visible confirmation text\", \"confirmation_url\": \"current confirmation URL\"}` without a Markdown code fence. confirmation_text must be non-empty. If the final click occurred but decisive page evidence is absent, output RESULT:SUBMISSION_UNCERTAIN; the launcher will run configured exact-job mailbox observers instead of treating this as a failed or retryable application."""
         result_codes = f"""RESULT:APPLIED -- submitted successfully
 RESULT:SUBMISSION_UNCERTAIN -- final action occurred but no decisive receipt was visible
 RESULT:EXPIRED -- job closed or no longer accepting applications
-RESULT:CAPTCHA -- any visible CAPTCHA blocks the application
+RESULT:CAPTCHA -- an interactive CAPTCHA challenge is visible and blocks normal progress
 RESULT:LOGIN_ISSUE -- {login_issue_result}
 RESULT:FAILED:reason -- any other failure (brief reason)"""
         captcha_navigation_instruction = (
-            "browser_snapshot to read the page. If a visible CAPTCHA blocks the form, do not interact with it; "
+            "browser_snapshot to read the page. Ignore passive CAPTCHA infrastructure. If an interactive challenge is visible and blocks the form, do not interact with it; "
             "save evidence and output RESULT:CAPTCHA."
         )
         captcha_efficiency_instruction = (
-            "CAPTCHA AWARENESS: hidden iframes are only signals, but any visible blocking control requires "
-            "RESULT:CAPTCHA without clicks, token injection, or retries."
+            "CAPTCHA AWARENESS: hidden iframes, badges, scripts, and protection notices are passive signals; "
+            "continue normally. Stop only when an interactive challenge is actually visible and blocks the next ordinary action."
         )
         form_validation_tip = "After a final click, retry only when the still-visible form shows specific validation errors proving that submission was rejected. Fix supported ordinary fields and allow at most one repair click. No receipt by itself never authorizes another click."
 
@@ -1681,7 +1705,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)"""
             "Open the ordinary application form without submitting it. If the role accepts applications only by "
             "email, follow EMAIL-ONLY APPLICATION ROUTE and prepare the verified plan without sending."
         )
-        final_steps = """10. BEFORE any submission action, snapshot and review EVERY field. Verify legal name, email, phone, current profile location, current company, work authorization, availability answers, required screening responses, and the uploaded resume. Resolve ordinary required unknowns through the profile, reference registry, resolver tool, and closest non-contradictory option. Stop only if the resume remains missing, an assessment/CAPTCHA is present, or a required direct-impact identity/legal/credential answer would be false. Otherwise fix supported errors and save a screenshot named pre-submit-review.png.
+        final_steps = """10. BEFORE any submission action, snapshot and review EVERY field. Verify legal name, email, phone, current profile location, current company, work authorization, availability answers, required screening responses, and any required resume. Resolve ordinary required unknowns through the profile, reference registry, resolver tool, and closest non-contradictory option. Stop only if a required resume remains missing after all configured fallbacks, an assessment or genuinely visible blocking CAPTCHA challenge is present, or a required direct-impact identity/legal/credential answer would be false. Otherwise fix supported errors and save a screenshot named pre-submit-review.png.
 11. STOP before clicking Submit/Apply/Send/Finish/Complete application or any equivalent final control. Do not press Enter while that control is focused.
 12. Output RESULT:READY_TO_SUBMIT when the completed form is visible at the final review point. The launcher will capture an advisory browser observation before a separate submission phase."""
         result_codes = f"""RESULT:READY_TO_SUBMIT -- form completed and waiting for an advisory browser observation
@@ -1701,18 +1725,18 @@ RESULT:FAILED:reason -- any other failure (brief reason)"""
             "snapshot, but the browser agent remains responsible for interpreting the current page."
         )
         resume_step = "6. Preserve the selected resume unless the visible page clearly shows it is missing or wrong; use confirmed profile facts to correct an obvious mismatch."
-        field_review_steps = """8. Snapshot the current page and use the launcher observation to focus review. A visible CAPTCHA, missing resume after repair, assessment, or directly false identity/legal/credential answer is a hard pause. Audited lossy taxonomy mappings are advisory.
+        field_review_steps = """8. Snapshot the current page and use the launcher observation to focus review. A genuinely visible blocking CAPTCHA challenge, missing required resume after all configured fallbacks, assessment, or directly false identity/legal/credential answer is a hard pause for this job. Optional attachment failures and passive CAPTCHA infrastructure are not blockers. Audited lossy taxonomy mappings are advisory.
 9. Compare every required answer with confirmed facts. Resolve ordinary unknowns through the configured selection order and tool. Stop only for a required direct-impact question with no non-contradictory answer; never guess an identity or legal declaration."""
 
     if manual_captcha_relay:
         captcha_section = _build_captcha_check_section()
         captcha_navigation_instruction = (
-            "browser_snapshot to read the page. If a visible verification checkbox or button blocks the form, "
+            "browser_snapshot to read the page. Ignore hidden/passive verification infrastructure. If an interactive verification challenge visibly blocks the form, "
             "do not interact with it; output RESULT:CAPTCHA immediately."
         )
         captcha_efficiency_instruction = (
-            "CAPTCHA CHECK: hidden iframes alone are not decisive, but any visible CAPTCHA is a hard pause. "
-            "Do not click, solve, inject, or loop on it."
+            "CAPTCHA CHECK: hidden iframes, badges, scripts, and protection notices are not blockers. "
+            "Stop only for an interactive challenge that is actually visible and prevents normal progress; do not solve, inject, or loop on it."
         )
         if not dry_run:
             apply_navigation = (
@@ -1731,8 +1755,9 @@ RESULT:CAPTCHA -- a visible CAPTCHA blocks ordinary form interaction
 RESULT:LOGIN_ISSUE -- {login_issue_result}
 RESULT:FAILED:reason -- any other failure (brief reason)"""
             else:
-                final_steps = """10. Snapshot the prepared form. Treat only launcher blocking_issues, visible CAPTCHA, assessment, missing resume after repair, or a directly false required identity/legal/credential answer as hard pauses. Audited lossy mappings and low-impact unknowns are not blockers.
+                final_steps = """10. Snapshot the prepared form. Treat only launcher blocking_issues, a genuinely visible blocking CAPTCHA challenge, assessment, a missing required resume after all configured fallbacks, or a directly false required identity/legal/credential answer as hard pauses for this job. Optional attachment failures, passive CAPTCHA infrastructure, audited lossy mappings, and low-impact unknowns are not blockers.
 11. If every gate is clear, click the final submission control exactly once and snapshot immediately. Never click Submit a second time merely because the receipt is absent.
+11a. Only when that snapshot is indecisive, inspect the browser console and relevant post-click network requests if those read-only tools are available. Treat matching 4xx/5xx responses or explicit form exceptions as auxiliary rejection evidence, while 2xx responses or redirects prove only request delivery and never count as a receipt. Never report request bodies, cookies, tokens, headers, or unrelated console/network data.
 12. Output RESULT:APPLIED only with a visible receipt or Applied marker, followed on the next line by `SUBMISSION_EVIDENCE: {\"receipt_visible\": true_or_false, \"applied_badge_visible\": true_or_false, \"confirmation_text\": \"exact visible confirmation text\", \"confirmation_url\": \"current confirmation URL\"}`. Otherwise output RESULT:SUBMISSION_UNCERTAIN."""
                 result_codes = """RESULT:APPLIED -- visible receipt or Applied marker observed
 RESULT:SUBMISSION_UNCERTAIN -- final action occurred without decisive confirmation
@@ -1952,7 +1977,10 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         "invalid state is gone, the listbox is closed, and the selected value remains before "
         "starting the next field. Do not use a manual-entry fallback when an exact confirmed "
         "option is visible. For Personal information City only, first try the exact city/country "
-        "option. If a fresh snapshot proves there is no selectable exact city/country option, "
+        "option. Treat a single visible place-name option as exact when the confirmed city and "
+        "country are the same place name (for example, confirmed `Singapore, Singapore` and "
+        "visible option `Singapore`); select that option and verify the listbox closes. If a "
+        "fresh snapshot still proves there is no selectable exact city/country option, "
         "the provider-owned `Cannot find your city? Click here to fill in manually` control is "
         "visibly associated with that required City widget, and the city comes from a confirmed "
         "fact, click that provider-owned fallback at most once using the fresh ref. Take another "
@@ -2005,7 +2033,7 @@ Use RESULT:FAILED:browser_mcp_unavailable only when the attached Playwright MCP 
 
 == FIELD IDENTITY RULES ==
 - Full name and all first/given/last/family/surname fields use the legal identity from APPLICANT PROFILE. Preferred/display name is used only when the label explicitly asks for it.
-- Current location/city/country fields use the confirmed profile value: {confirmed_location or 'Manual review'}. Use the full street address only when the form actually asks for address fields.
+- Current location/city/country fields use the confirmed profile value: {confirmed_location or 'Manual review'}. Leave optional street-address fields blank for privacy. Use the exact configured address only when the form makes an address component required; never infer or enrich it.
 - Current company and current title use the Current Employment record, not a resume-parser guess.
 - For a full-time internship tied to a stated start month, answer Yes only if the exact full-time availability in the current profile meets that month. Dates and duration are generally negotiable fit signals, not automatic rejection gates; answer required questions truthfully and continue unless a hard legal condition is unmet.
 
@@ -2116,10 +2144,12 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 {greenhouse_form_trick}
 - Identity-provider/MFA/security-challenge verification: an 8-character code split across one-character inputs is an identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. This rule does not cover an exact employer ATS mailbox OTP admitted by the narrow Authentication policy; enter that OTP only through its authorized mailbox-tool flow. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
 - Video/audio upload contradiction: if a field is labelled optional but native/site validation blocks submission until a recording or media file is provided, the validation behaviour is authoritative. Stop with RESULT:FAILED:unsafe_verification; never activate camera/microphone or fabricate media to satisfy it.
-- Required document preflight: before uploading anything, identify every visible required file field by its own label. FILES authorizes only the named Resume/CV and cover-letter materials. Never upload the resume into Transcript, Portfolio, Supporting documents, Certificates, or a generic optional attachment field to satisfy another requirement. If a required non-resume document is not supplied, stop before submission with `RESULT:FAILED:manual_review_required:required_document`, emit `UNANSWERED_QUESTIONS` for that exact field, and emit `FAILURE_CONTEXT: {{"category":"required_document","field_label":"<visible label>","blocking_material":"<required material>","visible_state":"required file not supplied","attempts":0}}`.
-- File upload verification: bind upload proof to the same labelled Resume/CV field container that received the upload. A filename or remove/replace control under Cover letter, Certificates, Supporting documents, or another attachment field is not resume proof. After browser_file_upload, wait and snapshot. Continue only when the Resume/CV field itself shows the filename or a remove/replace control. Do not click the upload area again after success. If no proof appears, retry the Resume/CV click-plus-upload sequence once, snapshot again, then output `RESULT:FAILED:resume_upload` and `FAILURE_CONTEXT: {{"category":"resume_upload","field_label":"<visible resume label>","visible_state":"<what remained empty or where attachment proof appeared>","attempts":2}}`.
-- Browser upload boundary: use only browser_file_upload/the browser file-chooser primitive. Never switch to Windows Computer Use or an OS-native file picker for a browser upload; the independent browser-URL safety gate is not an application workaround. A bounded upload failure belongs to the affected job and must not stop unrelated jobs in the batch.
-- Native dropdown/combobox: first read its bounded visible options. Use resolve_answer when exact wording is absent, then call browser_select_option with the selected visible option text and snapshot to verify it. The resolver proposes only; the browser agent remains the single writer. Use click-the-option only for a custom non-native dropdown.
+- Required document preflight: before uploading anything, identify every visible file field by its own label and whether it is required. FILES authorizes only the named Resume/CV and cover-letter materials. Never upload the resume into Transcript, Portfolio, Supporting documents, Certificates, or a generic optional attachment field to satisfy another requirement. Leave unavailable optional materials blank and continue. If a required non-resume document is not supplied, stop this job before submission with `RESULT:FAILED:manual_review_required:required_document`, emit `UNANSWERED_QUESTIONS` for that exact field, and emit `FAILURE_CONTEXT: {{"category":"required_document","field_label":"<visible label>","blocking_material":"<required material>","visible_state":"required file not supplied","attempts":0}}`. This job-level material stop must not halt replacement work elsewhere in the batch.
+- File upload recovery and verification: bind every attempt and proof to the same labelled field container. First use the directly labelled file input when exposed; otherwise start the browser file-chooser wait before clicking the associated upload control. If the provider exposes a browser-native drop area, Attach button, or equivalent second control for the same field, try one distinct fallback rather than repeating an identical failed click. After each attempt, wait for parsing and snapshot. Accept proof only when that same field shows the expected filename, remove/replace control, parsed-resume state, or review-page attachment. A filename under another attachment field is not proof. Once proof exists, never click the upload control again.
+- Resume text fallback: if PDF upload still lacks proof and the provider itself offers `Enter manually`, `Paste resume`, or an equivalent resume-text mode, use the supplied RESUME TEXT to complete it without asking the user to retype anything. If the resume field is optional and all automated paths fail, leave it blank and continue. If the resume is required and neither a verified file nor provider-supported resume text is accepted, output `RESULT:FAILED:resume_upload` for this job with `FAILURE_CONTEXT: {{"category":"resume_upload","field_label":"<visible resume label>","visible_state":"<what remained empty>","attempts":2}}`; then let the batch continue to a replacement job.
+- Browser upload boundary: keep browser uploads inside browser-native file input, file-chooser, drop-area, or provider resume-text mechanisms. Never switch to Windows Computer Use or an OS-native picker as a workaround. A bounded upload failure belongs only to the affected job and must not stop unrelated jobs in the batch.
+- Native dropdown and custom combobox: use browser_select_option for a native select. For an ARIA/custom combobox, open it, read only the current bounded listbox/tree options, choose the exact fact or registered alias, and click the option; if option clicking is unstable but the widget exposes standard combobox keyboard behavior, use ArrowDown/ArrowUp plus Enter once. Re-snapshot and require the selected value to persist and `aria-expanded`/the popup to close before moving on. For a multi-select, add one option at a time and verify its chip, checked state, or selected marker after each addition. Low-impact required fields such as application source use the configured simple truthful default and never block the application.
+- Embedded ATS iframe: when the application form is inside an iframe, bind interactions to one unique visible frame and keep using role/label locators inside that frame. After final submit, observe both the frame and top-level page because the receipt may replace either one. Do not add provider-specific iframe logic unless the live page requires it.
 - React/controlled text and number inputs: after a bulk fill, verify the visible value or the review-page answer. If one field clears itself or reports a format error despite a supported answer, retry only that field once by focusing it, selecting any existing text, and typing the value sequentially. Do not repeat the whole form, use DOM value injection, or loop. A review page that displays the intended answer is decisive persistence evidence even when the form snapshot omits raw input values.
 {lever_form_trick}
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.

@@ -545,6 +545,11 @@ def _cdp_endpoint_reachable(port: int) -> bool:
         return False
 
 
+def cdp_endpoint_reachable(port: int) -> bool:
+    """Return whether the owned browser still exposes its local CDP endpoint."""
+    return _cdp_endpoint_reachable(port)
+
+
 def _wait_for_browser_stopped(
     port: int | None,
     process: subprocess.Popen | None,

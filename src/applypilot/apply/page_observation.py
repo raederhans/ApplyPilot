@@ -21,6 +21,7 @@ from applypilot.apply import post_submit_observation as post_submit_observation_
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.answer_provenance import audit_pre_submit_answer_provenance
 from applypilot.apply.identity_materials import classify_identity_requirement
+from applypilot.apply.prepared_state import current_prepared_observations
 from applypilot.apply.specialists import (
     ATS_FORM_SNAPSHOT_SCHEMA_VERSION,
     freeze_ats_fill_plan_snapshot,
@@ -126,7 +127,10 @@ _STATEFUL_CONTROL_COVERAGE_SCRIPT = STATEFUL_CONTROL_COVERAGE_SCRIPT
 
 def _verified_agent_resume_upload(job: dict) -> bool:
     """Accept a compact same-turn upload proof, never a bare status claim."""
-    observations = job.get("_agent_observations")
+    observations = current_prepared_observations(job)
+    if not observations and "_prepared_state_evidence" not in job:
+        # Compatibility for callers that predate host-side lease binding.
+        observations = job.get("_agent_observations")
     if not isinstance(observations, dict):
         return False
     proof = observations.get("resume_upload")
@@ -237,6 +241,37 @@ def _same_bound_application_flow(
             and str(binding.get("publication_id") or "").casefold()
             == actual_publication_id.casefold()
         )
+
+    # Shopee moves an exact public job-detail route onto its same-host apply
+    # route.  Bind the change to the immutable job id carried by both routes;
+    # another job, a generic careers page, or a cross-host redirect still fails.
+    if expected.hostname.casefold() == "careers.shopee.sg":
+        expected_match = re.fullmatch(
+            r"/job-detail/([^/]+)/[^/]+/?", unquote(expected.path), re.IGNORECASE
+        )
+        actual_id = parse_qs(actual.query).get("id", [])
+        if (
+            expected_match
+            and unquote(actual.path).rstrip("/").casefold() == "/apply"
+            and len(actual_id) == 1
+            and actual_id[0].casefold() == expected_match.group(1).casefold()
+        ):
+            return True
+
+    # Workato's careers page rewrites a gh_jid query into a same-host slugged
+    # job route while retaining that exact Greenhouse id.  Require the id in
+    # both query strings and at the end of the rewritten path.
+    if expected.hostname.casefold() == "www.workato.com":
+        expected_ids = parse_qs(expected.query).get("gh_jid", [])
+        actual_ids = parse_qs(actual.query).get("gh_jid", [])
+        if (
+            len(expected_ids) == 1
+            and len(actual_ids) == 1
+            and expected_ids[0] == actual_ids[0]
+            and re.fullmatch(r"\d+", expected_ids[0])
+            and re.search(rf"-{re.escape(expected_ids[0])}/?$", unquote(actual.path))
+        ):
+            return True
 
     expected_path = unquote(expected.path).rstrip("/").removesuffix("/apply")
     actual_path = unquote(actual.path).rstrip("/").removesuffix("/apply")
@@ -426,6 +461,7 @@ def _is_post_graduation_work_context(text: str) -> bool:
             r"\b(?:upon|following)\s+(?:your\s+)?graduation\b|"
             r"\bafter\s+(?:(?:your|you)\s+)?graduat(?:ion|e|ing)\b|"
             r"\b(?:when|once)\s+you\s+graduate\b|"
+            r"\bwill\s+you\s+need\s+in\s+the\s+future\b|"
             r"\bpost[ -]?graduation\b",
             text,
         )
@@ -999,18 +1035,23 @@ def _validate_pre_submit_snapshot(snapshot: dict, profile: dict, job: dict) -> l
             ):
                 issues.append("resume_state_unconfirmed")
         elif not snapshot.get("resume_uploaded"):
-            resume_cards = [
-                str(value or "") for value in snapshot.get("resume_card_texts", [])
-            ]
-            expected_variant = prompt_mod._linkedin_resume_preference(profile, job)
-            expected_text = str(expected_variant or "").casefold()
-            existing_document_confirmed = any(
-                re.search(r"\.(?:pdf|docx?)\b", text, re.IGNORECASE)
-                and (not expected_text or expected_text in text.casefold())
-                for text in resume_cards
+            agent_upload_confirmed = (
+                _verified_agent_resume_upload(job)
+                and int(snapshot.get("submit_control_count") or 0) > 0
             )
-            if not existing_document_confirmed:
-                issues.append("resume_not_uploaded")
+            if not agent_upload_confirmed:
+                resume_cards = [
+                    str(value or "") for value in snapshot.get("resume_card_texts", [])
+                ]
+                expected_variant = prompt_mod._linkedin_resume_preference(profile, job)
+                expected_text = str(expected_variant or "").casefold()
+                existing_document_confirmed = any(
+                    re.search(r"\.(?:pdf|docx?)\b", text, re.IGNORECASE)
+                    and (not expected_text or expected_text in text.casefold())
+                    for text in resume_cards
+                )
+                if not existing_document_confirmed:
+                    issues.append("resume_not_uploaded")
 
     personal = profile.get("personal", {})
     legal_name = personal.get("full_name", "").strip().casefold()
@@ -1253,6 +1294,36 @@ def _build_ats_fill_plan_snapshot(
     raw_fields = snapshot.get("form_fields")
     if not isinstance(raw_fields, list) or not raw_fields:
         return None
+    allowed_field_keys = {
+        "field_key",
+        "id",
+        "name",
+        "selector",
+        "label",
+        "aria_label",
+        "type",
+        "tag",
+        "control",
+        "autocomplete",
+        "placeholder",
+        "required",
+        "disabled",
+        "readonly",
+        "options",
+        "minlength",
+        "maxlength",
+        "min",
+        "max",
+        "pattern",
+        "multiple",
+    }
+    projected_fields = [
+        {key: value for key, value in raw.items() if key in allowed_field_keys}
+        for raw in raw_fields
+        if isinstance(raw, Mapping)
+    ]
+    if not projected_fields:
+        return None
     ats_context = job.get("_ats_adapter_context")
     facts = (
         ats_context.get("available_fact_names", [])
@@ -1265,7 +1336,7 @@ def _build_ats_fill_plan_snapshot(
         {
             "schema_version": ATS_FORM_SNAPSHOT_SCHEMA_VERSION,
             "target_url": target_url,
-            "form_fields": raw_fields,
+            "form_fields": projected_fields,
             "available_fact_names": facts,
         }
     )
@@ -1356,12 +1427,43 @@ def _audit_live_pre_submit_page(
                 (element) => element.matches(selector)
               );
               const context = (el) => el.closest(
-                'li, fieldset, [data-qa*="field"], [class*="application-field"], [class*="question"]'
+                'li, fieldset, [data-qa*="field"], [class*="application-field"], [class*="form-item"], [class*="question"]'
               ) || el.parentElement;
               const labelText = (el) => {
                 const node = context(el);
-                return ((node && node.innerText) || el.getAttribute('aria-label') || el.name || '')
-                  .replace(/\s+/g, ' ').trim().slice(0, 500);
+                const associated = [...(el.labels || [])].find(visible);
+                const wrapping = el.closest('label');
+                const usefulText = (value) => {
+                  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+                  return Boolean(normalized.replace(/[✱*]/g, '').trim()) &&
+                    !['on', 'true', 'false'].includes(normalized.toLowerCase());
+                };
+                let ancestorText = '';
+                for (let ancestor = el.parentElement, depth = 0;
+                  ancestor && ancestor !== document.body && depth < 6;
+                  ancestor = ancestor.parentElement, depth += 1) {
+                  const candidate = String(ancestor.innerText || ancestor.textContent || '')
+                    .replace(/\s+/g, ' ').trim();
+                  if (usefulText(candidate) && candidate.length <= 500) {
+                    ancestorText = candidate;
+                    break;
+                  }
+                }
+                const direct = (
+                  (associated && associated.innerText) ||
+                  el.getAttribute('aria-label') ||
+                  (wrapping && wrapping.innerText) ||
+                  (node && node.innerText) ||
+                  el.name || ''
+                ).replace(/\s+/g, ' ').trim();
+                if (
+                  location.protocol === 'https:' &&
+                  location.hostname.toLowerCase() === 'jobs.smartrecruiters.com' &&
+                  !usefulText(direct)
+                ) {
+                  return (ancestorText || direct).slice(0, 500);
+                }
+                return (direct || ancestorText).slice(0, 500);
               };
               const required = (el) => el.required || el.getAttribute('aria-required') === 'true' || /[✱*]/.test(labelText(el));
               const responseSelector =
@@ -1381,6 +1483,7 @@ def _audit_live_pre_submit_page(
               const provenanceFields = [];
               const protectedIdentifier = (el, text) => {
                 if (el.hasAttribute('data-applypilot-protected')) return true;
+                if (/\b(?:first|last|full|legal|preferred)\s+name\b/i.test(text)) return false;
                 const descriptor = [
                   text,
                   el.getAttribute('aria-label'),

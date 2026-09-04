@@ -104,7 +104,7 @@ def _semantic(raw: Mapping[str, object]) -> str:
         ("race_ethnicity", ("race", "ethnicity", "ethnic")),
         ("veteran_status", ("veteran", "military status")),
         ("disability_status", ("disability", "disabled")),
-        ("consent", ("consent", "privacy policy", "terms and conditions")),
+        ("consent", ("consent", "privacy policy", "privacy notice", "terms and conditions")),
         ("password", ("password", "passcode")),
         (
             "verification_code",

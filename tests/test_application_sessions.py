@@ -202,6 +202,33 @@ def test_one_worker_reuses_browser_but_isolates_two_applications(tmp_path: Path)
     assert harness.cleanups == 1
 
 
+def test_worker_accepts_clean_edge_bootstrap_exit_when_cdp_is_live(
+    tmp_path: Path,
+) -> None:
+    harness = FakeBrowserHarness()
+    cdp_live = True
+    harness_process = FakeBrowserProcess(pid=10_001, returncode=0)
+    worker = BrowserWorkerProcess(
+        worker_id=1,
+        port=9333,
+        run_id="run-edge-bootstrap",
+        namespace_root=tmp_path,
+        launch_browser=lambda *_args, **_kwargs: harness_process,
+        cleanup_browser=harness.cleanup,
+        open_target=harness.open_target,
+        close_targets=harness.close_targets,
+        endpoint_manager=PerTurnStdioEndpointManager(1),
+        browser_health_probe=lambda: cdp_live,
+    )
+    supervisor = _supervisor(worker, BrowserBroker(), "attempt-edge-bootstrap", [])
+
+    assert supervisor.process is harness_process
+    assert worker.heartbeat(expected_generation=1).transport == "stdio-per-turn"
+
+    supervisor.close_application()
+    worker.close()
+
+
 def test_worker_rolls_after_task_limit_and_rejects_stale_generation(tmp_path: Path) -> None:
     harness = FakeBrowserHarness()
     worker = _worker(tmp_path, harness, max_applications=1)

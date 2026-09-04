@@ -284,7 +284,12 @@ def _route_fixture(page, provider: str) -> str:
         <label>Country <select id="country"><option>Choose</option><option value="sg">Singapore</option></select></label>
         <div id="department" role="combobox" aria-label="Department" aria-controls="department-options"></div>
         <div id="department-options" role="listbox"><div id="engineering" role="option">Engineering</div></div>
+        <label>Team <input id="team" role="combobox" aria-expanded="true" aria-owns="team-options"></label>
+        <div id="team-options" role="tree"><div id="platform" role="treeitem">Platform</div></div>
         <label><input id="consent" type="checkbox">Routine consent</label>
+        <div>You declare that you have read and understand the privacy notice.*
+          <input id="privacy" type="checkbox" required>
+        </div>
         <button id="updates" type="button" role="switch" aria-checked="false">Updates</button>
         <label>Date available <input id="available-date" type="date"></label>
         <label>Resume <input id="resume" type="file" required accept="application/pdf"></label>
@@ -378,6 +383,13 @@ def test_real_chromium_supported_provider_controls_use_p1_epoch_bound_gateway(
         final_inspection = inspect_form_surfaces(page, context, provider=provider)  # type: ignore[arg-type]
         assert any(item.frame_path for item in final_inspection.controls)
         assert any(item.shadow_path for item in final_inspection.controls)
+        team = next(item for item in final_inspection.controls if item.label == "Team")
+        assert team.kind == "custom_combobox"
+        assert team.options == ("Platform",)
+        if provider == "smartrecruiters":
+            privacy = next(item for item in final_inspection.controls if item.locator == "#privacy")
+            assert "privacy notice" in privacy.label
+            assert privacy.semantic == "boolean_choice"
         resume = next(item for item in final_inspection.controls if item.kind == "resume_file")
         with pytest.raises(SemanticControlDenied, match="bound resume"):
             SemanticControlRequest(

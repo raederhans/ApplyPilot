@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,35 @@ def application_surface_is_allowed(page, surface) -> bool:
     surface_url = str(getattr(surface, "url", "") or "").strip()
     if http_origin(surface_url) == top_origin:
         return True
+    top = urlparse(str(getattr(page, "url", None) or getattr(main_frame, "url", "")))
+    embedded = urlparse(surface_url)
+    if (
+        (top.hostname or "").casefold() == "www.workato.com"
+        and (embedded.hostname or "").casefold() == "job-boards.greenhouse.io"
+        and embedded.path.rstrip("/").casefold() == "/embed/job_app"
+    ):
+        top_ids = parse_qs(top.query).get("gh_jid", [])
+        embedded_query = parse_qs(embedded.query)
+        embedded_ids = embedded_query.get("token", [])
+        embedded_tenants = embedded_query.get("for", [])
+        validity_tokens = embedded_query.get("validityToken", [])
+        top_id = top_ids[0] if len(top_ids) == 1 else ""
+        token_bound = len(embedded_ids) == 1 and embedded_ids[0] == top_id
+        path_bound = (
+            not embedded_ids
+            and bool(top_id)
+            and top.path.rstrip("/").casefold().endswith(f"-{top_id}".casefold())
+            and len(validity_tokens) == 1
+            and len(validity_tokens[0]) >= 16
+        )
+        if (
+            len(top_ids) == 1
+            and len(embedded_tenants) == 1
+            and top_id.isdigit()
+            and embedded_tenants[0].casefold() == "workato"
+            and (token_bound or path_bound)
+        ):
+            return True
     if surface_url.casefold() not in {"about:blank", "about:srcdoc"}:
         return False
 

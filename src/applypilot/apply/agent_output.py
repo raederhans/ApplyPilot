@@ -597,6 +597,50 @@ def reconcile_agent_turn_outputs_with_diagnostics(
     return status, evidence, "structured+legacy", None
 
 
+def conflict_status_families(
+    output: str,
+    structured_result: AgentTurnResult | None,
+    *,
+    dry_run: bool,
+    submission_phase: str,
+) -> dict[str, str] | None:
+    """Describe a result mismatch without retaining raw statuses or page text."""
+    if structured_result is None:
+        return None
+    structured_status, _ = interpret_agent_turn_result(
+        structured_result,
+        dry_run=dry_run,
+        submission_phase=submission_phase,
+    )
+    parsed_legacy = parse_result_line(output)
+    if parsed_legacy is None:
+        legacy_status = "invalid"
+    else:
+        marker, reason = parsed_legacy
+        legacy_status = result_status(marker, reason)
+
+    def family(status: str) -> str:
+        normalized = str(status or "").strip().casefold()
+        if normalized.startswith("failed") or normalized == "invalid":
+            return "failure" if normalized != "invalid" else "invalid"
+        if normalized in {"ready_to_submit", "prepared_for_audit"}:
+            return "ready"
+        if normalized in {"applied"}:
+            return "applied"
+        if normalized in {"submission_uncertain"}:
+            return "uncertain"
+        if normalized in {"captcha", "login_issue"}:
+            return "manual_gate"
+        if normalized in {"previewed", "cover_not_required", "cover_letter_required"}:
+            return "non_submit"
+        return "other"
+
+    return {
+        "structured": family(structured_status),
+        "legacy": family(legacy_status),
+    }
+
+
 def reconcile_agent_turn_outputs(
     output: str,
     structured_result: AgentTurnResult | None,

@@ -47,6 +47,7 @@ from applypilot.apply import orchestration as orchestration_mod
 from applypilot.apply import page_observation as page_observation_mod
 from applypilot.apply import page_surfaces as page_surfaces_mod
 from applypilot.apply import post_submit_observation as post_submit_observation_mod
+from applypilot.apply import prepared_state as prepared_state_mod
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import receipt_observer as receipt_observer_mod
 from applypilot.apply import resume_authorization as resume_authorization_mod
@@ -81,6 +82,7 @@ from applypilot.apply.chrome import (
     _kill_process_tree,
     allocate_cdp_port,
     capture_browser_session,
+    cdp_endpoint_reachable,
     cleanup_on_exit,
     kill_all_chrome,
     launch_chrome,
@@ -596,6 +598,7 @@ def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
             release_cdp_port=release_cdp_port,
             launch_chrome=launch_chrome,
             cleanup_worker=cleanup_worker,
+            cdp_endpoint_reachable=cdp_endpoint_reachable,
             open_bound_application_target=_open_bound_application_target,
             close_bound_application_targets=_close_bound_application_targets,
             release_application_browser_authority=_release_application_browser_authority,
@@ -1530,16 +1533,77 @@ def _tool_result_succeeded(payload: object, *, terminal_event: bool) -> bool:
     return status in _TOOL_SUCCESS_STATUSES
 
 
+def _tool_failure_text(payload: object, *, depth: int = 0) -> str:
+    """Collect bounded transient error text for classification only."""
+    if depth > 4:
+        return ""
+    if isinstance(payload, str):
+        return payload[:1000]
+    if isinstance(payload, list):
+        return " ".join(_tool_failure_text(item, depth=depth + 1) for item in payload[:8])
+    if not isinstance(payload, Mapping):
+        return ""
+    return " ".join(
+        _tool_failure_text(payload.get(key), depth=depth + 1)
+        for key in ("status", "error", "message", "result", "output", "content")
+        if key in payload
+    )[:2000]
+
+
+def _classify_browser_tool_failure(payload: object) -> str:
+    """Reduce Playwright/MCP failures to a non-sensitive actionable category."""
+    text = " ".join(_tool_failure_text(payload).casefold().split())
+    if "strict mode violation" in text or "resolved to" in text and "elements" in text:
+        return "ambiguous_locator"
+    if "file chooser" in text or "setinputfiles" in text or "set input files" in text:
+        return "file_chooser_unavailable"
+    if "frame was detached" in text or "frame detached" in text:
+        return "stale_frame"
+    if "target closed" in text or "page closed" in text or "context closed" in text:
+        return "target_closed"
+    if "not attached" in text or "element is detached" in text:
+        return "stale_element"
+    if "intercepts pointer events" in text or "does not receive pointer events" in text:
+        return "actionability_intercepted"
+    if any(token in text for token in ("not visible", "not stable", "not enabled", "not editable")):
+        return "actionability_failed"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if any(token in text for token in ("connection refused", "econnrefused", "transport closed")):
+        return "transport_unavailable"
+    return "unclassified"
+
+
 def _normalize_browser_runtime_failure(
     status: str,
     *,
     browser_tool_call_count: int,
     browser_tool_success_count: int,
+    browser_failure_summary: Mapping[str, object] | None = None,
     failure_context: dict[str, object] | None,
 ) -> tuple[str, dict[str, object] | None]:
     """Distinguish an absent browser MCP from a later site interaction failure."""
+    normalized_status = status.strip().casefold()
+    safe_failures = {
+        str(key)[:64]: min(max(int(value), 0), 99)
+        for key, value in (browser_failure_summary or {}).items()
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    }
+    if normalized_status == "failed:conflicting_agent_results":
+        context = dict(failure_context or {})
+        context.update(
+            {
+                "category": "agent_result_conflict",
+                "recoverability": "retry_same_application",
+                "next_action": "reobserve_same_page_and_emit_one_consistent_turn_result",
+                "attempts": min(max(browser_tool_call_count, 0), 10),
+            }
+        )
+        if safe_failures:
+            context["browser_tool_failures"] = safe_failures
+        return status, context
     if (
-        status.strip().casefold() != "failed:browser_mcp_unavailable"
+        normalized_status != "failed:browser_mcp_unavailable"
         or browser_tool_success_count < 1
     ):
         return status, failure_context
@@ -1716,6 +1780,53 @@ def _persist_agent_turn_started(
     return occurred_at
 
 
+def _persist_agent_turn_progress(
+    request: AgentRunRequest,
+    *,
+    sequence: int,
+    last_tool: str,
+    tool_call_count: int,
+    browser_success_count: int,
+    browser_failure_count: int,
+    elapsed_ms: int,
+    occurred_after: datetime | None,
+) -> datetime:
+    """Persist a bounded heartbeat without page text, inputs, or tool outputs."""
+    from applypilot.database import append_agent_event
+
+    occurred_at = _ordered_agent_event_time(occurred_after)
+    safe_tool = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(last_tool or "unknown"))[:80]
+    idempotency_key = (
+        f"agent-turn:v2:{request.actor_id}:{request.turn_id}:progress:{max(1, sequence)}"
+    )
+    event = ApplicationEvent(
+        event_id=idempotency_key,
+        attempt_id=request.attempt_id,
+        run_id=request.run_id,
+        phase=request.phase,
+        actor=request.agent_role,
+        event_type="agent.turn.progress",
+        payload={
+            "sequence": max(1, sequence),
+            "last_tool": safe_tool,
+            "tool_call_count": max(0, tool_call_count),
+            "browser_success_count": max(0, browser_success_count),
+            "browser_failure_count": max(0, browser_failure_count),
+            "elapsed_ms": max(0, elapsed_ms),
+        },
+        idempotency_key=idempotency_key,
+        actor_id=request.actor_id,
+        turn_id=request.turn_id,
+        schema_version="2",
+        occurred_at=occurred_at,
+    )
+    try:
+        append_agent_event(event)
+    except Exception as exc:  # noqa: BLE001 - advisory telemetry must not alter apply outcome
+        logger.warning("Could not persist Agent turn progress %s: %s", request.run_id, exc)
+    return occurred_at
+
+
 def _persist_agent_turn_completed(
     request: AgentRunRequest,
     result: AgentTurnResult,
@@ -1725,6 +1836,7 @@ def _persist_agent_turn_completed(
     source: str,
     metrics: Mapping[str, object] | None = None,
     conflict_classification: str | None = None,
+    conflict_status_families: Mapping[str, object] | None = None,
     occurred_after: datetime | None = None,
     expected_checkpoint_sequence: int | None = None,
 ) -> datetime:
@@ -1789,6 +1901,27 @@ def _persist_agent_turn_completed(
         "status_mismatch",
     }:
         payload["conflict_classification"] = conflict_classification
+    if conflict_classification is not None and isinstance(
+        conflict_status_families, Mapping
+    ):
+        allowed_families = {
+            "failure",
+            "invalid",
+            "ready",
+            "applied",
+            "uncertain",
+            "manual_gate",
+            "non_submit",
+            "other",
+        }
+        safe_families = {
+            key: value
+            for key in ("structured", "legacy")
+            if (value := str(conflict_status_families.get(key) or ""))
+            in allowed_families
+        }
+        if safe_families:
+            payload["conflict_status_families"] = safe_families
     event = ApplicationEvent(
         event_id=completed_idempotency_key,
         attempt_id=request.attempt_id,
@@ -5109,6 +5242,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     turn_duration_ms: int | None = None
     turn_source = "runtime"
     conflict_classification: str | None = None
+    conflict_status_families: dict[str, str] | None = None
     pending_mailbox_tools: dict[str, dict[str, object]] = {}
     mailbox_runtime_evidence = {
         "send_call_completed": False,
@@ -5135,8 +5269,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     pending_report_tools: dict[str, str] = {}
     browser_tool_names: dict[str, str] = {}
     browser_tool_outcomes: dict[str, bool | None] = {}
+    browser_tool_failure_reasons: dict[str, str] = {}
     report_tool_outcomes: dict[str, bool | None] = {}
     prepare_search_events: list[tuple[object, object]] = []
+    progress_sequence = 0
+    last_progress_persisted_at = time.monotonic()
     if submission_phase == "prepare":
         job.pop("_mailbox_prepare_duplicate_receipt", None)
 
@@ -5201,6 +5338,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
             metrics[f"{safe_name}_failure_count"] = sum(
                 outcome is False for outcome in outcomes
+            )
+        for reason in sorted(set(browser_tool_failure_reasons.values()))[:12]:
+            safe_reason = re.sub(r"[^a-z0-9_]+", "_", reason.casefold())[:48]
+            metrics[f"browser_failure_{safe_reason}_count"] = sum(
+                item == reason for item in browser_tool_failure_reasons.values()
             )
         return metrics
 
@@ -5499,14 +5641,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if browser_tool:
                                 browser_tool_names[tool_key] = str(tool)
                                 browser_tool_outcomes.setdefault(tool_key, None)
+                                succeeded = _tool_result_succeeded(
+                                    item,
+                                    terminal_event=True,
+                                )
                                 settle_tool_outcome(
                                     browser_tool_outcomes,
                                     tool_key,
-                                    _tool_result_succeeded(
-                                        item,
-                                        terminal_event=True,
-                                    ),
+                                    succeeded,
                                 )
+                                if not succeeded:
+                                    browser_tool_failure_reasons[tool_key] = (
+                                        _classify_browser_tool_failure(item)
+                                    )
                             if (
                                 str(server) == "applypilot_control"
                                 and str(tool) == "report_agent_turn"
@@ -5523,6 +5670,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             desc = f"{server}:{tool}"
                             lf.write(f"  >> {desc}\n")
                             _record_worker_action(worker_id, desc)
+                            if time.monotonic() - last_progress_persisted_at >= 30.0:
+                                progress_sequence += 1
+                                last_agent_event_at = _persist_agent_turn_progress(
+                                    agent_request,
+                                    sequence=progress_sequence,
+                                    last_tool=desc,
+                                    tool_call_count=tool_call_count,
+                                    browser_success_count=sum(
+                                        outcome is True
+                                        for outcome in browser_tool_outcomes.values()
+                                    ),
+                                    browser_failure_count=sum(
+                                        outcome is False
+                                        for outcome in browser_tool_outcomes.values()
+                                    ),
+                                    elapsed_ms=int((time.time() - start) * 1000),
+                                    occurred_after=last_agent_event_at,
+                                )
+                                last_progress_persisted_at = time.monotonic()
                             if server == mailbox_mcp.server_name:
                                 record_mailbox_completion(
                                     str(tool),
@@ -5687,6 +5853,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 submission_phase=submission_phase,
             )
         )
+        if conflict_classification is not None:
+            conflict_status_families = agent_output_mod.conflict_status_families(
+                contract_output,
+                structured_result,
+                dry_run=dry_run,
+                submission_phase=submission_phase,
+            )
         if status == "prepared_for_audit" and not (
             submission_phase == "prepare"
             and not dry_run
@@ -5736,6 +5909,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             status,
             browser_tool_call_count=browser_tool_call_count,
             browser_tool_success_count=browser_tool_success_count,
+            browser_failure_summary={
+                reason: sum(item == reason for item in browser_tool_failure_reasons.values())
+                for reason in set(browser_tool_failure_reasons.values())
+            },
             failure_context=failure_context,
         )
         if normalized_status != status:
@@ -5899,6 +6076,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
             job["_agent_turn_result"] = contract_json(final_result)
             job["_agent_observations"] = dict(final_result.observations)
+            prepared_state_mod.bind_prepared_state_evidence(
+                job,
+                run_id=final_result.run_id,
+                observations=final_result.observations,
+            )
             job["_agent_turn_source"] = turn_source
             process_returncode = durable_handle.process.poll()
             if process_returncode is not None:
@@ -5910,6 +6092,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     source=turn_source,
                     occurred_after=last_agent_event_at,
                     conflict_classification=conflict_classification,
+                    conflict_status_families=conflict_status_families,
                     metrics={
                         **setup_metrics,
                         **stats,

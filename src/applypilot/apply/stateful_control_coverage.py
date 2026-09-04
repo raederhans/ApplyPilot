@@ -48,12 +48,48 @@ STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
   const proxySelected = (element) => [...(element.labels || [])]
     .filter(rendered)
     .some(selected);
+  const smartRecruitersLabelProxy = (element) => {
+    if (location.protocol !== 'https:' || location.hostname.toLowerCase() !== 'jobs.smartrecruiters.com') {
+      return false;
+    }
+    if (String(element.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return false;
+    const labels = [...(element.labels || [])].filter(rendered);
+    return Boolean(element.id) && labels.length === 1 &&
+      String(labels[0].innerText || labels[0].textContent || '').replace(/\s+/g, ' ').trim().length > 0;
+  };
+  const smartRecruitersCustomProxy = (element) => {
+    if (location.protocol !== 'https:' || location.hostname.toLowerCase() !== 'jobs.smartrecruiters.com') {
+      return false;
+    }
+    if (!rendered(element) || String(element.getAttribute('aria-disabled') || '').toLowerCase() === 'true') {
+      return false;
+    }
+    const roles = String(element.getAttribute('role') || '').toLowerCase().split(/\s+/);
+    const checkedRole = roles.some((role) => ['checkbox', 'radio', 'switch'].includes(role));
+    const stateAttribute = checkedRole ? 'aria-checked' : 'aria-pressed';
+    const state = String(element.getAttribute(stateAttribute) || '').toLowerCase();
+    let label = String(
+      element.getAttribute('aria-label') || element.innerText || element.textContent || ''
+    ).replace(/\s+/g, ' ').trim();
+    for (let node = element.parentElement, depth = 0;
+      !label && node && node !== document.body && depth < 6;
+      node = node.parentElement, depth += 1) {
+      const candidate = String(node.innerText || node.textContent || '')
+        .replace(/\s+/g, ' ').trim();
+      if (candidate && candidate.length <= 500) label = candidate;
+    }
+    return ['true', 'false', 'mixed'].includes(state) && label.length > 0;
+  };
   const natives = elements.filter((element) =>
     element.matches('input[type="checkbox"],input[type="radio"]') &&
     nativeActive(element)
   );
   const visibleNatives = natives.filter(rendered);
   const hiddenNatives = natives.filter((element) => !rendered(element));
+  const classifiedHiddenNatives = hiddenNatives.filter(smartRecruitersLabelProxy);
+  const unclassifiedHiddenNatives = hiddenNatives.filter(
+    (element) => !smartRecruitersLabelProxy(element)
+  );
   const customCandidates = [...new Set(elements.filter((element) =>
     !element.matches('input[type="checkbox"],input[type="radio"]') &&
     element.matches(
@@ -64,8 +100,13 @@ STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
   const activeCustom = customCandidates.filter((element) =>
     rendered(element) || selected(element) || required(element)
   );
-  const unclassified = [...hiddenNatives, ...activeCustom];
-  const discoveredCount = visibleNatives.length + unclassified.length;
+  const classifiedCustom = activeCustom.filter(smartRecruitersCustomProxy);
+  const unclassifiedCustom = activeCustom.filter(
+    (element) => !smartRecruitersCustomProxy(element)
+  );
+  const unclassified = [...unclassifiedHiddenNatives, ...unclassifiedCustom];
+  const classifiedCount = visibleNatives.length + classifiedHiddenNatives.length + classifiedCustom.length;
+  const discoveredCount = classifiedCount + unclassified.length;
   const selectedOrFilledCount = visibleNatives.filter(selected).length +
     hiddenNatives.filter((element) => selected(element) || proxySelected(element)).length +
     activeCustom.filter(selected).length;
@@ -73,7 +114,7 @@ STATEFUL_CONTROL_COVERAGE_SCRIPT = r"""() => {
   return {
     schema_version: 1,
     discovered_count: discoveredCount,
-    classified_visible_native_count: visibleNatives.length,
+    classified_visible_native_count: classifiedCount,
     unclassified_count: unclassified.length,
     selected_or_filled_count: selectedOrFilledCount,
     overflow,

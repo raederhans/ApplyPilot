@@ -17,6 +17,7 @@ from applypilot.apply.contracts import (
     MAX_AGENT_PROPOSALS,
     MAX_AGENT_REPORT_BYTES,
     AgentProposal,
+    AgentRunRequest,
     AgentTurnResult,
     agent_turn_result_from_mapping,
 )
@@ -34,6 +35,43 @@ def test_agent_event_clock_advances_when_wall_clock_collides(monkeypatch) -> Non
     assert started == fixed
     assert proposals == fixed + timedelta(microseconds=1)
     assert completed == fixed + timedelta(microseconds=2)
+
+
+def test_agent_progress_event_is_bounded_and_contains_no_tool_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = []
+    monkeypatch.setattr(database, "append_agent_event", captured.append)
+    request = AgentRunRequest(
+        run_id="turn-1",
+        attempt_id="attempt-1",
+        agent_role="browser-application-agent",
+        phase="prepare",
+        objective="prepare",
+    )
+
+    launcher._persist_agent_turn_progress(
+        request,
+        sequence=1,
+        last_tool="playwright:browser_click <private page text>",
+        tool_call_count=12,
+        browser_success_count=8,
+        browser_failure_count=4,
+        elapsed_ms=31_000,
+        occurred_after=None,
+    )
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.event_type == "agent.turn.progress"
+    assert event.payload == {
+        "sequence": 1,
+        "last_tool": "playwright:browser_click_private_page_text_",
+        "tool_call_count": 12,
+        "browser_success_count": 8,
+        "browser_failure_count": 4,
+        "elapsed_ms": 31_000,
+    }
 
 
 def proposal(
@@ -1599,6 +1637,10 @@ def test_durable_completed_event_classifies_status_conflict_without_raw_contract
     assert status == "failed:conflicting_agent_results"
     assert payload["source"] == "conflict"
     assert payload["conflict_classification"] == "status_mismatch"
+    assert payload["conflict_status_families"] == {
+        "structured": "failure",
+        "legacy": "ready",
+    }
     assert "failed:resume_upload" not in serialized
     assert "RESULT:READY_TO_SUBMIT" not in serialized
 
