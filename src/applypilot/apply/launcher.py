@@ -5686,6 +5686,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             server = item.get("server", "playwright")
                             tool = item.get("tool", item.get("name", "tool"))
                             now_tool = time.perf_counter()
+                            if (
+                                item_type == "mcp_tool_call"
+                                and first_mcp_ready_at is None
+                            ):
+                                # A completed Codex MCP item proves the server was
+                                # available, which preserves the established
+                                # turn-metrics contract. It is not a request-time
+                                # signal, so do not emit mcp.first_tool_request.
+                                first_mcp_ready_at = now_tool
                             if first_tool_at is None:
                                 first_tool_at = now_tool
                                 performance_attribution_mod.safe_record(
