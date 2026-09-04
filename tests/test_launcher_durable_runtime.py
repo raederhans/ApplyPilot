@@ -421,6 +421,7 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
             self.transport = SimpleNamespace(process=SimpleNamespace(pid=4002))
             self.requests: list[tuple[str, RuntimeCellRequest]] = []
             self.thread_config: dict[str, object] = {}
+            self.terminal_status = "completed"
 
         def health(self) -> RuntimeAdapterHealth:
             return RuntimeAdapterHealth(
@@ -436,8 +437,7 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
         def _turn(self, kind: str, request: RuntimeCellRequest) -> RuntimeCellTurn:
             self.requests.append((kind, request))
             number = len(self.requests)
-            control_config = self.thread_config["mcp_servers"]["applypilot_control"]
-            report_path = Path(control_config["env"][agent_report_mcp.REPORT_PATH_ENV])
+            report_path = request.cwd / "agent-turn-report.json"
             report_path.write_text(
                 json.dumps(
                     {
@@ -473,7 +473,11 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
                                 "text": "RESULT:READY_TO_SUBMIT",
                             },
                         },
-                        {"type": "turn.completed", "usage": {}},
+                        {
+                            "type": "turn.completed",
+                            "status": self.terminal_status,
+                            "usage": {},
+                        },
                     )
                 ),
             )
@@ -540,14 +544,31 @@ def test_run_job_feature_flag_uses_warm_app_server_and_resumes_same_thread(
         submission_phase="prepare",
         resume_existing_page=True,
     )
+    adapter.terminal_status = "failed"
+    failed_status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+        resume_existing_page=True,
+    )
 
     assert (first_status, second_status) == ("ready_to_submit", "ready_to_submit")
-    assert [kind for kind, _request in adapter.requests] == ["start", "resume"]
+    assert failed_status == "failed:app_server_turn_failed"
+    assert [kind for kind, _request in adapter.requests] == ["start", "resume", "resume"]
     assert adapter.requests[1][1].parent_provider_session_id == "provider-thread-1"
     assert all(job["url"] not in request.prompt for _kind, request in adapter.requests)
     assert all(str(tmp_path) not in request.prompt for _kind, request in adapter.requests)
     assert all("APPLICATION_PLAN_DELTA_V1" in request.prompt for _kind, request in adapter.requests)
-    assert "mcp_servers" in adapter.thread_config
+    assert set(adapter.thread_config["mcp_servers"]) == {"playwright"}
+    serialized_config = json.dumps(adapter.thread_config)
+    assert str(tmp_path) not in serialized_config
+    assert "mailbox" not in serialized_config
+    assert "credential_relay" not in serialized_config
+    assert "applypilot_control" not in serialized_config
+    assert "applypilot_ats" not in serialized_config
     assert job["_runtime_cell"]["active_backend"] == "codex-app-server"
 
 
@@ -870,6 +891,13 @@ def test_submit_scope_creates_parent_linked_submit_child_and_consumes_gate(
         _submission_gate=True,
     )
 
+    class RejectingPool:
+        def adapter_for_worker(self, _worker_id: int) -> object:
+            raise AssertionError("submit phase must remain on the CLI runtime")
+
+    monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
+    monkeypatch.setattr(launcher, "_app_server_runtime_pool", RejectingPool())
+
     with launcher._runtime_submit_scope(submit_job):
         assert launcher.run_job(
             submit_job,
@@ -902,6 +930,7 @@ def test_submit_scope_creates_parent_linked_submit_child_and_consumes_gate(
         "bound_backend": None,
     }
     assert submit_job["_runtime_cell"]["disposition"] == "execute"
+    assert submit_job["_runtime_cell"]["active_backend"] == "codex-cli"
 
 
 @pytest.mark.parametrize(

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import platform
 import queue
 import shutil
@@ -28,7 +27,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from applypilot.apply import agent_runtime as agent_runtime_mod
 from applypilot.apply.application_plan import ApplicationPlan, render_application_plan_delta
 from applypilot.apply.capabilities import CapabilityRegistry, capability_names_for_server
 from applypilot.apply.codex_app_server import (
@@ -44,6 +42,7 @@ from applypilot.apply.runtime_cell import (
 
 ConnectionProvider = Callable[[], sqlite3.Connection]
 AdapterFactory = Callable[[], CodexAppServerAdapter]
+AdapterFailureCallback = Callable[[CodexAppServerAdapter], None]
 
 _EFFECT_ITEM_TYPES = frozenset(
     {
@@ -200,7 +199,6 @@ class DurableAppServerStateStore:
         attempt_id: str,
         provider_session_id: str,
         provider_turn_id: str,
-        submit_started: bool,
     ) -> DurableAppServerState:
         if not all(
             isinstance(value, str) and value.strip()
@@ -221,26 +219,28 @@ class DurableAppServerStateStore:
                 current.attempt_id != attempt_id
                 or (current.provider_session_id is not None and current.provider_session_id != provider_session_id)
                 or current.submit_started
-                and not submit_started
             ):
-                raise DurableAppServerStateError("App Server provider binding or submit state changed")
+                raise DurableAppServerStateError(
+                    "App Server provider binding changed or is already receipt-only"
+                )
             connection.execute(
                 """
                 INSERT INTO app_server_runtime_bindings(
                     actor_id, attempt_id, provider_session_id, provider_turn_id,
                     request_accepted, tool_or_effect_started, submit_started,
                     status, updated_at
-                ) VALUES(?,?,?,?,1,?,?,?,?)
+                ) VALUES(?,?,?,?,1,?,0,?,?)
                 ON CONFLICT(actor_id) DO UPDATE SET
                     provider_session_id=excluded.provider_session_id,
                     provider_turn_id=excluded.provider_turn_id,
                     request_accepted=1,
                     tool_or_effect_started=app_server_runtime_bindings.tool_or_effect_started,
-                    submit_started=MAX(
-                        app_server_runtime_bindings.submit_started,
-                        excluded.submit_started
-                    ),
-                    status=excluded.status,
+                    submit_started=app_server_runtime_bindings.submit_started,
+                    status=CASE
+                        WHEN app_server_runtime_bindings.submit_started=1
+                            THEN 'receipt_only'
+                        ELSE excluded.status
+                    END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -249,9 +249,65 @@ class DurableAppServerStateStore:
                     provider_session_id,
                     provider_turn_id,
                     int(current.tool_or_effect_started) if current is not None else 0,
-                    int(submit_started),
-                    "receipt_only" if submit_started else "running",
+                    "running",
                     datetime.now(UTC).isoformat(),
+                ),
+            )
+            connection.commit()
+            state = self._from_row(
+                connection.execute(
+                    "SELECT * FROM app_server_runtime_bindings WHERE actor_id=?",
+                    (actor_id,),
+                ).fetchone()
+            )
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            self._release(connection)
+        assert state is not None
+        return state
+
+    def record_submit_started(
+        self,
+        *,
+        actor_id: str,
+        attempt_id: str,
+        provider_turn_id: str,
+    ) -> DurableAppServerState:
+        """Persist only an explicit host-observed Submit effect, irreversibly."""
+
+        connection = self._connection()
+        try:
+            self._ensure_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._from_row(
+                connection.execute(
+                    "SELECT * FROM app_server_runtime_bindings WHERE actor_id=?",
+                    (actor_id,),
+                ).fetchone()
+            )
+            if (
+                current is None
+                or current.attempt_id != attempt_id
+                or current.provider_turn_id != provider_turn_id
+                or not current.request_accepted
+            ):
+                raise DurableAppServerStateError(
+                    "Submit effect does not bind the accepted durable App Server turn"
+                )
+            connection.execute(
+                """
+                UPDATE app_server_runtime_bindings
+                SET submit_started=1, status='receipt_only', updated_at=?
+                WHERE actor_id=? AND attempt_id=? AND provider_turn_id=?
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    actor_id,
+                    attempt_id,
+                    provider_turn_id,
                 ),
             )
             connection.commit()
@@ -281,6 +337,8 @@ class DurableAppServerStateStore:
 
         if execution_state.bound_backend != "codex-app-server":
             raise ValueError("uncertain App Server acceptance must stay bound")
+        if execution_state.submit_started:
+            raise ValueError("submit_started requires an explicit durable host observation")
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -299,7 +357,7 @@ class DurableAppServerStateStore:
                     actor_id, attempt_id, provider_session_id, provider_turn_id,
                     request_accepted, tool_or_effect_started, submit_started,
                     status, updated_at
-                ) VALUES(?,?,NULL,NULL,?,?,?,?,?)
+                ) VALUES(?,?,NULL,NULL,?,?,0,?,?)
                 ON CONFLICT(actor_id) DO UPDATE SET
                     request_accepted=MAX(
                         app_server_runtime_bindings.request_accepted,
@@ -309,11 +367,12 @@ class DurableAppServerStateStore:
                         app_server_runtime_bindings.tool_or_effect_started,
                         excluded.tool_or_effect_started
                     ),
-                    submit_started=MAX(
-                        app_server_runtime_bindings.submit_started,
-                        excluded.submit_started
-                    ),
-                    status=excluded.status,
+                    submit_started=app_server_runtime_bindings.submit_started,
+                    status=CASE
+                        WHEN app_server_runtime_bindings.submit_started=1
+                            THEN 'receipt_only'
+                        ELSE excluded.status
+                    END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -321,8 +380,7 @@ class DurableAppServerStateStore:
                     attempt_id,
                     int(execution_state.request_accepted),
                     int(execution_state.tool_or_effect_started),
-                    int(execution_state.submit_started),
-                    "receipt_only" if execution_state.submit_started else "parked",
+                    "parked",
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -352,7 +410,14 @@ class DurableAppServerStateStore:
     ) -> DurableAppServerState:
         item = event.get("item")
         effect_started = isinstance(item, Mapping) and item.get("type") in _EFFECT_ITEM_TYPES
-        terminal = event.get("type") == "turn.completed"
+        terminal_status: str | None = None
+        if event.get("type") == "turn.completed":
+            raw_status = event.get("status")
+            if raw_status not in {"completed", "failed", "interrupted"}:
+                raise DurableAppServerStateError(
+                    "terminal App Server event has no valid provider status"
+                )
+            terminal_status = str(raw_status)
         connection = self._connection()
         try:
             self._ensure_schema(connection)
@@ -379,7 +444,9 @@ class DurableAppServerStateStore:
                 """,
                 (
                     int(effect_started),
-                    ("receipt_only" if current.submit_started else "completed" if terminal else "running"),
+                    "receipt_only"
+                    if current.submit_started
+                    else terminal_status or "running",
                     datetime.now(UTC).isoformat(),
                     actor_id,
                     attempt_id,
@@ -431,6 +498,18 @@ class AppServerRuntimePool:
             except (OSError, RuntimeError, TimeoutError, ValueError):
                 # Each adapter performs bounded transport containment itself.
                 pass
+
+    def evict_worker(self, worker_id: int, adapter: CodexAppServerAdapter) -> None:
+        """Remove and close a worker transport after a non-terminal anomaly."""
+
+        with self._lock:
+            if self._adapters.get(worker_id) is adapter:
+                self._adapters.pop(worker_id, None)
+        try:
+            adapter.shutdown()
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            # The adapter shutdown path is bounded and owns final containment.
+            pass
 
 
 def _content_ref(value: object) -> str:
@@ -495,43 +574,37 @@ def build_ref_only_request(
 def build_thread_config(
     mcp_config: Mapping[str, object],
     *,
-    process_env: Mapping[str, str],
-    server_env_names: Mapping[str, tuple[str, ...]] | None = None,
     enabled_tools: Mapping[str, tuple[str, ...]] | None = None,
     playwright_url: str | None = None,
 ) -> dict[str, object]:
-    """Convert the existing MCP config into App Server thread overrides."""
+    """Build a Playwright-only App Server config without per-turn env values."""
 
     raw_servers = mcp_config.get("mcpServers")
     if not isinstance(raw_servers, Mapping):
         raise TypeError("MCP config does not contain mcpServers")
-    env_names = server_env_names or {}
     tool_names = enabled_tools or {}
     servers: dict[str, object] = {}
-    for raw_name, raw_config in raw_servers.items():
-        name = str(raw_name)
-        if not isinstance(raw_config, Mapping):
-            raise TypeError(f"MCP server config is invalid: {name}")
-        config = dict(raw_config)
-        if name == "playwright" and playwright_url is not None:
-            config = {"url": playwright_url}
-        elif config.get("command") == "npx":
-            args = list(config.get("args", ()))
-            if platform.system() == "Windows":
-                config["command"] = process_env.get(
-                    "COMSPEC", os.environ.get("COMSPEC", "cmd.exe")
-                )
-                config["args"] = ["/d", "/s", "/c", "npx", *args]
-            else:
-                config["command"] = shutil.which("npx") or "npx"
-                config["args"] = args
-        selected_env = {key: process_env[key] for key in env_names.get(name, ()) if key in process_env}
-        if selected_env:
-            config["env"] = selected_env
-        if name in tool_names:
-            config["enabled_tools"] = list(tool_names[name])
-        config["default_tools_approval_mode"] = "approve"
-        servers[name] = config
+    raw_config = raw_servers.get("playwright")
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("MCP server config is invalid: playwright")
+    if playwright_url is not None:
+        config: dict[str, object] = {"url": playwright_url}
+    else:
+        command = raw_config.get("command")
+        args = raw_config.get("args", ())
+        if not isinstance(command, str) or not command:
+            raise TypeError("Playwright MCP command is invalid")
+        if not isinstance(args, (list, tuple)) or not all(isinstance(arg, str) for arg in args):
+            raise TypeError("Playwright MCP arguments are invalid")
+        if command == "npx" and platform.system() == "Windows":
+            config = {"command": "cmd.exe", "args": ["/d", "/s", "/c", "npx", *args]}
+        elif command == "npx":
+            config = {"command": shutil.which("npx") or "npx", "args": list(args)}
+        else:
+            config = {"command": command, "args": list(args)}
+    config["enabled_tools"] = list(tool_names.get("playwright", ()))
+    config["default_tools_approval_mode"] = "approve"
+    servers["playwright"] = config
     return {
         "features": {
             "shell_tool": False,
@@ -553,18 +626,22 @@ class AppServerTurnProcess:
         state_store: DurableAppServerStateStore,
         actor_id: str,
         attempt_id: str,
+        on_transport_failure: AdapterFailureCallback | None = None,
     ) -> None:
         self.adapter = adapter
         self.turn = turn
         self.state_store = state_store
         self.actor_id = actor_id
         self.attempt_id = attempt_id
+        self.on_transport_failure = on_transport_failure
         process = adapter.transport.process
         self.pid = int(process.pid) if process is not None else 0
         self.returncode: int | None = None
         self._stream: queue.Queue[object] = queue.Queue()
         self._stream_end = object()
         self._cancel_requested = threading.Event()
+        self._failure_contained = threading.Event()
+        self.terminal_status: str | None = None
         self._consumer = threading.Thread(
             target=self._consume_events,
             name=f"applypilot-app-server-turn-{turn.provider_turn_id}",
@@ -591,7 +668,6 @@ class AppServerTurnProcess:
             self._stream.put(self._stream_end)
 
     def _lines(self) -> Iterator[str]:
-        terminal = False
         cancel_deadline: float | None = None
         try:
             while True:
@@ -616,17 +692,64 @@ class AppServerTurnProcess:
                 if not isinstance(item, Mapping):
                     raise TypeError("App Server event stream yielded a non-mapping")
                 event = item
-                terminal = event.get("type") == "turn.completed"
+                if event.get("type") == "turn.completed":
+                    status = event.get("status")
+                    if status not in {"completed", "failed", "interrupted"}:
+                        raise CodexAppServerExecutionError(
+                            "App Server terminal event has no valid provider status",
+                            execution_state=self.state_store.execution_state(
+                                self.actor_id, self.attempt_id
+                            ),
+                        )
+                    self.terminal_status = str(status)
                 yield json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            if self.terminal_status is None:
+                raise CodexAppServerExecutionError(
+                    "App Server event stream ended before provider turn terminal",
+                    execution_state=self.state_store.execution_state(
+                        self.actor_id, self.attempt_id
+                    ),
+                )
         except CodexAppServerExecutionError as exc:
-            self.state_store.record_uncertain_acceptance(
-                actor_id=self.actor_id,
-                attempt_id=self.attempt_id,
-                execution_state=exc.execution_state,
-            )
+            try:
+                self.state_store.record_uncertain_acceptance(
+                    actor_id=self.actor_id,
+                    attempt_id=self.attempt_id,
+                    execution_state=exc.execution_state,
+                )
+            finally:
+                if self.terminal_status is None:
+                    self._contain_nonterminal_failure()
+            raise
+        except BaseException:
+            if self.terminal_status is None:
+                self._contain_nonterminal_failure()
             raise
         finally:
-            self.returncode = 0 if terminal else -1
+            if self.terminal_status == "completed":
+                self.returncode = 0
+            elif self.terminal_status == "interrupted":
+                self.returncode = -1
+            else:
+                self.returncode = 1
+
+    def _contain_nonterminal_failure(self) -> None:
+        if self._failure_contained.is_set():
+            return
+        self._failure_contained.set()
+        try:
+            self.adapter.cancel(self.turn.provider_turn_id)
+        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+            pass
+        try:
+            self.adapter.drain(
+                self.turn.provider_turn_id,
+                timeout=self.adapter.drain_timeout,
+            )
+        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError):
+            pass
+        if self.on_transport_failure is not None:
+            self.on_transport_failure(self.adapter)
 
     def poll(self) -> int | None:
         return self.returncode
@@ -649,12 +772,19 @@ def open_app_server_turn(
     adapter: CodexAppServerAdapter,
     state_store: DurableAppServerStateStore,
     request: RuntimeCellRequest,
-    submit_started: bool,
+    on_transport_failure: AdapterFailureCallback | None = None,
 ) -> AppServerTurnProcess:
     """Start or resume one durable application thread and persist acceptance."""
 
+    if request.phase == "submit":
+        raise ValueError("submit phase is not supported by the App Server runtime")
+
     existing = state_store.load(request.actor_id, request.attempt_id)
     if existing is not None and existing.request_accepted:
+        if existing.submit_started:
+            raise DurableAppServerStateError(
+                "App Server application is receipt-only after Submit started"
+            )
         if not existing.provider_session_id:
             raise DurableAppServerStateError("accepted App Server request has no resumable provider session")
         if request.parent_provider_session_id != existing.provider_session_id:
@@ -670,7 +800,7 @@ def open_app_server_turn(
             execution_state=RuntimeCellExecutionState(
                 request_accepted=True,
                 tool_or_effect_started=False,
-                submit_started=submit_started,
+                submit_started=False,
                 bound_backend="codex-app-server",
             ),
         )
@@ -688,16 +818,14 @@ def open_app_server_turn(
         attempt_id=request.attempt_id,
         provider_session_id=turn.provider_session_id,
         provider_turn_id=turn.provider_turn_id,
-        submit_started=submit_started,
     )
-    if submit_started:
-        adapter.mark_submit_started(turn.provider_turn_id)
     return AppServerTurnProcess(
         adapter=adapter,
         turn=turn,
         state_store=state_store,
         actor_id=request.actor_id,
         attempt_id=request.attempt_id,
+        on_transport_failure=on_transport_failure,
     )
 
 
@@ -712,13 +840,7 @@ def open_configured_app_server_turn(
     cwd: Path,
     model: str,
     mcp_config: Mapping[str, object],
-    process_env: Mapping[str, str],
     runtime_capabilities: CapabilityRegistry,
-    playwright_env: Mapping[str, str],
-    mailbox_server_name: str | None,
-    mailbox_env: Mapping[str, str],
-    credential_relay_authorized: bool,
-    identity_relay_authorized: bool,
     playwright_url: str | None,
     prompt_contract: object,
     ats_context: object,
@@ -726,36 +848,19 @@ def open_configured_app_server_turn(
     plan: ApplicationPlan | None,
     previous_plan: ApplicationPlan | None,
     plan_shadow_enabled: bool,
-    submit_started: bool,
+    on_transport_failure: AdapterFailureCallback | None = None,
 ) -> AppServerTurnProcess:
     """Configure one worker adapter and open its durable application turn."""
 
-    server_env_names: dict[str, tuple[str, ...]] = {
-        "playwright": tuple(playwright_env),
-        "applypilot_control": tuple(agent_runtime_mod.CONTROL_REPORT_ENV_VARS),
-        "applypilot_ats": tuple(agent_runtime_mod.APPLICATION_TOOL_ENV_VARS),
-        "credential_relay": tuple(agent_runtime_mod.CREDENTIAL_RELAY_ENV_VARS),
-    }
-    if mailbox_server_name:
-        server_env_names[mailbox_server_name] = tuple(mailbox_env)
+    if phase == "submit":
+        raise ValueError("submit phase is not supported by the App Server runtime")
+
     enabled_tools: dict[str, tuple[str, ...]] = {
-        server: tuple(capability_names_for_server(runtime_capabilities, server))
-        for server in ("playwright", "applypilot_control", "applypilot_ats")
+        "playwright": tuple(capability_names_for_server(runtime_capabilities, "playwright"))
     }
-    if credential_relay_authorized or identity_relay_authorized:
-        enabled_tools["credential_relay"] = tuple(
-            tool
-            for tool, enabled in (
-                ("fill_ats_credentials", credential_relay_authorized),
-                ("fill_protected_identifier", identity_relay_authorized),
-            )
-            if enabled
-        )
     adapter.configure_thread(
         build_thread_config(
             mcp_config,
-            process_env=process_env,
-            server_env_names=server_env_names,
             enabled_tools=enabled_tools,
             playwright_url=playwright_url,
         )
@@ -780,7 +885,7 @@ def open_configured_app_server_turn(
         adapter=adapter,
         state_store=state_store,
         request=request,
-        submit_started=submit_started,
+        on_transport_failure=on_transport_failure,
     )
 
 

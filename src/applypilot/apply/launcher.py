@@ -5279,7 +5279,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if runtime_settings.codex_app_server_enabled
         else _app_server_state_store.peek(actor_id, attempt_id)
     )
-    runtime_cell_execution_state = (
+    persisted_app_server_execution_state = (
         app_server_state.execution_state
         if app_server_state is not None
         else runtime_cell_mod.RuntimeCellExecutionState(
@@ -5288,6 +5288,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             submit_started=False,
             bound_backend=None,
         )
+    )
+    # App Server is a prepare/repair host only.  A terminal prepare turn may
+    # hand off to the existing CLI submit path, but an in-flight/failed binding
+    # remains parked and an explicit durable Submit observation stays receipt-only.
+    completed_prepare_handoff = bool(
+        submission_phase == "submit"
+        and app_server_state is not None
+        and app_server_state.status == "completed"
+        and not app_server_state.submit_started
+    )
+    runtime_cell_execution_state = (
+        runtime_cell_mod.RuntimeCellExecutionState(
+            request_accepted=False,
+            tool_or_effect_started=False,
+            submit_started=False,
+            bound_backend=None,
+        )
+        if completed_prepare_handoff
+        else persisted_app_server_execution_state
     )
     app_server_bound = runtime_cell_execution_state.bound_backend == "codex-app-server"
     if app_server_bound and runtime_route != "browser":
@@ -5302,10 +5321,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             if route_selection.health.disposition == "receipt_only"
             else "failed:runtime_route_changed"
         ), 0
-    app_server_eligible = runtime_route == "browser"
+    app_server_eligible = runtime_route == "browser" and submission_phase != "submit"
     app_server_adapter = None
-    if app_server_bound or (
-        runtime_settings.codex_app_server_enabled and app_server_eligible
+    if submission_phase != "submit" and (
+        app_server_bound
+        or runtime_settings.codex_app_server_enabled
+        and app_server_eligible
     ):
         app_server_adapter = _app_server_runtime_pool.adapter_for_worker(worker_id)
     runtime_cell_selection = runtime_cell_mod.select_runtime_cell(
@@ -5884,13 +5905,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 cwd=worker_dir,
                 model=model,
                 mcp_config=mcp_config,
-                process_env=env,
                 runtime_capabilities=runtime_capabilities,
-                playwright_env=playwright_mcp.env,
-                mailbox_server_name=(mailbox_mcp.server_name if mailbox_mcp.enabled else None),
-                mailbox_env=mailbox_mcp.env,
-                credential_relay_authorized=credential_relay_authorized,
-                identity_relay_authorized=identity_relay_authorized,
                 playwright_url=(
                     application_context.endpoint.address
                     if application_context is not None
@@ -5917,7 +5932,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     else None
                 ),
                 plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
-                submit_started=submission_phase == "submit" and not dry_run,
+                on_transport_failure=lambda failed_adapter: _app_server_runtime_pool.evict_worker(
+                    worker_id, failed_adapter
+                ),
             )
             proc = app_server_turn_process
             runtime_metadata["provider_session_id"] = proc.turn.provider_session_id
@@ -6294,6 +6311,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if lease_heartbeat is not None:
             lease_heartbeat.raise_if_failed()
         returncode = proc.returncode
+        app_server_terminal_status = (
+            app_server_turn_process.terminal_status
+            if app_server_turn_process is not None
+            else None
+        )
         proc = None
         job["_mailbox_runtime_evidence"] = dict(mailbox_runtime_evidence)
         browser_tool_call_count = len(browser_tool_outcomes)
@@ -6320,6 +6342,25 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 summary=f"Agent process timed out after {elapsed}s",
             )
             return turn_application_status, duration_ms
+
+        if app_server_turn_process is not None and returncode != 0:
+            interrupted = app_server_terminal_status == "interrupted" or bool(
+                returncode and returncode < 0
+            )
+            status = "skipped" if interrupted else "failed:app_server_turn_failed"
+            turn_application_status = status
+            turn_duration_ms = int((time.time() - start) * 1000)
+            turn_source = "runtime_interrupted" if interrupted else "runtime_provider_failed"
+            turn_result = AgentTurnResult(
+                run_id=run_id,
+                status=status,
+                summary=(
+                    "App Server turn was interrupted"
+                    if interrupted
+                    else "App Server provider reported a failed turn"
+                ),
+            )
+            return status, turn_duration_ms
 
         if returncode and returncode < 0:
             status = "submission_uncertain" if submission_phase == "submit" and not dry_run else "skipped"

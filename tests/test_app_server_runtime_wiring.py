@@ -20,6 +20,7 @@ from applypilot.apply.app_server_runtime_wiring import (
 from applypilot.apply.application_plan import ApplicationPlan
 from applypilot.apply.codex_app_server import (
     CodexAppServerAdapter,
+    CodexAppServerExecutionError,
     CodexAppServerStdioTransport,
     CodexAppServerTimeout,
 )
@@ -63,8 +64,8 @@ for raw_line in sys.stdin:
             "item": {
                 "id": f"tool-{turn_counter}",
                 "type": "mcpToolCall",
-                "server": "applypilot_control",
-                "tool": "report_agent_turn",
+                "server": "playwright",
+                "tool": "browser_snapshot",
                 "status": "completed",
                 "result": {"isError": False},
             },
@@ -145,30 +146,51 @@ def test_ref_only_request_adds_optional_plan_delta_without_raw_inputs(tmp_path: 
     assert all(value.startswith("sha256:") for value in request.context_refs.values())
 
 
-def test_thread_config_scopes_per_turn_env_and_tools() -> None:
+def test_thread_config_is_playwright_only_and_never_serializes_env_values() -> None:
+    secret_values = {
+        "C:/private/agent-turn-report.json",
+        "mailbox-secret-token",
+        "credential-secret-path",
+    }
     config = build_thread_config(
         {
             "mcpServers": {
-                "playwright": {"command": "pw", "args": ["--old"]},
-                "applypilot_control": {"command": "python", "args": ["-m", "control"]},
+                "playwright": {
+                    "command": "pw",
+                    "args": ["--old"],
+                    "env": {"PLAYWRIGHT_SECRET": "must-not-survive"},
+                },
+                "applypilot_control": {
+                    "command": "python",
+                    "args": ["-m", "control"],
+                    "env": {"REPORT_PATH": "C:/private/agent-turn-report.json"},
+                },
+                "mailbox": {
+                    "command": "mailbox",
+                    "env": {"TOKEN": "mailbox-secret-token"},
+                },
+                "credential_relay": {
+                    "command": "relay",
+                    "env": {"CREDENTIAL_PATH": "credential-secret-path"},
+                },
             }
         },
-        process_env={"REPORT_PATH": "C:/one/report.json", "UNRELATED": "no"},
-        server_env_names={"applypilot_control": ("REPORT_PATH",)},
         enabled_tools={
             "playwright": ("browser_snapshot",),
-            "applypilot_control": ("report_agent_turn",),
         },
         playwright_url="http://127.0.0.1:3210/mcp",
     )
 
     servers = config["mcp_servers"]
+    assert set(servers) == {"playwright"}
     assert servers["playwright"]["url"] == "http://127.0.0.1:3210/mcp"
     assert "command" not in servers["playwright"]
-    assert servers["applypilot_control"]["env"] == {
-        "REPORT_PATH": "C:/one/report.json"
-    }
-    assert "UNRELATED" not in json.dumps(config)
+    serialized = json.dumps(config)
+    assert "env" not in serialized
+    assert "mailbox" not in serialized
+    assert "credential_relay" not in serialized
+    assert "applypilot_control" not in serialized
+    assert all(value not in serialized for value in secret_values)
 
 
 def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: Path) -> None:
@@ -197,7 +219,6 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
             adapter=adapter,
             state_store=store,
             request=first_request,
-            submit_started=False,
         )
         assert [json.loads(line)["type"] for line in first.stdout][-1] == "turn.completed"
         first_state = store.load("application:attempt-1", "attempt-1")
@@ -213,6 +234,28 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
         )
         assert parked.health.disposition == "park"
         assert parked.health.fallback_used is False
+
+        submit_request = build_ref_only_request(
+            run_id="run-submit",
+            actor_id="application:attempt-1",
+            attempt_id="attempt-1",
+            phase="submit",
+            cwd=tmp_path,
+            model="gpt-5.6-sol",
+            prompt_contract={"phase": "submit"},
+            ats_context={"schema_version": "1"},
+            parent_provider_session_id=first_state.provider_session_id,
+        )
+        with pytest.raises(ValueError, match="submit phase is not supported"):
+            open_app_server_turn(
+                adapter=adapter,
+                state_store=store,
+                request=submit_request,
+            )
+        not_submitted = store.load("application:attempt-1", "attempt-1")
+        assert not_submitted is not None
+        assert not_submitted.submit_started is False
+        assert not_submitted.status == "completed"
 
         selection = select_runtime_cell(
             "codex",
@@ -237,10 +280,14 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
             adapter=adapter,
             state_store=store,
             request=repair_request,
-            submit_started=True,
         )
         assert repair.turn.provider_session_id == "thread-1"
         list(repair.stdout)
+        store.record_submit_started(
+            actor_id="application:attempt-1",
+            attempt_id="attempt-1",
+            provider_turn_id=repair.turn.provider_turn_id,
+        )
         final_state = store.load("application:attempt-1", "attempt-1")
         assert final_state is not None
         assert final_state.provider_session_id == "thread-1"
@@ -254,6 +301,24 @@ def test_fake_server_turn_persists_effect_and_repairs_on_same_thread(tmp_path: P
         )
         assert receipt_only.health.disposition == "receipt_only"
         assert receipt_only.health.fallback_used is False
+
+        with pytest.raises(RuntimeError, match="already receipt-only"):
+            store.record_accepted(
+                actor_id="application:attempt-1",
+                attempt_id="attempt-1",
+                provider_session_id="thread-1",
+                provider_turn_id="turn-after-submit",
+            )
+        with pytest.raises(RuntimeError, match="receipt-only after Submit"):
+            open_app_server_turn(
+                adapter=adapter,
+                state_store=store,
+                request=repair_request,
+            )
+        preserved = store.load("application:attempt-1", "attempt-1")
+        assert preserved is not None
+        assert preserved.submit_started is True
+        assert preserved.status == "receipt_only"
     finally:
         adapter.shutdown()
     assert transport.process is not None
@@ -297,9 +362,17 @@ def test_turn_facade_stops_waiting_when_cancel_cannot_reach_server(tmp_path: Pat
 
         def __init__(self) -> None:
             self.transport = SimpleNamespace(process=SimpleNamespace(pid=4003))
+            self.drain_calls = 0
 
         def cancel(self, _provider_turn_id: str) -> None:
             raise RuntimeError("transport unavailable")
+
+        def drain(
+            self, _provider_turn_id: str | None = None, *, timeout: float | None = None
+        ) -> tuple[object, ...]:
+            del timeout
+            self.drain_calls += 1
+            return ()
 
     store = _store(tmp_path / "control.db")
     store.record_accepted(
@@ -307,7 +380,6 @@ def test_turn_facade_stops_waiting_when_cancel_cannot_reach_server(tmp_path: Pat
         attempt_id="attempt-1",
         provider_session_id="thread-1",
         provider_turn_id="turn-1",
-        submit_started=False,
     )
     process = AppServerTurnProcess(
         adapter=BlockingAdapter(),  # type: ignore[arg-type]
@@ -326,5 +398,118 @@ def test_turn_facade_stops_waiting_when_cancel_cannot_reach_server(tmp_path: Pat
             process.cancel()
         with pytest.raises(CodexAppServerTimeout, match="did not terminate"):
             list(process.stdout)
+        assert process.adapter.drain_calls == 1
     finally:
         released.set()
+
+
+def test_nonterminal_stream_failure_evicts_worker_before_next_application(
+    tmp_path: Path,
+) -> None:
+    created: list[object] = []
+
+    class FailingAdapter:
+        backend = "codex-app-server"
+        drain_timeout = 0.05
+
+        def __init__(self) -> None:
+            self.transport = SimpleNamespace(process=SimpleNamespace(pid=4004))
+            self.cancel_calls = 0
+            self.drain_calls = 0
+            self.shutdown_calls = 0
+            created.append(self)
+
+        def cancel(self, _provider_turn_id: str) -> None:
+            self.cancel_calls += 1
+
+        def drain(
+            self, _provider_turn_id: str | None = None, *, timeout: float | None = None
+        ) -> tuple[object, ...]:
+            del timeout
+            self.drain_calls += 1
+            return ()
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    pool = AppServerRuntimePool(FailingAdapter)  # type: ignore[arg-type]
+    adapter = pool.adapter_for_worker(0)
+    store = _store(tmp_path / "control.db")
+    store.record_accepted(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+    )
+    process = AppServerTurnProcess(
+        adapter=adapter,
+        turn=RuntimeCellTurn(
+            backend="codex-app-server",
+            provider_session_id="thread-1",
+            provider_turn_id="turn-1",
+            events=iter(()),
+        ),
+        state_store=store,
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        on_transport_failure=lambda failed: pool.evict_worker(0, failed),
+    )
+
+    with pytest.raises(CodexAppServerExecutionError, match="before provider turn terminal"):
+        list(process.stdout)
+
+    assert adapter.cancel_calls == 1
+    assert adapter.drain_calls == 1
+    assert adapter.shutdown_calls == 1
+    replacement = pool.adapter_for_worker(0)
+    assert replacement is not adapter
+    pool.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "expected_returncode", "expected_state"),
+    (("failed", 1, "failed"), ("interrupted", -1, "interrupted")),
+)
+def test_terminal_provider_failure_never_reports_success(
+    tmp_path: Path,
+    provider_status: str,
+    expected_returncode: int,
+    expected_state: str,
+) -> None:
+    class TerminalAdapter:
+        drain_timeout = 0.05
+        transport = SimpleNamespace(process=SimpleNamespace(pid=4005))
+
+    store = _store(tmp_path / f"{provider_status}.db")
+    store.record_accepted(
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+    )
+    process = AppServerTurnProcess(
+        adapter=TerminalAdapter(),  # type: ignore[arg-type]
+        turn=RuntimeCellTurn(
+            backend="codex-app-server",
+            provider_session_id="thread-1",
+            provider_turn_id="turn-1",
+            events=iter(
+                (
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "RESULT:READY_TO_SUBMIT"},
+                    },
+                    {"type": "turn.completed", "status": provider_status},
+                )
+            ),
+        ),
+        state_store=store,
+        actor_id="application:attempt-1",
+        attempt_id="attempt-1",
+    )
+
+    assert len(list(process.stdout)) == 2
+    assert process.returncode == expected_returncode
+    state = store.load("application:attempt-1", "attempt-1")
+    assert state is not None
+    assert state.status == expected_state
