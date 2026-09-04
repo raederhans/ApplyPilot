@@ -335,6 +335,72 @@ class _RuntimeCellCoordinatorBase:
             if owns:
                 conn.close()
 
+    def register_next(
+        self,
+        *,
+        cell_index: int,
+        runtime_id: str,
+        process_id: int,
+        process_birth_time: int,
+    ) -> RuntimeCellBinding:
+        """Register the next generation under one transaction-owned Cell slot."""
+
+        if isinstance(cell_index, bool) or not 0 <= cell_index < self.decision.effective_cells:
+            raise ValueError("cell_index is outside the effective Cell allocation")
+        cell_id = f"runtime-cell-{cell_index}"
+        conn = self._connection_factory()
+        try:
+            conn.execute("SAVEPOINT runtime_cell_register_next")
+            try:
+                storage.ensure_schema(conn)
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(generation),0) FROM runtime_cell_generations "
+                    "WHERE cell_id=?",
+                    (cell_id,),
+                ).fetchone()
+                generation = int(row[0]) + 1
+                binding = self.register(
+                    cell_index=cell_index,
+                    generation=generation,
+                    runtime_id=runtime_id,
+                    process_id=process_id,
+                    process_birth_time=process_birth_time,
+                    connection=conn,
+                )
+                conn.execute("RELEASE SAVEPOINT runtime_cell_register_next")
+            except BaseException:
+                conn.execute("ROLLBACK TO SAVEPOINT runtime_cell_register_next")
+                conn.execute("RELEASE SAVEPOINT runtime_cell_register_next")
+                raise
+            return binding
+        finally:
+            conn.close()
+
+    def close_generation(
+        self,
+        binding: RuntimeCellBinding,
+        *,
+        context_cleanup_verified: bool,
+        residual_resources: int | None,
+    ) -> None:
+        """Close an idle generation with its complete process/source identity."""
+
+        conn = self._connection_factory()
+        try:
+            storage.close_generation_after_cleanup(
+                conn,
+                cell_id=binding.cell_id,
+                generation=binding.generation,
+                runtime_id=binding.runtime_id,
+                source_identity=binding.source_identity,
+                process_id=binding.process_id,
+                process_birth_time=binding.process_birth_time,
+                context_cleanup_verified=context_cleanup_verified,
+                residual_resources=residual_resources,
+            )
+        finally:
+            conn.close()
+
     def claim(
         self,
         binding: RuntimeCellBinding,
@@ -504,6 +570,78 @@ class RuntimeCellHost:
             raise
         return RuntimeCellApplication(token, context_lease, agent_stop, contain_runtime)
 
+    def open_claimed_application(
+        self,
+        *,
+        lease_token: storage.RuntimeCellLeaseToken,
+        application_id: str,
+        actor_id: str,
+        attempt_id: str,
+        application_url: str,
+        scope: BrowserStateScope,
+        state: ScopedBrowserState,
+        agent_stop: Callable[[], None],
+        contain_runtime: Callable[[], None],
+    ) -> RuntimeCellApplication:
+        """Adopt the exact lease atomically acquired with the job attempt."""
+
+        parsed = urlsplit(application_url)
+        hostname = storage.normalize_hostname(parsed.hostname)
+        if (
+            lease_token.cell_id != self.binding.cell_id
+            or lease_token.generation != self.binding.generation
+            or lease_token.runtime_id != self.binding.runtime_id
+            or lease_token.application_id != application_id
+            or lease_token.actor_id != actor_id
+            or lease_token.attempt_id != attempt_id
+            or lease_token.hostname != hostname
+        ):
+            raise storage.StaleRuntimeCellTokenError(
+                "preclaimed Runtime Cell lease does not match this host"
+            )
+        conn = self._connection_factory()
+        try:
+            storage.heartbeat_lease(conn, lease_token)
+        finally:
+            conn.close()
+        try:
+            context_lease = self.context_runtime.open_application(
+                application_id=lease_token.application_id,
+                scope=scope,
+                state=state,
+            )
+        except BaseException as open_error:
+            try:
+                contain_runtime()
+            except BaseException as containment_error:  # noqa: BLE001
+                open_error.add_note(
+                    "runtime containment also failed: "
+                    f"{type(containment_error).__name__}"
+                )
+            try:
+                self.context_runtime.close()
+            except BrowserContextRuntimeError as context_close_error:
+                open_error.add_note(
+                    "context containment also failed: "
+                    f"{type(context_close_error).__name__}"
+                )
+            conn = self._connection_factory()
+            try:
+                storage.quarantine_after_cleanup_failure(
+                    conn,
+                    lease_token,
+                    reason="context_open_failed",
+                )
+            finally:
+                conn.close()
+            raise
+        return RuntimeCellApplication(
+            lease_token,
+            context_lease,
+            agent_stop,
+            contain_runtime,
+        )
+
     def close_application(self, application: RuntimeCellApplication) -> None:
         agent_stopped = False
         cleanup_verified = False
@@ -559,6 +697,37 @@ class RuntimeCellHost:
             conn.close()
         if failure is not None:
             raise storage.RuntimeCellQuarantinedError("Runtime Cell application cleanup was quarantined") from failure
+
+    def close(self) -> None:
+        """Close the idle context runtime before releasing its generation identity."""
+
+        failure: BaseException | None = None
+        try:
+            self.context_runtime.close()
+        except BrowserContextRuntimeError as exc:
+            failure = exc
+        metrics = self.context_runtime.metrics
+        residual = (
+            metrics.active_contexts
+            + metrics.pages_after_close
+            + metrics.frames_after_close
+            + metrics.service_workers_after_close
+        )
+        try:
+            self.coordinator.close_generation(
+                self.binding,
+                context_cleanup_verified=failure is None and metrics.closed,
+                residual_resources=residual,
+            )
+        except (
+            storage.RuntimeCellQuarantinedError,
+            storage.StaleRuntimeCellTokenError,
+        ) as exc:
+            failure = failure or exc
+        if failure is not None:
+            raise storage.RuntimeCellQuarantinedError(
+                "Runtime Cell generation shutdown was quarantined"
+            ) from failure
 
 
 __all__ = [

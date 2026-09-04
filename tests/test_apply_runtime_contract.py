@@ -597,6 +597,20 @@ def test_worker_count_uses_configured_profile_cap_without_hidden_global_limit() 
     assert reduced is False
 
 
+def test_runtime_cell_shadow_hard_gates_production_worker_capacity() -> None:
+    workers, decision = launcher._resolve_runtime_cell_worker_capacity(
+        2,
+        mode="shadow",
+        manifest_path=None,
+        source_root=Path(__file__).resolve().parents[1],
+    )
+
+    assert workers == 1
+    assert decision is not None
+    assert decision.effective_cells == 1
+    assert decision.production_authority is False
+
+
 def test_finite_target_never_creates_zero_allocation_continuous_workers() -> None:
     assert launcher._workers_for_target(6, 2) == 2
     assert launcher._workers_for_target(6, 0) == 6

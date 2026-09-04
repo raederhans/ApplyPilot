@@ -708,6 +708,9 @@ def _worker_runtime_ports() -> worker_orchestration_mod.WorkerRuntimePorts:
             resolve_admission=runtime_cell_coordinator_mod.configured_runtime_cell_admission,
             coordinator_factory=runtime_cell_coordinator_mod.RuntimeCellCoordinator,
             host_factory=runtime_cell_coordinator_mod.RuntimeCellHost,
+            connection_factory=_open_durable_control_connection,
+            source_root=Path(__file__).resolve().parents[3],
+            process_identity=_launcher_process_identity,
             production_enabled=runtime_cell_coordinator_mod.APP_SERVER_PRODUCTION_CELL_ADMITTED,
         ),
     )
@@ -3854,6 +3857,26 @@ def _resolve_worker_count(
         browser_backend == "cloak" and workers > 1 and not cloak_concurrency_allowed
     )
     return (1 if reduced_for_cloak else workers), reduced_for_cloak
+
+
+def _resolve_runtime_cell_worker_capacity(
+    requested_workers: int,
+    *,
+    mode: str,
+    manifest_path: Path | None,
+    source_root: Path,
+) -> tuple[int, runtime_cell_coordinator_mod.RuntimeCellAdmissionDecision | None]:
+    """Apply the source-bound Runtime Cell hard gate before workers start."""
+
+    if mode == "off":
+        return requested_workers, None
+    decision = runtime_cell_coordinator_mod.configured_runtime_cell_admission(
+        mode=mode,
+        requested_workers=requested_workers,
+        source_root=source_root,
+        manifest_path=manifest_path,
+    )
+    return min(requested_workers, decision.effective_cells), decision
 
 
 def _workers_for_target(workers: int, effective_limit: int) -> int:
@@ -8147,6 +8170,21 @@ def main(limit: int = 1, target_url: str | None = None,
             "APPLYPILOT_CLOAK_ALLOW_CONCURRENCY=1 only when the license permits it.[/yellow]"
         )
         workers = 1
+
+    runtime_cell_settings = load_runtime_settings()
+    workers, runtime_cell_decision = _resolve_runtime_cell_worker_capacity(
+        workers,
+        mode=runtime_cell_settings.runtime_cell_mode,
+        manifest_path=runtime_cell_settings.runtime_cell_admission_manifest,
+        source_root=Path(__file__).resolve().parents[3],
+    )
+    if runtime_cell_decision is not None:
+        console.print(
+            "[dim]Runtime Cell shadow: "
+            f"{runtime_cell_decision.status}, effective_cells="
+            f"{runtime_cell_decision.effective_cells}; production authority="
+            f"{str(runtime_cell_decision.production_authority).lower()}.[/dim]"
+        )
 
     if dry_run and continuous:
         raise ValueError("Continuous dry-run is not supported; use a finite limit.")

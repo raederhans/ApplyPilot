@@ -682,6 +682,97 @@ def quarantine_after_cleanup_failure(
     return quarantined
 
 
+def close_generation_after_cleanup(
+    connection: sqlite3.Connection,
+    *,
+    cell_id: str,
+    generation: int,
+    runtime_id: str,
+    source_identity: str,
+    process_id: int,
+    process_birth_time: int,
+    context_cleanup_verified: bool,
+    residual_resources: int | None,
+    reason: str = "runtime_shutdown",
+    now: datetime | None = None,
+) -> RuntimeCellGeneration:
+    """Terminally close one idle generation or quarantine uncertain cleanup."""
+
+    cell_id = _required(cell_id, "cell_id")
+    runtime_id = _required(runtime_id, "runtime_id")
+    source_identity = _required(source_identity, "source_identity")
+    reason = _required(reason, "reason")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in (process_id, process_birth_time)
+    ):
+        raise ValueError("process identity must contain positive integers")
+    ensure_schema(connection)
+    now_text = _iso(now or datetime.now(UTC))
+    with _write(connection, "runtime_cell_generation_close"):
+        current = _generation(
+            connection.execute(
+                f"SELECT {_GEN_COLUMNS} FROM runtime_cell_generations "
+                "WHERE cell_id=? AND generation=?",
+                (cell_id, generation),
+            ).fetchone()
+        )
+        if current is None:
+            raise KeyError("runtime cell generation does not exist")
+        if (
+            current.runtime_id,
+            current.source_identity,
+            current.process_id,
+            current.process_birth_time,
+        ) != (runtime_id, source_identity, process_id, process_birth_time):
+            raise RuntimeCellConflictError(
+                "runtime cell generation identity changed before close"
+            )
+        if current.status == "closed":
+            return current
+        if current.status == "quarantined":
+            raise RuntimeCellQuarantinedError("runtime cell generation is quarantined")
+        live_lease = connection.execute(
+            "SELECT 1 FROM runtime_cell_leases WHERE cell_id=? AND generation=? "
+            "AND status IN ('open','suspect','draining') LIMIT 1",
+            (cell_id, generation),
+        ).fetchone()
+        cleanup_clean = context_cleanup_verified and residual_resources == 0
+        if live_lease is not None:
+            cleanup_clean = False
+            reason = "runtime_shutdown_with_live_lease"
+        status = "closed" if cleanup_clean else "quarantined"
+        quarantine_reason = None if cleanup_clean else reason
+        cursor = connection.execute(
+            "UPDATE runtime_cell_generations SET status=?,updated_at=?,quarantine_reason=? "
+            "WHERE cell_id=? AND generation=? AND runtime_id=? AND source_identity=? "
+            "AND process_id=? AND process_birth_time=? "
+            "AND status IN ('active','suspect','draining')",
+            (
+                status,
+                now_text,
+                quarantine_reason,
+                cell_id,
+                generation,
+                runtime_id,
+                source_identity,
+                process_id,
+                process_birth_time,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StaleRuntimeCellTokenError("runtime cell generation close CAS failed")
+        closed = get_generation(connection, cell_id, generation)
+    assert closed is not None
+    if not cleanup_clean:
+        raise RuntimeCellQuarantinedError(
+            "runtime cell generation cleanup was not proven"
+        )
+    return closed
+
+
 __all__ = [
     "RUNTIME_CELL_SCHEMA_VERSION",
     "RuntimeCellConflictError",
@@ -692,6 +783,7 @@ __all__ = [
     "StaleRuntimeCellTokenError",
     "begin_drain",
     "claim_lease",
+    "close_generation_after_cleanup",
     "ensure_schema",
     "get_generation",
     "heartbeat_lease",

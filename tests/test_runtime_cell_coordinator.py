@@ -618,6 +618,77 @@ def test_ten_contexts_close_zero_residual_after_agent_stop(tmp_path: Path) -> No
         assert all(not context.pages for context in browser.contexts)
 
 
+def test_preclaimed_job_lease_is_adopted_and_released_without_second_claim(
+    tmp_path: Path,
+) -> None:
+    host, _browser, path = _host(tmp_path)
+    scope, state = _scope_state()
+    attempt_id = "attempt-preclaimed"
+    token = host.coordinator.claim(
+        host.binding,
+        application_id="application-preclaimed",
+        actor_id=f"application:{attempt_id}",
+        attempt_id=attempt_id,
+        application_url="https://tenant.example.test/apply",
+    )
+
+    application = host.open_claimed_application(
+        lease_token=token,
+        application_id="application-preclaimed",
+        actor_id=f"application:{attempt_id}",
+        attempt_id=attempt_id,
+        application_url="https://tenant.example.test/apply",
+        scope=scope,
+        state=state,
+        agent_stop=lambda: None,
+        contain_runtime=lambda: None,
+    )
+    host.close_application(application)
+
+    connection = _connection(path)
+    rows = connection.execute(
+        "SELECT lease_id,status FROM runtime_cell_leases ORDER BY lease_id"
+    ).fetchall()
+    connection.close()
+    assert rows == [(token.lease_id, "released")]
+
+
+def test_preclaimed_job_lease_rejects_same_host_token_from_another_attempt(
+    tmp_path: Path,
+) -> None:
+    host, browser, path = _host(tmp_path)
+    scope, state = _scope_state()
+    token = host.coordinator.claim(
+        host.binding,
+        application_id="application-attempt-a",
+        actor_id="application:attempt-a",
+        attempt_id="attempt-a",
+        application_url="https://tenant.example.test/apply",
+    )
+
+    with pytest.raises(runtime_cells.StaleRuntimeCellTokenError):
+        host.open_claimed_application(
+            lease_token=token,
+            application_id="application-attempt-b",
+            actor_id="application:attempt-b",
+            attempt_id="attempt-b",
+            application_url="https://tenant.example.test/apply",
+            scope=scope,
+            state=state,
+            agent_stop=lambda: None,
+            contain_runtime=lambda: None,
+        )
+
+    connection = _connection(path)
+    lease_status = connection.execute(
+        "SELECT status FROM runtime_cell_leases WHERE lease_id=?",
+        (token.lease_id,),
+    ).fetchone()[0]
+    connection.close()
+    assert lease_status == "open"
+    assert browser.contexts == []
+
+
 def test_residual_context_quarantines_generation(tmp_path: Path) -> None:
     host, _browser, path = _host(tmp_path, residual=True)
     scope, state = _scope_state()
@@ -701,11 +772,53 @@ def test_generation_and_process_runtime_identity_cannot_be_adopted(tmp_path: Pat
         )
 
 
+def test_next_generation_registers_after_clean_host_shutdown(tmp_path: Path) -> None:
+    path = tmp_path / "next-generation.sqlite3"
+    coordinator = DiagnosticRuntimeCellCoordinator(
+        lambda: _connection(path),
+        source_identity=SOURCE,
+        cells=1,
+    )
+    first = coordinator.register_next(
+        cell_index=0,
+        runtime_id="runtime-first",
+        process_id=1001,
+        process_birth_time=2001,
+    )
+    browser = _Browser()
+    host = RuntimeCellHost(
+        coordinator=coordinator,
+        binding=first,
+        context_runtime=HotBrowserContextRuntime(
+            feature=BrowserContextFeature(True),
+            launch_browser=lambda: browser,
+        ),
+        connection_factory=lambda: _connection(path),
+    )
+    host.close()
+
+    second = coordinator.register_next(
+        cell_index=0,
+        runtime_id="runtime-second",
+        process_id=1002,
+        process_birth_time=2002,
+    )
+
+    assert first.generation == 1
+    assert second.generation == 2
+    connection = _connection(path)
+    prior = runtime_cells.get_generation(connection, "runtime-cell-0", 1)
+    current = runtime_cells.get_generation(connection, "runtime-cell-0", 2)
+    connection.close()
+    assert prior is not None and prior.status == "closed"
+    assert current is not None and current.status == "active"
+
+
 def test_job_attempt_and_cell_claim_share_savepoint_and_skip_domain_conflict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     connection = init_db(tmp_path / "jobs.sqlite3")
-    for name in ("alpha", "beta"):
+    for name in ("alpha", "beta", "gamma"):
         url = f"https://{name}.example.test/apply"
         connection.execute(
             "INSERT INTO jobs(url,application_url,title,company_name,fit_score,"
@@ -722,12 +835,13 @@ def test_job_attempt_and_cell_claim_share_savepoint_and_skip_domain_conflict(
         lambda *_a, **_k: {"admitted": True},
     )
     attempts_seen: list[str] = []
+    performance: dict[str, object] = {}
 
     def claim(_connection: sqlite3.Connection, job: dict, attempt_id: str) -> object:
         attempts_seen.append(attempt_id)
-        if "alpha.example.test" in job["url"]:
+        if any(host in job["url"] for host in ("alpha.example.test", "beta.example.test")):
             raise runtime_cells.RuntimeCellConflictError("same domain busy")
-        return {"lease": "beta"}
+        return {"lease": "gamma"}
 
     acquired = application_jobs.acquire_job(
         connection,
@@ -736,10 +850,15 @@ def test_job_attempt_and_cell_claim_share_savepoint_and_skip_domain_conflict(
         load_blocked=lambda: ([], []),
         application_lease_minutes=45,
         runtime_cell_claim=claim,
+        performance_sink=performance,
     )
     assert acquired is not None
-    assert acquired["url"] == "https://beta.example.test/apply"
-    assert acquired["_runtime_cell_lease"] == {"lease": "beta"}
+    assert acquired["url"] == "https://gamma.example.test/apply"
+    assert acquired["_runtime_cell_lease"] == {"lease": "gamma"}
     persisted = connection.execute("SELECT job_url,status FROM application_attempts ORDER BY job_url").fetchall()
-    assert [(row[0], row[1]) for row in persisted] == [("https://beta.example.test/apply", "in_progress")]
-    assert len(attempts_seen) == 2
+    assert [(row[0], row[1]) for row in persisted] == [("https://gamma.example.test/apply", "in_progress")]
+    assert len(attempts_seen) == 3
+    assert performance["candidate_rows"] == 3
+    assert performance["admission_rows_scanned"] == 3
+    assert performance["runtime_claim_rows_scanned"] == 3
+    assert performance["runtime_claim_conflicts"] == 2

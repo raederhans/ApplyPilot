@@ -8,15 +8,18 @@ while removing the orchestration state machine from the launcher facade.
 from __future__ import annotations
 
 import math
+import os
+import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import performance_attribution as performance_attribution_mod
@@ -37,6 +40,12 @@ from applypilot.apply.browser_broker import (
     BrowserBrokerError,
     BrowserLeaseBundle,
     StalePageBinding,
+)
+from applypilot.apply.browser_context_runtime import (
+    BrowserContextFeature,
+    BrowserStateScope,
+    HotBrowserContextRuntime,
+    ScopedBrowserState,
 )
 from applypilot.apply.contracts import application_actor_id, contract_json
 from applypilot.apply.email_routing import (
@@ -189,6 +198,9 @@ class WorkerRuntimeCellPorts:
     resolve_admission: Callable[..., Any]
     coordinator_factory: Callable[..., Any]
     host_factory: Callable[..., Any]
+    connection_factory: Callable[[], sqlite3.Connection]
+    source_root: Path
+    process_identity: Callable[[], tuple[int, int]]
     production_enabled: bool = False
 
 
@@ -225,6 +237,156 @@ class WorkerRunOptions:
     attempted_urls: set[str] | None = None
     attempted_urls_lock: threading.Lock | None = None
     run_progress: RunProgress | None = None
+
+
+class _ShadowContext:
+    """No-I/O Context used only to exercise the production ownership graph."""
+
+    pages: list[Any]
+    service_workers: list[Any]
+
+    def __init__(self) -> None:
+        self.pages = []
+        self.service_workers = []
+
+    def new_page(self) -> Any:
+        raise RuntimeError("Runtime Cell shadow contexts have no page authority")
+
+    def close(self) -> None:
+        self.pages.clear()
+        self.service_workers.clear()
+
+
+class _ShadowBrowser:
+    """Logical browser owner with no CDP, page, navigation, or Submit capability."""
+
+    def __init__(self) -> None:
+        self._contexts: list[_ShadowContext] = []
+
+    def new_context(self, **_kwargs: object) -> _ShadowContext:
+        context = _ShadowContext()
+        self._contexts.append(context)
+        return context
+
+    def close(self) -> None:
+        for context in self._contexts:
+            context.close()
+        self._contexts.clear()
+
+
+@dataclass(slots=True)
+class _RuntimeCellShadowSession:
+    """One production-shadow Cell binding without browser or effect authority."""
+
+    coordinator: Any
+    host: Any
+    binding: Any
+    active_application: Any = None
+
+    def claim(self, connection: sqlite3.Connection, job: dict, attempt_id: str) -> Any:
+        if self.active_application is not None:
+            raise RuntimeError("Runtime Cell shadow session already owns an application")
+        application_url = str(job.get("application_url") or job.get("url") or "")
+        return self.coordinator.claim(
+            self.binding,
+            application_id=f"runtime-cell-application:{attempt_id}",
+            actor_id=application_actor_id(attempt_id),
+            attempt_id=attempt_id,
+            application_url=application_url,
+            connection=connection,
+        )
+
+    def open_job(
+        self,
+        job: dict,
+        *,
+        agent_stop: Callable[[], None],
+        contain_runtime: Callable[[], None],
+    ) -> None:
+        token = job.get("_runtime_cell_lease")
+        if token is None:
+            raise RuntimeError("acquired job is missing its Runtime Cell lease")
+        application_url = str(job.get("application_url") or job.get("url") or "")
+        hostname = urlsplit(application_url).hostname
+        if not hostname:
+            raise ValueError("Runtime Cell job URL has no hostname")
+        scope = BrowserStateScope(
+            provider=str(job.get("site") or job.get("source_site") or "shadow"),
+            host=hostname,
+            account_id="runtime-cell-shadow",
+        )
+        state = ScopedBrowserState(scope, {"cookies": [], "origins": []})
+        self.active_application = self.host.open_claimed_application(
+            lease_token=token,
+            application_id=f"runtime-cell-application:{job['_attempt_id']}",
+            actor_id=application_actor_id(job["_attempt_id"]),
+            attempt_id=job["_attempt_id"],
+            application_url=application_url,
+            scope=scope,
+            state=state,
+            agent_stop=agent_stop,
+            contain_runtime=contain_runtime,
+        )
+        job["_runtime_cell_shadow"] = {
+            "schema_version": "applypilot-runtime-cell-shadow/v1",
+            "effective_cells": self.coordinator.decision.effective_cells,
+            "production_authority": False,
+            "context_evidence": "logical_no_io",
+        }
+
+    def close_application(self) -> None:
+        if self.active_application is None:
+            return
+        application = self.active_application
+        self.active_application = None
+        self.host.close_application(application)
+
+    def close(self) -> None:
+        self.close_application()
+        self.host.close()
+
+
+def _open_runtime_cell_shadow_session(
+    runtime: WorkerRuntimePorts,
+    *,
+    requested_workers: int,
+) -> _RuntimeCellShadowSession | None:
+    """Create the single admitted production-shadow Cell, or stay fully off."""
+
+    settings = runtime.host.load_runtime_settings()
+    mode = settings.runtime_cell_mode
+    if mode == "off":
+        return None
+    ports = runtime.runtime_cells
+    coordinator = ports.coordinator_factory(
+        ports.connection_factory,
+        mode=mode,
+        requested_workers=requested_workers,
+        source_root=ports.source_root,
+        manifest_path=settings.runtime_cell_admission_manifest,
+    )
+    if coordinator.decision.effective_cells != 1 or ports.production_enabled:
+        raise RuntimeError("production Runtime Cell shadow must remain hard-gated to one Cell")
+    process_id, process_birth_time = ports.process_identity()
+    binding = coordinator.register_next(
+        cell_index=0,
+        runtime_id=(
+            f"shadow-worker-{os.getpid()}-{process_birth_time}-{uuid.uuid4().hex}"
+        ),
+        process_id=process_id,
+        process_birth_time=process_birth_time,
+    )
+    context_runtime = HotBrowserContextRuntime(
+        feature=BrowserContextFeature(True),
+        launch_browser=_ShadowBrowser,
+    )
+    host = ports.host_factory(
+        coordinator=coordinator,
+        binding=binding,
+        context_runtime=context_runtime,
+        connection_factory=ports.connection_factory,
+    )
+    return _RuntimeCellShadowSession(coordinator, host, binding)
 
 
 def _prepared_email_application(job: dict) -> dict | None:
@@ -446,6 +608,7 @@ def _worker_loop_with_port(
     port: int,
     browser_worker: BrowserWorkerProcess,
     options: WorkerRunOptions,
+    runtime_cell_session: _RuntimeCellShadowSession | None = None,
 ) -> tuple[int, int]:
     """Run jobs until the confirmed-success target is reached or the queue is empty.
 
@@ -644,6 +807,11 @@ def _worker_loop_with_port(
                 exclude_urls=excluded_urls,
                 application_lease_minutes=application_lease_minutes,
                 performance_sink=acquisition_attempt,
+                runtime_cell_claim=(
+                    runtime_cell_session.claim
+                    if runtime_cell_session is not None
+                    else None
+                ),
             )
         except Exception:
             acquisition_attempt["outcome"] = "error"
@@ -687,14 +855,42 @@ def _worker_loop_with_port(
 
         empty_polls = 0
         worker_application_index = jobs_done + 1
+        chrome_proc = None
+        application_supervisor = None
+        worker_generation_state = {"tainted": False}
+
+        def stop_cell_application_agent(
+            generation_state=worker_generation_state,
+        ) -> None:
+            nonlocal application_supervisor, chrome_proc
+            if application_supervisor is None:
+                return
+            application_supervisor.close_application(
+                recycle_worker=generation_state["tainted"]
+            )
+            application_supervisor = None
+            chrome_proc = None
         preview_ticket: PreviewTicket | None = None
         if dry_run and run_progress is not None:
             preview_ticket = run_progress.claim_preview_ticket(job["url"])
             if preview_ticket is None:
+                if runtime_cell_session is not None:
+                    runtime_cell_session.open_job(
+                        job,
+                        agent_stop=stop_cell_application_agent,
+                        contain_runtime=browser_worker.recycle_idle_generation,
+                    )
+                    runtime_cell_session.close_application()
                 restore_preview_state(job)
                 break
         initialization_complete = False
         try:
+            if runtime_cell_session is not None:
+                runtime_cell_session.open_job(
+                    job,
+                    agent_stop=stop_cell_application_agent,
+                    contain_runtime=browser_worker.recycle_idle_generation,
+                )
             job.setdefault(
                 "_run_namespace_id",
                 (
@@ -715,15 +911,17 @@ def _worker_loop_with_port(
             initialization_complete = True
         finally:
             if not initialization_complete:
-                if dry_run:
-                    restore_preview_state(job)
-                else:
-                    release_lock(job["url"], job.get("_attempt_id"))
-                if preview_ticket is not None and run_progress is not None:
-                    run_progress.release_preview_ticket(preview_ticket)
+                try:
+                    if runtime_cell_session is not None:
+                        runtime_cell_session.close_application()
+                finally:
+                    if dry_run:
+                        restore_preview_state(job)
+                    else:
+                        release_lock(job["url"], job.get("_attempt_id"))
+                    if preview_ticket is not None and run_progress is not None:
+                        run_progress.release_preview_ticket(preview_ticket)
 
-        chrome_proc = None
-        application_supervisor = None
         submission_started = False
         submitted_at = None
         email_application = None
@@ -742,7 +940,6 @@ def _worker_loop_with_port(
         route_history: list[dict[str, object]] = []
         progress_submit_claimed = False
         progress_outcome: tuple[str, bool] | None = None
-        worker_generation_tainted = False
         pre_submit_audit_failure: dict[str, object] | None = None
         raw_acquisition_metrics = acquisition_attempt
         acquisition_metrics: dict[str, float | int] = {}
@@ -756,6 +953,8 @@ def _worker_loop_with_port(
                 "candidate_rows",
                 "admission_scan_ms",
                 "admission_rows_scanned",
+                "runtime_claim_rows_scanned",
+                "runtime_claim_conflicts",
                 "total_ms",
                 "worker_call_ms",
             ):
@@ -919,6 +1118,8 @@ def _worker_loop_with_port(
                 last_action="exact duplicate receipt/status",
                 jobs_done=jobs_done,
             )
+            if runtime_cell_session is not None:
+                runtime_cell_session.close_application()
             continue
         if read_only_preflight.get("specialist_required_block"):
             failed_specialists = read_only_preflight.get(
@@ -952,6 +1153,8 @@ def _worker_loop_with_port(
                 last_action=reason,
                 jobs_done=jobs_done,
             )
+            if runtime_cell_session is not None:
+                runtime_cell_session.close_application()
             continue
         if read_only_preflight.get("material_enforced_block"):
             material_readiness = read_only_preflight.get("material_readiness")
@@ -1006,6 +1209,8 @@ def _worker_loop_with_port(
                 last_action=reason,
                 jobs_done=jobs_done,
             )
+            if runtime_cell_session is not None:
+                runtime_cell_session.close_application()
             continue
 
         ats_binding = read_only_preflight.get("ats_binding")
@@ -1091,6 +1296,8 @@ def _worker_loop_with_port(
                 last_action="SmartRecruiters identity unresolved",
                 jobs_done=jobs_done,
             )
+            if runtime_cell_session is not None:
+                runtime_cell_session.close_application()
             continue
         try:
             active_route = initial_route(requested_browser_backend, phase="prepare")
@@ -3240,7 +3447,7 @@ def _worker_loop_with_port(
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
-            worker_generation_tainted = True
+            worker_generation_state["tainted"] = True
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             if dry_run:
@@ -3286,9 +3493,11 @@ def _worker_loop_with_port(
                 )
             if preview_ticket is not None and run_progress is not None:
                 run_progress.release_preview_ticket(preview_ticket)
-            if application_supervisor is not None:
+            if runtime_cell_session is not None:
+                runtime_cell_session.close_application()
+            elif application_supervisor is not None:
                 application_supervisor.close_application(
-                    recycle_worker=worker_generation_tainted
+                    recycle_worker=worker_generation_state["tainted"]
                 )
                 application_supervisor = None
                 chrome_proc = None
@@ -3338,6 +3547,7 @@ def worker_loop(
     port = browser.allocate_cdp_port(worker_id)
     browser_worker: BrowserWorkerProcess | None = None
     endpoint_manager = None
+    runtime_cell_session: _RuntimeCellShadowSession | None = None
     try:
         profile = host.config.load_profile()
         policy = profile.get("submission_policy", {})
@@ -3437,17 +3647,26 @@ def worker_loop(
                 "persistent_browser_max_rss_bytes", 1_500_000_000
             ),
         )
+        runtime_cell_session = _open_runtime_cell_shadow_session(
+            runtime,
+            requested_workers=1,
+        )
         return _worker_loop_with_port(
             runtime,
             port,
             browser_worker,
             options,
+            runtime_cell_session,
         )
     finally:
         try:
-            if browser_worker is not None:
-                browser_worker.close()
-            elif endpoint_manager is not None:
-                endpoint_manager.shutdown()
+            try:
+                if runtime_cell_session is not None:
+                    runtime_cell_session.close()
+            finally:
+                if browser_worker is not None:
+                    browser_worker.close()
+                elif endpoint_manager is not None:
+                    endpoint_manager.shutdown()
         finally:
             browser.release_cdp_port(worker_id)

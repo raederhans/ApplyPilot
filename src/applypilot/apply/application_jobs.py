@@ -258,7 +258,7 @@ def acquire_job(
 
         row = None
         authorized_entry = None
-        runtime_candidates: list[tuple[sqlite3.Row, dict | None]] = []
+        runtime_candidates: list[tuple[dict, dict | None]] = []
         from applypilot.apply.submission_admission import evaluate_submission_admission
 
         minimum_fit_score = max(1, min(int(min_score), 10))
@@ -331,7 +331,9 @@ def acquire_job(
                     continue
                 authorized_entry = authorized
             if runtime_cell_claim is not None:
-                runtime_candidates.append((candidate, authorized_entry))
+                # Preserve the normalized, admitted first-pass result. The
+                # second pass performs only atomic attempt+Cell claims.
+                runtime_candidates.append((candidate_job, authorized_entry))
                 authorized_entry = None
                 continue
             row = candidate
@@ -346,11 +348,11 @@ def acquire_job(
             # continues scanning without leaving an orphan attempt.
             from applypilot.storage.runtime_cells import RuntimeCellConflictError
 
+            runtime_claim_rows_scanned = 0
+            runtime_claim_conflicts = 0
             for candidate, candidate_authorization in runtime_candidates:
+                runtime_claim_rows_scanned += 1
                 candidate_job = dict(candidate)
-                candidate_job["application_url"] = (
-                    candidate_job.get("application_url") or candidate_job.get("url")
-                )
                 apply_url = candidate_job["application_url"]
                 portal_gate = config.portal_application_gate(
                     apply_url,
@@ -404,6 +406,7 @@ def acquire_job(
                 except RuntimeCellConflictError:
                     conn.execute("ROLLBACK TO SAVEPOINT runtime_cell_job_acquisition")
                     conn.execute("RELEASE SAVEPOINT runtime_cell_job_acquisition")
+                    runtime_claim_conflicts += 1
                     continue
                 except Exception:
                     conn.execute("ROLLBACK TO SAVEPOINT runtime_cell_job_acquisition")
@@ -416,9 +419,21 @@ def acquire_job(
                 if candidate_authorization is not None:
                     acquired["_authorization_entry"] = dict(candidate_authorization)
                 acquisition_performance["outcome"] = "acquired"
+                acquisition_performance["runtime_claim_rows_scanned"] = (
+                    runtime_claim_rows_scanned
+                )
+                acquisition_performance["runtime_claim_conflicts"] = (
+                    runtime_claim_conflicts
+                )
                 acquisition_performance["total_ms"] = _elapsed_ms(acquisition_started)
                 acquired["_acquisition_performance"] = dict(acquisition_performance)
                 return acquired
+            acquisition_performance["runtime_claim_rows_scanned"] = (
+                runtime_claim_rows_scanned
+            )
+            acquisition_performance["runtime_claim_conflicts"] = (
+                runtime_claim_conflicts
+            )
 
         if not row:
             acquisition_performance["outcome"] = "empty"
