@@ -11,11 +11,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Literal
-from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
-from applypilot.apply.page_surfaces import application_surface_is_allowed
 from applypilot.apply.provider_registry import provider_matches_host
 from applypilot.apply.recipe_cache import (
     RECIPE_CACHE_SCHEMA_VERSION,
@@ -237,7 +235,8 @@ class ProviderSemanticRecipeAdapter:
             raise SemanticBatchDenied("unclassified page markers forbid a routine recipe")
         target = self._target_identity(observation)
         structural_rows = [self._structural_row(control) for control in observation.controls]
-        schema_policy_digest = canonical_digest(
+        schema_policy_digest = private_binding_digest(
+            "schema-policy",
             {
                 "adapter_version": self.adapter_version,
                 "cache_schema_version": RECIPE_CACHE_SCHEMA_VERSION,
@@ -262,7 +261,7 @@ class ProviderSemanticRecipeAdapter:
             provider=self.provider,
             domain=target.domain,
             adapter_version=self.adapter_version,
-            page_signature=observation.page_signature,
+            page_signature=private_binding_digest("page-signature", observation.page_signature),
             schema_policy_digest=schema_policy_digest,
             page_digest=private_binding_digest("page", observation.page_url),
             frame_digest=private_binding_digest(
@@ -272,13 +271,15 @@ class ProviderSemanticRecipeAdapter:
                     "frame_url": observation.frame_url or observation.page_url,
                 },
             ),
-            option_digest=canonical_digest(
+            option_digest=private_binding_digest(
+                "option-set",
                 [(control.option_count, control.option_digest) for control in observation.controls]
             ),
             required_writable_digest=canonical_digest(
                 [(control.required, control.writable) for control in observation.controls]
             ),
-            locator_digest=canonical_digest(
+            locator_digest=private_binding_digest(
+                "locator-set",
                 [(control.locator_digest, control.dom_identity_digest) for control in observation.controls]
             ),
             taint_digest=private_binding_digest("taint", ""),
@@ -334,7 +335,10 @@ class ProviderSemanticRecipeAdapter:
             return None
         if control.kind == "native_select" and control.option_count < 1:
             return None
-        structure_digest = canonical_digest(ProviderSemanticRecipeAdapter._structural_row(control))
+        structure_digest = private_binding_digest(
+            "control-structure",
+            ProviderSemanticRecipeAdapter._structural_row(control),
+        )
         return CachedRoutineControl(
             structure_digest=structure_digest,
             semantic=control.semantic,
@@ -342,7 +346,10 @@ class ProviderSemanticRecipeAdapter:
             required=control.required,
             writable=True,
             option_count=control.option_count,
-            option_digest=control.option_digest,
+            option_digest=private_binding_digest(
+                "control-options",
+                (control.option_count, control.option_digest),
+            ),
             operation="set_text" if control.kind == "text" else "select_option",
         )
 
@@ -383,38 +390,21 @@ class GreenhouseSemanticRecipeAdapter(ProviderSemanticRecipeAdapter):
     adapter_version = GREENHOUSE_ADAPTER_VERSION
 
     def _target_identity(self, observation: ProviderPageRecipeObservation) -> _TargetIdentity:
-        if not observation.frame_path:
-            if observation.frame_url not in {None, observation.page_url}:
-                raise SemanticBatchDenied("unbound Greenhouse frame URL")
-            target = _direct_target("greenhouse", observation.application_target_url)
-            page = _direct_target("greenhouse", observation.page_url)
-            if (page.domain, page.tenant, page.requisition) != (
-                target.domain,
-                target.tenant,
-                target.requisition,
-            ):
-                raise SemanticBatchDenied("Greenhouse live page changed application target")
-            return target
-        if observation.frame_url is None:
-            raise SemanticBatchDenied("Greenhouse frame identity is incomplete")
-        main = SimpleNamespace(url=observation.page_url)
-        frame = SimpleNamespace(url=observation.frame_url, parent_frame=main)
-        page = SimpleNamespace(url=observation.page_url, main_frame=main)
-        if not application_surface_is_allowed(page, frame):
-            raise SemanticBatchDenied("Greenhouse cross-origin frame binding is not admitted")
-        top = urlsplit(observation.page_url)
-        embedded = urlsplit(observation.frame_url)
-        top_ids = parse_qs(top.query).get("gh_jid", [])
-        tenants = parse_qs(embedded.query).get("for", [])
-        if len(top_ids) != 1 or len(tenants) != 1:
-            raise SemanticBatchDenied("Greenhouse Workato binding is incomplete")
-        domain = (embedded.hostname or "").casefold()
-        return _TargetIdentity(
-            domain=domain,
-            tenant=tenants[0],
-            requisition=top_ids[0],
-            canonical_target=urlunsplit(("https", domain, "/embed/job_app", "", "")),
-        )
+        if observation.frame_path:
+            raise SemanticBatchDenied(
+                "Greenhouse framed recipes require unavailable live frame-binding proof"
+            )
+        if observation.frame_url not in {None, observation.page_url}:
+            raise SemanticBatchDenied("unbound Greenhouse frame URL")
+        target = _direct_target("greenhouse", observation.application_target_url)
+        page = _direct_target("greenhouse", observation.page_url)
+        if (page.domain, page.tenant, page.requisition) != (
+            target.domain,
+            target.tenant,
+            target.requisition,
+        ):
+            raise SemanticBatchDenied("Greenhouse live page changed application target")
+        return target
 
 
 class LeverSemanticRecipeAdapter(ProviderSemanticRecipeAdapter):

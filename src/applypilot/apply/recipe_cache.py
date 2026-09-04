@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,6 +27,69 @@ RECIPE_POLICY_VERSION = "routine-provider-recipe/v1"
 _CACHE_BINDING_KEY = secrets.token_bytes(32)
 _ALLOWED_OPERATIONS = frozenset({"set_text", "select_option"})
 _ALLOWED_KINDS = frozenset({"text", "native_select"})
+_ALLOWED_SEMANTICS = frozenset(
+    {
+        "city",
+        "country",
+        "email",
+        "phone",
+        "portfolio_url",
+        "preferred_name",
+        "postal_code",
+        "state",
+    }
+)
+_PROVIDER_DOMAINS = {
+    "greenhouse": frozenset({"boards.greenhouse.io", "job-boards.greenhouse.io"}),
+    "lever": frozenset({"jobs.lever.co", "jobs.eu.lever.co"}),
+    "ashby": frozenset({"jobs.ashbyhq.com"}),
+}
+_ADAPTER_VERSION_RE = re.compile(r"^(greenhouse|lever|ashby)-semantic-recipe/v[1-9][0-9]*$")
+_ALLOWED_PAYLOAD_KEYS = frozenset(
+    {
+        "adapter_version",
+        "application_target_digest",
+        "browser_generation",
+        "controls",
+        "domain",
+        "frame_digest",
+        "key",
+        "kind",
+        "lease_digest",
+        "locator_digest",
+        "operation",
+        "operations",
+        "option_count",
+        "option_digest",
+        "page_digest",
+        "page_epoch",
+        "page_signature",
+        "policy_version",
+        "provider",
+        "required",
+        "required_writable_digest",
+        "requisition_digest",
+        "schema_policy_digest",
+        "schema_version",
+        "semantic",
+        "structure_digest",
+        "synthetic_only",
+        "taint_digest",
+        "tenant_digest",
+        "writable",
+    }
+)
+_SAFE_PLAINTEXT_VALUES = frozenset(
+    {
+        RECIPE_CACHE_SCHEMA_VERSION,
+        RECIPE_POLICY_VERSION,
+        *_ALLOWED_OPERATIONS,
+        *_ALLOWED_KINDS,
+        *_ALLOWED_SEMANTICS,
+        *_PROVIDER_DOMAINS,
+        *(domain for domains in _PROVIDER_DOMAINS.values() for domain in domains),
+    }
+)
 
 
 def canonical_digest(value: object) -> str:
@@ -94,9 +159,21 @@ class RecipeCacheKey:
     browser_generation: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "provider", _required(self.provider, "provider").casefold())
-        object.__setattr__(self, "domain", _domain(self.domain))
-        object.__setattr__(self, "adapter_version", _required(self.adapter_version, "adapter_version"))
+        provider = _required(self.provider, "provider").casefold()
+        domain = _domain(self.domain)
+        adapter_version = _required(self.adapter_version, "adapter_version")
+        domains = _PROVIDER_DOMAINS.get(provider)
+        version_match = _ADAPTER_VERSION_RE.fullmatch(adapter_version)
+        if (
+            domains is None
+            or domain not in domains
+            or version_match is None
+            or version_match.group(1) != provider
+        ):
+            raise ValueError("provider recipe cache binding is unsupported")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "domain", domain)
+        object.__setattr__(self, "adapter_version", adapter_version)
         for name in (
             "page_signature",
             "schema_policy_digest",
@@ -166,7 +243,10 @@ class CachedRoutineControl:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "structure_digest", _digest(self.structure_digest, "structure_digest"))
-        object.__setattr__(self, "semantic", normalize_field_semantic(self.semantic))
+        semantic = normalize_field_semantic(self.semantic)
+        if semantic not in _ALLOWED_SEMANTICS:
+            raise ValueError("cached control semantic is not routine")
+        object.__setattr__(self, "semantic", semantic)
         object.__setattr__(self, "option_digest", _digest(self.option_digest, "option_digest"))
         if self.kind not in _ALLOWED_KINDS:
             raise ValueError("cached control kind is not routine")
@@ -274,6 +354,7 @@ class ValueFreeRecipeCache:
             raise ValueError("recipe cache capacity must be positive")
         self._capacity = capacity
         self._items: OrderedDict[str, CachedProviderRecipe] = OrderedDict()
+        self._lock = threading.RLock()
 
     def put(self, recipe: CachedProviderRecipe) -> None:
         if not isinstance(recipe, CachedProviderRecipe):
@@ -283,10 +364,11 @@ class ValueFreeRecipeCache:
         if not payload_is_value_free(recipe.as_dict()):
             raise ValueError("recipe payload is not value-free")
         identity = recipe.key.identity_digest
-        self._items[identity] = recipe
-        self._items.move_to_end(identity)
-        while len(self._items) > self._capacity:
-            self._items.popitem(last=False)
+        with self._lock:
+            self._items[identity] = recipe
+            self._items.move_to_end(identity)
+            while len(self._items) > self._capacity:
+                self._items.popitem(last=False)
 
     def get(
         self,
@@ -296,7 +378,9 @@ class ValueFreeRecipeCache:
     ) -> CachedProviderRecipe | None:
         if not isinstance(key, RecipeCacheKey) or not key.clean:
             return None
-        recipe = self._items.get(key.identity_digest)
+        identity = key.identity_digest
+        with self._lock:
+            recipe = self._items.get(identity)
         if recipe is None or recipe.key != key or validate_live is None:
             return None
         try:
@@ -305,21 +389,27 @@ class ValueFreeRecipeCache:
             valid = False
         if not valid:
             return None
-        self._items.move_to_end(key.identity_digest)
-        return recipe
+        with self._lock:
+            if self._items.get(identity) is not recipe:
+                return None
+            self._items.move_to_end(identity)
+            return recipe
 
     def invalidate(self, key: RecipeCacheKey) -> bool:
-        return self._items.pop(key.identity_digest, None) is not None
+        with self._lock:
+            return self._items.pop(key.identity_digest, None) is not None
 
     def clear(self) -> None:
-        self._items.clear()
+        with self._lock:
+            self._items.clear()
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)
 
 
 def payload_is_value_free(payload: Mapping[str, object]) -> bool:
-    """Guard exported cache shapes against accidental privileged/value keys."""
+    """Recursively admit only the closed cache schema, enums, and opaque digests."""
 
     forbidden = {
         "value",
@@ -344,12 +434,22 @@ def payload_is_value_free(payload: Mapping[str, object]) -> bool:
         if isinstance(value, Mapping):
             for key, nested in value.items():
                 normalized = str(key).casefold()
-                if normalized in forbidden or any(normalized.startswith(f"{item}_") for item in forbidden):
+                if (
+                    normalized not in _ALLOWED_PAYLOAD_KEYS
+                    or normalized in forbidden
+                    or any(normalized.startswith(f"{item}_") for item in forbidden)
+                ):
                     return False
                 if not walk(nested):
                     return False
         elif isinstance(value, (list, tuple)):
             return all(walk(item) for item in value)
+        elif isinstance(value, str):
+            return value in _SAFE_PLAINTEXT_VALUES or (
+                len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+            ) or _ADAPTER_VERSION_RE.fullmatch(value) is not None
+        elif not isinstance(value, (bool, int)):
+            return False
         return True
 
     return walk(payload)
@@ -364,5 +464,4 @@ __all__ = [
     "ValueFreeRecipeCache",
     "canonical_digest",
     "payload_is_value_free",
-    "private_binding_digest",
 ]

@@ -4,6 +4,7 @@ import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -17,7 +18,6 @@ from applypilot.apply.recipe_cache import (
     ValueFreeRecipeCache,
     canonical_digest,
     payload_is_value_free,
-    private_binding_digest,
 )
 from applypilot.apply.semantic_batch import (
     DEFAULT_SEMANTIC_BATCH_ADAPTER_REGISTRY,
@@ -126,7 +126,12 @@ def test_every_authority_or_structure_key_dimension_misses() -> None:
     cache.put(recipe)
     other = "f" * 64
     mismatches = (
-        replace(recipe.key, provider="ashby"),
+        replace(
+            recipe.key,
+            provider="ashby",
+            domain="jobs.ashbyhq.com",
+            adapter_version="ashby-semantic-recipe/v1",
+        ),
         replace(recipe.key, domain="jobs.eu.lever.co"),
         replace(recipe.key, adapter_version="lever-semantic-recipe/v2"),
         replace(recipe.key, page_signature=other),
@@ -136,7 +141,7 @@ def test_every_authority_or_structure_key_dimension_misses() -> None:
         replace(recipe.key, option_digest=other),
         replace(recipe.key, required_writable_digest=other),
         replace(recipe.key, locator_digest=other),
-        replace(recipe.key, taint_digest=private_binding_digest("taint", "changed")),
+        replace(recipe.key, taint_digest=other),
         replace(recipe.key, lease_digest=other),
         replace(recipe.key, tenant_digest=other),
         replace(recipe.key, requisition_digest=other),
@@ -148,7 +153,7 @@ def test_every_authority_or_structure_key_dimension_misses() -> None:
     assert all(cache.get(key, validate_live=lambda _key: True) is None for key in mismatches)
     assert cache.get(recipe.key, validate_live=None) is None
     assert cache.get(recipe.key, validate_live=lambda _key: False) is None
-    tainted_key = replace(recipe.key, taint_digest=private_binding_digest("taint", "changed"))
+    tainted_key = replace(recipe.key, taint_digest=other)
     with pytest.raises(ValueError, match="tainted"):
         cache.put(type(recipe).build(tainted_key, recipe.controls))
 
@@ -256,6 +261,93 @@ def test_cache_payload_omits_values_secrets_targets_and_privileged_operations() 
     assert "authority" not in serialized
     assert "file_path" not in serialized
     assert recipe.operations == ("select_option", "set_text")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"semantic": "https://jobs.lever.co/example/1002?token=private#fragment"},
+        {"semantic": "private@example.test"},
+        {"semantic": r"C:\private\resume.pdf"},
+        {"semantic": "candidate_token"},
+        {"unexpected": "email"},
+    ],
+)
+def test_recursive_value_free_guard_rejects_urls_tokens_email_paths_and_unknown_fields(
+    payload: dict[str, object],
+) -> None:
+    assert payload_is_value_free(payload) is False
+
+
+def test_caller_sha_fingerprints_are_rekeyed_with_process_private_hmac() -> None:
+    registry = default_provider_semantic_recipe_registry()
+    raw_locator = canonical_digest("email-locator")
+    raw_dom = canonical_digest("input-email")
+    raw_options = canonical_digest(["yes", "no"])
+    raw_page = canonical_digest("small-page-template")
+    control = ProviderControlStructure(
+        semantic="country",
+        kind="native_select",
+        required=True,
+        writable=True,
+        locator_digest=raw_locator,
+        dom_identity_digest=raw_dom,
+        option_count=2,
+        option_digest=raw_options,
+    )
+    recipe = registry.normalize(
+        _observation(
+            "lever",
+            "https://jobs.lever.co/example/1002",
+            controls=(control,),
+            page_signature=raw_page,
+        )
+    )
+    serialized = json.dumps(recipe.as_dict(), sort_keys=True)
+
+    assert raw_locator not in serialized
+    assert raw_dom not in serialized
+    assert raw_options not in serialized
+    assert raw_page not in serialized
+
+
+def test_cache_rechecks_identity_after_live_validation_races_with_invalidation() -> None:
+    registry = default_provider_semantic_recipe_registry()
+    recipe = registry.normalize(_observation("lever", "https://jobs.lever.co/example/1002"))
+    cache = ValueFreeRecipeCache()
+    cache.put(recipe)
+    validator_entered = Event()
+    validator_release = Event()
+    invalidated = Event()
+    result: list[object] = []
+
+    def validate_live(_key) -> bool:
+        validator_entered.set()
+        assert validator_release.wait(2)
+        return True
+
+    def read_cache() -> None:
+        result.append(cache.get(recipe.key, validate_live=validate_live))
+
+    def invalidate_cache() -> None:
+        cache.invalidate(recipe.key)
+        invalidated.set()
+
+    reader = Thread(target=read_cache)
+    invalidator = Thread(target=invalidate_cache)
+    reader.start()
+    assert validator_entered.wait(2)
+    invalidator.start()
+    try:
+        assert invalidated.wait(2), "invalidate must not wait on the external live validator"
+    finally:
+        validator_release.set()
+    reader.join(2)
+    invalidator.join(2)
+
+    assert not reader.is_alive()
+    assert not invalidator.is_alive()
+    assert result == [None]
 
 
 @pytest.mark.parametrize(
@@ -369,7 +461,10 @@ def test_fixture_lookalike_hosts_are_rejected_by_recipe_normalization() -> None:
             registry.normalize(_observation(provider, url))
 
 
-def test_greenhouse_workato_embed_reuses_exact_existing_frame_binding() -> None:
+@pytest.mark.parametrize("frame_path", [(0,), (1,), (0, 1)])
+def test_greenhouse_workato_embed_stays_unsupported_without_live_frame_proof(
+    frame_path: tuple[int, ...],
+) -> None:
     registry = default_provider_semantic_recipe_registry()
     top_url = "https://www.workato.com/careers/software-engineer-123?gh_jid=123"
     frame_url = "https://job-boards.greenhouse.io/embed/job_app?for=workato&token=123"
@@ -382,39 +477,40 @@ def test_greenhouse_workato_embed_reuses_exact_existing_frame_binding() -> None:
         page_lease_id="lease-workato",
         browser_generation=1,
         controls=(_control(),),
-        frame_path=(0,),
+        frame_path=frame_path,
         frame_url=frame_url,
     )
 
-    recipe = registry.normalize(observation)
+    with pytest.raises(SemanticBatchDenied, match="unavailable live frame-binding proof"):
+        registry.normalize(observation)
 
-    assert recipe.key.domain == "job-boards.greenhouse.io"
-    with pytest.raises(SemanticBatchDenied, match="frame binding"):
+
+def test_greenhouse_workato_evil_application_target_is_rejected() -> None:
+    registry = default_provider_semantic_recipe_registry()
+    observation = _observation(
+        "greenhouse",
+        "https://boards.greenhouse.io/acme/jobs/123",
+    )
+
+    with pytest.raises(SemanticBatchDenied, match="host is not exact"):
         registry.normalize(
             replace(
                 observation,
-                frame_url="https://job-boards.greenhouse.io.evil.example/embed/job_app?for=workato&token=123",
+                application_target_url="https://boards.greenhouse.io.evil.example/acme/jobs/123",
             )
         )
 
-    validity_top = replace(
-        observation,
-        application_target_url="https://www.workato.com/careers/software-engineer-123?gh_jid=123",
-        page_url="https://www.workato.com/careers/software-engineer-123?gh_jid=123",
-        frame_url=(
-            "https://job-boards.greenhouse.io/embed/job_app"
-            "?for=workato&validityToken=abcdefghijklmnop"
-        ),
-    )
-    changed_validity = replace(
-        validity_top,
-        frame_url=(
-            "https://job-boards.greenhouse.io/embed/job_app"
-            "?for=workato&validityToken=ponmlkjihgfedcba"
-        ),
+
+def test_greenhouse_unbound_frame_url_is_rejected_even_without_frame_path() -> None:
+    registry = default_provider_semantic_recipe_registry()
+    observation = _observation(
+        "greenhouse",
+        "https://boards.greenhouse.io/acme/jobs/123",
+        frame_url="https://job-boards.greenhouse.io/embed/job_app?for=workato&token=123",
     )
 
-    assert registry.normalize(validity_top).key != registry.normalize(changed_validity).key
+    with pytest.raises(SemanticBatchDenied, match="unbound"):
+        registry.normalize(observation)
 
 
 def test_non_greenhouse_cross_origin_frames_are_rejected() -> None:
