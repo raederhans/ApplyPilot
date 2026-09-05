@@ -13,41 +13,14 @@ import sqlite3
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 
 from applypilot import config
-from applypilot.scoring.cover_letter import read_resume_source
-from applypilot.scoring.validator import current_profile_resume_fact_errors
 
 logger = logging.getLogger(__name__)
 
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
-
-
-def _material_profile_fact_errors(job: dict, profile: dict) -> list[str]:
-    """Return current-profile conflicts in an otherwise validated resume."""
-    path = Path(str(job.get("tailored_resume_path") or ""))
-    if not path.is_file():
-        return []
-    if path.suffix.casefold() == ".pdf":
-        text_sidecar = path.with_suffix(".txt")
-        if text_sidecar.is_file():
-            text = read_resume_source(text_sidecar)
-        else:
-            try:
-                from pypdf import PdfReader
-
-                text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-            except Exception:  # noqa: BLE001 - legacy/synthetic PDFs may not expose text
-                return []
-    else:
-        try:
-            text = read_resume_source(path)
-        except (OSError, ValueError):
-            return []
-    return current_profile_resume_fact_errors(text, profile)
 
 
 def revalidate_duplicate_before_submit(
@@ -165,6 +138,16 @@ def acquire_job(
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
     phase_started = time.perf_counter()
     recover_stale_application_attempts(conn)
+    if authorization_manifest is not None and not preview_only:
+        from applypilot.apply.batch_progress import consumed_batch_job_urls
+
+        batch_id = str(authorization_manifest.get("batch_id") or "").strip()
+        if batch_id:
+            # Reservations are permanent, including failed and uncertain
+            # attempts. Avoid spending another prepare turn on an occupied slot.
+            consumed = consumed_batch_job_urls(conn, batch_id)
+            excluded.update(consumed)
+            acquisition_performance["consumed_batch_jobs_excluded"] = len(consumed)
     acquisition_performance["stale_recovery_ms"] = _elapsed_ms(phase_started)
     phase_started = time.perf_counter()
     try:
@@ -283,9 +266,22 @@ def acquire_job(
             candidate_job["application_url"] = (
                 candidate_job.get("application_url") or candidate_job.get("url")
             )
-            material_fact_errors = _material_profile_fact_errors(candidate_job, profile)
-            if material_fact_errors:
-                material_error = "stale_profile_fact:" + "; ".join(material_fact_errors)
+            candidate_admission = evaluate_submission_admission(
+                candidate_job,
+                profile,
+                minimum_fit_score=minimum_fit_score,
+                preview_only=preview_only,
+            )
+            admission_metadata = candidate_admission.get("metadata")
+            profile_resume_freshness = (
+                admission_metadata.get("profile_resume_fact_freshness")
+                if isinstance(admission_metadata, dict)
+                else None
+            )
+            if isinstance(profile_resume_freshness, dict) and (
+                profile_resume_freshness.get("state") == "stale_profile_fact"
+            ):
+                material_error = str(candidate_admission.get("reason") or "stale_profile_fact")
                 conn.execute(
                     "UPDATE jobs SET tailored_resume_path=NULL, "
                     "tailor_status='stale_profile_fact', tailor_error=? WHERE url=?",
@@ -298,12 +294,6 @@ def acquire_job(
                     material_error,
                 )
                 continue
-            candidate_admission = evaluate_submission_admission(
-                candidate_job,
-                profile,
-                minimum_fit_score=minimum_fit_score,
-                preview_only=preview_only,
-            )
             if not candidate_admission.get("admitted"):
                 portal_reason = config.portal_application_gate(
                     candidate_job["application_url"],

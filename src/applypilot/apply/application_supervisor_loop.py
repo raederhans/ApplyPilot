@@ -22,6 +22,7 @@ class SupervisorObservation:
     event_type: str
     observed_at: float
     meaningful_progress: bool = False
+    tool_call_id: str | None = None
     tool_name: str | None = None
     tool_params: Mapping[str, object] | None = None
     page_signature: str | None = None
@@ -39,6 +40,8 @@ class SupervisorSignals:
     turn_id: str
     meaningful_progress: bool
     no_progress_window: float
+    provider_state: str
+    pending_tool_count: int
     tool_repeat_count: int
     page_signature: str | None
     unresolved_control_delta: int
@@ -82,7 +85,7 @@ def _normalized_params(params: Mapping[str, object] | None) -> str:
 
 
 class ApplicationSupervisorLoop:
-    """Pure per-turn state machine with a bounded deterministic stall policy."""
+    """Pure per-turn state machine with provider-aware bounded interventions."""
 
     def __init__(
         self,
@@ -104,6 +107,10 @@ class ApplicationSupervisorLoop:
         self._last_observed_at: float | None = None
         self._last_tool_key: tuple[str, str] | None = None
         self._tool_repeat_count = 0
+        self._counted_tool_call_ids: set[str] = set()
+        self._pending_tool_call_ids: set[str] = set()
+        self._anonymous_tool_running = False
+        self._provider_state = "provider_starting"
         self._page_signature: str | None = None
         self._unresolved_control_delta = 0
         self._validation_delta = 0
@@ -132,6 +139,8 @@ class ApplicationSupervisorLoop:
         self._effect_started = self._effect_started or observation.effect_started
         self._submit_started = self._submit_started or observation.submit_started
         self._effect_uncertain = self._effect_uncertain or observation.effect_uncertain
+        event_type = observation.event_type.strip().casefold()
+        self._observe_provider_lifecycle(event_type, observation.tool_call_id)
 
         changed = bool(
             observation.meaningful_progress
@@ -159,7 +168,15 @@ class ApplicationSupervisorLoop:
             self._tool_repeat_count = 0
             self._stall_level = 0
 
-        if observation.tool_name:
+        new_tool_attempt = bool(
+            observation.tool_name
+            and self._is_new_tool_attempt(
+                event_type,
+                observation.tool_call_id,
+            )
+        )
+        if new_tool_attempt:
+            assert observation.tool_name is not None
             tool_key = (observation.tool_name, _normalized_params(observation.tool_params))
             if not changed and tool_key == self._last_tool_key:
                 self._tool_repeat_count += 1
@@ -169,7 +186,7 @@ class ApplicationSupervisorLoop:
                 if self._last_progress_at is None:
                     self._last_progress_at = now
 
-        if not changed and self._tool_repeat_count >= 2:
+        if not changed and new_tool_attempt and self._tool_repeat_count >= 2:
             candidate = min(3, self._tool_repeat_count - 1)
             return self._decision(candidate, "TOOL_REPEAT_NO_PROGRESS", now)
         return self._decision(0, "OBSERVING", now, meaningful_progress=changed)
@@ -181,11 +198,74 @@ class ApplicationSupervisorLoop:
         self._last_observed_at = now
         if self._last_progress_at is None:
             return self._decision(0, "OBSERVING", now)
+        protected_reason = {
+            "provider_starting": "PROVIDER_STARTING_WITHIN_TURN_DEADLINE",
+            "provider_thinking": "PROVIDER_THINKING_WITHIN_TURN_DEADLINE",
+            "tool_running": "TOOL_RUNNING_WITHIN_TURN_DEADLINE",
+            "terminal": "PROVIDER_TERMINAL",
+        }.get(self._provider_state)
+        if protected_reason is not None:
+            # Provider lifecycle silence is not evidence of a stall.  The
+            # launcher-owned turn deadline remains the hard time bound.
+            return self._decision(0, protected_reason, now)
         elapsed = now - self._last_progress_at
         if elapsed < self.stall_window_seconds * (self._stall_level + 1):
             return self._decision(0, "OBSERVING", now)
         self._stall_level = min(3, self._stall_level + 1)
         return self._decision(self._stall_level, "NO_PROGRESS_WINDOW", now)
+
+    def _observe_provider_lifecycle(
+        self,
+        event_type: str,
+        tool_call_id: str | None,
+    ) -> None:
+        call_id = str(tool_call_id or "").strip()
+        if event_type in {"tool.proposed", "tool.started"}:
+            if call_id:
+                self._pending_tool_call_ids.add(call_id)
+            else:
+                self._anonymous_tool_running = True
+            self._provider_state = "tool_running"
+            return
+        if event_type == "tool.completed":
+            if call_id:
+                self._pending_tool_call_ids.discard(call_id)
+            else:
+                self._anonymous_tool_running = False
+            self._provider_state = (
+                "tool_running"
+                if self._pending_tool_call_ids or self._anonymous_tool_running
+                else "provider_thinking"
+            )
+            return
+        if event_type in {
+            "assistant.text",
+            "provider.activity",
+            "provider.turn_started",
+        }:
+            if not self._pending_tool_call_ids and not self._anonymous_tool_running:
+                self._provider_state = "provider_thinking"
+            return
+        if event_type in {"provider.idle", "host.idle"}:
+            self._provider_state = "idle"
+            return
+        if event_type in {"provider.terminal", "turn.completed"}:
+            self._provider_state = "terminal"
+
+    def _is_new_tool_attempt(
+        self,
+        event_type: str,
+        tool_call_id: str | None,
+    ) -> bool:
+        if event_type not in {"tool.proposed", "tool.started", "tool.completed"}:
+            return False
+        call_id = str(tool_call_id or "").strip()
+        if not call_id:
+            return True
+        if call_id in self._counted_tool_call_ids:
+            return False
+        self._counted_tool_call_ids.add(call_id)
+        return True
 
     def _validate_binding(self, observation: SupervisorObservation) -> None:
         if observation.attempt_id != self.attempt_id or observation.turn_id != self.turn_id:
@@ -198,6 +278,11 @@ class ApplicationSupervisorLoop:
             meaningful_progress=meaningful_progress,
             no_progress_window=(
                 0.0 if self._last_progress_at is None else max(0.0, now - self._last_progress_at)
+            ),
+            provider_state=self._provider_state,
+            pending_tool_count=(
+                len(self._pending_tool_call_ids)
+                + int(self._anonymous_tool_running)
             ),
             tool_repeat_count=self._tool_repeat_count,
             page_signature=self._page_signature,
@@ -290,6 +375,11 @@ class AuthoritativeSupervisorController:
         if decision.level <= 0:
             return decision
         if decision.level == 1:
+            audit_reason = (
+                f"{decision.reason_code}_AUTHORITY_HEALTH_AUDIT"
+                if self._observe_authority_health is not None
+                else f"{decision.reason_code}_PAGE_OBSERVER_UNAVAILABLE"
+            )
             audit = SupervisorDecision(
                 level=1,
                 action=(
@@ -297,7 +387,7 @@ class AuthoritativeSupervisorController:
                     if self._observe_authority_health is not None
                     else "audit_only_no_observer"
                 ),
-                reason_code="PAGE_OBSERVER_UNAVAILABLE",
+                reason_code=audit_reason,
                 signals=decision.signals,
                 expected_turn_id=decision.expected_turn_id,
                 receipt_only=decision.receipt_only,
@@ -326,17 +416,21 @@ class AuthoritativeSupervisorController:
             self._record(audit)
             return audit
 
-        resolved = decision
         if decision.level == 2 and self._steer is None:
             resolved = SupervisorDecision(
-                level=3,
-                action="interrupt_park_manual",
-                reason_code="STEER_UNSUPPORTED",
+                level=2,
+                action="audit_only_steer_unsupported",
+                reason_code=f"{decision.reason_code}_STEER_UNSUPPORTED",
                 signals=decision.signals,
                 expected_turn_id=decision.expected_turn_id,
-                requires_extra_model=True,
-                receipt_only=False,
+                requires_extra_model=False,
+                receipt_only=decision.receipt_only,
             )
+            self._before_action(resolved)
+            self._after_action(resolved, "steer_unsupported")
+            self._record(resolved)
+            return resolved
+        resolved = decision
         if resolved.level >= 3:
             return self._interrupt_and_park(resolved)
 

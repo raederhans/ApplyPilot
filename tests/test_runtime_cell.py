@@ -95,8 +95,10 @@ def test_runtime_cell_request_carries_no_host_submission_authority() -> None:
         "cwd",
         "model",
         "context_refs",
+        "reasoning_effort",
         "parent_provider_session_id",
     }
+    assert request.reasoning_effort == "high"
     assert {
         "browser_handle",
         "submission_gate",
@@ -203,6 +205,34 @@ def test_runtime_cell_request_rejects_string_subclass_aliases() -> None:
             cwd=Path("runtime"),
             model="model",
             context_refs={Alias("page_observation"): "sha256:" + "a" * 64},
+        )
+
+
+def test_runtime_cell_request_normalizes_and_rejects_reasoning_effort() -> None:
+    normalized = RuntimeCellRequest(
+        run_id="turn-effort",
+        actor_id="actor-effort",
+        attempt_id="attempt-effort",
+        phase="prepare",
+        prompt="bounded prompt",
+        cwd=Path("runtime"),
+        model="model",
+        context_refs={"page_observation": "sha256:" + "a" * 64},
+        reasoning_effort=" Medium ",
+    )
+    assert normalized.reasoning_effort == "medium"
+
+    with pytest.raises(ValueError, match="not supported"):
+        RuntimeCellRequest(
+            run_id="turn-invalid-effort",
+            actor_id="actor-invalid-effort",
+            attempt_id="attempt-invalid-effort",
+            phase="prepare",
+            prompt="bounded prompt",
+            cwd=Path("runtime"),
+            model="model",
+            context_refs={"page_observation": "sha256:" + "a" * 64},
+            reasoning_effort="turbo",
         )
 
 
@@ -443,6 +473,7 @@ def test_incomplete_app_server_capabilities_degrade_without_invoking_adapter() -
     assert selection.health.disposition == "fallback"
     assert selection.health.reason_code == "CODEX_APP_SERVER_CAPABILITIES_INCOMPLETE"
     assert selection.health.missing_capabilities == (
+        "model/list",
         "thread/resume",
         "turn/interrupt",
     )

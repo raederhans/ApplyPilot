@@ -50,6 +50,10 @@ class CodexAppServerProtocolError(CodexAppServerError):
         self.code = code
 
 
+class CodexAppServerConfigurationError(CodexAppServerError):
+    """The requested model/effort cannot be proven compatible pre-dispatch."""
+
+
 class CodexAppServerTimeout(CodexAppServerError, TimeoutError):
     """A bounded App Server operation did not complete in time."""
 
@@ -953,6 +957,7 @@ class CodexAppServerAdapter:
         self._opening_applications: set[str] = set()
         self._dynamic_surface: DynamicToolSurface | None = None
         self._application_surface_digests: dict[str, str] = {}
+        self._model_catalog: dict[str, frozenset[str] | None] | None = None
         self._lock = threading.RLock()
 
     def configure_dynamic_tools(self, surface: DynamicToolSurface | None) -> None:
@@ -1021,22 +1026,137 @@ class CodexAppServerAdapter:
     def health(self) -> RuntimeAdapterHealth:
         try:
             self.transport.start()
+            catalog = self._load_model_catalog()
         except (OSError, RuntimeError, TimeoutError, ValueError):
             return RuntimeAdapterHealth(
                 backend="codex-app-server",
                 status="unavailable",
-                reason_code="CODEX_APP_SERVER_UNAVAILABLE",
-                capabilities=CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
+                reason_code=(
+                    "CODEX_APP_SERVER_MODEL_CATALOG_UNAVAILABLE"
+                    if self.transport.is_ready
+                    else "CODEX_APP_SERVER_UNAVAILABLE"
+                ),
+                capabilities=(
+                    CODEX_APP_SERVER_REQUIRED_CAPABILITIES - {"model/list"}
+                    if self.transport.is_ready
+                    else CODEX_APP_SERVER_REQUIRED_CAPABILITIES
+                ),
             )
-        status = "ready" if self.transport.is_ready else "unavailable"
+        status = "ready" if self.transport.is_ready and catalog else "unavailable"
         return RuntimeAdapterHealth(
             backend="codex-app-server",
             status=status,
-            reason_code=("CODEX_APP_SERVER_READY" if status == "ready" else "CODEX_APP_SERVER_UNAVAILABLE"),
+            reason_code=(
+                "CODEX_APP_SERVER_READY"
+                if status == "ready"
+                else "CODEX_APP_SERVER_MODEL_CATALOG_EMPTY"
+            ),
             capabilities=CODEX_APP_SERVER_REQUIRED_CAPABILITIES,
         )
 
+    def _load_model_catalog(self) -> dict[str, frozenset[str] | None]:
+        """Load the official model/list capability once per owned process."""
+
+        with self._lock:
+            if self._model_catalog is not None:
+                return dict(self._model_catalog)
+            catalog: dict[str, frozenset[str] | None] = {}
+            cursor: str | None = None
+            for _page in range(20):
+                params: dict[str, object] = {"limit": 100, "includeHidden": True}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                result = self.transport.request("model/list", params)
+                raw_models = result.get("data")
+                if not isinstance(raw_models, list):
+                    raise CodexAppServerProtocolError(
+                        "model/list returned no model array",
+                        method="model/list",
+                    )
+                for raw_model in raw_models:
+                    if not isinstance(raw_model, Mapping):
+                        raise CodexAppServerProtocolError(
+                            "model/list returned an invalid model entry",
+                            method="model/list",
+                        )
+                    model = raw_model.get("model", raw_model.get("id"))
+                    if not isinstance(model, str) or not model:
+                        raise CodexAppServerProtocolError(
+                            "model/list returned a model without an id",
+                            method="model/list",
+                        )
+                    raw_efforts = raw_model.get("supportedReasoningEfforts")
+                    efforts: frozenset[str] | None = None
+                    if raw_efforts is not None:
+                        if not isinstance(raw_efforts, list):
+                            raise CodexAppServerProtocolError(
+                                "model/list returned invalid reasoning capabilities",
+                                method="model/list",
+                            )
+                        parsed_efforts: set[str] = set()
+                        for raw_effort in raw_efforts:
+                            effort = (
+                                raw_effort.get("reasoningEffort")
+                                if isinstance(raw_effort, Mapping)
+                                else None
+                            )
+                            if not isinstance(effort, str) or not effort:
+                                raise CodexAppServerProtocolError(
+                                    "model/list returned an invalid reasoning effort",
+                                    method="model/list",
+                                )
+                            parsed_efforts.add(effort.casefold())
+                        efforts = frozenset(parsed_efforts)
+                    if model in catalog and catalog[model] != efforts:
+                        raise CodexAppServerProtocolError(
+                            "model/list returned conflicting model capabilities",
+                            method="model/list",
+                        )
+                    catalog[model] = efforts
+                next_cursor = result.get("nextCursor")
+                if next_cursor is None:
+                    self._model_catalog = catalog
+                    return dict(catalog)
+                if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                    raise CodexAppServerProtocolError(
+                        "model/list returned an invalid pagination cursor",
+                        method="model/list",
+                    )
+                cursor = next_cursor
+            raise CodexAppServerProtocolError(
+                "model/list exceeded the pagination limit",
+                method="model/list",
+            )
+
+    def validate_configuration(
+        self,
+        request: RuntimeCellRequest,
+    ) -> dict[str, object]:
+        """Prove configured model/effort support before accepting a turn."""
+
+        catalog = self._load_model_catalog()
+        if request.model not in catalog:
+            raise CodexAppServerConfigurationError(
+                "configured model is not advertised by Codex App Server"
+            )
+        supported_efforts = catalog[request.model]
+        if supported_efforts is None:
+            raise CodexAppServerConfigurationError(
+                "Codex App Server model catalog does not advertise reasoning effort support"
+            )
+        if request.reasoning_effort not in supported_efforts:
+            raise CodexAppServerConfigurationError(
+                "configured reasoning effort is not supported by the selected model"
+            )
+        return {
+            "model_validation": "model/list",
+            "reasoning_effort_validation": "supportedReasoningEfforts",
+            "model_supported": True,
+            "reasoning_effort_supported": True,
+        }
+
     def start(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+        self.validate_configuration(request)
         self._claim_application_turn(request.actor_id)
         try:
             with self._lock:
@@ -1049,6 +1169,7 @@ class CodexAppServerAdapter:
                 self._opening_applications.discard(request.actor_id)
 
     def resume(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
+        self.validate_configuration(request)
         self._claim_application_turn(request.actor_id)
         try:
             with self._lock:
@@ -1179,6 +1300,7 @@ class CodexAppServerAdapter:
                         "access": {"type": "fullAccess"},
                     },
                     "model": request.model,
+                    "effort": request.reasoning_effort,
                 },
             )
             raw_turn = turn_result.get("turn")
@@ -1520,6 +1642,7 @@ class CodexAppServerAdapter:
 
 __all__ = [
     "CodexAppServerAdapter",
+    "CodexAppServerConfigurationError",
     "CodexAppServerError",
     "CodexAppServerExecutionError",
     "CodexAppServerProtocolError",

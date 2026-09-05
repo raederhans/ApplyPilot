@@ -354,18 +354,27 @@ def test_run_job_ingests_repeated_authoritative_events_and_parks_cli(
     def popen(_command, **kwargs):
         events.append("popen")
         process = _FakeProcess(4901, events, kwargs["env"])
-        repeated_snapshot = {
-            "type": "item.completed",
-            "item": {
-                "id": "snapshot",
+        def repeated_snapshot(
+            call_id: str,
+        ) -> tuple[dict[str, object], dict[str, object]]:
+            item = {
+                "id": call_id,
                 "type": "mcp_tool_call",
                 "server": "playwright",
                 "tool": "browser_snapshot",
                 "arguments": {"ref": "same"},
-                "status": "completed",
-                "result": {"isError": False, "content": "same-page"},
-            },
-        }
+            }
+            return (
+                {"type": "item.started", "item": item},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        **item,
+                        "status": "completed",
+                        "result": {"isError": False, "content": "same-page"},
+                    },
+                },
+            )
         assistant_text = {
             "type": "item.completed",
             "item": {"type": "agent_message", "text": "Still working."},
@@ -374,11 +383,13 @@ def test_run_job_ingests_repeated_authoritative_events_and_parks_cli(
             "\n".join(
                 json.dumps(message)
                 for message in (
-                    repeated_snapshot,
+                    *repeated_snapshot("snapshot-1"),
                     assistant_text,
-                    repeated_snapshot,
+                    *repeated_snapshot("snapshot-2"),
                     assistant_text,
-                    repeated_snapshot,
+                    *repeated_snapshot("snapshot-3"),
+                    *repeated_snapshot("snapshot-4"),
+                    *repeated_snapshot("snapshot-5"),
                 )
             )
         )
@@ -400,7 +411,7 @@ def test_run_job_ingests_repeated_authoritative_events_and_parks_cli(
     assert job["_application_supervisor_state"] == {
         "status": "parked_manual",
         "receipt_only": False,
-        "intervention_count": 2,
+        "intervention_count": 3,
     }
     assert "_application_supervisor_authority_health_observations" not in job
     with sqlite3.connect(db_path) as connection:
@@ -416,41 +427,89 @@ def test_run_job_ingests_repeated_authoritative_events_and_parks_cli(
     assert [(payload["stage"], payload["level"]) for payload in payloads] == [
         ("intent", 1),
         ("outcome", 1),
+        ("intent", 2),
+        ("outcome", 2),
         ("intent", 3),
         ("outcome", 3),
     ]
     assert payloads[0]["action"] == "audit_only_no_observer"
+    assert payloads[0]["reason_code"] == (
+        "TOOL_REPEAT_NO_PROGRESS_PAGE_OBSERVER_UNAVAILABLE"
+    )
     assert payloads[1]["outcome"] == "observer_unavailable"
-    assert payloads[2]["reason_code"] == "STEER_UNSUPPORTED"
-    assert payloads[3]["outcome"] == "runtime_interrupted"
+    assert payloads[2]["reason_code"] == (
+        "TOOL_REPEAT_NO_PROGRESS_STEER_UNSUPPORTED"
+    )
+    assert payloads[3]["outcome"] == "steer_unsupported"
+    assert payloads[4]["reason_code"] == "TOOL_REPEAT_NO_PROGRESS"
+    assert payloads[5]["outcome"] == "runtime_interrupted"
     assert completed_row is not None
     assert json.loads(completed_row[0])["application_status"] == (
         "failed:supervisor_parked_manual"
     )
 
 
-def test_run_job_arms_silent_turn_watchdog_before_provider_output(
+def test_run_job_silent_startup_watchdog_defers_to_total_deadline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     events: list[str] = []
     _configure_launcher(monkeypatch, tmp_path, events)
+    timers: list[object] = []
+    loops: list[object] = []
+    original_loop = launcher.supervisor_loop_mod.ApplicationSupervisorLoop
+
+    def loop_factory(**kwargs):
+        loop = original_loop(**kwargs)
+        loops.append(loop)
+        return loop
+
+    monkeypatch.setattr(
+        launcher.supervisor_loop_mod,
+        "ApplicationSupervisorLoop",
+        loop_factory,
+    )
 
     class CapturedTimer:
         daemon = False
 
-        def __init__(self, interval: float, _callback) -> None:
+        def __init__(self, interval: float, callback) -> None:
             assert interval <= 2
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
 
         def start(self) -> None:
             events.append("supervisor_watchdog_started")
 
         def cancel(self) -> None:
-            return None
+            self.cancelled = True
 
     monkeypatch.setattr(launcher.threading, "Timer", CapturedTimer)
 
+    class SilentStartupStream:
+        def __init__(self, process: _FakeProcess) -> None:
+            self.process = process
+
+        def __iter__(self):
+            assert timers and loops
+            loop = loops[0]
+            started_at = loop._last_observed_at  # type: ignore[attr-defined]
+            loop._clock = lambda: started_at + 120  # type: ignore[attr-defined]
+            timers[-1].callback()  # type: ignore[attr-defined]
+            self.process.returncode = 0
+            return iter(())
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        process = _FakeProcess(4904, events, kwargs["env"])
+        process.returncode = None
+        process.stdout = SilentStartupStream(process)  # type: ignore[assignment]
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    job = _job("attempt-silent-watchdog")
     status, _ = launcher.run_job(
-        _job("attempt-silent-watchdog"),
+        job,
         port=9432,
         worker_id=0,
         model="model",
@@ -459,8 +518,124 @@ def test_run_job_arms_silent_turn_watchdog_before_provider_output(
     )
 
     assert status == "ready_to_submit"
+    assert job.get("_application_supervisor_interventions") in (None, [])
     assert events.index("popen") < events.index("supervisor_watchdog_started")
     assert events.index("supervisor_watchdog_started") < events.index("advisory_started")
+
+
+def test_run_job_long_tool_lifecycle_is_not_silence_interrupted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    timers: list[object] = []
+    loops: list[object] = []
+    original_loop = launcher.supervisor_loop_mod.ApplicationSupervisorLoop
+
+    def loop_factory(**kwargs):
+        loop = original_loop(**kwargs)
+        loops.append(loop)
+        return loop
+
+    monkeypatch.setattr(
+        launcher.supervisor_loop_mod,
+        "ApplicationSupervisorLoop",
+        loop_factory,
+    )
+
+    class CapturedTimer:
+        daemon = False
+
+        def __init__(self, _interval: float, callback) -> None:
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self) -> None:
+            return None
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    monkeypatch.setattr(launcher.threading, "Timer", CapturedTimer)
+
+    class LongToolStream:
+        def __init__(self, process: _FakeProcess) -> None:
+            self.process = process
+
+        def __iter__(self):
+            tool = {
+                "id": "snapshot-1",
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_snapshot",
+                "arguments": {"ref": "same"},
+            }
+            yield json.dumps({"type": "item.started", "item": tool})
+            loop = loops[0]
+            proposed_at = loop._last_observed_at  # type: ignore[attr-defined]
+            loop._clock = lambda: proposed_at + 90  # type: ignore[attr-defined]
+            next(timer for timer in reversed(timers) if not timer.cancelled).callback()
+            self.process.returncode = 0
+
+    def popen(_command, **kwargs):
+        events.append("popen")
+        process = _FakeProcess(4905, events, kwargs["env"])
+        process.returncode = None
+        process.stdout = LongToolStream(process)  # type: ignore[assignment]
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    job = _job("attempt-long-supervised-tool")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase="prepare",
+    )
+
+    assert status == "ready_to_submit"
+    assert job.get("_application_supervisor_interventions") in (None, [])
+
+
+@pytest.mark.parametrize(
+    ("submission_phase", "expected_status"),
+    [
+        ("prepare", "failed:agent_runtime_timeout"),
+        ("submit", "submission_uncertain"),
+    ],
+)
+def test_run_job_total_deadline_remains_authoritative_over_supervisor_silence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    submission_phase: str,
+    expected_status: str,
+) -> None:
+    events: list[str] = []
+    _configure_launcher(monkeypatch, tmp_path, events)
+    timed_out = threading.Event()
+    timed_out.set()
+    monkeypatch.setattr(
+        launcher,
+        "_start_timeout_watchdog",
+        lambda *_args: (timed_out, _Timer()),
+    )
+    job = _job(f"attempt-deadline-{submission_phase}")
+
+    status, _ = launcher.run_job(
+        job,
+        port=9432,
+        worker_id=0,
+        model="model",
+        agent_backend="codex",
+        submission_phase=submission_phase,
+    )
+
+    assert status == expected_status
+    assert job.get("_application_supervisor_interventions") in (None, [])
 
 
 def test_run_job_level_one_audits_exact_browser_authority_without_page_delta(
@@ -511,20 +686,24 @@ def test_run_job_level_one_audits_exact_browser_authority_without_page_delta(
     def popen(_command, **kwargs):
         events.append("popen")
         process = _FakeProcess(4902, events, kwargs["env"])
-        repeated_snapshot = {
-            "type": "item.completed",
-            "item": {
-                "id": "snapshot",
-                "type": "mcp_tool_call",
-                "server": "playwright",
-                "tool": "browser_snapshot",
-                "arguments": {"ref": "same"},
-                "status": "completed",
-                "result": {"isError": False, "content": "same-page"},
-            },
-        }
+        def repeated_snapshot(call_id: str) -> dict[str, object]:
+            return {
+                "type": "item.completed",
+                "item": {
+                    "id": call_id,
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_snapshot",
+                    "arguments": {"ref": "same"},
+                    "status": "completed",
+                    "result": {"isError": False, "content": "same-page"},
+                },
+            }
         process.stdout = io.StringIO(
-            "\n".join(json.dumps(repeated_snapshot) for _ in range(5))
+            "\n".join(
+                json.dumps(repeated_snapshot(f"snapshot-{index}"))
+                for index in range(5)
+            )
         )
         return process
 
@@ -554,7 +733,7 @@ def test_run_job_level_one_audits_exact_browser_authority_without_page_delta(
     assert job["_application_supervisor_interventions"][0]["signals"][
         "page_signature"
     ] != requests[0]["authority_signature"]
-    assert len(job["_application_supervisor_interventions"]) == 2
+    assert len(job["_application_supervisor_interventions"]) == 3
 
 
 def test_run_job_terminal_invalidates_already_started_watchdog_callback(
@@ -677,6 +856,7 @@ def test_run_job_feature_flag_records_app_server_degradation_and_uses_cli(
         },
         "missing_capabilities": [
             "initialize",
+            "model/list",
             "thread/resume",
             "thread/start",
             "turn/interrupt",
@@ -718,6 +898,9 @@ class _CanaryAdapter:
     def configure_thread(self, _config: dict[str, object]) -> None:
         if self.configure_error is not None:
             raise self.configure_error
+
+    def validate_configuration(self, request: RuntimeCellRequest) -> dict[str, object]:
+        return {"model": request.model, "reasoning_effort": request.reasoning_effort}
 
     def start(self, request: RuntimeCellRequest) -> RuntimeCellTurn:
         self.requests.append(request)
@@ -791,6 +974,19 @@ def test_run_job_canary_remains_observational_and_cli_owns_prepare_result(
     events: list[str] = []
     _configure_launcher(monkeypatch, tmp_path, events)
     monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_MODE", "canary")
+    monkeypatch.setenv("APPLYPILOT_REASONING_EFFORTS", '{"prepare":"low"}')
+    monkeypatch.setattr(
+        config, "load_profile",
+        lambda: {"authentication": {}, "agent_runtime": {"reasoning_efforts": {"prepare": "medium"}}},
+    )
+    configurations = []
+    build_command = launcher._build_agent_command
+
+    def capture_command(**kwargs):
+        configurations.append(kwargs["resolved_configuration"])
+        return build_command(**kwargs)
+
+    monkeypatch.setattr(launcher, "_build_agent_command", capture_command)
     adapter = _CanaryAdapter()
     monkeypatch.setattr(launcher, "_app_server_runtime_pool", _CanaryPool(adapter))
     job = _job("attempt-app-server-canary")
@@ -815,6 +1011,9 @@ def test_run_job_canary_remains_observational_and_cli_owns_prepare_result(
 
     assert (first_status, second_status) == ("ready_to_submit", "ready_to_submit")
     assert len(adapter.requests) == 1
+    assert adapter.requests[0].model == configurations[0].model
+    assert adapter.requests[0].reasoning_effort == configurations[0].reasoning.value == "medium"
+    assert job["_runtime_configuration"]["reasoning_effort_source"] == "profile"
     assert events.count("popen") == 2
     assert job["_runtime_cell"]["mode"] == "canary_observation"
     assert job["_runtime_cell"]["authoritative_backend"] == "codex-cli"
@@ -883,7 +1082,7 @@ def test_run_job_app_server_is_non_authoritative_shadow_and_cli_owns_result(
     monkeypatch.setenv("APPLYPILOT_CODEX_APP_SERVER_ENABLED", "1")
     monkeypatch.setenv("APPLYPILOT_APPLICATION_PLAN_SHADOW_ENABLED", "1")
 
-    class FakeAdapter:
+    class FakeAdapter(_CanaryAdapter):
         backend = "codex-app-server"
 
         def __init__(self) -> None:
@@ -1124,7 +1323,7 @@ def test_blocked_app_server_shadow_does_not_delay_authoritative_cli_completion(
     cancel_started = threading.Event()
     adapter_detached = threading.Event()
 
-    class BlockingAdapter:
+    class BlockingAdapter(_CanaryAdapter):
         backend = "codex-app-server"
         drain_timeout = 0.1
 

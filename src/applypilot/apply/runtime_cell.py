@@ -33,6 +33,7 @@ RuntimeCellDisposition = Literal[
 CODEX_APP_SERVER_REQUIRED_CAPABILITIES = frozenset(
     {
         "initialize",
+        "model/list",
         "thread/start",
         "thread/resume",
         "turn/start",
@@ -52,6 +53,9 @@ RUNTIME_CELL_CONTEXT_REF_KEYS = frozenset(
     }
 )
 RUNTIME_CELL_CONTEXT_REF_SCHEMES = frozenset({"sha256"})
+REASONING_EFFORT_VALUES = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 
 def _validate_reason_code(value: str) -> None:
@@ -94,13 +98,25 @@ class RuntimeCellRequest:
     cwd: Path
     model: str
     context_refs: Mapping[str, str]
+    reasoning_effort: str = "high"
     parent_provider_session_id: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("run_id", "actor_id", "attempt_id", "phase", "model"):
+        for name in (
+            "run_id",
+            "actor_id",
+            "attempt_id",
+            "phase",
+            "model",
+            "reasoning_effort",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} is required")
+        normalized_effort = self.reasoning_effort.strip().casefold()
+        if normalized_effort not in REASONING_EFFORT_VALUES:
+            raise ValueError("reasoning_effort is not supported by the runtime protocol")
+        object.__setattr__(self, "reasoning_effort", normalized_effort)
         if self.parent_provider_session_id is not None and not (
             isinstance(self.parent_provider_session_id, str) and self.parent_provider_session_id.strip()
         ):
@@ -467,6 +483,7 @@ def select_runtime_cell(
 
 __all__ = [
     "CODEX_APP_SERVER_REQUIRED_CAPABILITIES",
+    "REASONING_EFFORT_VALUES",
     "RUNTIME_CELL_CONTEXT_REF_KEYS",
     "RUNTIME_CELL_CONTEXT_REF_SCHEMES",
     "RuntimeAdapterHealth",

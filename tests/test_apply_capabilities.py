@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from applypilot.apply import agent_runtime, launcher
 from applypilot.apply.capabilities import (
     CapabilityRegistry,
@@ -301,6 +303,63 @@ def test_reasoning_effort_is_configurable_by_workload_without_model_binding(
     )
 
     assert 'model_reasoning_effort="medium"' in command
+
+
+def test_runtime_configuration_is_shared_with_command_and_comparison_metadata(
+    tmp_path: Path,
+) -> None:
+    resolved = agent_runtime.resolve_agent_runtime_configuration(
+        "codex",
+        "gpt-5.6-sol",
+        workload_class="submit_repair",
+        reasoning_efforts={"submit_repair": "medium"},
+        environ={"APPLYPILOT_REASONING_EFFORTS": '{"submit_repair":"low"}'},
+        model_source="environment",
+    )
+    metadata: dict = {}
+
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "gpt-5.6-sol",
+        9432,
+        tmp_path,
+        tmp_path / "mcp.json",
+        resolve_codex=lambda: ["codex"],
+        runtime_metadata=metadata,
+        resolved_configuration=resolved,
+    )
+
+    assert 'model_reasoning_effort="medium"' in command
+    assert metadata["runtime_configuration"] == {
+        "schema_version": "1",
+        "backend": "codex",
+        "model": "gpt-5.6-sol",
+        "model_source": "environment",
+        "reasoning_effort": "medium",
+        "reasoning_effort_source": "profile",
+        "workload_class": "submit_repair",
+        "reasoning_effort_source_key": "submit_repair",
+        "reasoning_effort_applied": True,
+    }
+
+
+def test_reasoning_resolution_records_default_fallback_and_rejects_unknown_values() -> None:
+    resolved = agent_runtime.resolve_reasoning_effort_configuration(
+        "prepare_repair",
+        configured={"default": " HIGH "},
+        environ={"APPLYPILOT_REASONING_EFFORTS": '{"default":"low"}'},
+    )
+
+    assert resolved.value == "high"
+    assert resolved.source == "profile"
+    assert resolved.source_key == "default"
+    assert resolved.workload_class == "prepare_repair"
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        agent_runtime.resolve_reasoning_effort(
+            "prepare",
+            configured={"prepare": "turbo"},
+            environ={},
+        )
 
 
 def test_build_agent_command_accepts_custom_process_and_tool_surface(tmp_path: Path) -> None:

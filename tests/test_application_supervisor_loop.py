@@ -81,13 +81,14 @@ def test_page_control_or_validation_change_resets_repetition() -> None:
     assert changed.signals.tool_repeat_count == 1
 
 
-def test_stall_window_intervenes_within_configured_two_seconds() -> None:
+def test_confirmed_provider_idle_intervenes_within_configured_two_seconds() -> None:
     loop = ApplicationSupervisorLoop(
         attempt_id="attempt-1",
         turn_id="turn-1",
         stall_window_seconds=2,
     )
-    loop.observe(observation(0, tool_name="browser_snapshot"))
+    loop.start(observed_at=0)
+    loop.observe(observation(0, event_type="provider.idle"))
 
     assert loop.tick(observed_at=1.999).level == 0
     decision = loop.tick(observed_at=2)
@@ -118,7 +119,7 @@ def test_level_two_steers_exact_expected_turn() -> None:
     assert calls and calls[0][1] == "turn-1"
 
 
-def test_cli_without_steer_escalates_and_cancels_authoritative_runtime() -> None:
+def test_cli_without_steer_escalates_at_next_bounded_level_and_cancels() -> None:
     interrupted: list[bool] = []
     loop = ApplicationSupervisorLoop(attempt_id="attempt-1", turn_id="turn-1")
     controller = AuthoritativeSupervisorController(
@@ -127,12 +128,40 @@ def test_cli_without_steer_escalates_and_cancels_authoritative_runtime() -> None
         interrupt=lambda: interrupted.append(True),
         observe_authority_health=None,
     )
-    for at in (0.0, 0.1):
-        controller.apply(loop.observe(observation(at, tool_name="browser_snapshot")))
-    decision = controller.apply(loop.observe(observation(0.2, tool_name="browser_snapshot")))
+    for index, at in enumerate((0.0, 0.1), start=1):
+        controller.apply(
+            loop.observe(
+                observation(
+                    at,
+                    tool_call_id=f"snapshot-{index}",
+                    tool_name="browser_snapshot",
+                )
+            )
+        )
+    unsupported = controller.apply(
+        loop.observe(
+            observation(
+                0.2,
+                tool_call_id="snapshot-3",
+                tool_name="browser_snapshot",
+            )
+        )
+    )
+    assert interrupted == []
+    decision = controller.apply(
+        loop.observe(
+            observation(
+                0.3,
+                tool_call_id="snapshot-4",
+                tool_name="browser_snapshot",
+            )
+        )
+    )
 
+    assert unsupported.level == 2
+    assert unsupported.action == "audit_only_steer_unsupported"
     assert decision.level == 3
-    assert decision.reason_code == "STEER_UNSUPPORTED"
+    assert decision.reason_code == "TOOL_REPEAT_NO_PROGRESS"
     assert decision.action == "interrupt_park_manual"
     assert interrupted == [True]
     assert controller.parked is True
@@ -205,7 +234,7 @@ def test_wrong_attempt_or_turn_fails_closed() -> None:
         raise AssertionError("binding mismatch must fail closed")
 
 
-def test_silent_started_turn_triggers_level_one_at_two_seconds() -> None:
+def test_silent_started_turn_remains_under_outer_deadline_at_two_seconds() -> None:
     loop = ApplicationSupervisorLoop(
         attempt_id="attempt-1",
         turn_id="turn-1",
@@ -215,7 +244,12 @@ def test_silent_started_turn_triggers_level_one_at_two_seconds() -> None:
 
     assert started.signals.meaningful_progress is True
     assert loop.tick(observed_at=1.999).level == 0
-    assert loop.tick(observed_at=2).level == 1
+    decision = loop.tick(observed_at=2)
+    assert decision.level == 0
+    assert decision.reason_code == "PROVIDER_STARTING_WITHIN_TURN_DEADLINE"
+    much_later = loop.tick(observed_at=120)
+    assert much_later.level == 0
+    assert much_later.signals.no_progress_window == 120
 
 
 def test_level_one_observes_authority_health_without_faking_page_progress() -> None:
@@ -264,6 +298,11 @@ def test_assistant_text_does_not_reset_repeated_tool_detection() -> None:
     assert repeated.level == 1
     assert repeated.signals.tool_repeat_count == 2
 
+    narration = loop.observe(observation(0.15, event_type="assistant.text"))
+
+    assert narration.level == 0
+    assert narration.signals.tool_repeat_count == 2
+
 
 def test_launcher_synthetic_authoritative_stream_interrupts_cli_and_audits() -> None:
     interrupted: list[bool] = []
@@ -284,12 +323,14 @@ def test_launcher_synthetic_authoritative_stream_interrupts_cli_and_audits() -> 
         for event in stream
     ]
 
-    assert [decision.level for decision in decisions] == [0, 1, 3, 4]
-    assert decisions[-1].reason_code == "ALREADY_PARKED"
+    assert [decision.level for decision in decisions] == [0, 1, 2, 3]
+    assert decisions[-1].reason_code == "TOOL_REPEAT_NO_PROGRESS"
     assert interrupted == [True]
-    assert len(controller.interventions) == 2
-    assert controller.interventions[-1]["reason_code"] == "STEER_UNSUPPORTED"
-    assert controller.interventions[-1]["signals"]["tool_repeat_count"] == 3
+    assert len(controller.interventions) == 3
+    assert controller.interventions[1]["reason_code"] == (
+        "TOOL_REPEAT_NO_PROGRESS_STEER_UNSUPPORTED"
+    )
+    assert controller.interventions[-1]["signals"]["tool_repeat_count"] == 4
 
 
 def test_control_intent_is_persisted_before_interrupt_and_outcome_after() -> None:
@@ -297,7 +338,7 @@ def test_control_intent_is_persisted_before_interrupt_and_outcome_after() -> Non
     loop = ApplicationSupervisorLoop(attempt_id="attempt-1", turn_id="turn-1")
     decisions = [
         loop.observe(observation(at, tool_name="browser_snapshot"))
-        for at in (0.0, 0.1, 0.2)
+        for at in (0.0, 0.1, 0.2, 0.3)
     ]
     controller = AuthoritativeSupervisorController(
         loop=loop,
@@ -335,3 +376,105 @@ def test_failed_intent_persist_prevents_steer_or_interrupt() -> None:
         controller.apply(decision)
 
     assert actions == []
+
+
+def test_long_running_tool_is_not_interrupted_by_silence_ticks() -> None:
+    loop = ApplicationSupervisorLoop(
+        attempt_id="attempt-1",
+        turn_id="turn-1",
+        stall_window_seconds=2,
+    )
+    loop.start(observed_at=0)
+    proposed = loop.observe(
+        observation(
+            1,
+            event_type="tool.proposed",
+            tool_call_id="tool-1",
+            tool_name="browser_snapshot",
+        )
+    )
+
+    still_running = loop.tick(observed_at=90)
+
+    assert proposed.level == 0
+    assert still_running.level == 0
+    assert still_running.reason_code == "TOOL_RUNNING_WITHIN_TURN_DEADLINE"
+
+
+def test_tool_lifecycle_events_count_one_attempt_and_completion_returns_to_thinking() -> None:
+    loop = ApplicationSupervisorLoop(attempt_id="attempt-1", turn_id="turn-1")
+    loop.start(observed_at=0)
+    proposed = loop.observe(
+        observation(
+            1,
+            event_type="tool.proposed",
+            tool_call_id="tool-1",
+            tool_name="browser_snapshot",
+            tool_params={"ref": "same"},
+        )
+    )
+    completed = loop.observe(
+        observation(
+            10,
+            event_type="tool.completed",
+            tool_call_id="tool-1",
+            tool_name="browser_snapshot",
+            tool_params={"ref": "same"},
+            page_signature="same-page",
+        )
+    )
+
+    assert proposed.signals.tool_repeat_count == 1
+    assert completed.signals.tool_repeat_count == 0
+    assert loop.tick(observed_at=30).reason_code == (
+        "PROVIDER_THINKING_WITHIN_TURN_DEADLINE"
+    )
+
+
+def test_assistant_narration_does_not_refresh_the_progress_clock() -> None:
+    loop = ApplicationSupervisorLoop(attempt_id="attempt-1", turn_id="turn-1")
+    loop.start(observed_at=0)
+
+    first = loop.observe(observation(5, event_type="assistant.text"))
+    second = loop.observe(observation(30, event_type="assistant.text"))
+
+    assert first.signals.no_progress_window == 5
+    assert second.signals.no_progress_window == 30
+    assert loop.tick(observed_at=60).reason_code == (
+        "PROVIDER_THINKING_WITHIN_TURN_DEADLINE"
+    )
+
+
+def test_submit_unknown_result_preserves_receipt_only_boundary() -> None:
+    interrupted: list[bool] = []
+    loop = ApplicationSupervisorLoop(attempt_id="attempt-1", turn_id="turn-1")
+    controller = AuthoritativeSupervisorController(
+        loop=loop,
+        backend="codex-cli",
+        interrupt=lambda: interrupted.append(True),
+        observe_authority_health=None,
+    )
+
+    decisions = []
+    for index, at in enumerate((0.0, 0.1, 0.2), start=1):
+        decisions.append(
+            controller.apply(
+                loop.observe(
+                    observation(
+                        at,
+                        tool_call_id=f"submit-{index}",
+                        tool_name="browser_click",
+                        tool_params={"ref": "submit"},
+                        effect_started=True,
+                        submit_started=True,
+                        effect_uncertain=True,
+                    )
+                )
+            )
+        )
+
+    assert decisions[-1].level == 4
+    assert decisions[-1].action == "interrupt_park_receipt_only"
+    assert decisions[-1].reason_code == "EFFECT_REPLAY_FORBIDDEN"
+    assert controller.receipt_only is True
+    assert interrupted == [True]

@@ -153,6 +153,7 @@ from applypilot.apply.email_routing import (
 from applypilot.apply.execution_scheduler import PhaseDemand, build_execution_plan
 from applypilot.apply.failure_taxonomy import classify_failure
 from applypilot.apply.operator_commands import OperatorCommand
+from applypilot.apply.prepare_fast_path import run_prepare_fast_path
 from applypilot.apply.profile_lock import inspect_process_identity
 from applypilot.apply.retention import (
     archive_new_evidence,
@@ -2057,6 +2058,7 @@ def _build_agent_command(
     workload_class: str | None = None,
     reasoning_efforts: dict[str, str] | None = None,
     playwright_mcp_url: str | None = None,
+    resolved_configuration: agent_runtime_mod.AgentRuntimeConfiguration | None = None,
 ) -> tuple[list[str], Path | None]:
     return agent_runtime_mod.build_agent_command(
         backend,
@@ -2077,6 +2079,7 @@ def _build_agent_command(
         workload_class=workload_class,
         reasoning_efforts=reasoning_efforts,
         playwright_mcp_url=playwright_mcp_url,
+        resolved_configuration=resolved_configuration,
     )
 
 
@@ -2457,6 +2460,22 @@ def _supervisor_page_signature(payload: object) -> str:
         default=lambda value: f"<{type(value).__name__}>",
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _supervisor_tool_is_effectful(tool_name: object, server: object = "") -> bool:
+    resolved_server = str(server or "")
+    resolved_tool = str(tool_name or "")
+    if not resolved_server and resolved_tool.startswith("mcp__"):
+        parts = resolved_tool.split("__", 2)
+        if len(parts) == 3:
+            _, resolved_server, resolved_tool = parts
+    return app_server_wiring_mod.app_server_item_starts_effect(
+        {
+            "type": "mcp_tool_call",
+            "server": resolved_server,
+            "tool": resolved_tool,
+        }
+    )
 
 
 def _apply_authoritative_supervisor_observation(
@@ -6141,6 +6160,27 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         len(selected_fragments) if isinstance(selected_fragments, list) else 0
     )
 
+    # Freeze phase configuration once so the CLI and optional App Server
+    # observation cannot silently use different effort or environment values.
+    configured_efforts = (
+        dict(profile.get("agent_runtime", {}).get("reasoning_efforts", {}))
+        if isinstance(profile.get("agent_runtime"), Mapping)
+        and isinstance(profile.get("agent_runtime", {}).get("reasoning_efforts"), Mapping)
+        else None
+    )
+    resolved_configuration = agent_runtime_mod.resolve_agent_runtime_configuration(
+        agent_backend,
+        model,
+        workload_class=(
+            "submit_repair"
+            if submission_phase == "submit" and "repair" in runtime_state
+            else submission_phase
+        ),
+        reasoning_efforts=configured_efforts,
+        environ=runtime_settings.environ,
+    )
+    job["_runtime_configuration"] = resolved_configuration.as_dict()
+
     # Write per-worker MCP config
     runtime_metadata: dict = {}
     runtime_metadata["tool_broker"] = {
@@ -6201,20 +6241,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             and application_context.endpoint.reusable
             else None
         ),
-        workload_class=(
-            "submit_repair"
-            if submission_phase == "submit" and "repair" in runtime_state
-            else submission_phase
-        ),
-        reasoning_efforts=(
-            dict(profile.get("agent_runtime", {}).get("reasoning_efforts", {}))
-            if isinstance(profile.get("agent_runtime"), Mapping)
-            and isinstance(
-                profile.get("agent_runtime", {}).get("reasoning_efforts"),
-                Mapping,
-            )
-            else None
-        ),
+        workload_class=resolved_configuration.reasoning.workload_class,
+        resolved_configuration=resolved_configuration,
     )
     setup_metrics["turn_setup_ms"] = round(
         (time.perf_counter() - setup_started) * 1000,
@@ -6596,6 +6624,40 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     try:
         process_spawn_started = time.perf_counter()
+        if application_supervisor is not None and not verification_child:
+            semantic_mode = runtime_settings.semantic_batch_mode
+            fast_path = run_prepare_fast_path(
+                job,
+                profile,
+                mode=semantic_mode,
+                phase=submission_phase,
+                resume_existing_page=resume_existing_page,
+                dry_run=dry_run,
+                route=runtime_route,
+                provider=runtime_ats_adapter,
+                host_audit=lambda: _audit_live_pre_submit_page(port, worker_id, job),
+                prepare_plan=lambda report: _prepare_ats_fill_plan_repair(job, report),
+                execute_batch=lambda report, plan: _try_semantic_batch_fill(
+                    port, worker_id, job, profile, report, plan,
+                    mode=semantic_mode,
+                    application_supervisor=application_supervisor,
+                ),
+            )
+            if isinstance(job.get("_prepare_fast_path"), dict):
+                job["_prepare_fast_path"]["agent_invoked"] = (
+                    fast_path.disposition == "continue_agent"
+                )
+            if fast_path.disposition != "continue_agent":
+                duration_ms = int((time.perf_counter() - setup_started) * 1000)
+                performance_attribution_mod.safe_record_job_span(
+                    job, "browser.prepare", duration_ms
+                )
+                if fast_path.disposition == "ready_to_submit":
+                    return "ready_to_submit", duration_ms
+                return (
+                    "failed:manual_review_required:prepare_fast_path:"
+                    + fast_path.reason_code
+                ), duration_ms
         raw_control_contract = job.get("_control_contract")
         prompt_contract = (
             dict(raw_control_contract)
@@ -6663,6 +6725,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 ),
                 plan_shadow_enabled=runtime_settings.application_plan_shadow_enabled,
                 dynamic_tools=app_server_dynamic_tools,
+                resolved_configuration=resolved_configuration,
+                runtime_metadata=runtime_metadata,
                 on_transport_failure=lambda failed_adapter: _app_server_runtime_pool.evict_worker(
                     worker_id, failed_adapter
                 ),
@@ -6981,7 +7045,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 decision = record_supervisor_decision(
                     supervisor_controller.apply(online_supervisor.tick())
                 )
-            if decision.level < 3 and not supervisor_controller.parked:
+            if (
+                # Lifecycle-protected silence is bounded by the existing turn
+                # watchdog and must not spin a two-second supervisor timer.
+                decision.reason_code == "NO_PROGRESS_WINDOW"
+                and decision.level < 3
+                and not supervisor_controller.parked
+            ):
                 arm_supervisor_stall_watchdog()
 
         def arm_supervisor_stall_watchdog() -> None:
@@ -7018,6 +7088,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             *,
             event_type: str,
             meaningful_progress: bool = False,
+            tool_call_id: str | None = None,
             tool_name: str | None = None,
             tool_params: Mapping[str, object] | None = None,
             page_signature: str | None = None,
@@ -7043,6 +7114,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 event_type=event_type,
                 observed_at=time.monotonic(),
                 meaningful_progress=meaningful_progress,
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 tool_params=tool_params,
                 page_signature=page_signature,
@@ -7117,7 +7189,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 try:
                     msg = json.loads(line)
                     msg_type = msg.get("type")
-                    if msg_type == "assistant":
+                    if msg_type in {"thread.started", "turn.started"}:
+                        observe_authoritative_event(
+                            event_type="provider.turn_started",
+                        )
+                    elif msg_type == "assistant":
                         for block in msg.get("message", {}).get("content", []):
                             bt = block.get("type")
                             if bt == "text":
@@ -7130,6 +7206,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     )
                                 text_parts.append(block["text"])
                                 lf.write(_redacted_agent_log_line(block["text"]))
+                                observe_authoritative_event(
+                                    event_type="assistant.text",
+                                )
                             elif bt == "tool_use":
                                 raw_name = block.get("name", "")
                                 now_tool = time.perf_counter()
@@ -7168,8 +7247,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     )
                                 observe_authoritative_event(
                                     event_type="tool.proposed",
+                                    tool_call_id=raw_supervisor_id or None,
                                     tool_name=str(raw_name),
                                     tool_params=supervisor_input,
+                                    effect_started=_supervisor_tool_is_effectful(
+                                        raw_name
+                                    ),
+                                    arm_stall=True,
                                 )
                                 if str(raw_name).startswith("mcp__playwright__"):
                                     browser_tool_id = str(block.get("id") or "")
@@ -7226,21 +7310,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     block,
                                     terminal_event=False,
                                 )
-                                supervisor_effect = not (
-                                    "playwright" in supervisor_name.casefold()
-                                    and any(
-                                        marker in supervisor_name.casefold()
-                                        for marker in (
-                                            "snapshot",
-                                            "screenshot",
-                                            "console_messages",
-                                            "network_requests",
-                                            "wait_for",
-                                        )
-                                    )
+                                supervisor_effect = _supervisor_tool_is_effectful(
+                                    supervisor_name
                                 )
                                 observe_authoritative_event(
                                     event_type="tool.completed",
+                                    tool_call_id=tool_use_id or None,
                                     tool_name=supervisor_name,
                                     tool_params=supervisor_input,
                                     page_signature=_supervisor_page_signature(
@@ -7304,6 +7379,30 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             "turns": msg.get("num_turns", 0),
                         }
                         text_parts.append(msg.get("result", ""))
+                    elif msg_type == "item.started":
+                        item = msg.get("item", {})
+                        item_type = item.get("type")
+                        if item_type in {"mcp_tool_call", "tool_call"}:
+                            server = item.get("server", "playwright")
+                            tool = item.get("tool", item.get("name", "tool"))
+                            raw_supervisor_input = item.get(
+                                "input", item.get("arguments")
+                            )
+                            supervisor_input = (
+                                dict(raw_supervisor_input)
+                                if isinstance(raw_supervisor_input, Mapping)
+                                else {}
+                            )
+                            observe_authoritative_event(
+                                event_type="tool.started",
+                                tool_call_id=str(item.get("id") or "") or None,
+                                tool_name=f"{server}:{tool}",
+                                tool_params=supervisor_input,
+                                effect_started=_supervisor_tool_is_effectful(
+                                    tool, server
+                                ),
+                                arm_stall=True,
+                            )
                     elif msg_type == "item.completed":
                         item = msg.get("item", {})
                         item_type = item.get("type")
@@ -7319,6 +7418,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     )
                                 text_parts.append(text)
                                 lf.write(_redacted_agent_log_line(text))
+                                observe_authoritative_event(
+                                    event_type="assistant.text",
+                                )
                         elif item_type in {"mcp_tool_call", "tool_call"}:
                             server = item.get("server", "playwright")
                             tool = item.get("tool", item.get("name", "tool"))
@@ -7356,21 +7458,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 item,
                                 terminal_event=True,
                             )
-                            supervisor_effect = not (
-                                "playwright" in str(server).casefold()
-                                and any(
-                                    marker in str(tool).casefold()
-                                    for marker in (
-                                        "snapshot",
-                                        "screenshot",
-                                        "console_messages",
-                                        "network_requests",
-                                        "wait_for",
-                                    )
-                                )
+                            supervisor_effect = _supervisor_tool_is_effectful(
+                                tool, server
                             )
                             observe_authoritative_event(
                                 event_type="tool.completed",
+                                tool_call_id=str(item.get("id") or "") or None,
                                 tool_name=supervisor_name,
                                 tool_params=supervisor_input,
                                 page_signature=_supervisor_page_signature(

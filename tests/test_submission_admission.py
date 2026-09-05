@@ -144,6 +144,48 @@ def test_missing_surface_policy_preserves_normal_channels() -> None:
     assert result["reason"] == "requires_runtime_linkedin_apply_route_resolution"
 
 
+def test_admission_rejects_current_profile_fact_conflict_without_writing(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "stale.pdf"
+    resume.write_bytes(b"%PDF-stale-sidecar")
+    resume.with_suffix(".txt").write_text(
+        "University of Pennsylvania, GPA: 3.6",
+        encoding="utf-8",
+    )
+    profile = _profile()
+    profile["education"] = [
+        {
+            "institution": "University of Pennsylvania",
+            "gpa": "3.46/4.0",
+            "gpa_may_be_disclosed": True,
+        }
+    ]
+
+    result = evaluate_submission_admission(
+        _job(tailored_resume_path=str(resume)), profile, minimum_fit_score=6
+    )
+
+    assert result["admitted"] is False
+    assert result["decision"] == "needs_review"
+    assert result["reason"].startswith("stale_profile_fact:")
+    freshness = result["metadata"]["profile_resume_fact_freshness"]
+    assert freshness["state"] == "stale_profile_fact"
+    assert "current profile records 3.46" in freshness["fact_errors"][0]
+
+
+def test_admission_keeps_unavailable_resume_distinct_from_stale_fact() -> None:
+    result = evaluate_submission_admission(
+        _job(tailored_resume_path="missing-resume.pdf"), _profile(), minimum_fit_score=6
+    )
+
+    assert result["admitted"] is True
+    assert result["metadata"]["profile_resume_fact_freshness"] == {
+        "state": "resume_unavailable",
+        "fact_errors": [],
+    }
+
+
 def test_explicit_surface_policy_and_email_authorization_are_enforced() -> None:
     linkedin = _job(
         source_site="linkedin",

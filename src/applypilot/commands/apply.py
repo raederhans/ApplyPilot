@@ -475,6 +475,28 @@ def run_apply(
             f"{authorization_manifest['max_submissions']} submissions.[/green]"
         )
 
+    if not dry_run and authorization_manifest is not None:
+        from applypilot.apply.batch_progress import batch_progress
+
+        progress = batch_progress(
+            get_connection(),
+            authorization_manifest,
+            profile,
+            minimum_fit_score=min_score,
+            limit=min(5, max(1, effective_limit)),
+        )
+        counts = progress["counts"]
+        console.print(
+            "[blue]Batch progress:[/blue] "
+            f"consumed={progress['consumed']}, "
+            f"receipt_confirmed={counts['receipt_confirmed']}, "
+            f"uncertain={counts['uncertain']}, "
+            f"consumed_without_receipt={counts['consumed_without_receipt']}, "
+            f"in_progress={counts['in_progress']}, "
+            f"ready={counts['ready']}, blocked={counts['blocked']}, "
+            f"remaining_capacity={progress['remaining_capacity']}."
+        )
+
     worker_allocation = {
         "requested_workers": workers,
         "bound_candidates": 0,

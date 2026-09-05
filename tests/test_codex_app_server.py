@@ -11,6 +11,7 @@ import pytest
 
 from applypilot.apply.codex_app_server import (
     CodexAppServerAdapter,
+    CodexAppServerConfigurationError,
     CodexAppServerError,
     CodexAppServerExecutionError,
     CodexAppServerProtocolError,
@@ -90,6 +91,20 @@ for raw_line in sys.stdin:
         }})
     elif method == "initialized":
         continue
+    elif method == "model/list" and mode != "no_model_list":
+        model_entry = {
+            "id": "gpt-5.6-sol",
+            "model": "gpt-5.6-sol",
+        }
+        if mode != "missing_effort_caps":
+            model_entry["supportedReasoningEfforts"] = [
+                {"reasoningEffort": "medium"},
+                {"reasoningEffort": "high"},
+            ]
+        emit({"id": request_id, "result": {
+            "data": [model_entry],
+            "nextCursor": None,
+        }})
     elif method == "thread/start":
         if not validate_thread_sandbox(params, request_id):
             continue
@@ -230,6 +245,8 @@ def _request(
     *,
     actor_id: str = "application-1",
     parent_provider_session_id: str | None = None,
+    model: str = "gpt-5.6-sol",
+    reasoning_effort: str = "high",
 ) -> RuntimeCellRequest:
     return RuntimeCellRequest(
         run_id="run-1",
@@ -238,8 +255,9 @@ def _request(
         phase="prepare",
         prompt="Inspect the already-bound application without submitting it.",
         cwd=tmp_path.resolve(),
-        model="gpt-5.6-sol",
+        model=model,
         context_refs={"prompt_contract": "sha256:" + "a" * 64},
+        reasoning_effort=reasoning_effort,
         parent_provider_session_id=parent_provider_session_id,
     )
 
@@ -337,6 +355,7 @@ def test_stdio_transport_handshake_turn_and_event_normalization(tmp_path: Path) 
     assert [message["method"] for message in wire] == [
         "initialize",
         "initialized",
+        "model/list",
         "thread/start",
         "turn/start",
         "thread/unsubscribe",
@@ -344,9 +363,72 @@ def test_stdio_transport_handshake_turn_and_event_normalization(tmp_path: Path) 
     assert all("jsonrpc" not in message for message in wire)
     assert wire[0]["params"]["clientInfo"]["name"] == "applypilot"
     assert "capabilities" not in wire[0]["params"]
-    assert "dynamicTools" not in wire[2]["params"]
-    assert wire[2]["params"]["approvalPolicy"] == "never"
-    assert wire[2]["params"]["sandbox"] == "read-only"
+    assert wire[2]["params"] == {"limit": 100, "includeHidden": True}
+    assert "dynamicTools" not in wire[3]["params"]
+    assert wire[3]["params"]["model"] == "gpt-5.6-sol"
+    assert wire[3]["params"]["approvalPolicy"] == "never"
+    assert wire[3]["params"]["sandbox"] == "read-only"
+    assert wire[4]["params"]["model"] == "gpt-5.6-sol"
+    assert wire[4]["params"]["effort"] == "high"
+
+
+def test_old_app_server_without_model_catalog_degrades_before_thread_start(
+    tmp_path: Path,
+) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode="no_model_list")
+    adapter = CodexAppServerAdapter(transport)
+
+    health = adapter.health()
+    selection = select_runtime_cell(
+        "codex",
+        codex_app_server_enabled=True,
+        execution_state=RuntimeCellExecutionState(
+            request_accepted=False,
+            tool_or_effect_started=False,
+            submit_started=False,
+            bound_backend=None,
+        ),
+        codex_app_server_adapter=adapter,
+    )
+
+    assert health.status == "unavailable"
+    assert health.reason_code == "CODEX_APP_SERVER_MODEL_CATALOG_UNAVAILABLE"
+    assert "model/list" not in health.capabilities
+    assert selection.health.disposition == "fallback"
+    assert selection.health.missing_capabilities == ("model/list",)
+    assert "thread/start" not in [message["method"] for message in _wire_messages(log_path)]
+    adapter.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mode", "model", "effort", "message"),
+    (
+        ("complete", "unknown-model", "high", "model is not advertised"),
+        ("complete", "gpt-5.6-sol", "low", "effort is not supported"),
+        (
+            "missing_effort_caps",
+            "gpt-5.6-sol",
+            "high",
+            "does not advertise reasoning effort support",
+        ),
+    ),
+)
+def test_model_catalog_rejects_unverifiable_configuration_before_thread_start(
+    tmp_path: Path,
+    mode: str,
+    model: str,
+    effort: str,
+    message: str,
+) -> None:
+    transport, log_path = _fake_transport(tmp_path, mode=mode)
+    adapter = CodexAppServerAdapter(transport)
+
+    with pytest.raises(CodexAppServerConfigurationError, match=message):
+        adapter.start(_request(tmp_path, model=model, reasoning_effort=effort))
+
+    methods = [item["method"] for item in _wire_messages(log_path)]
+    assert methods == ["initialize", "initialized", "model/list"]
+    adapter.shutdown()
 
 
 def test_dynamic_tool_handshake_descriptor_dispatch_and_read_only_effect(tmp_path: Path) -> None:

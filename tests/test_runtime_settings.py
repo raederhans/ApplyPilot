@@ -48,6 +48,33 @@ def test_runtime_settings_preserve_established_defaults() -> None:
     assert settings.application_lease_minutes == 45
 
 
+def test_model_resolution_records_precedence_without_changing_defaults() -> None:
+    default = load_runtime_settings({}).resolve_model_configuration("codex")
+    environment = load_runtime_settings(
+        {"APPLYPILOT_CODEX_MODEL": "environment-model"}
+    ).resolve_model_configuration("codex")
+    override = load_runtime_settings(
+        {"APPLYPILOT_CODEX_MODEL": "environment-model"}
+    ).resolve_model_configuration("codex", "override-model")
+
+    assert default.as_dict() == {
+        "backend": "codex",
+        "model": "gpt-5.6-sol",
+        "model_source": "default",
+    }
+    assert environment.source == "environment"
+    assert environment.value == "environment-model"
+    assert override.source == "override"
+    assert override.value == "override-model"
+
+
+def test_model_resolution_rejects_empty_or_unknown_configuration() -> None:
+    with pytest.raises(ValueError, match="must be non-empty"):
+        load_runtime_settings({"APPLYPILOT_CODEX_MODEL": " "}).resolve_model("codex")
+    with pytest.raises(ValueError, match="codex.*claude"):
+        load_runtime_settings({}).resolve_model("future-backend")
+
+
 def test_runtime_settings_are_snapshotted_per_command() -> None:
     environ = {"APPLYPILOT_AGENT_TIMEOUT_SECONDS": "300"}
     first = load_runtime_settings(environ)

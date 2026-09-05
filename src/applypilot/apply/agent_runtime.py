@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -33,6 +33,7 @@ from applypilot.apply.capabilities import (
     resolve_playwright_mcp_spec,
 )
 from applypilot.apply.email_routing import MailboxMcpSpec, resolve_mailbox_mcp_spec
+from applypilot.apply.runtime_cell import REASONING_EFFORT_VALUES
 
 logger = logging.getLogger(__name__)
 _REAL_POPEN_TYPE = subprocess.Popen
@@ -164,23 +165,148 @@ DEFAULT_MAILBOX_BLOCKED_TOOLS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningEffortResolution:
+    """Final effort and the exact precedence key that selected it."""
+
+    value: str
+    source: str
+    workload_class: str
+    source_key: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "reasoning_effort": self.value,
+            "reasoning_effort_source": self.source,
+            "workload_class": self.workload_class,
+            "reasoning_effort_source_key": self.source_key,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeConfiguration:
+    """One resolved model/effort pair shared by CLI and App Server."""
+
+    backend: str
+    model: str
+    model_source: str
+    reasoning: ReasoningEffortResolution
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"codex", "claude"}:
+            raise ValueError("agent backend must be 'codex' or 'claude'")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("resolved agent model must be non-empty")
+        if not isinstance(self.model_source, str) or not self.model_source.strip():
+            raise ValueError("model_source must be non-empty")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "1",
+            "backend": self.backend,
+            "model": self.model,
+            "model_source": self.model_source,
+            **self.reasoning.as_dict(),
+            "reasoning_effort_applied": self.backend == "codex",
+        }
+
+
+def _validated_reasoning_mapping(
+    value: Mapping[object, object] | None,
+    *,
+    source: str,
+) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for raw_key, raw_effort in (value or {}).items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError(f"{source} reasoning effort keys must be non-empty strings")
+        if not isinstance(raw_effort, str):
+            raise ValueError(f"{source} reasoning effort values must be strings")  # noqa: TRY004 - configuration errors preserve the ValueError contract
+        effort = raw_effort.strip().casefold()
+        if effort not in REASONING_EFFORT_VALUES:
+            allowed = ", ".join(sorted(REASONING_EFFORT_VALUES))
+            raise ValueError(f"unsupported reasoning effort {raw_effort!r}; expected one of {allowed}")
+        validated[raw_key.strip()] = effort
+    return validated
+
+
+def resolve_reasoning_effort_configuration(
+    workload_class: str | None = None,
+    *,
+    configured: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> ReasoningEffortResolution:
+    """Resolve effort with profile > environment > established-high precedence."""
+
+    environment = os.environ if environ is None else environ
+    workload = (workload_class or "default").strip()
+    if not workload:
+        raise ValueError("workload_class must be non-empty when provided")
+    raw_environment_mapping = environment.get("APPLYPILOT_REASONING_EFFORTS")
+    parsed_environment: object = {}
+    if raw_environment_mapping:
+        parsed_environment = json.loads(raw_environment_mapping)
+        if not isinstance(parsed_environment, dict):
+            raise ValueError("APPLYPILOT_REASONING_EFFORTS must be a JSON object")
+    environment_mapping = _validated_reasoning_mapping(
+        parsed_environment,
+        source="environment",
+    )
+    configured_mapping = _validated_reasoning_mapping(
+        configured,
+        source="profile",
+    )
+    for source, mapping in (
+        ("profile", configured_mapping),
+        ("environment", environment_mapping),
+    ):
+        if workload in mapping:
+            return ReasoningEffortResolution(mapping[workload], source, workload, workload)
+    for source, mapping in (
+        ("profile", configured_mapping),
+        ("environment", environment_mapping),
+    ):
+        if "default" in mapping:
+            return ReasoningEffortResolution(mapping["default"], source, workload, "default")
+    return ReasoningEffortResolution("high", "default", workload, "default")
+
+
 def resolve_reasoning_effort(
     workload_class: str | None = None,
     *,
-    configured: dict[str, str] | None = None,
-    environ: dict[str, str] | None = None,
+    configured: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
     """Resolve a configurable workload effort while preserving the old default."""
-    environment = os.environ if environ is None else environ
-    mapping: dict[str, str] = {"default": "high"}
-    raw = environment.get("APPLYPILOT_REASONING_EFFORTS")
-    if raw:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("APPLYPILOT_REASONING_EFFORTS must be a JSON object")
-        mapping.update({str(key): str(value) for key, value in parsed.items()})
-    mapping.update(configured or {})
-    return mapping.get(workload_class or "default", mapping["default"])
+    return resolve_reasoning_effort_configuration(
+        workload_class,
+        configured=configured,
+        environ=environ,
+    ).value
+
+
+def resolve_agent_runtime_configuration(
+    backend: str,
+    model: str,
+    *,
+    workload_class: str | None = None,
+    reasoning_efforts: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
+    model_source: str = "launcher_argument",
+) -> AgentRuntimeConfiguration:
+    """Resolve the immutable configuration consumed by every runtime host."""
+
+    normalized_backend = backend.strip().casefold()
+    return AgentRuntimeConfiguration(
+        backend=normalized_backend,
+        model=model.strip() if isinstance(model, str) else model,
+        model_source=model_source,
+        reasoning=resolve_reasoning_effort_configuration(
+            workload_class,
+            configured=reasoning_efforts,
+            environ=environ,
+        ),
+    )
 
 
 def _runtime_tool_names(
@@ -420,6 +546,7 @@ def build_agent_command(
     workload_class: str | None = None,
     reasoning_efforts: dict[str, str] | None = None,
     playwright_mcp_url: str | None = None,
+    resolved_configuration: AgentRuntimeConfiguration | None = None,
 ) -> tuple[list[str], Path | None]:
     """Build an isolated browser-agent command for Claude or Codex."""
     spec = resolve_playwright_mcp_spec(playwright_mcp)
@@ -455,12 +582,20 @@ def build_agent_command(
     control_tool_names = _runtime_tool_names(
         registry, "applypilot_control", ["report_agent_turn"] if using_default_registry else []
     )
-    reasoning_effort = resolve_reasoning_effort(
-        workload_class,
-        configured=reasoning_efforts,
+    runtime_configuration = resolved_configuration or resolve_agent_runtime_configuration(
+        backend,
+        model,
+        workload_class=workload_class,
+        reasoning_efforts=reasoning_efforts,
     )
+    if runtime_configuration.backend != backend.strip().casefold():
+        raise ValueError("resolved runtime backend does not match command backend")
+    if runtime_configuration.model != model:
+        raise ValueError("resolved runtime model does not match command model")
+    reasoning_effort = runtime_configuration.reasoning.value
     record_runtime_surface(runtime_metadata, spec, registry)
     if runtime_metadata is not None:
+        runtime_metadata["runtime_configuration"] = runtime_configuration.as_dict()
         runtime_metadata["control_plane"] = {
             "schema_version": "1",
             "tools": control_tool_names,

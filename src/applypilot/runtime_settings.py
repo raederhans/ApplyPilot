@@ -12,6 +12,22 @@ _PROVIDER_RECIPE_SHADOW_PROVIDERS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedRuntimeModel:
+    """Final runtime model plus its precedence layer."""
+
+    backend: str
+    value: str
+    source: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "backend": self.backend,
+            "model": self.value,
+            "model_source": self.source,
+        }
+
+
 @dataclass(frozen=True)
 class ApplyRuntimeSettings:
     """Typed runtime knobs without import-time environment reads."""
@@ -54,12 +70,41 @@ class ApplyRuntimeSettings:
             raise ValueError("interaction mode must be auto or playwright")
         return mode
 
-    def resolve_model(self, backend: str, override: str | None = None) -> str:
+    def resolve_model_configuration(
+        self,
+        backend: str,
+        override: str | None = None,
+    ) -> ResolvedRuntimeModel:
+        """Resolve one model and retain the non-secret configuration source."""
+
+        normalized_backend = backend.strip().casefold()
+        if normalized_backend not in {"codex", "claude"}:
+            raise ValueError("agent backend must be 'codex' or 'claude'")
         if override:
-            return override
-        if backend == "codex":
-            return self.environ.get("APPLYPILOT_CODEX_MODEL", "gpt-5.6-sol")
-        return self.environ.get("APPLYPILOT_CLAUDE_MODEL", "opus")
+            value = override.strip()
+            source = "override"
+        else:
+            environment_key = (
+                "APPLYPILOT_CODEX_MODEL"
+                if normalized_backend == "codex"
+                else "APPLYPILOT_CLAUDE_MODEL"
+            )
+            if environment_key in self.environ:
+                value = self.environ[environment_key].strip()
+                source = "environment"
+            else:
+                value = "gpt-5.6-sol" if normalized_backend == "codex" else "opus"
+                source = "default"
+        if not value:
+            raise ValueError("resolved agent model must be non-empty")
+        return ResolvedRuntimeModel(
+            backend=normalized_backend,
+            value=value,
+            source=source,
+        )
+
+    def resolve_model(self, backend: str, override: str | None = None) -> str:
+        return self.resolve_model_configuration(backend, override).value
 
     @property
     def codex_app_server_mode(self) -> str:

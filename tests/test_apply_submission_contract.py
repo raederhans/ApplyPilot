@@ -240,6 +240,88 @@ def test_standing_authorization_selects_only_ready_exact_jobs(tmp_path: Path) ->
     assert manifest["jobs"][0]["url"] == job["url"]
 
 
+def test_standing_authorization_rejects_stale_profile_resume_without_mutating_job(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "standing-stale-profile.db")
+    job = _job()
+    resume = tmp_path / "stale.pdf"
+    resume.write_bytes(b"%PDF-stale-profile")
+    resume.with_suffix(".txt").write_text(
+        "University of Pennsylvania, GPA: 3.6",
+        encoding="utf-8",
+    )
+    _insert_ready_job(conn, job, resume)
+    profile = {
+        "education": [
+            {
+                "institution": "University of Pennsylvania",
+                "gpa": "3.46/4.0",
+                "gpa_may_be_disclosed": True,
+            }
+        ],
+        "submission_policy": {
+            "authorization_granted": True,
+            "standing_auto_authorize_ready_jobs": True,
+            "batch_authorization_required": False,
+        },
+    }
+
+    with pytest.raises(ValueError, match="stale_profile_fact"):
+        _build_standing_authorization_manifest(
+            conn,
+            profile=profile,
+            target_url=job["url"],
+            requested_limit=1,
+            min_score=6,
+        )
+
+    stored = conn.execute(
+        "SELECT tailored_resume_path, tailor_status FROM jobs WHERE url=?", (job["url"],)
+    ).fetchone()
+    assert stored["tailored_resume_path"] == str(resume)
+    assert stored["tailor_status"] == "machine_validated"
+
+
+def test_authorize_batch_rejects_stale_profile_resume_without_mutating_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = init_db(tmp_path / "authorize-stale-profile.db")
+    job = _job()
+    resume = tmp_path / "stale.pdf"
+    resume.write_bytes(b"%PDF-stale-profile")
+    resume.with_suffix(".txt").write_text(
+        "University of Pennsylvania, GPA: 3.6",
+        encoding="utf-8",
+    )
+    _insert_ready_job(conn, job, resume)
+    profile = {
+        "education": [
+            {
+                "institution": "University of Pennsylvania",
+                "gpa": "3.46/4.0",
+                "gpa_may_be_disclosed": True,
+            }
+        ],
+        "submission_policy": {},
+    }
+    monkeypatch.setattr("applypilot.cli._bootstrap", lambda: None)
+    monkeypatch.setattr("applypilot.config.APP_DIR", tmp_path / "workspace")
+    monkeypatch.setattr("applypilot.config.load_profile", lambda: profile)
+    monkeypatch.setattr("applypilot.database.get_connection", lambda: conn)
+
+    result = CliRunner().invoke(app, ["authorize-batch", "--url", job["url"]])
+
+    assert result.exit_code == 2
+    assert "stale_profile_fact:" in result.output
+    stored = conn.execute(
+        "SELECT tailored_resume_path, tailor_status FROM jobs WHERE url=?", (job["url"],)
+    ).fetchone()
+    assert stored["tailored_resume_path"] == str(resume)
+    assert stored["tailor_status"] == "machine_validated"
+
+
 def test_example_profile_declares_but_does_not_grant_standing_submission() -> None:
     example_profile = Path(__file__).parents[1] / "profile.example.json"
     profile = json.loads(example_profile.read_text(encoding="utf-8"))
@@ -512,6 +594,32 @@ def test_manifest_queue_claims_only_authorized_job_and_is_idempotent(
     assert claimed["url"] == authorized["url"]
     assert claimed["_authorization_entry"] == manifest["jobs"][0]
     assert second_claim is None
+
+
+@pytest.mark.parametrize("exact_url", [False, True])
+@pytest.mark.parametrize("consumption_status", ["failed", "submission_uncertain"])
+def test_acquisition_does_not_prepare_an_already_consumed_batch_job(
+    tmp_path: Path, monkeypatch, exact_url: bool, consumption_status: str
+) -> None:
+    conn = init_db(tmp_path / "consumed-jobs.db")
+    job = _job()
+    manifest = authorization.load_manifest(
+        _manifest_path(tmp_path, job, expires_at=datetime.now(UTC) + timedelta(minutes=5)),
+        now=NOW,
+    )
+    _insert_ready_job(conn, job, Path(manifest["jobs"][0]["resume_path"]), status="failed")
+    batch_id = manifest["batch_id"]
+    assert reserve_batch_submission(batch_id, job["url"], 1, conn)
+    update_batch_submission_status(batch_id, job["url"], consumption_status, conn=conn)
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    acquired = launcher.acquire_job(
+        worker_id="worker-1", authorization_manifest=manifest,
+        target_url=job["url"] if exact_url else None,
+    )
+    assert acquired is None
+    assert conn.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0] == 0
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == "failed"
 
 
 def test_manifest_queue_preserves_fallback_application_url_for_material_binding(

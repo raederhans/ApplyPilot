@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.apply.authorization import compute_file_binding, compute_job_fingerprint
+from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.scoring.validator import current_profile_resume_fact_errors
 
 _KNOWN_LABELS = {
     "resume": ("resume", "cv", "curriculum vitae"),
@@ -18,6 +20,55 @@ _KNOWN_LABELS = {
     "certificate": ("certificate", "certification"),
     "supporting_document": ("supporting document", "additional document"),
 }
+
+
+def evaluate_profile_resume_fact_freshness(
+    job: Mapping[str, object],
+    profile: Mapping[str, object],
+) -> dict[str, object]:
+    """Read one validated resume once and classify its current-profile facts.
+
+    This is deliberately a read-only predicate: candidate selection, manifest
+    creation, worker allocation, and runtime acquisition can all consume the
+    same result without creating a database side effect.  Only an *explicit*
+    conflict is ``stale_profile_fact``.  A missing path, an unreadable source,
+    or a PDF whose text cannot be extracted is kept distinct so none of those
+    operational/material failures can retire a resume as a factual conflict.
+    """
+    if str(job.get("tailor_status") or "").casefold() != "machine_validated":
+        return {"state": "not_applicable", "fact_errors": []}
+    raw_path = str(job.get("tailored_resume_path") or "").strip()
+    if not raw_path:
+        return {"state": "resume_missing", "fact_errors": []}
+
+    path = Path(raw_path).expanduser()
+    if not path.is_file():
+        return {"state": "resume_unavailable", "fact_errors": []}
+
+    try:
+        if path.suffix.casefold() == ".pdf":
+            text_sidecar = path.with_suffix(".txt")
+            if text_sidecar.is_file():
+                text = read_resume_source(text_sidecar)
+            else:
+                try:
+                    from pypdf import PdfReader
+
+                    text = "\n".join(
+                        page.extract_text() or "" for page in PdfReader(path).pages
+                    )
+                except Exception:  # noqa: BLE001 - legacy PDFs may not expose text
+                    return {"state": "resume_text_unavailable", "fact_errors": []}
+        else:
+            text = read_resume_source(path)
+    except (OSError, TypeError, ValueError):
+        return {"state": "resume_unreadable", "fact_errors": []}
+
+    errors = current_profile_resume_fact_errors(text, dict(profile))
+    return {
+        "state": "stale_profile_fact" if errors else "fresh",
+        "fact_errors": errors,
+    }
 
 
 def _canonical_label(label: str) -> str | None:

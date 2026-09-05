@@ -27,6 +27,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from applypilot.apply.agent_runtime import (
+    AgentRuntimeConfiguration,
+    resolve_agent_runtime_configuration,
+)
 from applypilot.apply.application_plan import ApplicationPlan, render_application_plan_delta
 from applypilot.apply.capabilities import CapabilityRegistry, capability_names_for_server
 from applypilot.apply.codex_app_server import (
@@ -755,6 +759,7 @@ def build_ref_only_request(
     previous_plan: ApplicationPlan | None = None,
     plan_shadow_enabled: bool = False,
     parent_provider_session_id: str | None = None,
+    reasoning_effort: str = "high",
 ) -> RuntimeCellRequest:
     """Build an App Server request containing only identities and digest refs."""
 
@@ -786,6 +791,7 @@ def build_ref_only_request(
         cwd=cwd,
         model=model,
         context_refs=context_refs,
+        reasoning_effort=reasoning_effort,
         parent_provider_session_id=parent_provider_session_id,
     )
 
@@ -1028,6 +1034,11 @@ def open_app_server_turn(
     if request.phase == "submit":
         raise ValueError("submit phase is not supported by the App Server runtime")
 
+    # This model/list preflight is deliberately before the durable ambiguous
+    # dispatch boundary. Unsupported App Server/model/effort combinations can
+    # therefore degrade without pretending that a provider turn was accepted.
+    adapter.validate_configuration(request)
+
     existing = state_store.load(request.actor_id, request.attempt_id)
     if existing is not None and existing.request_accepted:
         if existing.submit_started:
@@ -1104,11 +1115,28 @@ def open_configured_app_server_turn(
     plan_shadow_enabled: bool,
     dynamic_tools: tuple[DynamicToolSpec, ...] = (),
     on_transport_failure: AdapterFailureCallback | None = None,
+    workload_class: str | None = None,
+    reasoning_efforts: Mapping[str, str] | None = None,
+    resolved_configuration: AgentRuntimeConfiguration | None = None,
+    runtime_metadata: dict[str, object] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> AppServerTurnProcess:
     """Configure one worker adapter and open its durable application turn."""
 
     if phase == "submit":
         raise ValueError("submit phase is not supported by the App Server runtime")
+
+    runtime_configuration = resolved_configuration or resolve_agent_runtime_configuration(
+        "codex",
+        model,
+        workload_class=workload_class or phase,
+        reasoning_efforts=reasoning_efforts,
+        environ=environ,
+    )
+    if runtime_configuration.backend != "codex":
+        raise ValueError("App Server requires a resolved Codex runtime configuration")
+    if runtime_configuration.model != model:
+        raise ValueError("resolved App Server model does not match the requested model")
 
     dynamic_enabled = os.getenv("APPLYPILOT_CODEX_DYNAMIC_TOOLS_ENABLED", "").strip().casefold() in {
         "1",
@@ -1159,7 +1187,12 @@ def open_configured_app_server_turn(
         previous_plan=previous_plan,
         plan_shadow_enabled=plan_shadow_enabled,
         parent_provider_session_id=(existing.provider_session_id if existing is not None else None),
+        reasoning_effort=runtime_configuration.reasoning.value,
     )
+    configuration_validation = adapter.validate_configuration(request)
+    if runtime_metadata is not None:
+        runtime_metadata["runtime_configuration"] = runtime_configuration.as_dict()
+        runtime_metadata["app_server_configuration_validation"] = configuration_validation
     process = open_app_server_turn(
         adapter=adapter,
         state_store=state_store,

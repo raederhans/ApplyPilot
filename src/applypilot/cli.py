@@ -48,9 +48,15 @@ runs_app = typer.Typer(
     help="Inspect durable Actor runs and reconcile exact submission receipts.",
     no_args_is_help=True,
 )
+batches_app = typer.Typer(
+    name="batches",
+    help="Inspect bounded, read-only progress for an authorized application batch.",
+    no_args_is_help=True,
+)
 app.add_typer(radar_app, name="radar")
 app.add_typer(exceptions_app, name="exceptions")
 app.add_typer(runs_app, name="runs")
+app.add_typer(batches_app, name="batches")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -364,6 +370,30 @@ def _command_for_exception(
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+@batches_app.command("next")
+def batches_next(
+    authorization_file: Path = typer.Option(
+        ...,
+        "--authorization-file",
+        exists=True,
+        dir_okay=False,
+        help="Existing exact-job authorization manifest.",
+    ),
+    offset: int = typer.Option(0, "--offset", min=0),
+    limit: int = typer.Option(5, "--limit", min=1, max=10),
+) -> None:
+    """Show durable progress and at most ten never-consumed next candidates."""
+    try:
+        return _command_module("batches").run_next(
+            console,
+            authorization_file=authorization_file,
+            offset=offset,
+            limit=limit,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        console.print(f"[red]Batch progress unavailable:[/red] {exc}")
+        raise typer.Exit(code=2) from None
 
 @app.callback()
 def main(

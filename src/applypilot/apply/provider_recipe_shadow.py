@@ -9,12 +9,14 @@ outcome preserves the existing Agent fallback.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from time import perf_counter
+from pathlib import Path
+from time import perf_counter, time_ns
 from typing import Literal
 from urllib.parse import urlsplit
 
+from applypilot import config
 from applypilot.apply.browser_authority import BrowserAuthorityHandle
 from applypilot.apply.provider_registry import provider_for_url
 from applypilot.apply.provider_semantic_adapters import (
@@ -23,10 +25,18 @@ from applypilot.apply.provider_semantic_adapters import (
     ProviderSemanticRecipeRegistry,
     default_provider_recipe_shadow_registry,
 )
-from applypilot.apply.recipe_cache import ValueFreeRecipeCache, canonical_digest
+from applypilot.apply.recipe_cache import CachedProviderRecipe, ValueFreeRecipeCache, canonical_digest
+from applypilot.apply.recipe_experience import (
+    RecipeExperienceStore,
+    RecipeExperienceTemplate,
+    RoutineControlTemplate,
+)
 from applypilot.apply.semantic_batch import SemanticBatchDenied
 
 RecipeShadowOutcome = Literal["off", "not_applicable", "denied", "miss", "hit"]
+PersistentExperienceStatus = Literal[
+    "disabled", "not_recorded", "persistent_candidate", "persistent_hit", "invalidated", "degraded"
+]
 _ADMITTED_PROVIDERS = frozenset({"greenhouse", "smartrecruiters", "workday"})
 _LEGAL_OR_SENSITIVE_RE = re.compile(
     r"work (?:authorization|authorisation)|right to work|visa|sponsorship|"
@@ -46,6 +56,9 @@ class ProviderRecipeShadowTelemetry:
     reason_code: str
     duration_ms: float
     routine_control_count: int = 0
+    persistent_status: PersistentExperienceStatus = "not_recorded"
+    persistent_observation_count: int = 0
+    persistent_validation_count: int = 0
 
     def __post_init__(self) -> None:
         if self.agent_fallback_required is not True:
@@ -54,6 +67,8 @@ class ProviderRecipeShadowTelemetry:
             raise ValueError("cache_hit must match the shadow outcome")
         if self.duration_ms < 0:
             raise ValueError("duration_ms must be non-negative")
+        if self.persistent_observation_count < 0 or self.persistent_validation_count < 0:
+            raise ValueError("persistent evidence counts must be non-negative")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +81,11 @@ class ProviderRecipeShadowTelemetry:
             "reason_code": self.reason_code,
             "duration_ms": self.duration_ms,
             "routine_control_count": self.routine_control_count,
+            "persistent_status": self.persistent_status,
+            "persistent_candidate": self.persistent_status == "persistent_candidate",
+            "persistent_hit": self.persistent_status == "persistent_hit",
+            "persistent_observation_count": self.persistent_observation_count,
+            "persistent_validation_count": self.persistent_validation_count,
             "browser_write_authority": False,
             "file_upload_authority": False,
             "submit_authority": False,
@@ -81,6 +101,9 @@ def _telemetry(
     admission_enabled: bool,
     reason_code: str,
     routine_control_count: int = 0,
+    persistent_status: PersistentExperienceStatus = "not_recorded",
+    persistent_observation_count: int = 0,
+    persistent_validation_count: int = 0,
 ) -> ProviderRecipeShadowTelemetry:
     return ProviderRecipeShadowTelemetry(
         provider=provider,
@@ -91,6 +114,9 @@ def _telemetry(
         reason_code=reason_code,
         duration_ms=round(max(0.0, (perf_counter() - started) * 1000), 3),
         routine_control_count=routine_control_count,
+        persistent_status=persistent_status,
+        persistent_observation_count=persistent_observation_count,
+        persistent_validation_count=persistent_validation_count,
     )
 
 
@@ -210,6 +236,49 @@ def _origin(value: str) -> tuple[str, str, int | None] | None:
         return None
 
 
+def _experience_template(
+    observation: ProviderPageRecipeObservation,
+    candidate: CachedProviderRecipe,
+) -> RecipeExperienceTemplate | None:
+    """Build a public structure key without persisting private/HMAC digests."""
+
+    if (
+        observation.control_schema_version != "prepare-shadow/v1"
+        or observation.taint_reason is not None
+        or observation.markers
+        or len(candidate.controls) != len(observation.controls)
+    ):
+        return None
+    public_controls: list[RoutineControlTemplate] = []
+    for observed, normalized in zip(observation.controls, candidate.controls, strict=True):
+        if (
+            observed.semantic != normalized.semantic
+            or observed.kind != normalized.kind
+            or observed.required is not normalized.required
+            or observed.writable is not normalized.writable
+            or observed.option_count != normalized.option_count
+        ):
+            return None
+        public_controls.append(
+            RoutineControlTemplate(
+                semantic=observed.semantic,
+                kind=observed.kind,
+                required=observed.required,
+                writable=observed.writable,
+                option_count=observed.option_count,
+            )
+        )
+    try:
+        return RecipeExperienceTemplate(
+            provider=observation.provider,
+            adapter_version=candidate.key.adapter_version,
+            policy_version=candidate.policy_version,
+            controls=tuple(public_controls),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 class ProviderRecipeShadowObserver:
     """Process-local shadow cache that can never return an executable decision."""
 
@@ -218,9 +287,18 @@ class ProviderRecipeShadowObserver:
         *,
         cache: ValueFreeRecipeCache | None = None,
         registry: ProviderSemanticRecipeRegistry | None = None,
+        experience_store: RecipeExperienceStore | None = None,
+        experience_db_path: str | Path | None = None,
+        validate_experience_fresh: (
+            Callable[[RecipeExperienceTemplate, RecipeExperienceTemplate], bool] | None
+        ) = None,
     ) -> None:
         self._cache = cache if cache is not None else ValueFreeRecipeCache()
         self._registry = registry if registry is not None else default_provider_recipe_shadow_registry()
+        self._experience_store = experience_store or RecipeExperienceStore(
+            experience_db_path or (config.APP_DIR / "recipe-experience.db")
+        )
+        self._validate_experience_fresh = validate_experience_fresh or (lambda stored, fresh: stored == fresh)
 
     def observe(
         self,
@@ -253,6 +331,7 @@ class ProviderRecipeShadowObserver:
                 outcome="off",
                 admission_enabled=False,
                 reason_code="provider_shadow_disabled",
+                persistent_status="disabled",
             )
         if not surface_is_main_frame:
             return _telemetry(
@@ -312,6 +391,10 @@ class ProviderRecipeShadowObserver:
                 admission_enabled=True,
                 reason_code="observation_not_recipe_safe",
             )
+        persistent_status, observation_count, validation_count = self._record_persistent_experience(
+            observation,
+            candidate,
+        )
         hit = self._cache.get(
             candidate.key,
             validate_live=lambda fresh: fresh == candidate.key,
@@ -325,6 +408,9 @@ class ProviderRecipeShadowObserver:
                 admission_enabled=True,
                 reason_code="cache_miss_observed",
                 routine_control_count=len(candidate.controls),
+                persistent_status=persistent_status,
+                persistent_observation_count=observation_count,
+                persistent_validation_count=validation_count,
             )
         return _telemetry(
             started,
@@ -333,7 +419,42 @@ class ProviderRecipeShadowObserver:
             admission_enabled=True,
             reason_code="cache_hit_observed",
             routine_control_count=len(hit.controls),
+            persistent_status=persistent_status,
+            persistent_observation_count=observation_count,
+            persistent_validation_count=validation_count,
         )
+
+    def _record_persistent_experience(
+        self,
+        observation: ProviderPageRecipeObservation,
+        candidate: CachedProviderRecipe,
+    ) -> tuple[PersistentExperienceStatus, int, int]:
+        template = _experience_template(observation, candidate)
+        if template is None:
+            return "not_recorded", 0, 0
+        try:
+            persistent_hit = self._experience_store.lookup(
+                template,
+                adapter_version=template.adapter_version,
+                policy_version=template.policy_version,
+                validate_fresh=lambda stored: self._validate_experience_fresh(stored, template),
+            )
+            event_nonce = time_ns()
+            self._experience_store.observe(template, event_id=f"shadow-observation:{event_nonce}")
+            experience = self._experience_store.record_validation(
+                template,
+                event_id=f"shadow-host-structure:{event_nonce}",
+                evidence="host_structure",
+            )
+        except Exception:  # noqa: BLE001 - persistence is advisory and must fail open to the process-local shadow
+            return "degraded", 0, 0
+        if experience.state == "invalidated":
+            status: PersistentExperienceStatus = "invalidated"
+        elif persistent_hit is not None:
+            status = "persistent_hit"
+        else:
+            status = "persistent_candidate"
+        return status, experience.observation_count, experience.validation_count
 
 
 _PRODUCTION_SHADOW_OBSERVER = ProviderRecipeShadowObserver()

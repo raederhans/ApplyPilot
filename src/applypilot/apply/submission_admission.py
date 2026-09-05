@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 from applypilot import config
 from applypilot.apply import decision
+from applypilot.apply.material_readiness import evaluate_profile_resume_fact_freshness
 from applypilot.apply.submission_surfaces import (
     classify_submission_surface,
     linkedin_target_verification,
@@ -43,6 +44,18 @@ def evaluate_submission_admission(
     """
     surface = classify_submission_surface(job)
     surface_metadata: dict[str, object] = {"surface": surface}
+    profile_resume_freshness = evaluate_profile_resume_fact_freshness(job, profile)
+    surface_metadata["profile_resume_fact_freshness"] = profile_resume_freshness
+    if profile_resume_freshness["state"] == "stale_profile_fact":
+        errors = profile_resume_freshness["fact_errors"]
+        assert isinstance(errors, list)
+        return {
+            "admitted": False,
+            "decision": "needs_review",
+            "reason": "stale_profile_fact:" + "; ".join(str(error) for error in errors),
+            "surface": surface,
+            "metadata": surface_metadata,
+        }
     if surface == "linkedin_apply_entry":
         surface_metadata["requires_runtime_linkedin_apply_route_resolution"] = True
     if surface == "linkedin_native_easy_apply":

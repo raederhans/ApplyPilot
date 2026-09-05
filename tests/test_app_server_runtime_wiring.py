@@ -17,6 +17,7 @@ from applypilot.apply.app_server_runtime_wiring import (
     build_thread_config,
     dynamic_tools_from_registry,
     open_app_server_turn,
+    open_configured_app_server_turn,
 )
 from applypilot.apply.application_plan import ApplicationPlan
 from applypilot.apply.capabilities import CapabilityRegistry
@@ -103,6 +104,18 @@ for raw_line in sys.stdin:
         emit({"id": request_id, "result": {"userAgent": "fake"}})
     elif method == "initialized":
         continue
+    elif method == "model/list":
+        emit({"id": request_id, "result": {
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "model": "gpt-5.6-sol",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                ],
+            }],
+            "nextCursor": None,
+        }})
     elif method == "thread/start":
         thread_counter += 1
         thread_id = f"thread-{thread_counter}"
@@ -480,6 +493,68 @@ def test_fake_server_turn_persists_observation_and_repairs_on_same_thread(tmp_pa
         adapter.shutdown()
     assert transport.process is not None
     assert transport.process.poll() is not None
+
+
+def test_configured_turn_resolves_phase_effort_and_records_comparable_metadata(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_app_server.py"
+    script.write_text(FAKE_SERVER, encoding="utf-8")
+    adapter = CodexAppServerAdapter(
+        CodexAppServerStdioTransport(
+            [sys.executable, "-u", str(script)],
+            startup_timeout=5,
+            request_timeout=5,
+            shutdown_timeout=5,
+        )
+    )
+    metadata: dict[str, object] = {}
+    try:
+        process = open_configured_app_server_turn(
+            adapter=adapter,
+            state_store=_store(tmp_path / "configured.db"),
+            run_id="run-configured",
+            actor_id="application:configured",
+            attempt_id="attempt-configured",
+            phase="prepare",
+            cwd=tmp_path,
+            model="gpt-5.6-sol",
+            mcp_config={"mcpServers": {}},
+            runtime_capabilities=CapabilityRegistry(),
+            playwright_url=None,
+            prompt_contract={"phase": "prepare"},
+            ats_context={"schema_version": "1"},
+            application_context=None,
+            plan=None,
+            previous_plan=None,
+            plan_shadow_enabled=False,
+            workload_class="prepare_repair",
+            reasoning_efforts={"prepare_repair": "medium"},
+            environ={"APPLYPILOT_REASONING_EFFORTS": '{"prepare_repair":"low"}'},
+            runtime_metadata=metadata,
+        )
+        list(process.stdout)
+
+        assert process.turn.backend == "codex-app-server"
+        assert metadata["runtime_configuration"] == {
+            "schema_version": "1",
+            "backend": "codex",
+            "model": "gpt-5.6-sol",
+            "model_source": "launcher_argument",
+            "reasoning_effort": "medium",
+            "reasoning_effort_source": "profile",
+            "workload_class": "prepare_repair",
+            "reasoning_effort_source_key": "prepare_repair",
+            "reasoning_effort_applied": True,
+        }
+        assert metadata["app_server_configuration_validation"] == {
+            "model_validation": "model/list",
+            "reasoning_effort_validation": "supportedReasoningEfforts",
+            "model_supported": True,
+            "reasoning_effort_supported": True,
+        }
+    finally:
+        adapter.shutdown()
 
 
 def test_state_store_persists_effect_but_not_read_observation(tmp_path: Path) -> None:

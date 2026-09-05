@@ -4317,6 +4317,17 @@ def test_application_acquisition_retires_resume_with_stale_profile_gpa(
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
     monkeypatch.setattr(config, "load_profile", lambda: profile)
 
+    from applypilot.apply.submission_admission import evaluate_submission_admission
+
+    candidate = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (url,)).fetchone())
+    candidate["application_url"] = candidate["application_url"] or candidate["url"]
+    expected_admission = evaluate_submission_admission(
+        candidate,
+        profile,
+        minimum_fit_score=6,
+    )
+    assert expected_admission["reason"].startswith("stale_profile_fact:")
+
     acquired = launcher.acquire_job(target_url=url, preview_only=False)
 
     assert acquired is None
@@ -4326,7 +4337,7 @@ def test_application_acquisition_retires_resume_with_stale_profile_gpa(
     ).fetchone()
     assert stored["tailored_resume_path"] is None
     assert stored["tailor_status"] == "stale_profile_fact"
-    assert "current profile records 3.46" in stored["tailor_error"]
+    assert stored["tailor_error"] == expected_admission["reason"]
 
 
 def test_submission_uncertain_requires_manual_review_and_is_not_reacquired(
