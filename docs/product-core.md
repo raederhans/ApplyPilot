@@ -17,6 +17,22 @@ Discovery creates candidates; it does not create applications. Opening a form
 is not authorization, and clicking Submit is not proof of acceptance. Those
 boundaries are the core of the product rather than implementation detail.
 
+Fit scoring retains the configured threshold and 1–10 scale. The agent interprets
+the role's responsibilities, transferable experience, required conditions,
+preferences, and alternatives; domain examples guide judgment without adding
+keyword-based rejection rules. Current qualification and availability evidence
+is supplied separately from the resume, with role-specific authorization
+conditions preserved.
+
+When the agent identifies a doubt that re-reading the available evidence could
+resolve, a score at the configured floor or one point below may receive one
+automatic review. A scoring batch permits at most two such reviews; an exact-job
+scoring request permits one. A supported review can raise, retain, or lower the
+initial score. A failed or incomplete review preserves the initial assessment.
+Initial and review evidence remain in local scoring records. Missing facts are
+recorded as unknown rather than repeatedly reconsidered or invented, and these
+reviews do not change application authorization or receipt requirements.
+
 ## Frontend information architecture
 
 The browser product follows the same four-stage workflow. The **Discovery

@@ -172,7 +172,7 @@ def test_scoring_persists_the_same_selected_resume_for_tailoring(tmp_path: Path,
         assert job["url"] == url
         return data_resume, {"method": "fixture", "track": "data", "score": 1}
 
-    def score_selected_resume(resume_text: str, job: dict) -> dict:
+    def score_selected_resume(resume_text: str, job: dict, **kwargs) -> dict:
         assert job["url"] == url
         captured.append(resume_text)
         return {"score": 8, "keywords": "SQL", "reasoning": "fixture score"}

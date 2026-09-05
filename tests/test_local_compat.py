@@ -2394,7 +2394,7 @@ def test_score_exact_job_persists_explicit_resume_for_tailoring(
     monkeypatch.setattr(
         single_job,
         "score_job",
-        lambda text, job: {"score": 8, "keywords": "SQL", "reasoning": "match"},
+        lambda text, job, **kwargs: {"score": 8, "keywords": "SQL", "reasoning": "match"},
     )
 
     single_job.score_exact_job_for_url(url, str(resume))

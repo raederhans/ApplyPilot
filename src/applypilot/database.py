@@ -263,6 +263,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
             score_reasoning       TEXT,
+            score_evidence_json   TEXT,
             scored_at             TEXT,
 
             -- Tailoring stage (resume tailor)
@@ -389,6 +390,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
+    "score_evidence_json": "TEXT",
     "scored_at": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",

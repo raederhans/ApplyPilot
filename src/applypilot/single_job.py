@@ -21,7 +21,7 @@ from applypilot.scoring.cover_letter import (
     load_evidence_sources,
     read_resume_source,
 )
-from applypilot.scoring.scorer import score_job
+from applypilot.scoring.scorer import score_job_with_review as score_job
 from applypilot.scoring.validator import validate_cover_letter
 
 
@@ -352,14 +352,15 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
     resume_text = read_resume_source(selected_resume)
     evidence_sources = load_evidence_sources(profile, selected_resume, resume_text)
     score_context = "\n\n".join(source["text"] for source in evidence_sources)
-    score = score_job(score_context, job)
+    score = score_job(score_context, job, profile=profile)
+    score_evidence = {**score.get("score_evidence", {}), "source_resume_path": str(selected_resume)}
     now = datetime.now(UTC).isoformat()
     if score["score"] == 0:
         conn.execute(
             "UPDATE jobs SET fit_score=NULL, scored_at=NULL, score_status='failed', "
             "score_error=?, score_attempts=COALESCE(score_attempts,0)+1, "
-            "tailor_source_resume_path=? WHERE url=?",
-            (score["reasoning"], str(selected_resume), url),
+            "tailor_source_resume_path=?, score_evidence_json=? WHERE url=?",
+            (score["reasoning"], str(selected_resume), json.dumps(score_evidence, ensure_ascii=False), url),
         )
         conn.commit()
         raise RuntimeError(f"LLM scoring failed: {score['reasoning']}")
@@ -368,12 +369,13 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
         "UPDATE jobs SET fit_score=?, score_reasoning=?, scored_at=?, "
         "score_status='scored', score_error=NULL, "
         "score_attempts=COALESCE(score_attempts,0)+1, "
-        "tailor_source_resume_path=? WHERE url=?",
+        "tailor_source_resume_path=?, score_evidence_json=? WHERE url=?",
         (
             score["score"],
             f"{score['keywords']}\n{score['reasoning']}",
             now,
             str(selected_resume),
+            json.dumps(score_evidence, ensure_ascii=False),
             url,
         ),
     )
@@ -388,6 +390,7 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
         "fit_score_estimate": score["score"],
         "matched_keywords": score["keywords"],
         "score_reasoning": score["reasoning"],
+        "score_evidence": score_evidence,
         "scored_at": now,
     }
 
@@ -693,13 +696,14 @@ def prepare_cover_letter_for_url(
     evidence_sources = load_evidence_sources(profile, selected_resume, resume_text)
 
     score_context = "\n\n".join(source["text"] for source in evidence_sources)
-    score = score_job(score_context, job)
+    score = score_job(score_context, job, profile=profile)
+    score_evidence = {**score.get("score_evidence", {}), "source_resume_path": str(selected_resume)}
     if score["score"] == 0:
         conn.execute(
             "UPDATE jobs SET company_name=?, source_site=?, fit_score=NULL, scored_at=NULL, "
             "score_status='failed', score_error=?, "
-            "score_attempts=COALESCE(score_attempts,0)+1 WHERE url=?",
-            (company, source_site, score["reasoning"], url),
+            "score_attempts=COALESCE(score_attempts,0)+1, score_evidence_json=? WHERE url=?",
+            (company, source_site, score["reasoning"], json.dumps(score_evidence, ensure_ascii=False), url),
         )
         conn.commit()
         raise RuntimeError(f"LLM scoring failed: {score['reasoning']}")
@@ -708,13 +712,14 @@ def prepare_cover_letter_for_url(
     conn.execute(
         "UPDATE jobs SET company_name = ?, source_site = ?, fit_score = ?, "
         "score_reasoning = ?, scored_at = ?, score_status='scored', score_error=NULL, "
-        "score_attempts=COALESCE(score_attempts,0)+1 WHERE url = ?",
+        "score_attempts=COALESCE(score_attempts,0)+1, score_evidence_json=? WHERE url = ?",
         (
             company,
             source_site,
             score["score"],
             f"{score['keywords']}\n{score['reasoning']}",
             now,
+            json.dumps(score_evidence, ensure_ascii=False),
             url,
         ),
     )
