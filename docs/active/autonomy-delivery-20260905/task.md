@@ -26,7 +26,7 @@ Non-browser regression after the initial parser repair: 2267 passed, 47 deselect
 
 Ruff and diff checks passed. Release build/privacy audit and clean installed-wheel smoke passed before the final provider/parser follow-ups. The mixed-clause parser review finding is resolved; 40 affected tests and a focused review passed. The whole browser tier passed 53 tests; final build/privacy audit passed. The project-owned Python MCP tools now explicitly receive an existing parent PYTHONPATH, preventing mixed-source canaries; unrelated tool environments are unchanged. Final affected runtime/identity/provider checks: 82 passed in 10.90s; Ruff and the final release rebuild/privacy audit passed.
 
-Integration base: ad81f1c; implementation baseline: a7cb610. Main was freshly clean at 2d1323e. Destination: personal fork raederhans/ApplyPilot. Final commit, merge, push and CI evidence will be added after qualification.
+Delivery code commit: 18dcb0bfe614fbc581c93686a4e11e1afcfa229e, including implementation baseline a7cb610 and ancestor candidate ad81f1c. Root fast-forwarded clean main from 2d1323e and pushed to personal fork raederhans/ApplyPilot; ls-remote confirmed the exact code commit. This documentation follow-up records that observed delivery. Current remote verification is available in the [main CI runs](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml?query=branch%3Amain); the parent task reports the final observed CI outcome.
 
 ## Real applications and limits
 
@@ -35,6 +35,3 @@ New-company qualification covers Temasek, Allium, Unravel Carbon and Syfe. NCS w
 Allium and Syfe expose missing subtype coverage; Unravel Carbon lacks registered evidence for a named required skill. None was force-admitted. Success requires a verified receipt.
 
 Successful applications per hour, tokens per verified application, broad ATS autonomous completion and online model-effort comparisons remain unproven. Different jobs and an interrupted run are not a controlled speed comparison. Multi-cell production writes and experience-driven autonomous writes remain gated. Worktrees are retained for recovery; unrelated WIP is preserved.
-
-
-
