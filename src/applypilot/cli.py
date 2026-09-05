@@ -1023,6 +1023,10 @@ def radar_collect(
 def radar_import_leads(
     file: Path = typer.Option(..., "--file", exists=True, dir_okay=False),
     source_id: str = typer.Option("linkedin-content-manual", "--source-id"),
+    official_targets_reviewed: bool = typer.Option(
+        False, "--official-targets-reviewed",
+        help="Attest that this review session checked each supplied employer target and company identity.",
+    ),
 ) -> None:
     """Import a candidate-reviewed JSON/CSV lead file without creating jobs."""
     return _command_module("radar").run_radar_import_leads(
@@ -1030,6 +1034,7 @@ def radar_import_leads(
         {
             "file": file,
             "source_id": source_id,
+            "official_targets_reviewed": official_targets_reviewed,
         },
     )
 

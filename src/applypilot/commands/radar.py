@@ -225,6 +225,7 @@ def run_radar_import_leads(runtime: ModuleType, values: dict[str, object]) -> No
 
     import csv
     import json
+    from datetime import UTC, datetime
 
     import yaml
 
@@ -283,6 +284,14 @@ def run_radar_import_leads(runtime: ModuleType, values: dict[str, object]) -> No
             classify_job_subtracks(lead.get("title"), query_config)
         )
         lead["reason"] = "requires fresh exact employer-official verification"
+        if values.get("official_targets_reviewed") and lead.get("official_job_url"):
+            # The normalized input drops self-reported trust fields. Only this
+            # explicit attended source-review action can issue the attestation.
+            lead["official_target_review"] = {
+                "url": lead["official_job_url"],
+                "observed_at": datetime.now(UTC).isoformat(),
+                "method": "agent_visible_employer_review",
+            }
         normalized.append(lead)
 
     _radar_bootstrap()

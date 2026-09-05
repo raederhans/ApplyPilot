@@ -48,6 +48,13 @@
   explicit source-review session, which the authorized agent can conduct; it
   does not require the user to review every record personally. Imported and
   searched records remain unverified until fresh employer evidence is obtained.
+- Job-board employer targets also require independent identity review. After
+  actually checking the employer page and its company relationship in the
+  current visible review session, import that lead with
+  `--official-targets-reviewed`. This records a short-lived exact-target review;
+  a field claimed by the source file cannot grant trust. Then `radar advance`
+  still checks the live structured job evidence. Do not set this flag merely
+  because the board provided a link or because the target repeats its name.
 - Keep the existing 1–10 score and admission threshold. Missing title taxonomy
   is a reason to inspect duties, not reject. Prefer another company among
   equally suitable jobs; fit evidence and explicit user targets take priority.

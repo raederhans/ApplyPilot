@@ -183,6 +183,14 @@ data remain pending for visible review or a supported official adapter; this is
 not a general-purpose ATS crawler. Seeing a directory entry is never a verified
 job or an application receipt.
 
+For a board lead, the company name and employer URL originate in the same
+untrusted result. Before promotion, independently inspect the employer identity
+in the visible browser, then use `-AttendedReview radar import-leads
+--official-targets-reviewed` for that reviewed file. The CLI issues a 24-hour
+exact-target attestation after normalization; source-supplied trust fields are
+discarded. A redirect to a different host requires a new review. This step can
+be performed by the authorized agent, and does not require per-job user approval.
+
 The same-score diversity preference also applies to batch authorization and
 worker acquisition. Recent means an actual attempt or application within 14
 days. Higher fit scores remain ahead, exact user-selected URLs remain exact,

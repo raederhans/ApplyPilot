@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -100,3 +101,31 @@ def test_unclassified_official_title_survives_for_later_assessment(conn, monkeyp
     result = CliRunner().invoke(cli.app, ["radar", "collect"])
     assert result.exit_code == 0, result.output
     assert conn.execute("SELECT title FROM jobs").fetchone()[0] == "Marketplace Enablement Intern"
+
+
+def test_only_explicit_review_session_can_issue_target_attestation(conn, monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from applypilot import cli, database
+
+    monkeypatch.setenv("APPLYPILOT_ATTENDED_REVIEW", "1")
+    monkeypatch.setattr(cli, "_radar_bootstrap", lambda: None)
+    monkeypatch.setattr(cli, "_assert_discovery_storage_path", lambda *a: None)
+    monkeypatch.setattr(database, "get_connection", lambda: conn)
+    file = tmp_path / "reviewed.json"
+    file.write_text(json.dumps([{
+        "source_url": "https://sg.indeed.com/viewjob?jk=review", "title": "Intern",
+        "company_name": "Small", "official_job_url": "https://small.example/job/1",
+        "official_target_review": {"method": "source_claim"},
+    }]), encoding="utf-8")
+    args = ["radar", "import-leads", "--source-id", "indeed-jobs", "--file", str(file)]
+    runner = CliRunner()
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(conn.execute("SELECT payload_json FROM radar_source_observations").fetchone()[0])
+    assert "official_target_review" not in payload
+    result = runner.invoke(cli.app, [*args, "--official-targets-reviewed"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(conn.execute("SELECT payload_json FROM radar_source_observations").fetchone()[0])
+    assert payload["official_target_review"]["method"] == "agent_visible_employer_review"
+    assert payload["official_target_review"]["url"] == "https://small.example/job/1"

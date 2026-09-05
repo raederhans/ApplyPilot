@@ -257,6 +257,34 @@ def _trusted_seed_host(row, final_url: str) -> bool:
     return any(final_host == domain or final_host.endswith(f".{domain}") for domain in evidence)
 
 
+def _lead_target_review_error(row, *, final_url: str | None = None) -> str | None:
+    if row["kind"] != "lead":
+        return None
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    review = payload.get("official_target_review")
+    if not isinstance(review, Mapping):
+        return "official target lacks recent agent-visible employer review"
+    target_url = str(row["url"] or "")
+    reviewed_url = str(review.get("url") or "")
+    if reviewed_url != target_url:
+        return "official target review URL does not match the imported target"
+    if review.get("method") != "agent_visible_employer_review":
+        return "official target review method is invalid"
+    observed_at = _parse_timestamp(review.get("observed_at"))
+    now = datetime.now(UTC)
+    if observed_at is None or observed_at.utcoffset() != timedelta(0):
+        return "official target review timestamp must be ISO UTC"
+    age = now - observed_at.astimezone(UTC)
+    if age < timedelta(0) or age > _REFRESH_AFTER:
+        return "official target review is stale or future-dated"
+    if final_url is not None and _host(final_url) != _host(reviewed_url):
+        return "final host does not match the reviewed official target host"
+    return None
+
+
 def _verified_jobposting_groups(
     body: str,
     page_url: str,
@@ -365,18 +393,20 @@ def _recent_attempts(conn) -> dict[tuple[str, str], datetime]:
 def _queue_rows(conn, limit: int):
     rows = conn.execute(
         """
-        SELECT 'lead' kind, lead_id item_id, official_job_url url, last_seen_at,
-               company_id company, title, source_url, status,
-               NULL official_domain, NULL official_url
-        FROM radar_leads
-        WHERE status = 'awaiting_official' AND TRIM(COALESCE(official_job_url, '')) != ''
+        SELECT 'lead' kind, l.lead_id item_id, l.official_job_url url, l.last_seen_at,
+               l.company_id company, l.title, l.source_url, l.status,
+               NULL official_domain, NULL official_url, o.payload_json
+        FROM radar_leads l
+        JOIN radar_source_observations o ON o.observation_key = l.observation_key
+        WHERE l.status = 'awaiting_official'
+          AND TRIM(COALESCE(l.official_job_url, '')) != ''
         UNION ALL
         SELECT 'company_seed', company_key, careers_url, last_seen_at,
                company_name, NULL,
                (SELECT source_url FROM radar_company_seed_sources s
                 WHERE s.company_key = radar_company_seeds.company_key
                 ORDER BY s.last_seen_at DESC, s.source_url LIMIT 1),
-               status, official_domain, official_url
+               status, official_domain, official_url, NULL
         FROM radar_company_seeds
         WHERE status IN ('awaiting_official_careers', 'official_careers_verified')
           AND TRIM(COALESCE(careers_url, '')) != ''
@@ -475,6 +505,18 @@ def advance_radar_queue(conn, *, limit: int = 5, transport: Transport | None = N
             _finish_pending(conn, run_id, row, reason, blocked=True)
             attempts.append(_pending_attempt(row, reason, run_id))
             continue
+        review_error = _lead_target_review_error(row)
+        if review_error:
+            _finish_pending(conn, run_id, row, review_error)
+            attempts.append(
+                _pending_attempt(
+                    row,
+                    review_error,
+                    run_id,
+                    "review_employer_page_then_import_reviewed_target",
+                )
+            )
+            continue
         try:
             response = safe_public_get(str(row["url"]).strip(), transport=transport)
         except Exception as exc:  # noqa: BLE001
@@ -500,6 +542,18 @@ def advance_radar_queue(conn, *, limit: int = 5, transport: Transport | None = N
             reason = "final careers host lacks official_domain or official_url evidence"
             _finish_pending(conn, run_id, row, reason)
             attempts.append(_pending_attempt(row, reason, run_id, "confirm_official_domain"))
+            continue
+        review_error = _lead_target_review_error(row, final_url=final_url)
+        if review_error:
+            _finish_pending(conn, run_id, row, review_error)
+            attempts.append(
+                _pending_attempt(
+                    row,
+                    review_error,
+                    run_id,
+                    "review_employer_page_then_import_reviewed_target",
+                )
+            )
             continue
         groups, rejected = _verified_jobposting_groups(
             response["body"].decode("utf-8", errors="replace"), final_url, row["company"],

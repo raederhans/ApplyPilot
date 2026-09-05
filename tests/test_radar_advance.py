@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -53,6 +54,7 @@ def _add_lead(
     official_url: str | None,
     *,
     company: str = "unverified-company-label",
+    review=True,
 ) -> str:
     source = {
         "source_id": "linkedin-content-manual",
@@ -60,20 +62,27 @@ def _add_lead(
         "provider": "candidate_reviewed_import",
     }
     run_id = start_radar_fetch_run(conn, source)
+    lead = {
+        "source_url": "https://www.linkedin.com/posts/example-lead",
+        "official_job_url": official_url,
+        "title": "Data Analyst Intern",
+        "company_id": company,
+        "status": "awaiting_official",
+        "verification_status": "unverified",
+    }
+    if review is True and official_url:
+        lead["official_target_review"] = {
+            "url": official_url,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "method": "agent_visible_employer_review",
+        }
+    elif isinstance(review, dict):
+        lead["official_target_review"] = review
     ingest_radar_leads(
         conn,
         run_id,
         source,
-        [
-            {
-                "source_url": "https://www.linkedin.com/posts/example-lead",
-                "official_job_url": official_url,
-                "title": "Data Analyst Intern",
-                "company_id": company,
-                "status": "awaiting_official",
-                "verification_status": "unverified",
-            }
-        ],
+        [lead],
     )
     finish_radar_fetch_run(conn, run_id, status="partial", pagination_complete=False)
     return conn.execute("SELECT lead_id FROM radar_leads").fetchone()[0]
@@ -192,6 +201,69 @@ def test_company_alias_mismatch_and_expired_job_remain_pending_without_freshness
         ),
     )
     assert "validThrough" in expired["attempts"][0]["reason"]
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    close_connection(db_path)
+
+
+@pytest.mark.parametrize("review_kind", ["missing", "expired", "wrong_url"])
+def test_lead_requires_recent_exact_agent_visible_target_review(tmp_path, review_kind):
+    db_path = tmp_path / f"{review_kind}.db"
+    conn = init_db(db_path)
+    target = "https://jobs.example.com/role/1"
+    review = False
+    if review_kind == "expired":
+        review = {
+            "url": target,
+            "observed_at": (datetime.now(UTC) - timedelta(hours=25)).isoformat(),
+            "method": "agent_visible_employer_review",
+        }
+    elif review_kind == "wrong_url":
+        review = {
+            "url": "https://jobs.example.com/role/other",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "method": "agent_visible_employer_review",
+        }
+    _add_lead(conn, target, company="Expected Employer", review=review)
+    called = False
+
+    def transport(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return _jsonld_page(url=target, company="Expected Employer")
+
+    result = advance_radar_queue(conn, transport=transport)
+
+    assert result["attempts"][0]["status"] == "pending"
+    assert result["attempts"][0]["next_action"] == (
+        "review_employer_page_then_import_reviewed_target"
+    )
+    assert called is False
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    close_connection(db_path)
+
+
+def test_lead_reviewed_host_must_match_final_redirect_host(tmp_path):
+    db_path = tmp_path / "radar.db"
+    conn = init_db(db_path)
+    target = "https://jobs.example.com/start"
+    _add_lead(conn, target, company="Expected Employer")
+
+    def transport(url, headers=None):
+        if url == target:
+            return {
+                "status_code": 302,
+                "headers": {"Location": "https://careers.example.com/role/1"},
+            }
+        return _jsonld_page(url=url, company="Expected Employer")
+
+    result = advance_radar_queue(conn, transport=transport)
+
+    attempt = result["attempts"][0]
+    assert attempt["status"] == "pending"
+    assert "final host" in attempt["reason"]
+    assert attempt["next_action"] == (
+        "review_employer_page_then_import_reviewed_target"
+    )
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     close_connection(db_path)
 
