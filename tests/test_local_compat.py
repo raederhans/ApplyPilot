@@ -1213,17 +1213,27 @@ def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -
     assert "exact employer ATS mailbox OTP admitted" in steps
     assert "identity-provider security code/security challenge" in steps
     assert "credential_relay_required" in steps
-    assert "actively make one bounded ordinary authentication attempt" in steps
+    assert "make one bounded authentication attempt" in steps
     assert "click the ordinary Sign in, Log in, or Continue control" in steps
-    assert "reuse an already authenticated browser session" in steps
+    assert "reuse an already authenticated employer ATS session" in steps
     assert "already signed-in Google account" in steps
     assert "already signed-in Google or LinkedIn account" not in steps
     assert "Do not use LinkedIn as a third-party ATS OAuth provider" in steps
     assert "Do not return RESULT:LOGIN_ISSUE merely because a login page appears" in steps
     assert "Credential relay is independently authorized" in steps
+    assert "sign-in or authorized registration form" in steps
+    assert "two matching password and confirmation fields" in steps
     assert "must not click Sign in, Continue, Apply, or Submit" in steps
     assert "authorizes this relay without a separate confirmation" in steps
-    assert "Only after that one bounded attempt fails" in steps
+    assert "one selected sign-in or registration branch fails" in steps
+    assert "proactively select the observed Create account or Sign up control once" in steps
+    assert "Fill only required registration fields" in steps
+    assert "real APPLICANT PROFILE values" in steps
+    assert "leave optional registration fields blank" in steps
+    assert "generic invalid-password" in steps
+    assert "Never infer a missing account" in steps
+    assert "retry registration, or create a duplicate account" in steps
+    assert "RESULT:FAILED:credential_relay_required" in steps
     assert "account recovery, unavailable authorized credentials, or broader OAuth scopes" in steps
 
     claude_steps = prompt._build_login_steps(
@@ -1324,6 +1334,7 @@ def test_explicit_login_capabilities_do_not_authorize_account_creation() -> None
     assert "does not authorize account creation" in steps
     assert "Google SSO reuse is not authorized" in steps
     assert "must not click Sign in, Continue, Apply, or Submit" in steps
+    assert "proactively select the observed Create account" not in steps
 
 
 def test_explicit_login_capabilities_override_legacy_account_creation_fallback() -> None:
@@ -1341,6 +1352,27 @@ def test_explicit_login_capabilities_override_legacy_account_creation_fallback()
     assert "Do not start an ordinary first-party ATS sign-in flow" in steps
     assert "Credential relay is not authorized" in steps
     assert "account creation with candidate@example.com is authorized" in steps
+    assert "Create account or Sign up" in steps
+    assert "generic invalid-password" in steps
+    assert "create a duplicate account" in steps
+
+
+def test_login_capability_failures_use_parseable_specific_result_codes() -> None:
+    profile = _application_profile()
+    missing_mailbox_steps = prompt._build_login_steps(profile, available_tools=())
+
+    assert "RESULT:FAILED:credential_relay_required" in missing_mailbox_steps
+    assert "FAILURE_CONTEXT category credential_relay_required" in missing_mailbox_steps
+    assert "RESULT:FAILED:mailbox_capability_missing" in missing_mailbox_steps
+    assert "FAILURE_CONTEXT category mailbox_capability_missing" in missing_mailbox_steps
+    assert launcher._parse_result_line("RESULT:FAILED:credential_relay_required") == (
+        "FAILED",
+        "credential_relay_required",
+    )
+    assert launcher._parse_result_line("RESULT:FAILED:mailbox_capability_missing") == (
+        "FAILED",
+        "mailbox_capability_missing",
+    )
 
 
 def test_legacy_account_creation_policy_still_authorizes_bounded_sign_in_and_relay() -> None:
@@ -1547,9 +1579,19 @@ def test_credential_relay_fills_password_and_confirmation_without_exposing_value
     class Field:
         def __init__(self) -> None:
             self.values: list[str] = []
+            self.value = ""
 
         def fill(self, value: str) -> None:
             self.values.append(value)
+            self.value = value
+
+        def blur(self) -> None:
+            pass
+
+        def evaluate(self, _script: str, expected: str | None = None) -> bool:
+            if expected is None:
+                return True
+            return self.value == expected
 
     password = Field()
     confirmation = Field()
@@ -1564,6 +1606,48 @@ def test_credential_relay_fills_password_and_confirmation_without_exposing_value
         credential_relay._fill_password_fields(
             [password, confirmation, Field()], "test-only-secret"
         )
+
+
+def test_credential_relay_password_readback_fails_closed_without_secret_output() -> None:
+    class DroppedPasswordField:
+        def fill(self, _value: str) -> None:
+            pass
+
+        def blur(self) -> None:
+            pass
+
+        def evaluate(self, _script: str, expected: str | None = None) -> bool:
+            return expected is None
+
+    secret = "must-not-appear-in-error"
+    with pytest.raises(credential_relay.CredentialRelayError) as raised:
+        credential_relay._fill_password_fields([DroppedPasswordField()], secret)
+
+    assert str(raised.value) == (
+        "Credential relay could not verify that every password field was filled."
+    )
+    assert secret not in str(raised.value)
+
+
+def test_credential_relay_refuses_non_password_control_before_secret_fill() -> None:
+    class TextField:
+        def __init__(self) -> None:
+            self.fill_called = False
+
+        def fill(self, _value: str) -> None:
+            self.fill_called = True
+
+        def evaluate(self, _script: str, _expected: str | None = None) -> bool:
+            return False
+
+    field = TextField()
+    secret = "must-not-reach-text-input"
+    with pytest.raises(credential_relay.CredentialRelayError) as raised:
+        credential_relay._fill_password_fields([field], secret)
+
+    assert field.fill_called is False
+    assert str(raised.value) == "Credential relay refused a non-password credential field."
+    assert secret not in str(raised.value)
 
 
 def test_apply_backend_defaults_to_codex(monkeypatch) -> None:

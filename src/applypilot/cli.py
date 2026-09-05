@@ -1427,6 +1427,7 @@ def browser_session(
 
     from applypilot.apply.chrome import (
         allocate_cdp_port,
+        cdp_endpoint_reachable,
         cleanup_worker,
         get_browser_executable,
         launch_chrome,
@@ -1457,7 +1458,9 @@ def browser_session(
             start_url=url,
             browser_backend=effective_browser_backend,
         )
-        while process.poll() is None:
+        # Edge can hand off to another process after CDP has become ready.
+        # The owned endpoint represents the live session, not the launch handle.
+        while cdp_endpoint_reachable(port):
             time.sleep(0.5)
     except KeyboardInterrupt:
         console.print("\n[yellow]Closing browser session...[/yellow]")
@@ -1716,6 +1719,10 @@ def resume_library_status_command() -> None:
 @app.command("resume-route")
 def resume_route_command(
     url: str = typer.Option(..., "--url", help="Exact job or application URL."),
+    min_score: int | None = typer.Option(
+        None, "--min-score", min=1, max=10,
+        help="Fit-score floor; defaults to the workspace submission policy.",
+    ),
     artifact_id: str | None = typer.Option(
         None,
         "--artifact-id",
@@ -1747,7 +1754,19 @@ def resume_route_command(
     profile = load_profile()
     sync_resume_library(conn, profile)
     job = dict(rows[0])
-    result = route_resume_for_job(conn, job, profile, artifact_id=artifact_id)
+    from applypilot import config as app_config
+
+    effective_min_score = (
+        min_score if min_score is not None else int(
+            profile.get("submission_policy", {}).get(
+                "minimum_fit_score", app_config.DEFAULTS["min_score"]
+            )
+        )
+    )
+    result = route_resume_for_job(
+        conn, job, profile, artifact_id=artifact_id,
+        minimum_fit_score=effective_min_score,
+    )
     if project_reuse:
         if result["decision"] not in {"reuse_exact", "manual_selection"}:
             console.print_json(data=result)

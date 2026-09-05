@@ -719,7 +719,7 @@ def test_failed_job_revalidation_deactivates_same_content_library_artifact(
     assert restored_route["decision"] == "reuse_exact"
 
 
-def test_new_subtype_creates_variant_and_unsupported_hard_skill_needs_review(
+def test_new_subtype_and_unsupported_hard_skill_create_truthful_variants(
     tmp_path: Path,
 ) -> None:
     conn = init_db(tmp_path / "library.db")
@@ -746,13 +746,217 @@ def test_new_subtype_creates_variant_and_unsupported_hard_skill_needs_review(
             "title": "Data Analyst",
             "full_description": "Required: AWS. Build dashboards.",
             "eligibility_status": "eligible",
+            "fit_score": 8,
         },
         profile,
+        minimum_fit_score=7,
     )
 
     assert product["decision"] == "create_variant"
-    assert unsupported["decision"] == "manual_review"
+    assert unsupported["decision"] == "create_variant"
     assert unsupported["hard_gaps"] == ["aws"]
+
+
+@pytest.mark.parametrize(
+    ("title", "description"),
+    [
+        (
+            "Allium Engineering General / AI Intern",
+            "Support engineering delivery across several product workstreams.",
+        ),
+        (
+            "General Intern",
+            "Support cross-functional projects and operational coordination.",
+        ),
+    ],
+)
+def test_passing_fit_gate_routes_unclassified_job_to_factual_base_variant(
+    tmp_path: Path, title: str, description: str
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    job = {
+        "url": "https://careers.example.test/" + title.replace(" ", "-"),
+        "title": title,
+        "full_description": description,
+        "eligibility_status": "eligible",
+        "fit_score": 8,
+    }
+
+    result = route_resume_for_job(conn, job, profile, minimum_fit_score=7)
+
+    assert result["job_profile"]["subtype"] is None
+    assert result["decision"] == "create_variant"
+    assert result["decision"] != "reuse_exact"
+    components = _route_components(conn, result)
+    assert components["fit_gate"] == {
+        "fit_score": 8,
+        "minimum_fit_score": 7,
+        "passed": True,
+    }
+    assert components["usable_base_sources"][0]["text_path"] == str(base.resolve())
+    selected_path, source_route = tailor.select_resume_source(job, profile)
+    assert selected_path == base.resolve()
+    assert source_route == {
+        "method": "configured_default_source",
+        "track": "data_bi_decision_analysis",
+        "score": 0,
+    }
+
+
+def test_no_keyword_source_selection_skips_stale_profile_facts_but_keeps_override(
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "stale.txt"
+    stale.write_text(
+        "University of Pennsylvania, Master of City Planning, GPA: 3.6",
+        encoding="utf-8",
+    )
+    current = tmp_path / "current.txt"
+    current.write_text(
+        "University of Pennsylvania, Master of City Planning, GPA: 3.46",
+        encoding="utf-8",
+    )
+    profile = {
+        "education": [
+            {
+                "institution": "University of Pennsylvania",
+                "gpa": "3.46/4.0",
+                "gpa_may_be_disclosed": True,
+            }
+        ],
+        "tailoring": {
+            "resume_variants": [
+                {"track": "stale", "path": str(stale), "keywords": []},
+                {"track": "current", "path": str(current), "keywords": []},
+            ]
+        },
+    }
+    job = {
+        "title": "General Intern",
+        "full_description": "Support cross-functional delivery.",
+    }
+
+    selected, routing = tailor.select_resume_source(job, profile)
+
+    assert selected == current.resolve()
+    assert routing == {
+        "method": "configured_default_source",
+        "track": "current",
+        "score": 0,
+    }
+    explicit, explicit_routing = tailor.select_resume_source(
+        {**job, "tailor_source_resume_path": str(stale)},
+        profile,
+    )
+    assert explicit == stale.resolve()
+    assert explicit_routing == {"method": "job_override", "track": "explicit", "score": None}
+
+
+@pytest.mark.parametrize(("fit_score", "minimum_fit_score"), [(None, 7), (6, 7), (8, None)])
+def test_unclassified_job_requires_proven_configured_fit_gate(
+    tmp_path: Path, fit_score: int | None, minimum_fit_score: int | None
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": f"https://careers.example.test/unclassified-{fit_score}-{minimum_fit_score}",
+            "title": "General Intern",
+            "full_description": "Support cross-functional projects.",
+            "eligibility_status": "eligible",
+            "fit_score": fit_score,
+        },
+        profile,
+        minimum_fit_score=minimum_fit_score,
+    )
+
+    assert result["decision"] == "manual_review"
+
+
+def test_tailoring_pipeline_uses_configured_base_for_passing_unclassified_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    general_base = tmp_path / "general-base.txt"
+    general_base.write_text("GENERAL FACTUAL SOURCE: SQL and Python.", encoding="utf-8")
+    ai_base = tmp_path / "ai-base.txt"
+    ai_base.write_text("AI FACTUAL SOURCE: Python and machine learning.", encoding="utf-8")
+    profile = {
+        "skills_boundary": {"languages": ["Python", "SQL"]},
+        "tailoring": {
+            "resume_variants": [
+                {
+                    "track": "general_product_consulting",
+                    "path": str(general_base),
+                    "keywords": ["operations"],
+                },
+                {
+                    "track": "ai_implementation_automation",
+                    "path": str(ai_base),
+                    "keywords": ["ai", "machine learning"],
+                },
+            ]
+        },
+    }
+    job = {
+        "url": "https://careers.example.test/allium-engineering-general-ai",
+        "title": "Allium Engineering General / AI Intern",
+        "company_name": "Allium",
+        "full_description": "Support engineering delivery across several product workstreams.",
+        "eligibility_status": "eligible",
+        "fit_score": 8,
+    }
+    _insert_job(
+        conn,
+        url=str(job["url"]),
+        title=str(job["title"]),
+        description=str(job["full_description"]),
+        company_name="Allium",
+        fit_score=8,
+    )
+    output_dir = tmp_path / "tailored"
+    used_sources: list[str] = []
+
+    monkeypatch.setattr(tailor, "get_connection", lambda: conn)
+    monkeypatch.setattr(tailor, "load_profile", lambda: profile)
+    monkeypatch.setattr(tailor, "get_jobs_by_stage", lambda **_kwargs: [job])
+    monkeypatch.setattr(tailor, "TAILORED_DIR", output_dir)
+
+    def fake_tailor(resume_text, *_args, **_kwargs):
+        used_sources.append(resume_text)
+        return "Validated factual variant.", {"status": "machine_validated", "attempts": 1}
+
+    monkeypatch.setattr(tailor, "tailor_resume", fake_tailor)
+
+    from applypilot.scoring import pdf as scoring_pdf
+
+    def fake_pdf(text_path: Path) -> Path:
+        pdf_path = text_path.with_suffix(".pdf")
+        pdf_path.write_bytes(b"synthetic-pdf")
+        return pdf_path
+
+    monkeypatch.setattr(scoring_pdf, "convert_to_pdf", fake_pdf)
+    monkeypatch.setattr(
+        resume_library,
+        "register_tailored_artifact",
+        lambda *args, **kwargs: {"artifact_id": "artifact-allium"},
+    )
+
+    result = tailor.run_tailoring(min_score=7, limit=1, validation_mode="strict")
+
+    assert used_sources == ["AI FACTUAL SOURCE: Python and machine learning."]
+    assert result["results"][0]["resume_library_decision"] == "create_variant"
+    assert result["results"][0]["source_resume_path"] == str(ai_base.resolve())
+    assert result["results"][0]["status"] == "machine_validated"
 
 
 def _unsupported_aws_job(suffix: str) -> dict[str, str]:
@@ -825,7 +1029,7 @@ def test_confirmed_skill_experience_allows_variant_without_claiming_resume_cover
     ],
     ids=["unconfirmed", "zero", "negative", "boolean", "unknown-skill", "wrong-key"],
 )
-def test_only_positive_confirmed_known_skill_experience_facts_clear_unsupported_gap(
+def test_invalid_skill_experience_facts_do_not_claim_unsupported_gap_coverage(
     tmp_path: Path, fact: dict[str, object]
 ) -> None:
     conn = init_db(tmp_path / "library.db")
@@ -836,9 +1040,14 @@ def test_only_positive_confirmed_known_skill_experience_facts_clear_unsupported_
     profile["application_facts"] = [fact]
     sync_resume_library(conn, profile, tmp_path)
 
-    result = route_resume_for_job(conn, _unsupported_aws_job("invalid-fact"), profile)
+    result = route_resume_for_job(
+        conn,
+        {**_unsupported_aws_job("invalid-fact"), "fit_score": 8},
+        profile,
+        minimum_fit_score=7,
+    )
 
-    assert result["decision"] == "manual_review"
+    assert result["decision"] == "create_variant"
     assert result["hard_gaps"] == ["aws"]
     components = _route_components(conn, result)
     assert components["unsupported_required_skills"] == ["aws"]
@@ -873,18 +1082,19 @@ def test_manual_selection_uses_confirmed_skill_experience_for_unsupported_gap(
     sync_resume_library(conn, profile, tmp_path)
     monkeypatch.setattr(resume_library, "REUSE_REQUIRED_COVERAGE", 0.0)
     monkeypatch.setattr(resume_library, "REUSE_OVERALL_SCORE", 0.0)
-    job = _unsupported_aws_job("confirmed-manual-selection")
+    job = {**_unsupported_aws_job("confirmed-manual-selection"), "fit_score": 8}
 
-    automatic = route_resume_for_job(conn, job, profile)
+    automatic = route_resume_for_job(conn, job, profile, minimum_fit_score=7)
     automatic_components = _route_components(conn, automatic)
     selected = route_resume_for_job(
         conn,
         job,
         profile,
         artifact_id=automatic["candidates"][0]["artifact_id"],
+        minimum_fit_score=7,
     )
 
-    assert automatic["decision"] == "manual_review"
+    assert automatic["decision"] == "create_variant"
     assert automatic_components["unsupported_required_skills"] == []
     assert automatic_components["confirmed_required_skill_facts"][0]["fact_key"] == (
         "aws_experience_years"
@@ -925,6 +1135,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
             "Required: SQL. Build dashboards and reporting for business decisions."
         ),
         "eligibility_status": "eligible",
+        "fit_score": 8,
     }
     _insert_job(
         conn,
@@ -933,9 +1144,9 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
         description=str(job["full_description"]),
     )
 
-    unresolved = route_resume_for_job(conn, job, profile)
+    unresolved = route_resume_for_job(conn, job, profile, minimum_fit_score=7)
 
-    assert unresolved["decision"] == "manual_review"
+    assert unresolved["decision"] == "create_variant"
     assert len(unresolved["candidates"]) == 2
     selected_artifact_id = unresolved["candidates"][1]["artifact_id"]
 
@@ -944,6 +1155,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
         job,
         profile,
         artifact_id=selected_artifact_id,
+        minimum_fit_score=7,
     )
 
     assert selected["decision"] == "manual_selection"
@@ -973,6 +1185,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
             unsupported_job,
             profile,
             artifact_id=selected_artifact_id,
+            minimum_fit_score=7,
         )
 
     with pytest.raises(ValueError, match="candidate"):
@@ -981,6 +1194,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
             job,
             profile,
             artifact_id="resume:not-a-candidate",
+            minimum_fit_score=7,
         )
 
     selected_pdf = Path(selected["artifact"]["pdf_path"])
@@ -991,6 +1205,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
             job,
             profile,
             artifact_id=selected_artifact_id,
+            minimum_fit_score=7,
         )
 
 
@@ -1085,7 +1300,7 @@ def test_exact_target_reevaluates_existing_material_and_creates_variant(
 
     routed: list[str] = []
 
-    def route_existing(_conn, job, _profile):
+    def route_existing(_conn, job, _profile, **_kwargs):
         routed.append(job["tailored_resume_path"])
         return {
             "decision": "create_variant",

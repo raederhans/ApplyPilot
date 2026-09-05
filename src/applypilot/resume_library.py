@@ -1221,6 +1221,7 @@ def route_resume_for_job(
     profile: Mapping[str, object],
     *,
     artifact_id: str | None = None,
+    minimum_fit_score: int | None = None,
 ) -> dict:
     """Choose reuse/create/review/ignore for one exact job, without LLM calls."""
     ensure_resume_library_schema(conn)
@@ -1243,13 +1244,57 @@ def route_resume_for_job(
         "profile_fact_rejections": profile_fact_rejections,
     }
 
+    fit_score = job.get("fit_score")
+    fit_gate_passed = (
+        minimum_fit_score is not None
+        and isinstance(fit_score, (int, float))
+        and not isinstance(fit_score, bool)
+        and fit_score >= minimum_fit_score
+    )
+    components["fit_gate"] = {
+        "fit_score": fit_score,
+        "minimum_fit_score": minimum_fit_score,
+        "passed": fit_gate_passed,
+    }
+
     if str(job.get("eligibility_status") or "").casefold() == "ineligible":
         decision = "ignore"
         reason = f"Job is ineligible: {job.get('eligibility_reason') or 'explicit eligibility failure'}"
     elif not str(job.get("full_description") or "").strip():
         reason = "Full job description is missing; subtype and hard requirements cannot be verified."
     elif not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55:
-        reason = "No sufficiently confident fine-grained role subtype was found."
+        usable_base_sources = []
+        for row in conn.execute(
+            "SELECT artifact_id, text_path FROM resume_artifacts "
+            "WHERE active=1 AND kind='base' ORDER BY created_at, artifact_id"
+        ).fetchall():
+            source_path = Path(str(row["text_path"] or ""))
+            if not source_path.is_file():
+                continue
+            fact_errors = current_profile_resume_fact_errors(
+                read_resume_source(source_path), dict(profile)
+            )
+            if not fact_errors:
+                usable_base_sources.append(
+                    {"artifact_id": row["artifact_id"], "text_path": str(source_path)}
+                )
+        components["usable_base_sources"] = usable_base_sources
+        if not fit_gate_passed:
+            reason = (
+                "No sufficiently confident fine-grained role subtype was found, and the "
+                "configured fit-score gate was not proven to pass."
+            )
+        elif not usable_base_sources:
+            reason = (
+                "The job passed the configured fit-score gate, but no current factual base "
+                "resume is available for tailoring."
+            )
+        else:
+            decision = "create_variant"
+            reason = (
+                "The job passed the configured fit-score gate; use a current factual base "
+                "resume and validate a new variant because subtype classification is uncertain."
+            )
     else:
         configured_source_paths = _configured_source_paths_for_track(
             profile, str(job_profile.get("track") or "") or None
@@ -1372,8 +1417,18 @@ def route_resume_for_job(
                 components["unsupported_required_skills"] = unsupported
                 components["confirmed_required_skill_facts"] = confirmed_fact_support
             if not top["exact_job_validation"] and unsupported:
-                decision = "manual_review"
-                reason = "A required named skill is unsupported by every registered factual source."
+                if fit_gate_passed:
+                    decision = "create_variant"
+                    reason = (
+                        "A required named skill is absent from registered factual sources; "
+                        "create and validate a variant without claiming unsupported experience."
+                    )
+                else:
+                    decision = "manual_review"
+                    reason = (
+                        "A required named skill is unsupported, and the configured fit-score "
+                        "gate was not proven to pass."
+                    )
             elif not top["exact_job_validation"] and required_coverage < REUSE_REQUIRED_COVERAGE:
                 decision = "create_variant"
                 reason = "The best artifact does not expose enough required skills for exact reuse."
@@ -1381,9 +1436,19 @@ def route_resume_for_job(
                 decision = "create_variant"
                 reason = "The best artifact is below the conservative exact-reuse score."
             elif not top["exact_job_validation"] and margin < REUSE_MIN_MARGIN:
-                decision = "manual_review"
-                reason = "Two validated artifacts are too close to choose automatically."
                 manual_selection_allowed = True
+                if fit_gate_passed:
+                    decision = "create_variant"
+                    reason = (
+                        "Two validated artifacts are too close for exact reuse; create and "
+                        "validate a job-specific variant from factual source material."
+                    )
+                else:
+                    decision = "manual_review"
+                    reason = (
+                        "Two validated artifacts are too close, and the configured fit-score "
+                        "gate was not proven to pass."
+                    )
             elif not top["exact_job_validation"]:
                 decision = "reuse_exact"
                 if route_preference_resolved_tie:
@@ -1410,9 +1475,9 @@ def route_resume_for_job(
             raise ValueError(
                 "The requested resume artifact is not a current candidate for this exact job"
             )
-        if decision != "manual_review" or not manual_selection_allowed:
+        if decision not in {"manual_review", "create_variant"} or not manual_selection_allowed:
             raise ValueError(
-                "Manual selection cannot resolve this route decision; review remains required"
+                "Manual selection cannot resolve this route decision"
             )
         selected_required_coverage = float(selected["required_coverage"])
         selected_overall_score = float(selected["overall_score"])
@@ -1437,6 +1502,7 @@ def route_resume_for_job(
         required_coverage = selected_required_coverage
         overall_score = selected_overall_score
         hard_gaps = selected_hard_gaps
+        original_decision = decision
         original_reason = reason
         decision = "manual_selection"
         reason = (
@@ -1445,7 +1511,7 @@ def route_resume_for_job(
         )
         components["manual_selection"] = {
             "artifact_id": artifact_id,
-            "original_decision": "manual_review",
+            "original_decision": original_decision,
             "original_reason": original_reason,
         }
 

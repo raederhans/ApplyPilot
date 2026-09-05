@@ -45,10 +45,12 @@ EMAIL_LABEL_RE = re.compile(
     r"^email(?:\s+address)?(?:\s*[:：*✱])*$",
     re.IGNORECASE,
 )
+EMAIL_CONFIRMATION_LABEL_RE = re.compile(
+    r"^(?:confirm|retype|re-enter)\s+email(?:\s+address)?(?:\s*[:：*✱])*$",
+    re.IGNORECASE,
+)
 PASSWORD_SELECTORS = (
     'input[type="password"]',
-    'input[autocomplete="new-password"]',
-    'input[autocomplete="current-password"]',
 )
 PROTECTED_IDENTIFIER_INPUT_SELECTOR = (
     'input:not([type]), input[type="text"], input[type="tel"], input[type="number"]'
@@ -314,32 +316,57 @@ def _visible_locator(frame: Frame, selectors: tuple[str, ...]) -> Locator | None
     return visible[0] if visible else None
 
 
+def _accessible_label(locator: Locator) -> str:
+    """Read one input's non-secret accessible label."""
+    label = locator.evaluate(
+        r"""element => {
+          const labelledBy = String(element.getAttribute('aria-labelledby') || '')
+            .trim().split(/\s+/).filter(Boolean)
+            .map(id => document.getElementById(id)?.innerText || '')
+            .filter(Boolean).join(' ');
+          if (labelledBy) return labelledBy;
+          const ariaLabel = String(element.getAttribute('aria-label') || '').trim();
+          if (ariaLabel) return ariaLabel;
+          return [...(element.labels || [])]
+            .map(label => label.innerText || label.textContent || '')
+            .filter(Boolean).join(' ');
+        }"""
+    )
+    return " ".join(str(label or "").split())
+
+
 def _visible_accessible_email_locator(frame: Frame) -> Locator | None:
     """Return one text-like input whose accessible label is exactly email."""
 
     matches: list[Locator] = []
     for candidate in _visible_locators(frame, (EMAIL_LABEL_FALLBACK_SELECTOR,)):
         try:
-            label = candidate.evaluate(
-                r"""element => {
-                  const labelledBy = String(element.getAttribute('aria-labelledby') || '')
-                    .trim().split(/\s+/).filter(Boolean)
-                    .map(id => document.getElementById(id)?.innerText || '')
-                    .filter(Boolean).join(' ');
-                  if (labelledBy) return labelledBy;
-                  const ariaLabel = String(element.getAttribute('aria-label') || '').trim();
-                  if (ariaLabel) return ariaLabel;
-                  return [...(element.labels || [])]
-                    .map(label => label.innerText || label.textContent || '')
-                    .filter(Boolean).join(' ');
-                }"""
-            )
+            normalized = _accessible_label(candidate)
         except Exception:  # noqa: BLE001, S112 - detached fields are expected during navigation
             continue
-        normalized = " ".join(str(label or "").split())
         if EMAIL_LABEL_RE.fullmatch(normalized):
             matches.append(candidate)
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) > 1:
+        raise CredentialRelayError(
+            "Credential relay found multiple primary email fields and refused an ambiguous form."
+        )
+    return matches[0] if matches else None
+
+
+def _visible_email_confirmation_locator(frame: Frame) -> Locator | None:
+    """Return at most one explicit confirm/retype email input."""
+    matches: list[Locator] = []
+    for candidate in _visible_locators(frame, (EMAIL_LABEL_FALLBACK_SELECTOR,)):
+        try:
+            if EMAIL_CONFIRMATION_LABEL_RE.fullmatch(_accessible_label(candidate)):
+                matches.append(candidate)
+        except Exception:  # noqa: BLE001, S112 - detached fields are expected during navigation
+            continue
+    if len(matches) > 1:
+        raise CredentialRelayError(
+            "Credential relay found multiple email confirmation fields and refused an ambiguous form."
+        )
+    return matches[0] if matches else None
 
 
 def _fill_password_fields(password_fields: list[Locator], password: str) -> int:
@@ -349,9 +376,94 @@ def _fill_password_fields(password_fields: list[Locator], password: str) -> int:
             "Credential relay found more than two password fields and refused a "
             "possible password-change or recovery form."
         )
+    if not password_fields:
+        return 0
     for field in password_fields:
-        field.fill(password)
+        try:
+            is_password = bool(
+                field.evaluate(
+                    "element => String(element.type || '').toLowerCase() === 'password'"
+                )
+            )
+        except Exception as exc:
+            raise CredentialRelayError(
+                "Credential relay could not verify the password field type."
+            ) from exc
+        if not is_password:
+            raise CredentialRelayError(
+                "Credential relay refused a non-password credential field."
+            )
+    for field in password_fields:
+        try:
+            field.fill(password)
+        except Exception:  # noqa: BLE001 - never expose a driver error containing the secret
+            raise CredentialRelayError(
+                "Credential relay could not fill every password field."
+            ) from None
+    try:
+        password_fields[-1].blur()
+    except Exception:  # noqa: BLE001 - do not accept credentials before validation blur
+        raise CredentialRelayError(
+            "Credential relay could not finalize password-field validation."
+        ) from None
+    for field in password_fields:
+        try:
+            matched = bool(
+                field.evaluate(
+                    "(element, expected) => "
+                    "String(element.type || '').toLowerCase() === 'password' "
+                    "&& element.value === expected",
+                    password,
+                )
+            )
+        except Exception:  # noqa: BLE001 - detached fields fail closed
+            matched = False
+        if not matched:
+            raise CredentialRelayError(
+                "Credential relay could not verify that every password field was filled."
+            )
     return len(password_fields)
+
+
+def _clear_exact_secret_from_text_inputs(frame: Frame, password: str) -> None:
+    """Clear only current-frame text inputs proven equal to this attempt's secret."""
+    for locator in _visible_locators(frame, (EMAIL_LABEL_FALLBACK_SELECTOR,)):
+        try:
+            misplaced = bool(
+                locator.evaluate(
+                    "(element, expected) => element.value === expected",
+                    password,
+                )
+            )
+            if misplaced:
+                locator.fill("")
+        except Exception:  # noqa: BLE001, S112 - best-effort cleanup stays in this frame
+            continue
+
+
+def _fill_credential_fields(
+    frame: Frame,
+    email_locator: Locator | None,
+    email_confirmation_locator: Locator | None,
+    password_locators: list[Locator],
+    email: str,
+    password: str,
+) -> tuple[bool, bool, int]:
+    """Fill credentials in primary-email, confirmation, then password order."""
+    email_filled = False
+    email_confirmation_filled = False
+    if email_locator is not None:
+        email_locator.fill(email)
+        email_filled = True
+    if email_confirmation_locator is not None:
+        email_confirmation_locator.fill(email)
+        email_confirmation_filled = True
+    try:
+        password_fields_filled = _fill_password_fields(password_locators, password)
+    except CredentialRelayError:
+        _clear_exact_secret_from_text_inputs(frame, password)
+        raise
+    return email_filled, email_confirmation_filled, password_fields_filled
 
 
 def _requested_fields_present(field: str, email_present: bool, password_present: bool) -> bool:
@@ -684,13 +796,13 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                 ):
                     continue
 
-                email_locator = (
-                    _visible_locator(frame, EMAIL_SELECTORS)
-                    if field in {"email", "both"}
-                    else None
-                )
-                if email_locator is None and field in {"email", "both"}:
+                email_locator = None
+                email_confirmation_locator = None
+                if field in {"email", "both"}:
                     email_locator = _visible_accessible_email_locator(frame)
+                    email_confirmation_locator = _visible_email_confirmation_locator(frame)
+                    if email_locator is None and email_confirmation_locator is None:
+                        email_locator = _visible_locator(frame, EMAIL_SELECTORS)
                 password_locators = (
                     _visible_locators(frame, PASSWORD_SELECTORS)
                     if field in {"password", "both"}
@@ -713,22 +825,34 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                         "frame_url": frame.url,
                         "host": target_host,
                         "match": match,
-                        "field_count": int(email_locator is not None) + len(password_locators),
+                        "frame": frame,
+                        "field_count": (
+                            int(email_locator is not None)
+                            + int(email_confirmation_locator is not None)
+                            + len(password_locators)
+                        ),
                         "email_locator": email_locator,
+                        "email_confirmation_locator": email_confirmation_locator,
                         "password_locators": password_locators,
                     }
                 )
 
         selected = _select_candidate(candidates)
         email_locator = selected["email_locator"]
+        email_confirmation_locator = selected["email_confirmation_locator"]
         password_locators = list(selected["password_locators"])
-        email_filled = False
-        password_fields_filled = 0
-        if email_locator is not None:
-            email_locator.fill(email)
-            email_filled = True
-        if password_locators:
-            password_fields_filled = _fill_password_fields(password_locators, password)
+        (
+            email_filled,
+            _email_confirmation_filled,
+            password_fields_filled,
+        ) = _fill_credential_fields(
+            selected["frame"],
+            email_locator,
+            email_confirmation_locator,
+            password_locators,
+            email,
+            password,
+        )
         return {
             "status": "filled",
             "host": selected["host"],

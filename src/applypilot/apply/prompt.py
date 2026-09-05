@@ -911,19 +911,22 @@ def _build_login_steps(
         or account_creation_authorized
     ):
         session_rule = (
-            "then reuse an already authenticated browser session or select an already signed-in Google "
+            "reuse an already authenticated employer ATS session or select an already signed-in Google "
             "account when offered. "
             if google_reuse_authorized
-            else "then reuse only an existing first-party employer ATS session or the authorized credential relay. "
+            else "reuse an existing first-party employer ATS session when present. "
         )
         attempt_rule = (
-            "When a login page appears, actively make one bounded ordinary authentication attempt: "
-            "click the ordinary Sign in, Log in, or Continue control, "
+            "When an authentication page appears, first "
             + session_rule
+            + "Otherwise make one bounded authentication attempt using the "
+            "branch supported by the observed page: click the ordinary Sign in, Log in, or Continue "
+            "control for an existing account. "
             + "The trusted profile already authorizes this ordinary login action, so do not request a separate "
             "confirmation for it. "
             + "Do not return RESULT:LOGIN_ISSUE merely because a login page appears. Do not retry the "
-            "authentication flow or switch identities. "
+            "selected authentication branch or switch identities. A generic invalid-password message does "
+            "not prove that no account exists and must never trigger account creation. "
             if ordinary_sign_in_authorized
             else "Do not start an ordinary first-party ATS sign-in flow. "
         )
@@ -943,18 +946,27 @@ def _build_login_steps(
             "the worker directory"
         )
         relay_rule = (
-            f"Credential relay is independently authorized for an already-visible ordinary employer ATS sign-in form: "
+            f"Credential relay is independently authorized for an already-visible ordinary employer ATS "
+            f"sign-in or authorized registration form: "
             f"{relay_instruction}. Never type, print, read aloud, copy into the prompt, or expose the password. "
+            "On a registration form, the same relay may fill the email plus one password field or the two "
+            "matching password and confirmation fields. "
             "The trusted profile authorizes this relay without a separate confirmation. "
             "The relay fills credentials directly and must not click Sign in, Continue, Apply, or Submit. If the relay "
-            "is missing, unconfigured, rejects the current host, or fails, stop with RESULT:LOGIN_ISSUE and "
-            "FAILURE_CONTEXT category credential_relay_required."
+            "is missing, unconfigured, rejects the current host, or fails, stop with "
+            "RESULT:FAILED:credential_relay_required and FAILURE_CONTEXT category credential_relay_required."
             if credential_relay_authorized
             else "Credential relay is not authorized."
         )
         signup_rule = (
-            f"For an ordinary employer ATS only, account creation with {email} is authorized; use credential relay "
-            "only when it is independently authorized."
+            f"For an ordinary employer ATS only, account creation with {email} is authorized as one bounded branch. "
+            "Use it only when the observed page clearly shows there is no account for this flow, or exposes "
+            "an ordinary Create account or Sign up entry and there is no evidence of an existing account. "
+            "In that bounded case, proactively select the observed Create account or Sign up control once. "
+            "Fill only required registration fields, using the real APPLICANT PROFILE values; leave optional "
+            "registration fields blank unless the form requires them. Use credential relay only when it is "
+            "independently authorized. Never infer a missing account from a generic invalid-password error, "
+            "retry registration, or create a duplicate account."
             if account_creation_authorized
             else "Do not create a new account. Ordinary sign-in or credential relay authorization does not authorize account creation."
         )
@@ -973,7 +985,8 @@ def _build_login_steps(
             if gmail_verification_authorized and mailbox_tools_available
             else (
                 "This runtime has no authorized mailbox search/read capability. If email verification is required, "
-                "stop with RESULT:LOGIN_ISSUE and FAILURE_CONTEXT category mailbox_capability_missing; continue the batch with another job."
+                "stop with RESULT:FAILED:mailbox_capability_missing and FAILURE_CONTEXT category "
+                "mailbox_capability_missing; continue the batch with another job."
                 if gmail_verification_authorized
                 else "Do not open email or enter verification codes."
             )
@@ -999,7 +1012,7 @@ def _build_login_steps(
             + verification_rule
             + " Do not use LinkedIn as a third-party ATS OAuth provider; no independent LinkedIn SSO authorization is configured."
             + " After authentication navigation, list tabs and return to the application tab if needed. "
-            "Only after that one bounded attempt fails, or the flow requires MFA, an identity-provider security "
+            "Only after that one selected sign-in or registration branch fails, or the flow requires MFA, an identity-provider security "
             "code/security challenge, account recovery, "
             "unavailable authorized credentials, or broader OAuth scopes, output RESULT:LOGIN_ISSUE. "
             "That hard stop does not include the exact employer ATS mailbox OTP admitted by the narrow mailbox "

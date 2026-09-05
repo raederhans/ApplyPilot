@@ -23,6 +23,7 @@ from applypilot.llm import get_client
 from applypilot.scoring.cover_letter import read_resume_source
 from applypilot.scoring.validator import (
     BANNED_WORDS,
+    current_profile_resume_fact_errors,
     sanitize_text,
     validate_json_fields,
     validate_tailored_resume,
@@ -63,6 +64,13 @@ def select_resume_source(job: dict, profile: dict) -> tuple[Path, dict]:
         if not path.exists():
             log.warning("Configured tailoring resume variant is missing: %s", path)
             continue
+        source_text = read_resume_source(path)
+        if current_profile_resume_fact_errors(source_text, profile):
+            log.warning(
+                "Configured tailoring resume variant conflicts with current profile facts: %s",
+                path,
+            )
+            continue
         keywords = [str(item) for item in variant.get("keywords", [])]
         title_score = sum(_keyword_hits(title, keyword) for keyword in keywords) * 4
         description_score = sum(_keyword_hits(description, keyword) for keyword in keywords)
@@ -76,6 +84,12 @@ def select_resume_source(job: dict, profile: dict) -> tuple[Path, dict]:
                 "track": str(variant.get("track") or path.stem),
                 "score": score,
             }
+        _, _, variant, path = max(ranked, key=lambda item: item[1])
+        return path, {
+            "method": "configured_default_source",
+            "track": str(variant.get("track") or path.stem),
+            "score": 0,
+        }
 
     return RESUME_PATH.resolve(), {
         "method": "default_resume_fallback",
@@ -893,7 +907,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         completed += 1
         try:
             library_route = (
-                route_resume_for_job(conn, job, profile)
+                route_resume_for_job(
+                    conn,
+                    job,
+                    profile,
+                    minimum_fit_score=min_score,
+                )
                 if library_enabled
                 else {
                     "decision": "create_variant",
