@@ -1,4 +1,31 @@
 sources:
+  - id: linkedin-jobs
+    name: LinkedIn Jobs
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: job_board
+    access_mode: public_manual_review
+    collection_modes: {job_lead: bounded_job_search}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [linkedin.com]
+    discovery_url: https://www.linkedin.com/jobs/search/
+    login_requirement: public_search_or_existing_visible_session
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
+
+  - id: indeed-jobs
+    name: Indeed Jobs Singapore
+    enabled: true
+    record_kinds: [job_lead]
+    publisher_type: job_board
+    access_mode: public_manual_review
+    collection_modes: {job_lead: bounded_job_search}
+    coverage_mode: non_exhaustive
+    allowed_hosts: [indeed.com]
+    discovery_url: https://sg.indeed.com/jobs
+    login_requirement: public_search_or_existing_visible_session
+    employer_official_url_policy: reject_ecosystem_hosts
+    disable_reason: null
   - id: linkedin-content-manual
     name: LinkedIn Content Search
     enabled: true

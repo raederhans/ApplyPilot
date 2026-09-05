@@ -16,6 +16,8 @@ def test_registry_classifies_sources_and_record_kinds() -> None:
     sources = {source["id"]: source for source in load_ecosystem_sources()}
 
     assert set(sources) == {
+        "linkedin-jobs",
+        "indeed-jobs",
         "linkedin-content-manual",
         "careeraxis",
         "mycareersfuture",
@@ -25,6 +27,9 @@ def test_registry_classifies_sources_and_record_kinds() -> None:
         "startup-sg-directory",
     }
     assert sources["sfa-job-portal"]["enabled"] is False
+    for source_id in ("linkedin-jobs", "indeed-jobs"):
+        assert sources[source_id]["record_kinds"] == ["job_lead"]
+        assert radar_source_descriptor(source_id, "job_lead")["collection_mode"] == "bounded_job_search"
     assert sources["startup-sg-directory"]["record_kinds"] == ["company_seed"]
     assert sources["sginnovate-dtc"]["record_kinds"] == ["job_lead", "company_seed"]
     assert all(source["coverage_mode"] == "non_exhaustive" for source in sources.values())

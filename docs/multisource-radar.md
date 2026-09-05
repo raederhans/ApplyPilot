@@ -2,7 +2,7 @@
 
 这套雷达把“发现职位”从原有固定求职网站扩展为四层信息面：
 
-1. 公司官网和官方 ATS/RSS：可核验的正式职位，经过新加坡地域、标题和赛道过滤后进入 `jobs`。
+1. 公司官网和官方 ATS/RSS：可核验的正式职位，经过新加坡地域和现有标题过滤后进入 `jobs`；赛道标签缺失保留待评估。
 2. LinkedIn Content Search：生成候选人可见的定向查询 URL；ApplyPilot 不自动抓取 LinkedIn。
 3. 新加坡校园、政府和行业门户：由候选人在场复核后只进入 `radar_leads`；导入时不依据门户声明或历史职位自动升级。
 4. SGInnovate/Startup SG 公司目录：只进入 `radar_company_seeds`，用于后续发现和核验公司官网招聘入口，不虚构职位。
@@ -124,3 +124,73 @@ LinkedIn 默认 prompt 采用实测更能压低全球泛帖噪声的本地招聘
 - `radar` 子命令不调用 apply、表单填写、消息、简历上传或推荐历史写入；日报明确只是发现证据，不是已发布推荐。
 
 用户覆盖配置位于 `APPLYPILOT_DIR/radar.yaml`。若不存在，会优先复用真实存在的 `searches.yaml`，全新安装则使用包内新加坡雷达默认策略。只有在明确希望人工复核无地域说明的远程职位时，才应在 `radar.yaml` 设置 `allow_ambiguous_remote: true`。
+# Bounded employer exploration (September 2026)
+
+The daily radar now has three complementary paths: the existing official
+watchlist, cross-company LinkedIn/Indeed searches, and advancement of imported
+company/role leads. A source registry entry alone never starts discovery.
+
+From the local installation directory:
+
+```powershell
+.\run-radar.ps1 radar collect
+.\run-radar.ps1 radar explore --limit 5
+.\run-radar.ps1 radar explore --query "business analyst" --job-type internship --limit 5
+.\run-radar.ps1 radar advance --limit 5
+```
+
+`explore` defaults to two role queries rotating through the four fields, both
+platforms, and five retained leads per query/platform. Search fetches at most
+twice that number (capped at ten), then rotates employers before truncating.
+An agent may choose up to three
+queries and ten results, broaden a sparse field, or inspect a directory instead.
+These bounds limit effort; they do not assign employer quotas or change fit
+scores. Retain useful large-company monitoring and use a final shortlist of
+5–10 suitable jobs. Prefer unprocessed employers among equally suitable roles.
+
+Each board runs independently with one 30-second attempt. `partial`, `empty`
+and `error` describe that query; none implies exhaustive platform coverage.
+Company/title/source/description and employer targets retain their provenance.
+Missing company metadata is explicitly returned for review. Board results create
+unverified `radar_leads`, never verified `jobs` directly. Portal destinations
+such as MyCareersFuture are not silently treated as employer careers URLs.
+
+Use the returned `search_url` in the existing visible browser session when the
+API gives missing metadata, noisy/empty results or an access error. Read a small
+set of actual job cards, verify the selected location/type/date filters, then
+read job duties and the official link. Browser-visible review by the authorized
+agent can supply a JSON/CSV file to `run-radar.ps1 -AttendedReview radar
+import-leads --source-id linkedin-jobs` (or `indeed-jobs`); it does not require a
+human to review each record. Stop at CAPTCHA/security challenges. Social-content
+URL generation remains separate from Jobs search and is non-exhaustive.
+
+In the September 5 bounded live comparison, both APIs returned three records.
+LinkedIn's public search still returned experienced roles after an internship
+filter; the signed-in visible search showed four different internship results
+and confirmed its selected filters. Therefore HTTP success is not evidence that
+LinkedIn honored filters. Indeed's installed adapter cannot combine `hours_old`
+with `job_type`; explicit `--job-type` drops its time filter and records that
+limitation. The agent should verify dates on returned pages.
+
+For smaller employers and organizations, inspect a few CareerAxis/SGInnovate/
+Startup SG entries when a field is sparse, retain the directory URL, employer
+name and actual careers URL, and import via the existing source-specific command.
+`advance` consumes both role leads and company seeds with a shared small budget.
+It returns missing-link items separately with an explicit next action. Public
+JSON-LD verification can admit jobs through the existing official ingestion and
+fresh exact-URL reconciliation contract. Pages without usable structured job
+data remain pending for visible review or a supported official adapter; this is
+not a general-purpose ATS crawler. Seeing a directory entry is never a verified
+job or an application receipt.
+
+The same-score diversity preference also applies to batch authorization and
+worker acquisition. Recent means an actual attempt or application within 14
+days. Higher fit scores remain ahead, exact user-selected URLs remain exact,
+and no employer is excluded. A title without a known radar subtrack now remains
+available for duties-based assessment instead of being discarded. Existing
+location, admission, submission and Applied-snapshot checks still apply.
+
+The operational `applypilot-local/run-radar.ps1` is outside this repository.
+Deployments must allow `explore` and `advance` in its discovery command list and
+`linkedin-jobs`/`indeed-jobs` in its reviewed lead sources. It must still block
+application commands and constrain imports/reports to the workspace directories.

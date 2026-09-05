@@ -21,7 +21,7 @@ _ACCESS_MODES = {
     "public_manual_review",
     "public_directory",
 }
-_COLLECTION_MODES = {"manual_url_import", "public_company_seed"}
+_COLLECTION_MODES = {"manual_url_import", "public_company_seed", "bounded_job_search"}
 _OFFICIAL_URL_POLICY = "reject_ecosystem_hosts"
 _HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _COMPOUND_PUBLIC_SUFFIXES = {

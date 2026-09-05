@@ -12,7 +12,7 @@ def run_radar_main(runtime: ModuleType, values: dict[str, object]) -> None:
 
     _assert_discovery_only_command(
         ctx.invoked_subcommand,
-        {"collect", "queries", "import-leads", "import-company-seeds", "report"},
+        {"collect", "queries", "explore", "advance", "import-leads", "import-company-seeds", "report"},
     )
 
 
@@ -51,8 +51,32 @@ def run_radar_queries(runtime: ModuleType, values: dict[str, object]) -> None:
         table.add_row(item["track"], item["subtrack"], item["window"], item["url"])
     console.print(table)
     console.print(
-        "[dim]URLs are for visible, candidate-operated review. CapyPilot does not crawl LinkedIn.[/dim]"
+        "[dim]Content URLs require visible review. Use radar explore for bounded LinkedIn/Indeed Jobs searches.[/dim]"
     )
+
+
+def run_radar_explore(runtime: ModuleType, values: dict[str, object]) -> None:
+    """Search both boards independently, keeping results as unverified leads."""
+    from applypilot.database import get_connection
+    from applypilot.discovery.explore import explore_job_boards
+
+    runtime._radar_bootstrap()
+    result = explore_job_boards(
+        get_connection(), queries=values["query"],
+        sites=values["site"] or ("linkedin", "indeed"),
+        results_per_site=values["limit"],
+        job_type=values.get("job_type"),
+    )
+    runtime.console.print_json(data=result)
+
+
+def run_radar_advance(runtime: ModuleType, values: dict[str, object]) -> None:
+    """Advance a small pending queue through public employer verification."""
+    from applypilot.database import get_connection
+    from applypilot.discovery.advance import advance_radar_queue
+
+    runtime._radar_bootstrap()
+    runtime.console.print_json(data=advance_radar_queue(get_connection(), limit=values["limit"]))
 
 
 def run_radar_collect(runtime: ModuleType, values: dict[str, object]) -> None:
@@ -128,7 +152,7 @@ def run_radar_collect(runtime: ModuleType, values: dict[str, object]) -> None:
             result = collect_company(company_config)
             accepted_jobs = []
             location_title_filtered = 0
-            track_filtered = 0
+            unclassified = 0
             for job in result.get("jobs", []):
                 if not app_config.radar_location_is_accepted(
                     job.get("location"),
@@ -142,8 +166,7 @@ def run_radar_collect(runtime: ModuleType, values: dict[str, object]) -> None:
                     continue
                 subtracks = classify_job_subtracks(job.get("title"), query_config)
                 if not subtracks:
-                    track_filtered += 1
-                    continue
+                    unclassified += 1
                 accepted_job = dict(job)
                 accepted_job["subtracks"] = list(subtracks)
                 accepted_job["track_tags"] = list(subtracks)
@@ -165,7 +188,8 @@ def run_radar_collect(runtime: ModuleType, values: dict[str, object]) -> None:
                     "accepted_count": len(accepted_jobs),
                     "filtered_count": len(result.get("jobs", [])) - len(accepted_jobs),
                     "location_title_filtered_count": location_title_filtered,
-                    "track_filtered_count": track_filtered,
+                    "track_filtered_count": 0,
+                    "unclassified_count": unclassified,
                 },
             )
             reconciled = reconcile_radar_leads(conn, official_run_ids=[run_id])

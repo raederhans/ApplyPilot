@@ -143,6 +143,11 @@ def _build_standing_authorization_manifest(
                 "enrichment, scoring, and material-readiness steps before retrying `apply --url`."
             )
     else:
+        from applypilot.discovery.diversity import (
+            rank_company_diverse,
+            recent_handled_companies,
+        )
+
         # Scan a bounded superset so a portal/manual exclusion cannot consume
         # a standing-authorization slot.  The decision gate below remains the
         # single source of truth for final readiness.
@@ -158,6 +163,10 @@ def _build_standing_authorization_manifest(
             """,
             (minimum_fit_score, min(candidate_cap * 8, 80)),
         ).fetchall()
+        rows = rank_company_diverse(
+            [dict(row) for row in rows],
+            recent_companies=recent_handled_companies(conn),
+        )
 
     selected: list[dict] = []
     exact_blocker: dict[str, str] | None = None
@@ -959,6 +968,29 @@ def radar_queries(
             "subtrack": subtrack,
             "json_output": json_output,
         },
+    )
+
+
+@radar_app.command("explore")
+def radar_explore(
+    query: list[str] | None = typer.Option(None, "--query", help="Up to 3 role queries; defaults rotate daily."),
+    site: list[str] | None = typer.Option(None, "--site", help="linkedin or indeed; defaults to both."),
+    limit: int = typer.Option(5, "--limit", min=1, max=10, help="Results per query and platform."),
+    job_type: str | None = typer.Option(None, "--job-type", help="Optional internship/fulltime/parttime/contract filter."),
+) -> None:
+    """Discover new employers on LinkedIn/Indeed; retain unverified leads."""
+    return _command_module("radar").run_radar_explore(
+        sys.modules[__name__], {"query": query, "site": site, "limit": limit, "job_type": job_type},
+    )
+
+
+@radar_app.command("advance")
+def radar_advance(
+    limit: int = typer.Option(5, "--limit", min=1, max=10, help="Maximum pending items to verify."),
+) -> None:
+    """Verify pending employer links before admitting discovered jobs."""
+    return _command_module("radar").run_radar_advance(
+        sys.modules[__name__], {"limit": limit},
     )
 
 

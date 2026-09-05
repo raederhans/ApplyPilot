@@ -236,6 +236,15 @@ def acquire_job(
                   {url_clauses}
                 ORDER BY fit_score DESC, url
             """, [max_apply_attempts] + params).fetchall()
+            from applypilot.discovery.diversity import (
+                rank_company_diverse,
+                recent_handled_companies,
+            )
+
+            rows = rank_company_diverse(
+                [dict(candidate) for candidate in rows],
+                recent_companies=recent_handled_companies(conn),
+            )
         acquisition_performance["candidate_fetch_ms"] = _elapsed_ms(phase_started)
         acquisition_performance["candidate_rows"] = len(rows)
 

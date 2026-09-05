@@ -139,6 +139,120 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     return config.location_is_accepted(location, accept, reject, keep_unknown=True)
 
 
+# -- Bounded job-board search -----------------------------------------------
+
+def _clean_jobspy_value(value):
+    """Return a JSON-friendly scalar, treating pandas/numpy missing values as absent."""
+    if value is None:
+        return None
+    try:
+        import pandas as pd
+
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _normalize_job_board_rows(df, limit: int) -> list[dict]:
+    """Normalize JobSpy rows without persisting them."""
+    jobs: list[dict] = []
+    for raw in df.to_dict(orient="records"):
+        url = _clean_jobspy_value(raw.get("job_url"))
+        title = _clean_jobspy_value(raw.get("title"))
+        if not url or not str(url).strip() or not title or not str(title).strip():
+            continue
+
+        company = _clean_jobspy_value(raw.get("company"))
+        description = _clean_jobspy_value(raw.get("description"))
+        job = {
+            "url": str(url),
+            "title": str(title),
+            "company_name": str(company) if company else None,
+            "location": (
+                str(clean_location)
+                if (clean_location := _clean_jobspy_value(raw.get("location"))) is not None
+                else None
+            ),
+            "full_description": str(description) if description else None,
+            "application_url": (
+                str(clean_apply_url)
+                if (clean_apply_url := _clean_jobspy_value(raw.get("job_url_direct"))) is not None
+                else None
+            ),
+        }
+        if not company:
+            job["quality_issues"] = ["missing_company_name"]
+        jobs.append(job)
+        if len(jobs) >= limit:
+            break
+    return jobs
+
+
+def search_job_board(
+    query: str,
+    site: str,
+    *,
+    location: str = "Singapore",
+    country: str = "Singapore",
+    results_per_site: int = 10,
+    hours_old: int = 168,
+    timeout_seconds: float = 30,
+    job_type: str | None = None,
+) -> dict:
+    """Run one bounded LinkedIn or Indeed search without writing to the database."""
+    normalized_site = site.strip().lower()
+    if normalized_site not in {"linkedin", "indeed"}:
+        raise ValueError("site must be 'linkedin' or 'indeed'")
+    if results_per_site < 1:
+        raise ValueError("results_per_site must be at least 1")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than 0")
+    if job_type not in {None, "internship", "fulltime", "parttime", "contract"}:
+        raise ValueError("unsupported job_type")
+
+    kwargs = {
+        "site_name": [normalized_site],
+        "search_term": query,
+        "location": location,
+        "results_wanted": results_per_site,
+        "hours_old": hours_old,
+        "description_format": "markdown",
+        "verbose": 0,
+    }
+    if normalized_site == "linkedin":
+        kwargs["linkedin_fetch_description"] = True
+    else:
+        kwargs["country_indeed"] = country
+    if job_type:
+        kwargs["job_type"] = job_type
+        # JobSpy's Indeed adapter ignores job_type when hours_old is supplied.
+        # An explicit caller-selected type takes precedence over the time filter.
+        if normalized_site == "indeed":
+            kwargs.pop("hours_old")
+
+    response = {
+        "site": normalized_site,
+        "query": query,
+        "status": "error",
+        "jobs": [],
+        "raw_count": 0,
+        "error": None,
+        "coverage": "non_exhaustive",
+    }
+    try:
+        df = _scrape_once_with_timeout(kwargs, float(timeout_seconds))
+    except Exception as exc:
+        response["error"] = f"{type(exc).__name__}: {exc}"
+        return response
+
+    response["raw_count"] = len(df)
+    response["jobs"] = _normalize_job_board_rows(df, results_per_site)
+    response["status"] = "partial" if response["jobs"] else "empty"
+    return response
+
+
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
 def store_jobspy_results(
@@ -243,69 +357,61 @@ def _run_one_search(
     if "tier" in s:
         label += f" [tier {s['tier']}]"
 
-    # Split sites: Glassdoor needs simplified location, others use original
+    # Glassdoor needs a simplified location; every board still gets its own
+    # request so one platform failure cannot hide another platform's results.
     gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
-    has_glassdoor = "glassdoor" in sites
-    other_sites = [si for si in sites if si != "glassdoor"]
-
     all_dfs = []
+    site_statuses: dict[str, dict] = {}
+    timeout_seconds = float(defaults.get("query_timeout_seconds", 150))
 
-    # Run non-Glassdoor sites with original location
-    if other_sites:
+    for site in sites:
+        site_location = gd_location if site == "glassdoor" else s["location"]
         kwargs = {
-            "site_name": other_sites,
+            "site_name": [site],
             "search_term": s["query"],
-            "location": s["location"],
+            "location": site_location,
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
-            "country_indeed": defaults.get("country_indeed", "usa"),
             "verbose": 0,
         }
+        if site == "indeed":
+            kwargs["country_indeed"] = defaults.get("country_indeed", "usa")
         if s.get("remote"):
             kwargs["is_remote"] = True
         if proxy_config:
             kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
+        if site == "linkedin":
             kwargs["linkedin_fetch_description"] = True
         try:
             df = _scrape_with_retry(
                 kwargs,
                 max_retries=max_retries,
-                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
+                timeout_seconds=timeout_seconds,
             )
             all_dfs.append(df)
+            count = len(df)
+            site_statuses[site] = {
+                "status": "partial" if count else "empty",
+                "total": count,
+                "error": None,
+                "coverage": "non_exhaustive",
+            }
         except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
-
-    # Run Glassdoor separately with simplified location
-    if has_glassdoor:
-        gd_kwargs = {
-            "site_name": ["glassdoor"],
-            "search_term": s["query"],
-            "location": gd_location,
-            "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
-            "verbose": 0,
-        }
-        if s.get("remote"):
-            gd_kwargs["is_remote"] = True
-        if proxy_config:
-            gd_kwargs["proxies"] = [proxy_config["jobspy"]]
-        try:
-            gd_df = _scrape_with_retry(
-                gd_kwargs,
-                max_retries=max_retries,
-                timeout_seconds=float(defaults.get("query_timeout_seconds", 150)),
-            )
-            all_dfs.append(gd_df)
-        except Exception as e:
-            log.error("[%s] (glassdoor): %s", label, e)
+            site_statuses[site] = {
+                "status": "error",
+                "total": 0,
+                "error": f"{type(e).__name__}: {e}",
+                "coverage": "non_exhaustive",
+            }
+            log.error("[%s] (%s): %s", label, site, e)
 
     if not all_dfs:
         log.error("[%s]: all sites failed", label)
-        return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
+        return {
+            "new": 0, "existing": 0, "errors": len(site_statuses),
+            "filtered": 0, "total": 0, "label": label, "sites": site_statuses,
+        }
 
     import pandas as pd
 
@@ -315,7 +421,11 @@ def _run_one_search(
 
     if len(df) == 0:
         log.info("[%s] 0 results", label)
-        return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
+        return {
+            "new": 0, "existing": 0,
+            "errors": sum(item["status"] == "error" for item in site_statuses.values()),
+            "filtered": 0, "total": 0, "label": label, "sites": site_statuses,
+        }
 
     # Filter by location before storing
     before = len(df)
@@ -339,7 +449,11 @@ def _run_one_search(
         msg += f", {filtered} filtered (location)"
     log.info(msg)
 
-    return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
+    return {
+        "new": new, "existing": existing,
+        "errors": sum(item["status"] == "error" for item in site_statuses.values()),
+        "filtered": filtered, "total": before, "label": label, "sites": site_statuses,
+    }
 
 
 # -- Single query search -----------------------------------------------------
