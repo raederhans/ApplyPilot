@@ -54,7 +54,7 @@ _REQUIRED_MARKERS = re.compile(
     r"(?i)\b(?:must|required|requirements?|qualifications?|you have|proficien(?:t|cy)|experience with)\b"
 )
 _PREFERRED_MARKERS = re.compile(
-    r"(?i)\b(?:preferred|nice to have|bonus|plus|ideally)\b"
+    r"(?i)\b(?:preferred|optional|nice to have|bonus|plus|ideally)\b"
 )
 
 _KNOWN_SKILLS = {
@@ -90,6 +90,82 @@ _KNOWN_SKILLS = {
     "product management",
     "stakeholder management",
 }
+
+
+def _requirement_marker_events(text: str) -> list[tuple[int, int, str]]:
+    """Return non-negated requirement/preference markers in textual order."""
+    events: list[tuple[int, int, str]] = []
+    for marker, kind in (
+        (_PREFERRED_MARKERS, "preferred"),
+        (_REQUIRED_MARKERS, "required"),
+    ):
+        for match in marker.finditer(text):
+            prefix = text[max(0, match.start() - 16):match.start()]
+            if re.search(r"(?i)\b(?:not|no)\s+$", prefix):
+                continue
+            events.append((match.start(), match.end(), kind))
+    return sorted(events)
+
+
+def _marker_introduces_skill(text: str, event: tuple[int, int, str]) -> bool:
+    """Whether a marker is a prefix for the immediately following skill."""
+    marker_start, marker_end, _ = event
+    suffix = text[marker_end:]
+    if not any(
+        re.match(rf"\s*(?:[:,\-]\s*)?{re.escape(skill)}(?!\w)", suffix)
+        for skill in _KNOWN_SKILLS
+    ):
+        return False
+    clause_start = max(text.rfind(";", 0, marker_start), text.rfind(",", 0, marker_start)) + 1
+    return not _has_known_skill_between(text, clause_start, marker_start)
+
+
+def _marker_is_broad_list_introducer(text: str, event: tuple[int, int, str]) -> bool:
+    """Return whether a marker can legitimately govern a whole skill list."""
+    return text[event[0]:event[1]].casefold() in {
+        "experience with",
+        "proficient",
+        "proficiency",
+    }
+
+
+def _has_known_skill_between(text: str, start: int, end: int) -> bool:
+    """Return whether another known skill separates two markers."""
+    between = text[start:end]
+    return any(
+        re.search(rf"(?<!\w){re.escape(skill)}(?!\w)", between)
+        for skill in _KNOWN_SKILLS
+    )
+
+
+def _skill_requirement_status(line: str, skill: str) -> str | None:
+    """Classify one skill from its nearest explicit requirement marker.
+
+    A generic ``experience with`` prefix must not turn a trailing
+    ``preferred but not required`` list into hard requirements. Conversely,
+    a marker that directly introduces a later skill must not override a
+    preceding marker for this skill.
+    """
+    normalized = _normalise_text(line)
+    match = re.search(rf"(?<!\w){re.escape(skill)}(?!\w)", normalized)
+    if match is None:
+        return None
+    events = _requirement_marker_events(normalized)
+    following = [event for event in events if event[0] >= match.end()]
+    preceding = [event for event in events if event[1] <= match.start()]
+    if following and not _marker_introduces_skill(normalized, following[0]):
+        prior = preceding[-1] if preceding else None
+        if (
+            prior is not None
+            and prior[2] != following[0][2]
+            and _marker_introduces_skill(normalized, prior)
+            and not _marker_is_broad_list_introducer(normalized, prior)
+            and _has_known_skill_between(normalized, match.end(), following[0][0])
+        ):
+            return prior[2]
+        return following[0][2]
+    return preceding[-1][2] if preceding else None
+
 
 _DELIVERABLE_TERMS = {
     "dashboard",
@@ -506,10 +582,14 @@ def extract_job_profile(
         if not _contains_phrase(combined, skill):
             continue
         mentioned.add(skill)
-        skill_lines = [line for line in sentences if _contains_phrase(_normalise_text(line), skill)]
-        if any(_REQUIRED_MARKERS.search(line) for line in skill_lines):
+        skill_statuses = {
+            _skill_requirement_status(line, skill)
+            for line in sentences
+            if _contains_phrase(_normalise_text(line), skill)
+        }
+        if "required" in skill_statuses:
             required.add(skill)
-        elif any(_PREFERRED_MARKERS.search(line) for line in skill_lines):
+        elif "preferred" in skill_statuses:
             preferred.add(skill)
 
     deliverables = sorted(term for term in _DELIVERABLE_TERMS if _contains_phrase(combined, term))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 
 from applypilot.apply.application_sessions import ContextBundle
@@ -24,6 +25,12 @@ from applypilot.apply.semantic_batch import (
 
 ADAPTER_VERSION = "playwright-semantic-batch/v1"
 _ROUTINE_KINDS = frozenset({"text", "native_select", "custom_combobox"})
+_ROUTINE_LABEL_PATTERNS = {
+    "country": re.compile(r"^country(?:\s*/\s*region|\s+or\s+region)?$", re.IGNORECASE),
+}
+_ROUTINE_ALIAS_SOURCE_SEMANTICS = {
+    "country": frozenset({"location"}),
+}
 
 
 def inspection_signature(inspection: FormInspection) -> str:
@@ -120,7 +127,11 @@ class PlaywrightProductionSemanticBatchAdapter:
 
     def control_for(self, field_semantic: str) -> BatchControlDescriptor:
         inspection = self._inspect()
-        matches = [descriptor for descriptor in inspection.controls if descriptor.semantic == field_semantic]
+        matches = [
+            descriptor
+            for descriptor in inspection.controls
+            if self._matches_semantic(descriptor, field_semantic)
+        ]
         if len(matches) != 1:
             raise SemanticBatchDenied("routine semantic control is absent or ambiguous")
         descriptor = matches[0]
@@ -156,7 +167,8 @@ class PlaywrightProductionSemanticBatchAdapter:
         matches = [
             descriptor
             for descriptor in inspection.controls
-            if descriptor.descriptor_id == control.control_id and descriptor.semantic == control.field_semantic
+            if descriptor.descriptor_id == control.control_id
+            and self._matches_semantic(descriptor, control.field_semantic)
         ]
         if len(matches) != 1:
             raise SemanticBatchDenied("semantic batch descriptor drifted before write")
@@ -185,7 +197,11 @@ class PlaywrightProductionSemanticBatchAdapter:
         for semantic, initial in self._initial.items():
             request = self._requests.get(semantic)
             if request is None:
-                matches = [descriptor for descriptor in inspection.controls if descriptor.semantic == semantic]
+                matches = [
+                    descriptor
+                    for descriptor in inspection.controls
+                    if self._matches_semantic(descriptor, semantic)
+                ]
                 if len(matches) != 1 or self._classification(matches[0]) != "routine":
                     return False
                 request = self._request(matches[0], self._values[semantic])
@@ -220,6 +236,21 @@ class PlaywrightProductionSemanticBatchAdapter:
         if descriptor.kind not in _ROUTINE_KINDS or descriptor.stateful or not descriptor.writable:
             return "sensitive"
         return "routine"
+
+    @staticmethod
+    def _matches_semantic(descriptor: ControlDescriptor, field_semantic: str) -> bool:
+        if descriptor.semantic == field_semantic:
+            return True
+        pattern = _ROUTINE_LABEL_PATTERNS.get(field_semantic)
+        admitted_sources = _ROUTINE_ALIAS_SOURCE_SEMANTICS.get(field_semantic)
+        if pattern is None or admitted_sources is None or descriptor.semantic not in admitted_sources:
+            return False
+        label = " ".join(descriptor.label.replace("*", " ").replace("✱", " ").split())
+        if descriptor.kind == "native_select" and descriptor.options:
+            option_suffix = " ".join(" ".join(descriptor.options).split())
+            if label.endswith(f" {option_suffix}"):
+                label = label[: -(len(option_suffix) + 1)].rstrip()
+        return pattern.fullmatch(label) is not None
 
     @staticmethod
     def _request(descriptor: ControlDescriptor, value: str) -> SemanticControlRequest:

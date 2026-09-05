@@ -38,6 +38,13 @@ EMAIL_SELECTORS = (
     'input[name*="email" i]',
     'input[id*="email" i]',
 )
+EMAIL_LABEL_FALLBACK_SELECTOR = (
+    'input:not([type]), input[type="text"], input[type="email"]'
+)
+EMAIL_LABEL_RE = re.compile(
+    r"^email(?:\s+address)?(?:\s*[:：*✱])*$",
+    re.IGNORECASE,
+)
 PASSWORD_SELECTORS = (
     'input[type="password"]',
     'input[autocomplete="new-password"]',
@@ -305,6 +312,34 @@ def _visible_locators(frame: Frame, selectors: tuple[str, ...]) -> list[Locator]
 def _visible_locator(frame: Frame, selectors: tuple[str, ...]) -> Locator | None:
     visible = _visible_locators(frame, selectors)
     return visible[0] if visible else None
+
+
+def _visible_accessible_email_locator(frame: Frame) -> Locator | None:
+    """Return one text-like input whose accessible label is exactly email."""
+
+    matches: list[Locator] = []
+    for candidate in _visible_locators(frame, (EMAIL_LABEL_FALLBACK_SELECTOR,)):
+        try:
+            label = candidate.evaluate(
+                r"""element => {
+                  const labelledBy = String(element.getAttribute('aria-labelledby') || '')
+                    .trim().split(/\s+/).filter(Boolean)
+                    .map(id => document.getElementById(id)?.innerText || '')
+                    .filter(Boolean).join(' ');
+                  if (labelledBy) return labelledBy;
+                  const ariaLabel = String(element.getAttribute('aria-label') || '').trim();
+                  if (ariaLabel) return ariaLabel;
+                  return [...(element.labels || [])]
+                    .map(label => label.innerText || label.textContent || '')
+                    .filter(Boolean).join(' ');
+                }"""
+            )
+        except Exception:  # noqa: BLE001, S112 - detached fields are expected during navigation
+            continue
+        normalized = " ".join(str(label or "").split())
+        if EMAIL_LABEL_RE.fullmatch(normalized):
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _fill_password_fields(password_fields: list[Locator], password: str) -> int:
@@ -654,6 +689,8 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                     if field in {"email", "both"}
                     else None
                 )
+                if email_locator is None and field in {"email", "both"}:
+                    email_locator = _visible_accessible_email_locator(frame)
                 password_locators = (
                     _visible_locators(frame, PASSWORD_SELECTORS)
                     if field in {"password", "both"}

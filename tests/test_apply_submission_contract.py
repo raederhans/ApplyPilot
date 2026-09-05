@@ -42,6 +42,26 @@ FIXTURES = Path(__file__).parent / "fixtures" / "apply"
 NOW = datetime(2026, 8, 24, 9, 30, tzinfo=UTC)
 
 
+def _write_resume_pdf(path: Path, text: str) -> None:
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+    })
+    stream = DecodedStreamObject()
+    stream.set_data(f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii"))
+    page[NameObject("/Contents")] = stream
+    writer.write(path)
+
+
 def _job(url: str = "https://careers.example.test/jobs/data") -> dict:
     return {
         "url": url,
@@ -246,9 +266,9 @@ def test_standing_authorization_rejects_stale_profile_resume_without_mutating_jo
     conn = init_db(tmp_path / "standing-stale-profile.db")
     job = _job()
     resume = tmp_path / "stale.pdf"
-    resume.write_bytes(b"%PDF-stale-profile")
+    _write_resume_pdf(resume, "University of Pennsylvania, GPA: 3.6")
     resume.with_suffix(".txt").write_text(
-        "University of Pennsylvania, GPA: 3.6",
+        "University of Pennsylvania, GPA: 3.46",
         encoding="utf-8",
     )
     _insert_ready_job(conn, job, resume)
@@ -290,9 +310,9 @@ def test_authorize_batch_rejects_stale_profile_resume_without_mutating_job(
     conn = init_db(tmp_path / "authorize-stale-profile.db")
     job = _job()
     resume = tmp_path / "stale.pdf"
-    resume.write_bytes(b"%PDF-stale-profile")
+    _write_resume_pdf(resume, "University of Pennsylvania, GPA: 3.6")
     resume.with_suffix(".txt").write_text(
-        "University of Pennsylvania, GPA: 3.6",
+        "University of Pennsylvania, GPA: 3.46",
         encoding="utf-8",
     )
     _insert_ready_job(conn, job, resume)

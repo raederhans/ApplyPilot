@@ -160,6 +160,113 @@ def test_schema_and_job_profile_use_fine_grained_subtype(tmp_path: Path) -> None
     assert profile["required_skills"] == ["sql"]
 
 
+def test_job_profile_does_not_promote_trailing_preferred_skills_to_required() -> None:
+    profile = extract_job_profile(
+        {
+            "url": "https://example.test/temasek-data",
+            "title": "Data Analytics Intern",
+            "full_description": (
+                "Requirements: Proficiency in Python, R, and SQL. "
+                "Experience with AWS, S3, JFrog, Kubernetes preferred. "
+                "Experience with QlikSense, Snowflake, Tableau, and Git preferred but not required."
+            ),
+        },
+        {},
+    )
+
+    assert profile["required_skills"] == ["python", "r", "sql"]
+    assert profile["preferred_skills"] == ["aws", "git", "tableau"]
+
+
+def test_route_does_not_turn_preferred_skills_into_hard_gaps(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("Python, R, and SQL analytics experience.", encoding="utf-8")
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        content="DATA ANALYST\nPython, R, and SQL. Built analytics dashboards.",
+    )
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    route = route_resume_for_job(
+        conn,
+        {
+            "url": "https://example.test/temasek-data-route",
+            "title": "Data Analytics Intern",
+            "full_description": (
+                "Proficiency in Python, R, and SQL. "
+                "Experience with AWS, S3, JFrog, Kubernetes preferred. "
+                "Experience with QlikSense, Snowflake, Tableau, and Git preferred but not required."
+            ),
+            "eligibility_status": "eligible",
+        },
+        profile,
+    )
+
+    assert route["hard_gaps"] == []
+    assert route["job_profile"]["required_skills"] == ["python", "r", "sql"]
+
+
+def test_job_profile_keeps_explicit_required_clauses_after_preferred_clauses() -> None:
+    profile = extract_job_profile(
+        {
+            "url": "https://example.test/mixed-requirements",
+            "title": "Data Analytics Intern",
+            "full_description": (
+                "AWS is preferred but not required. "
+                "Python and SQL are required for this internship."
+            ),
+        },
+        {},
+    )
+
+    assert profile["required_skills"] == ["python", "sql"]
+    assert profile["preferred_skills"] == ["aws"]
+
+
+def test_job_profile_treats_same_clause_preferred_and_required_by_nearest_marker() -> None:
+    profile = extract_job_profile(
+        {
+            "url": "https://example.test/mixed-clause",
+            "title": "Data Analytics Intern",
+            "full_description": "AWS is preferred, but Python and SQL are required.",
+        },
+        {},
+    )
+
+    assert profile["required_skills"] == ["python", "sql"]
+    assert profile["preferred_skills"] == ["aws"]
+
+
+@pytest.mark.parametrize(
+    ("description", "required", "preferred"),
+    [
+        ("Required Python, preferred AWS.", ["python"], ["aws"]),
+        ("Python is required; AWS preferred.", ["python"], ["aws"]),
+        ("Python is not preferred but is required.", ["python"], []),
+        ("Preferred Python, SQL is required.", ["sql"], ["python"]),
+        ("Python optional, SQL required.", ["sql"], ["python"]),
+    ],
+)
+def test_job_profile_honors_prefix_and_negated_requirement_markers(
+    description: str, required: list[str], preferred: list[str]
+) -> None:
+    profile = extract_job_profile(
+        {
+            "url": "https://example.test/marker-boundaries",
+            "title": "Data Analytics Intern",
+            "full_description": description,
+        },
+        {},
+    )
+
+    assert profile["required_skills"] == required
+    assert profile["preferred_skills"] == preferred
+
+
 def test_senior_or_high_experience_role_is_routed_after_fit_scoring(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "library.db")
     base = tmp_path / "base.txt"

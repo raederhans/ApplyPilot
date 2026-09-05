@@ -46,3 +46,38 @@ def test_credential_relay_hosts_do_not_gain_detection_or_write_capabilities() ->
     assert host_supports_credential_relay("tenant.icims.com") is True
     assert provider_for_url("https://tenant.icims.com/apply", "detection") is None
     assert provider_for_url("https://tenant.icims.com/apply", "semantic_upload") is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://career2.successfactors.eu/careers?company=temasekcapP2",
+        "https://careersd2.successfactors.eu/career?company=ACEEU95",
+    ],
+)
+def test_successfactors_eu_is_credential_relay_only(url: str) -> None:
+    assert provider_for_url(url, "credential_relay") == "successfactors"
+    assert provider_for_url(url, "detection") is None
+    assert provider_for_url(url, "semantic_upload") is None
+    assert provider_for_url(url, "control_write") is None
+    assert provider_for_url(url, "linkedin_external_handoff") is None
+    assert provider_supports("successfactors", "application_episode") is False
+
+
+def test_successfactors_eu_credential_relay_requires_https() -> None:
+    assert provider_for_url(
+        "http://career2.successfactors.eu/careers?company=temasekcapP2",
+        "credential_relay",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "successfactors.eu.evil.test",
+        "notsuccessfactors.eu",
+        "successfactors-eu.example",
+    ],
+)
+def test_successfactors_eu_spoof_suffixes_are_rejected(hostname: str) -> None:
+    assert host_supports_credential_relay(hostname) is False

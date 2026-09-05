@@ -8,8 +8,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from applypilot.apply.authorization import compute_file_binding, compute_job_fingerprint
-from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.apply.authorization import (
+    compute_file_binding,
+    compute_job_fingerprint,
+    resolve_resume_attachment,
+)
 from applypilot.scoring.validator import current_profile_resume_fact_errors
 
 _KNOWN_LABELS = {
@@ -41,28 +44,26 @@ def evaluate_profile_resume_fact_freshness(
     if not raw_path:
         return {"state": "resume_missing", "fact_errors": []}
 
-    path = Path(raw_path).expanduser()
-    if not path.is_file():
+    try:
+        # Match the submission pipeline: tailored_resume_path frequently names
+        # its editable .txt source, while the sibling PDF is what is uploaded.
+        path = resolve_resume_attachment(dict(job))
+    except (OSError, RuntimeError, ValueError):
         return {"state": "resume_unavailable", "fact_errors": []}
 
     try:
-        if path.suffix.casefold() == ".pdf":
-            text_sidecar = path.with_suffix(".txt")
-            if text_sidecar.is_file():
-                text = read_resume_source(text_sidecar)
-            else:
-                try:
-                    from pypdf import PdfReader
+        # The PDF is the uploadable, byte-bound material. A neighbouring text
+        # sidecar can be stale or generated from another revision, so it must
+        # not override facts extracted from the actual PDF.
+        from pypdf import PdfReader
 
-                    text = "\n".join(
-                        page.extract_text() or "" for page in PdfReader(path).pages
-                    )
-                except Exception:  # noqa: BLE001 - legacy PDFs may not expose text
-                    return {"state": "resume_text_unavailable", "fact_errors": []}
-        else:
-            text = read_resume_source(path)
-    except (OSError, TypeError, ValueError):
-        return {"state": "resume_unreadable", "fact_errors": []}
+        text = "\n".join(
+            page.extract_text() or "" for page in PdfReader(path).pages
+        )
+    except Exception:  # noqa: BLE001 - legacy PDFs may not expose text
+        return {"state": "resume_text_unavailable", "fact_errors": []}
+    if not text.strip():
+        return {"state": "resume_text_unavailable", "fact_errors": []}
 
     errors = current_profile_resume_fact_errors(text, dict(profile))
     return {

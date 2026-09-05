@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Local ATS semantic batch fixture</title>
+  </head>
+  <body>
+    <form id="application">
+      <label>Email <input id="email" name="email" type="email" required></label>
+      <label>
+        Country
+        <select id="country" name="country" required>
+          <option value="">Choose</option>
+          <option value="sg">Singapore</option>
+          <option value="us">United States</option>
+        </select>
+      </label>
+      <label><input id="legal" name="legal" type="checkbox" required> I accept the legal declaration</label>
+      <label>Resume <input id="resume" name="resume" type="file" accept="application/pdf" required></label>
+      <div
+        id="department"
+        role="combobox"
+        aria-label="Department"
+        aria-controls="department-options"
+        aria-expanded="true"
+      ></div>
+      <div id="department-options" role="listbox">
+        <div id="engineering" role="option">Engineering</div>
+      </div>
+      <button id="submit" type="submit">Submit</button>
+    </form>
+    <script>
+      window.fixtureEvents = [];
+      for (const eventName of ['input', 'change', 'click', 'submit']) {
+        document.addEventListener(eventName, (event) => {
+          window.fixtureEvents.push({eventName, id: event.target.id || ''});
+          if (eventName === 'submit') event.preventDefault();
+        });
+      }
+      document.querySelector('#engineering').addEventListener('click', () => {
+        document.querySelector('#department').setAttribute('aria-valuetext', 'Engineering');
+      });
+      window.removeSingaporeOption = () => document.querySelector('#country option[value="sg"]').remove();
+      window.armEmailPostconditionDrift = () => {
+        document.querySelector('#email').addEventListener('change', (event) => {
+          const input = event.currentTarget;
+          queueMicrotask(() => {
+            input.value = '';
+          });
+        }, {once: true});
+      };
+    </script>
+  </body>
+</html>

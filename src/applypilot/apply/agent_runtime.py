@@ -146,6 +146,16 @@ CONTROL_REPORT_ENV_VARS = (
     "APPLYPILOT_AGENT_RUN_ID",
     "APPLYPILOT_TOOL_BROKER_MODE",
 )
+
+
+def _project_python_mcp_env_vars(env_vars: tuple[str, ...]) -> list[str]:
+    """Keep project-owned Python MCPs on the caller-selected source tree."""
+
+    if os.environ.get("PYTHONPATH"):
+        return [*env_vars, "PYTHONPATH"]
+    return list(env_vars)
+
+
 DEFAULT_MAILBOX_BLOCKED_TOOLS = (
     "draft_email",
     "modify_email",
@@ -754,7 +764,7 @@ def build_agent_command(
             "-c", f"mcp_servers.credential_relay.args={_toml_value(['-m', 'applypilot.apply.credential_relay_mcp'])}",
             "-c", (
                 "mcp_servers.credential_relay.env_vars="
-                f"{_toml_value(list(CREDENTIAL_RELAY_ENV_VARS))}"
+                f"{_toml_value(_project_python_mcp_env_vars(CREDENTIAL_RELAY_ENV_VARS))}"
             ),
             "-c", "mcp_servers.credential_relay.required=true",
             "-c", "mcp_servers.credential_relay.startup_timeout_sec=20",
@@ -767,7 +777,7 @@ def build_agent_command(
         "-c", f"mcp_servers.applypilot_ats.args={_toml_value(['-m', 'applypilot.apply.ats_tools_mcp'])}",
         "-c", (
             "mcp_servers.applypilot_ats.env_vars="
-            f"{_toml_value(list(APPLICATION_TOOL_ENV_VARS))}"
+            f"{_toml_value(_project_python_mcp_env_vars(APPLICATION_TOOL_ENV_VARS))}"
         ),
         "-c", "mcp_servers.applypilot_ats.startup_timeout_sec=20",
         "-c", "mcp_servers.applypilot_ats.tool_timeout_sec=20",
@@ -779,7 +789,7 @@ def build_agent_command(
         "-c", f"mcp_servers.applypilot_control.args={_toml_value(['-m', 'applypilot.apply.agent_report_mcp'])}",
         "-c", (
             "mcp_servers.applypilot_control.env_vars="
-            f"{_toml_value(list(CONTROL_REPORT_ENV_VARS))}"
+            f"{_toml_value(_project_python_mcp_env_vars(CONTROL_REPORT_ENV_VARS))}"
         ),
         "-c", "mcp_servers.applypilot_control.startup_timeout_sec=20",
         "-c", "mcp_servers.applypilot_control.tool_timeout_sec=20",

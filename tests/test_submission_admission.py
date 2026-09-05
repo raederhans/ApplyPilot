@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -145,14 +147,26 @@ def test_missing_surface_policy_preserves_normal_channels() -> None:
 
 
 def test_admission_rejects_current_profile_fact_conflict_without_writing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    resume = tmp_path / "stale.pdf"
-    resume.write_bytes(b"%PDF-stale-sidecar")
-    resume.with_suffix(".txt").write_text(
+    resume = tmp_path / "stale.txt"
+    resume.write_text(
         "University of Pennsylvania, GPA: 3.6",
         encoding="utf-8",
     )
+    uploaded = resume.with_suffix(".pdf")
+    uploaded.write_bytes(b"%PDF-stale-upload")
+
+    class Page:
+        def extract_text(self) -> str:
+            return "University of Pennsylvania, GPA: 3.6"
+
+    class Reader:
+        def __init__(self, path: Path) -> None:
+            assert path == uploaded
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=Reader))
     profile = _profile()
     profile["education"] = [
         {
@@ -172,6 +186,65 @@ def test_admission_rejects_current_profile_fact_conflict_without_writing(
     freshness = result["metadata"]["profile_resume_fact_freshness"]
     assert freshness["state"] == "stale_profile_fact"
     assert "current profile records 3.46" in freshness["fact_errors"][0]
+
+
+def test_admission_reads_actual_pdf_not_conflicting_text_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resume = tmp_path / "actual.pdf"
+    source = resume.with_suffix(".txt")
+    source.write_text(
+        "University of Pennsylvania, GPA: 3.46",
+        encoding="utf-8",
+    )
+    resume.write_bytes(b"%PDF-actual-upload")
+
+    class Page:
+        def extract_text(self) -> str:
+            return "University of Pennsylvania, GPA: 3.6"
+
+    class Reader:
+        def __init__(self, path: Path) -> None:
+            assert path == resume
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=Reader))
+    profile = _profile()
+    profile["education"] = [{
+        "institution": "University of Pennsylvania",
+        "gpa": "3.46/4.0",
+        "gpa_may_be_disclosed": True,
+    }]
+
+    result = evaluate_submission_admission(
+        _job(tailored_resume_path=str(source)), profile, minimum_fit_score=6
+    )
+
+    assert result["admitted"] is False
+    assert result["reason"].startswith("stale_profile_fact:")
+    assert result["metadata"]["profile_resume_fact_freshness"]["state"] == (
+        "stale_profile_fact"
+    )
+
+
+def test_admission_does_not_label_image_only_pdf_as_fresh(
+    tmp_path: Path,
+) -> None:
+    from pypdf import PdfWriter
+
+    resume = tmp_path / "image-only.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(resume)
+
+    result = evaluate_submission_admission(
+        _job(tailored_resume_path=str(resume)), _profile(), minimum_fit_score=6
+    )
+
+    assert result["metadata"]["profile_resume_fact_freshness"] == {
+        "state": "resume_text_unavailable",
+        "fact_errors": [],
+    }
 
 
 def test_admission_keeps_unavailable_resume_distinct_from_stale_fact() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -178,6 +179,95 @@ def test_playwright_adapter_never_exposes_navigation_as_routine(
     control = adapter.control_for("page_progress")
 
     assert control.classification == "navigation"
+
+
+def test_playwright_adapter_binds_country_plan_to_inspector_location_descriptor(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, inspection = _context_and_inspection(tmp_path, kind="native_select")
+    country = replace(
+        inspection.controls[0],
+        semantic="location",
+        label="Country Choose Singapore United States",
+        options=("Choose", "Singapore", "United States"),
+    )
+    inspection = replace(inspection, controls=(country,))
+    _Driver.values = {}
+    _Driver.perform_calls = 0
+    monkeypatch.setattr(adapter_mod, "inspect_form_surfaces", lambda *_a, **_k: inspection)
+    monkeypatch.setattr(adapter_mod, "PlaywrightSemanticControlDriver", _Driver)
+    adapter = adapter_mod.PlaywrightProductionSemanticBatchAdapter(
+        _Page(),
+        context,
+        provider="workday",
+        values={"country": "Singapore"},
+        validate_authority=lambda: None,
+    )
+
+    control = adapter.control_for("country")
+
+    assert control.classification == "routine"
+    assert control.control_id == country.descriptor_id
+
+
+def test_playwright_adapter_does_not_alias_country_code_ordinary_text(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, inspection = _context_and_inspection(tmp_path)
+    unrelated = replace(
+        inspection.controls[0],
+        semantic="ordinary_text",
+        label="Country code for phone",
+    )
+    inspection = replace(inspection, controls=(unrelated,))
+    monkeypatch.setattr(adapter_mod, "inspect_form_surfaces", lambda *_a, **_k: inspection)
+    adapter = adapter_mod.PlaywrightProductionSemanticBatchAdapter(
+        _Page(),
+        context,
+        provider="workday",
+        values={"country": "Singapore"},
+        validate_authority=lambda: None,
+    )
+
+    with pytest.raises(SemanticBatchDenied, match="absent or ambiguous"):
+        adapter.control_for("country")
+
+
+@pytest.mark.parametrize(
+    ("field_semantic", "label"),
+    [
+        ("country", "Country of birth Choose Singapore United States"),
+        ("country", "Country of citizenship Choose Singapore United States"),
+        ("state", "State of tax residence Choose Singapore United States"),
+    ],
+)
+def test_playwright_adapter_rejects_sensitive_location_aliases(
+    monkeypatch,
+    tmp_path: Path,
+    field_semantic: str,
+    label: str,
+) -> None:
+    context, inspection = _context_and_inspection(tmp_path, kind="native_select")
+    sensitive_location = replace(
+        inspection.controls[0],
+        semantic="location",
+        label=label,
+        options=("Choose", "Singapore", "United States"),
+    )
+    inspection = replace(inspection, controls=(sensitive_location,))
+    monkeypatch.setattr(adapter_mod, "inspect_form_surfaces", lambda *_a, **_k: inspection)
+    adapter = adapter_mod.PlaywrightProductionSemanticBatchAdapter(
+        _Page(),
+        context,
+        provider="workday",
+        values={field_semantic: "Singapore"},
+        validate_authority=lambda: None,
+    )
+
+    with pytest.raises(SemanticBatchDenied, match="absent or ambiguous"):
+        adapter.control_for(field_semantic)
 
 
 def test_playwright_adapter_rechecks_browser_authority_before_observation(

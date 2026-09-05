@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -4293,14 +4294,14 @@ def test_application_acquisition_retires_resume_with_stale_profile_gpa(
         encoding="utf-8",
     )
     resume_pdf = resume.with_suffix(".pdf")
-    resume_pdf.write_bytes(b"%PDF-stale-gpa-sidecar-binding")
+    resume_pdf.write_bytes(b"%PDF-stale-gpa-upload")
     url = "https://example.com/stale-gpa"
     conn.execute(
         "INSERT INTO jobs (url, title, company_name, source_site, site, application_url, "
         "full_description, tailored_resume_path, tailor_status, cover_letter_status, "
         "eligibility_status, fit_score) VALUES (?, 'Data Intern', 'Example', 'lever', "
         "'lever', ?, 'Verified JD', ?, 'machine_validated', 'not_required', 'eligible', 8)",
-        (url, url, str(resume_pdf)),
+        (url, url, str(resume)),
     )
     conn.commit()
     profile = _application_profile()
@@ -4316,6 +4317,17 @@ def test_application_acquisition_retires_resume_with_stale_profile_gpa(
     ]
     monkeypatch.setattr(launcher, "get_connection", lambda: conn)
     monkeypatch.setattr(config, "load_profile", lambda: profile)
+
+    class Page:
+        def extract_text(self) -> str:
+            return "University of Pennsylvania, Master of City Planning, GPA: 3.6"
+
+    class Reader:
+        def __init__(self, path: Path) -> None:
+            assert path == resume_pdf
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
 
     from applypilot.apply.submission_admission import evaluate_submission_admission
 

@@ -131,7 +131,8 @@ _PROVIDERS = (
     ProviderDescriptor("jobvite", credential_relay_hosts=_suffix("jobvite.com")),
     ProviderDescriptor("oracle", credential_relay_hosts=_suffix("oraclecloud.com")),
     ProviderDescriptor(
-        "successfactors", credential_relay_hosts=_suffix("successfactors.com")
+        "successfactors",
+        credential_relay_hosts=_suffix("successfactors.com", "successfactors.eu"),
     ),
     ProviderDescriptor("workable", credential_relay_hosts=_suffix("workable.com")),
 )

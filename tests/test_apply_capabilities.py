@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -341,6 +344,83 @@ def test_runtime_configuration_is_shared_with_command_and_comparison_metadata(
         "reasoning_effort_source_key": "submit_repair",
         "reasoning_effort_applied": True,
     }
+
+
+def test_project_python_mcps_inherit_only_an_existing_pythonpath(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    installed = tmp_path / "installed"
+    neutral = tmp_path / "neutral"
+    for source, marker in ((candidate, "candidate"), (installed, "installed")):
+        source.mkdir()
+        (source / "runtime_source_probe.py").write_text(
+            f"MARKER = {marker!r}\n",
+            encoding="utf-8",
+        )
+    neutral.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(candidate))
+
+    command, _ = agent_runtime.build_agent_command(
+        "codex",
+        "gpt-5.6-sol",
+        9432,
+        tmp_path,
+        tmp_path / "mcp.json",
+        resolve_codex=lambda: ["codex"],
+        credential_relay_authorized=True,
+    )
+    overrides = {
+        command[index + 1].split("=", 1)[0]: command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-c" and "=" in command[index + 1]
+    }
+    project_servers = (
+        "mcp_servers.credential_relay.env_vars",
+        "mcp_servers.applypilot_ats.env_vars",
+        "mcp_servers.applypilot_control.env_vars",
+    )
+    assert all('"PYTHONPATH"' in overrides[key] for key in project_servers)
+    assert all(
+        "PYTHONPATH" not in value
+        for key, value in overrides.items()
+        if key.endswith(".env_vars") and key not in project_servers
+    )
+
+    probe = (
+        "import sys; "
+        f"sys.path.append({str(installed)!r}); "
+        "import runtime_source_probe; print(runtime_source_probe.MARKER)"
+    )
+    child_env = {"PYTHONPATH": os.environ["PYTHONPATH"]}
+    selected = subprocess.check_output(
+        [sys.executable, "-S", "-c", probe],
+        cwd=neutral,
+        env=child_env,
+        text=True,
+        encoding="utf-8",
+    ).strip()
+    fallback = subprocess.check_output(
+        [sys.executable, "-S", "-c", probe],
+        cwd=neutral,
+        env={},
+        text=True,
+        encoding="utf-8",
+    ).strip()
+    assert (selected, fallback) == ("candidate", "installed")
+
+    monkeypatch.delenv("PYTHONPATH")
+    command_without_pythonpath, _ = agent_runtime.build_agent_command(
+        "codex",
+        "gpt-5.6-sol",
+        9432,
+        tmp_path,
+        tmp_path / "mcp.json",
+        resolve_codex=lambda: ["codex"],
+        credential_relay_authorized=True,
+    )
+    assert "PYTHONPATH" not in " ".join(command_without_pythonpath)
 
 
 def test_reasoning_resolution_records_default_fallback_and_rejects_unknown_values() -> None:

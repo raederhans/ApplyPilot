@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from applypilot.apply import authorization
+from applypilot.apply import application_jobs, submission_admission
 from applypilot.apply.batch_progress import (
     batch_progress,
     consumed_batch_job_urls,
@@ -228,6 +229,53 @@ def test_consumed_helper_and_missing_storage_are_read_only(tmp_path: Path) -> No
         assert consumed_batch_job_urls(connection, "batch") == set()
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("job_count", [5, 10])
+def test_snapshot_next_matches_first_acquisition_and_counts_actual_freshness_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job_count: int
+) -> None:
+    """The read-only snapshot and the writer choose the same first eligible job.
+
+    This is deliberately a candidate-read count, not a timing claim.  It
+    records the extra bounded work incurred when an operator asks for a full
+    5/10-job projection before one actual acquisition.
+    """
+    connection = init_db(tmp_path / f"cohort-{job_count}.db")
+    _, manifest = _ready_jobs(connection, tmp_path, job_count)
+    reads = 0
+    original = submission_admission.evaluate_profile_resume_fact_freshness
+
+    def counted(job, profile):
+        nonlocal reads
+        reads += 1
+        return original(job, profile)
+
+    monkeypatch.setattr(
+        submission_admission, "evaluate_profile_resume_fact_freshness", counted
+    )
+    profile = _profile()
+    projection = batch_progress(
+        connection, manifest, profile, limit=10, now=NOW
+    )
+    assert reads == job_count
+    assert len(projection["next"]) == job_count
+
+    reads = 0
+    monkeypatch.setattr(application_jobs.config, "load_profile", lambda: profile)
+    acquired = application_jobs.acquire_job(
+        connection,
+        min_score=6,
+        authorization_manifest=manifest,
+        load_blocked=lambda: ([], []),
+        application_lease_minutes=15,
+    )
+
+    assert acquired is not None
+    assert acquired["url"] == projection["next"][0]["job_url"]
+    assert reads == 1
+    assert acquired["_acquisition_performance"]["admission_rows_scanned"] == 1
+    connection.close()
 
 
 @pytest.mark.parametrize("job_count", [5, 10, 100])
