@@ -24,6 +24,7 @@ from urllib.parse import urlparse, urlsplit
 from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import performance_attribution as performance_attribution_mod
 from applypilot.apply import recovery_execution as recovery_execution_mod
+from applypilot.apply import successfactors_binding as successfactors_binding_mod
 from applypilot.apply.answer_provenance import build_host_provenance_binding
 from applypilot.apply.application_sessions import (
     ApplicationSupervisor,
@@ -35,6 +36,7 @@ from applypilot.apply.application_sessions import (
     PerTurnStdioEndpointManager,
     resolve_persistent_playwright_launcher,
 )
+from applypilot.apply.ats import same_workday_application
 from applypilot.apply.browser_authority import adopt_browser_authority
 from applypilot.apply.browser_broker import (
     BrowserBrokerError,
@@ -514,6 +516,20 @@ def _provenance_only_audit(report: Mapping[str, object]) -> bool:
     )
 
 
+def _qualified_prepared_audit(report: Mapping[str, object]) -> bool:
+    """Use the host audit decision, without revalidating its explanatory metadata."""
+    return bool(
+        report.get("status") == "clear"
+        and report.get("disposition") in {"clear", "proceed_with_advisories"}
+        and report.get("submission_gate") is True
+        and not report.get("blocking_issues")
+        and not report.get("repairable_issues")
+        and report.get("required_unfilled_count") == 0
+        and report.get("sensitive_required_unknown_count") == 0
+        and str(report.get("page_url") or "").strip()
+    )
+
+
 def _enforce_stateful_control_coverage(
     audit_signal: str | None,
     report: Mapping[str, object],
@@ -927,7 +943,7 @@ def _worker_loop_with_port(
         email_application = None
         verification_relay_used = False
         provenance_verification_child_used = False
-        provenance_audit_page_url: str | None = None
+        prepared_audit_page_url: str | None = None
         cover_material_retries_remaining = material_regeneration_limit
         field_repair_retries_remaining = field_repair_limit
         ats_fill_plan_feedback: dict[str, object] | None = None
@@ -1213,9 +1229,17 @@ def _worker_loop_with_port(
                 runtime_cell_session.close_application()
             continue
 
+        ats_identity_provider = str(
+            read_only_preflight.get("ats_identity_provider") or ""
+        ).casefold()
+        if ats_identity_provider not in {"smartrecruiters", "successfactors"}:
+            if read_only_preflight.get("provider") == "smartrecruiters":
+                ats_identity_provider = "smartrecruiters"
+            elif successfactors_binding_mod.successfactors_probe_candidate(job):
+                ats_identity_provider = "successfactors"
         ats_binding = read_only_preflight.get("ats_binding")
         if (
-            read_only_preflight.get("provider") == "smartrecruiters"
+            ats_identity_provider in {"smartrecruiters", "successfactors"}
             and "ats_binding" not in read_only_preflight
         ):
             ats_binding = _resolve_ats_application_binding(job)
@@ -1227,7 +1251,9 @@ def _worker_loop_with_port(
             else read_only_preflight.get("provider")
         )
         admitted_target_url = (
-            ats_binding.get("application_url") or ats_binding.get("url")
+            ats_binding.get("job_application_url")
+            or ats_binding.get("application_url")
+            or ats_binding.get("url")
             if isinstance(ats_binding, Mapping)
             else job.get("application_url") or job.get("url")
         )
@@ -1247,9 +1273,9 @@ def _worker_loop_with_port(
             )
 
         bind_attribution_target()
-        if read_only_preflight.get("provider") == "smartrecruiters" and not (
+        if ats_identity_provider in {"smartrecruiters", "successfactors"} and not (
             isinstance(ats_binding, dict)
-            and ats_binding.get("provider") == "smartrecruiters"
+            and ats_binding.get("provider") == ats_identity_provider
             and ats_binding.get("resolved") is True
         ):
             identity_reason = (
@@ -1258,7 +1284,7 @@ def _worker_loop_with_port(
                 else "unavailable"
             )
             reason = (
-                "smartrecruiters_provider_identity_unresolved:"
+                f"{ats_identity_provider}_provider_identity_unresolved:"
                 f"{identity_reason}"
             )
             if dry_run:
@@ -1287,13 +1313,13 @@ def _worker_loop_with_port(
             failed += 1
             jobs_done += 1
             add_event(
-                f"[W{worker_id}] SmartRecruiters identity blocked before browser: "
+                f"[W{worker_id}] {ats_identity_provider} identity blocked before browser: "
                 f"{identity_reason[:35]}"
             )
             update_state(
                 worker_id,
                 status="failed",
-                last_action="SmartRecruiters identity unresolved",
+                last_action=f"{ats_identity_provider} identity unresolved",
                 jobs_done=jobs_done,
             )
             if runtime_cell_session is not None:
@@ -2017,6 +2043,10 @@ def _worker_loop_with_port(
                     performance_attribution_mod.safe_record_job_span(
                         job, "audit.pre_submit", audit_duration_ms
                     )
+                    if audit_signal is None and _qualified_prepared_audit(audit_report):
+                        prepared_audit_page_url = str(audit_report["page_url"])
+                        result = "ready_to_submit"
+                        continue
                     if not _provenance_only_audit(audit_report):
                         pre_submit_audit_failure = dict(audit_report)
                         result = (
@@ -2025,7 +2055,7 @@ def _worker_loop_with_port(
                         )
                         break
                     provenance_verification_child_used = True
-                    provenance_audit_page_url = str(audit_report["page_url"])
+                    prepared_audit_page_url = str(audit_report["page_url"])
                     verification_job = dict(job)
                     for protected_key in (
                         "_browser_lease_binding",
@@ -2326,9 +2356,13 @@ def _worker_loop_with_port(
                             audit_signal, audit_report
                         )
                         if (
-                            provenance_audit_page_url is not None
+                            prepared_audit_page_url is not None
                             and str(audit_report.get("page_url") or "")
-                            != provenance_audit_page_url
+                            != prepared_audit_page_url
+                            and not same_workday_application(
+                                prepared_audit_page_url,
+                                str(audit_report.get("page_url") or ""),
+                            )
                         ):
                             audit_signal = "answer_provenance_verification:page_drift"
                             audit_report = {

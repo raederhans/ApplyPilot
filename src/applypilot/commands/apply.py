@@ -393,7 +393,31 @@ def run_apply(
     # Check 3: Submission needs an approved cover letter. A fill-only preview
     # can proceed with a validated resume and leave an optional letter blank.
     ready = 0
-    if not (gen and url):
+    if dry_run and url and not gen:
+        from applypilot.apply.submission_admission import evaluate_submission_admission
+
+        rows = get_connection().execute(
+            "SELECT * FROM jobs WHERE url = ? OR application_url = ?",
+            (url, url),
+        ).fetchall()
+        if len(rows) != 1:
+            console.print(
+                f"[red]Preview expected one exact registered job, found {len(rows)}:[/red] {url}"
+            )
+            raise runtime.exit_exception(1)
+        job = dict(rows[0])
+        job["application_url"] = job.get("application_url") or job.get("url")
+        admission = evaluate_submission_admission(
+            job, profile, minimum_fit_score=min_score, preview_only=True
+        )
+        if not admission.get("admitted"):
+            console.print(
+                "[red]Exact job is not ready for preview.[/red] "
+                f"Gate: {admission.get('reason') or 'admission did not pass'}"
+            )
+            raise runtime.exit_exception(1)
+        ready = 1
+    elif not (gen and url):
         ready = count_submission_ready_jobs(
             get_connection(),
             dry_run=dry_run,

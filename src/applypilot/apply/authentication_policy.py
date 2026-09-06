@@ -19,7 +19,9 @@ def authentication_capability(profile: Mapping[str, object], key: str) -> bool:
     if not isinstance(raw_authentication, Mapping):
         return False
     if key in raw_authentication:
-        return bool(raw_authentication[key])
+        return raw_authentication[key] is True
     if key in _LEGACY_COMPATIBLE_KEYS:
-        return bool(raw_authentication.get(_LEGACY_ACCOUNT_CREATION_KEY, False))
+        return raw_authentication.get(_LEGACY_ACCOUNT_CREATION_KEY) is True
+    if key == "mailbox_read_authorized":
+        return raw_authentication.get("gmail_verification_authorized") is True
     return False

@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from applypilot.apply.answer_policy import FieldRisk, field_risk
 from applypilot.apply.provider_registry import provider_matches_host
@@ -67,6 +67,52 @@ def _hostname(url: str) -> str:
         return (urlsplit(url).hostname or "").rstrip(".").casefold()
     except ValueError:
         return ""
+
+
+def workday_application_identity(url: str) -> tuple[str, tuple[str, ...], str] | None:
+    """Identify a Workday job independently of locale, location, title and apply step."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").casefold()
+        if (
+            parsed.scheme.casefold() != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or not any(host == suffix or host.endswith("." + suffix)
+                       for suffix in ("myworkdayjobs.com", "myworkdaysite.com"))
+        ):
+            return None
+        parts = tuple(unquote(part) for part in parsed.path.strip("/").split("/"))
+        if any(not part or part in {".", ".."} or "/" in part or "\\" in part
+               or re.search(r"%(?:2f|5c|2e)", part, re.IGNORECASE) for part in parts):
+            return None
+        if parts.count("job") != 1:
+            return None
+        job_index = parts.index("job")
+        site = parts[:job_index]
+        if site and re.fullmatch(r"[a-z]{2}[-_][a-z]{2}", site[0], re.IGNORECASE):
+            site = site[1:]
+        posting = parts[job_index + 1:]
+        if "apply" in posting:
+            apply_index = posting.index("apply")
+            if any(re.search(r"forgot|recover|reset|unlock", step, re.IGNORECASE)
+                   for step in posting[apply_index + 1:]):
+                return None
+            posting = posting[:apply_index]
+        if not site or not posting or "_" not in posting[-1]:
+            return None
+        requisition = posting[-1].rsplit("_", 1)[1]
+        if not re.fullmatch(r"[A-Za-z0-9-]+", requisition) or not re.search(r"\d", requisition):
+            return None
+        return host, site, requisition
+    except ValueError:
+        return None
+
+
+def same_workday_application(expected_url: str, actual_url: str) -> bool:
+    expected = workday_application_identity(expected_url)
+    return expected is not None and expected == workday_application_identity(actual_url)
 
 
 def _field_key(raw: Mapping[str, object], index: int) -> str:
@@ -303,6 +349,24 @@ class SmartRecruitersAtsAdapter(GenericAtsAdapter):
 
 
 @dataclass(frozen=True, slots=True)
+class CornerstoneAtsAdapter(GenericAtsAdapter):
+    """Named, proposal-only detection for Cornerstone CSOD careers pages."""
+
+    name: str = "cornerstone"
+
+    def matches(self, *, hostname: str, path: str) -> bool:
+        del path
+        return provider_matches_host(self.name, hostname, "detection")
+
+    def guidance(self) -> tuple[str, ...]:
+        return (
+            *GenericAtsAdapter.guidance(self),
+            ("Treat Cornerstone conditional questions and required declarations as "
+             "freshly observed controls; do not infer answers from prior pages."),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkdayAtsAdapter(GenericAtsAdapter):
     name: str = "workday"
 
@@ -363,6 +427,7 @@ def default_ats_registry() -> AtsAdapterRegistry:
             LeverAtsAdapter(),
             AshbyAtsAdapter(),
             SmartRecruitersAtsAdapter(),
+            CornerstoneAtsAdapter(),
             WorkdayAtsAdapter(),
         )
     )

@@ -241,6 +241,14 @@ def test_snapshot_next_matches_first_acquisition_and_counts_actual_freshness_rea
     records the extra bounded work incurred when an operator asks for a full
     5/10-job projection before one actual acquisition.
     """
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz is not None else NOW.replace(tzinfo=None)
+
+    # The projection already receives NOW. Its acquisition comparison must
+    # use the same clock instead of expiring this fixed historical manifest.
+    monkeypatch.setattr(application_jobs, "datetime", FrozenDateTime)
     connection = init_db(tmp_path / f"cohort-{job_count}.db")
     _, manifest = _ready_jobs(connection, tmp_path, job_count)
     reads = 0

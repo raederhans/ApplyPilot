@@ -6,7 +6,11 @@ from datetime import date, timedelta
 import pytest
 
 from applypilot.database import close_connection, init_db
-from applypilot.discovery.explore import default_exploration_queries, explore_job_boards
+from applypilot.discovery.explore import (
+    board_search_url,
+    default_exploration_queries,
+    explore_job_boards,
+)
 
 
 @pytest.fixture
@@ -53,6 +57,89 @@ def test_empty_is_not_platform_complete_and_validation_precedes_search(conn):
         explore_job_boards(conn, queries=["a", "b", "c", "d"])
     with pytest.raises(ValueError):
         explore_job_boards(conn, sites=["unsupported"])
+    with pytest.raises(ValueError):
+        explore_job_boards(conn, hours_old=0)
+
+
+def test_recent_window_is_forwarded_but_remains_unverified(conn):
+    calls = []
+
+    def search(query, site, **kwargs):
+        calls.append((site, kwargs["hours_old"]))
+        return {"status": "empty", "jobs": [], "raw_count": 0}
+
+    result = explore_job_boards(
+        conn, queries=["data intern"], hours_old=8, search=search,
+    )
+
+    assert calls == [("linkedin", 8), ("indeed", 8)]
+    linkedin, indeed = result["sources"]
+    assert "f_TPR=r28800" in linkedin["search_url"]
+    assert "fromage=1" in indeed["search_url"]
+    assert linkedin["requested_time_filter_hours"] == 8
+    assert linkedin["time_filter_hours"] is None
+    assert indeed["time_filter_hours"] is None
+    assert linkedin["provider_requested_time_filter_hours"] == 8
+    assert indeed["provider_requested_time_filter_hours"] == 8
+    assert linkedin["search_url_requested_time_filter_hours"] == 8
+    assert indeed["search_url_requested_time_filter_hours"] == 24
+    assert linkedin["time_filter_status"] == "requires_visible_verification"
+    assert "treat reposted separately" in linkedin["next_action"]
+
+
+def test_indeed_job_type_reports_omitted_time_filter(conn):
+    calls = []
+
+    def search(query, site, **kwargs):
+        calls.append(kwargs)
+        return {"status": "empty", "jobs": [], "raw_count": 0}
+
+    result = explore_job_boards(
+        conn,
+        queries=["business analyst"],
+        sites=["indeed"],
+        job_type="internship",
+        hours_old=24,
+        search=search,
+    )
+
+    source = result["sources"][0]
+    assert calls[0]["hours_old"] == 24
+    assert source["requested_time_filter_hours"] == 24
+    assert source["time_filter_hours"] is None
+    assert source["provider_requested_time_filter_hours"] is None
+    assert source["search_url_requested_time_filter_hours"] is None
+    assert source["time_filter_status"] == "omitted_for_indeed_job_type"
+    assert "jt=internship" in source["search_url"]
+    assert "fromage=" not in source["search_url"]
+
+
+def test_board_search_defaults_to_recent_24_hours():
+    assert "f_TPR=r86400" in board_search_url("linkedin", "product intern")
+    assert "fromage=1" in board_search_url("indeed", "product intern")
+
+
+def test_explore_cli_forwards_optional_hour_window(monkeypatch):
+    from typer.testing import CliRunner
+
+    from applypilot import cli
+    from applypilot.commands import radar as radar_commands
+
+    captured = {}
+    monkeypatch.setattr(
+        radar_commands,
+        "run_radar_explore",
+        lambda _runtime, values: captured.update(values),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["radar", "explore", "--query", "data intern", "--hours", "8"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["hours"] == 8
+    assert captured["query"] == ["data intern"]
 
 
 def test_rotating_queries_cover_all_four_fields():

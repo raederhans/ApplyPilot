@@ -406,6 +406,8 @@ def test_explicit_manual_captcha_relay_remains_enabled_for_mode_rejection(
 def test_profile_manual_captcha_relay_is_disabled_for_dry_run_before_launch(
     tmp_path: Path, monkeypatch
 ) -> None:
+    conn = init_db(tmp_path / "preview.db")
+    _insert_ready_job(conn, _job(), tmp_path / "resume.pdf")
     profile = tmp_path / "profile.json"
     profile.write_text(
         json.dumps({"submission_policy": {"manual_captcha_relay": True}}),
@@ -426,7 +428,7 @@ def test_profile_manual_captcha_relay_is_disabled_for_dry_run_before_launch(
         "applypilot.services.application.resolve_apply_model",
         lambda *_args, **_kwargs: "test-model",
     )
-    monkeypatch.setattr("applypilot.database.get_connection", lambda: object())
+    monkeypatch.setattr("applypilot.database.get_connection", lambda: conn)
     monkeypatch.setattr("applypilot.apply.chrome.get_browser_executable", lambda *_: "edge")
     monkeypatch.setattr("applypilot.apply.chrome.resolve_browser_backend", lambda *_: "edge")
     monkeypatch.setattr("applypilot.apply.router.resolve_interaction_mode", lambda *_: "playwright")

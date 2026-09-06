@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>ApplyPilot visual worker smoke</title>
+<style>body{font:20px system-ui;margin:32px;background:#f1f5f9;color:#142238}button,input{font:inherit;padding:12px;margin:8px}main{display:flex;gap:24px}#jobs{height:250px;overflow:auto;width:400px;background:white;padding:12px}article{padding:16px;border-bottom:1px solid #ccc}#detail{padding:24px;background:white;min-width:320px}</style>
+<h1>ApplyPilot visual worker smoke</h1><p>Local fixture. No accounts, uploads or submission.</p>
+<label>Keywords <input id="query" placeholder="Search jobs"></label>
+<button onclick="document.querySelector('#filter').textContent='Last 24 hours'">Last 24 hours</button>
+<button onclick="document.querySelector('#filter').textContent='Last 8 hours'">Last 8 hours</button>
+<p id="filter">Any time</p>
+<main><section id="jobs" aria-label="Job list">
+<article>Data analyst · Posted 2 hours ago<button onclick="show('Data analyst','A-101')">View analyst</button></article>
+<article>Product intern · Posted 6 hours ago<button onclick="show('Product intern','B-202')">View product</button></article>
+<article>Research intern · Posted 20 hours ago<button onclick="show('Research intern','C-303')">View research</button></article>
+</section><section id="detail" aria-live="polite">Select a job</section></main>
+<script>function show(title,id){document.querySelector('#detail').innerHTML='<h2>'+title+'</h2><p>Job ID: '+id+'</p><p>Example employer, Singapore. Analyse data and communicate findings.</p><button onclick="this.parentElement.innerHTML=\'Guest application entry: '+id+'\'">Apply as guest</button>'}</script></html>

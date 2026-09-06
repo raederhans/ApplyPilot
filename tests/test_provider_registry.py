@@ -28,6 +28,31 @@ def test_capabilities_are_scoped_instead_of_using_a_supported_provider_union() -
     }
 
 
+def test_cornerstone_csod_is_detection_only() -> None:
+    url = (
+        "https://henkel.csod.com/ux/ats/careersite/1/"
+        "requisition/87202/application?c=henkel"
+    )
+
+    assert provider_for_url(url, "detection") == "cornerstone"
+    assert provider_for_url(url, "semantic_upload") is None
+    assert provider_for_url(url, "control_write") is None
+    assert provider_for_url(url, "credential_relay") is None
+    assert provider_for_url(url, "linkedin_external_handoff") is None
+    assert provider_supports("cornerstone", "application_episode") is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://henkel.csod.com/ux/ats/careersite/1/requisition/87202/application?c=henkel",
+        "https://csod.com.evil.test/ux/ats/careersite/1/requisition/87202/application?c=henkel",
+    ],
+)
+def test_cornerstone_requires_an_exact_https_csod_host(url: str) -> None:
+    assert provider_for_url(url, "detection") is None
+
+
 @pytest.mark.parametrize(
     "url",
     [

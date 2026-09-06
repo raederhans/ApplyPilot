@@ -169,6 +169,28 @@ def test_sensitive_answer_fields_are_classified_before_planning(
     assert plan.actions[0].source_key is None
 
 
+def test_cornerstone_uses_named_generic_adapter_without_semantic_write() -> None:
+    url = (
+        "https://henkel.csod.com/ux/ats/careersite/1/"
+        "requisition/87202/application?c=henkel"
+    )
+    form = build_form_ir(
+        url,
+        [
+            {"id": "resume", "label": "Resume / CV", "type": "file", "required": True},
+            {"id": "gender", "label": "Gender", "type": "select", "required": True},
+        ],
+    )
+    plan = propose_fill_plan(form, {"resume", "gender"})
+
+    assert form.adapter == "cornerstone"
+    assert [item.action for item in plan.actions] == ["upload", "review"]
+    adapter = default_ats_registry().get("cornerstone")
+    assert adapter is not None
+    assert adapter.semantic_control_kinds() == frozenset()
+    assert any("Cornerstone" in item for item in adapter_prompt_guidance(url))
+
+
 def test_default_registry_is_open_and_does_not_encode_tenants_or_versions() -> None:
     registry = default_ats_registry()
     assert registry.names() == [
@@ -176,6 +198,7 @@ def test_default_registry_is_open_and_does_not_encode_tenants_or_versions() -> N
         "lever",
         "ashby",
         "smartrecruiters",
+        "cornerstone",
         "workday",
         "generic",
     ]

@@ -1,0 +1,6 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Local upload smoke</title>
+<h1>Local upload smoke</h1><p>Files stay in this page; no network submission.</p>
+<label>Attachment <input id="attachment" type="file"></label><p id="result" role="status">No file selected</p>
+<script>document.querySelector('#attachment').addEventListener('change', e => {
+document.querySelector('#result').textContent = [...e.target.files].map(f => `${f.name} (${f.size} bytes)`).join(', ');
+});</script></html>

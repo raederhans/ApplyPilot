@@ -31,6 +31,11 @@ from applypilot.apply.stateful_control_coverage import (
     STATEFUL_CONTROL_COVERAGE_SCRIPT,
     stateful_control_coverage_error,
 )
+from applypilot.apply.successfactors_binding import (
+    successfactors_binding_is_resolved,
+    successfactors_credential_host,
+    successfactors_final_application_is_bound,
+)
 from applypilot.apply.workday_state import (
     ProgressAction,
     evaluate_page_progress,
@@ -194,6 +199,19 @@ def _same_bound_application_flow(
     """Accept a proven same-tenant ATS review route, not arbitrary path drift."""
     expected = urlparse(expected_url)
     actual = urlparse(actual_url)
+    if successfactors_binding_is_resolved(binding):
+        return successfactors_final_application_is_bound(
+            expected_url,
+            actual_url,
+            snapshot,
+            binding,
+        )
+    if successfactors_credential_host(expected.hostname) or successfactors_credential_host(
+        actual.hostname
+    ):
+        # SuccessFactors job identity lives in query parameters. Never let one
+        # of its routes reach the generic query-blind path comparison.
+        return False
     if (
         expected.scheme.casefold() != "https"
         or actual.scheme.casefold() != "https"
@@ -201,6 +219,12 @@ def _same_bound_application_flow(
         or expected.hostname.casefold() != (actual.hostname or "").casefold()
     ):
         return False
+
+    if ats_mod.workday_application_identity(expected_url) is not None and (
+        ats_mod.workday_application_identity(actual_url) is not None
+        or "/job/" in unquote(actual.path)
+    ):
+        return ats_mod.same_workday_application(expected_url, actual_url)
 
     if (
         ats_mod.detect_ats_site(expected_url) == "smartrecruiters"
@@ -304,6 +328,8 @@ def _same_bound_application_flow(
 
 
 def _same_exact_application_path(expected_url: str, actual_url: str) -> bool:
+    if ats_mod.workday_application_identity(expected_url) is not None:
+        return ats_mod.same_workday_application(expected_url, actual_url)
     expected = urlparse(expected_url)
     actual = urlparse(actual_url)
     if (

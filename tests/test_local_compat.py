@@ -160,6 +160,8 @@ def test_windows_claude_resolver_wraps_cmd_shim_when_native_missing(
 
 
 def test_windows_codex_resolver_prefers_native_npm_executable(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.delenv("APPLYPILOT_CODEX_EXECUTABLE", raising=False)
     shim = tmp_path / "codex.cmd"
     native = (
         tmp_path
@@ -1198,6 +1200,22 @@ def test_phone_and_linkedin_uploaded_resume_routing_are_contextual() -> None:
     ) == "Data Analyst"
 
 
+@pytest.mark.parametrize("auth_authorized", [False, True])
+def test_guest_application_is_preferred_regardless_of_account_authorization(auth_authorized) -> None:
+    profile = _application_profile()
+    if not auth_authorized:
+        profile.pop("authentication")
+    steps = prompt._build_login_steps(profile)
+    assert "Apply as guest, Continue without an account" in steps
+    assert "Do not leave a usable form to register or sign in" in steps
+    assert "An email/contact field alone is not an account requirement" in steps
+    assert "Direct-email applications stay on the mailbox route" in steps
+    if auth_authorized:
+        assert steps.index("Apply as guest") < steps.index("make one bounded authentication attempt")
+        assert "Only when authentication is required and no guest/application form can continue" in steps
+        assert "this application requires an account, no guest route is offered" in steps
+
+
 def test_login_policy_allows_google_ats_signup_and_narrow_gmail_verification() -> None:
     steps = prompt._build_login_steps(
         _application_profile(),
@@ -1412,7 +1430,8 @@ def test_authorized_login_result_code_requires_a_bounded_attempt(
     built = prompt.build_prompt(job, "Verified resume", dry_run=False)
 
     assert (
-        "RESULT:LOGIN_ISSUE -- one bounded authorized authentication attempt failed, "
+        "RESULT:LOGIN_ISSUE -- authentication is required with no guest route, and "
+        "one bounded authorized authentication attempt failed, "
         "or MFA/identity-provider security challenge, recovery, unavailable authorized credentials, or abnormal OAuth scope blocked it"
         in built
     )
@@ -2715,9 +2734,13 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "`captcha_required` may use `captcha`" in built
     assert "`expired` may use `expired`" in built
     assert "Same page signature after one corrective attempt" in built
+    assert "a first blank, Loading..., or cookie-only snapshot is not a page failure" in real_prepare
+    assert "one bounded condition wait (up to 10 seconds)" in real_prepare
+    assert "Do not reload, loop, or change application identity" in real_prepare
+    assert "this loading allowance never authorizes another submit" in built
+    assert "Page is broken/500 error/blank -> RESULT:FAILED:page_error" not in built
     assert (
-        "Fill ALL fields in ONE browser_fill_form call, except Workday segmented/composite "
-        "controlled dates" in built
+        "Prefer bulk filling ordinary fields when their current refs are reliable." in built
     )
     assert "Workday segmented/composite dates" in built
     assert "never bulk-fill a segmented date or put a complete date into one segment" in built
@@ -2830,7 +2853,7 @@ def test_apply_prompt_scopes_smartrecruiters_autocomplete_recovery(
     assert "one fresh-ref corrective retry per autocomplete field" not in non_smartrecruiters
     assert "Personal information City only" not in non_smartrecruiters
     assert "Cannot find your city? Click here to fill in manually" not in non_smartrecruiters
-    assert conflicting_bulk_rule in non_smartrecruiters
+    assert "Use individual clicks or field fills when the page changes" in non_smartrecruiters
     assert "bulk-fill only ordinary non-autocomplete fields" not in non_smartrecruiters
 
 
@@ -3047,7 +3070,6 @@ def test_prepare_prompt_stops_for_advisory_observation_before_submit(
     assert "advisory observation" in built
     assert "send_email with subject" not in built
     assert "STOP before clicking the final submission control" in built
-    assert "never click the upload control again" in built
     assert "Click the final submission control exactly once" not in built
     assert "RESULT:APPLIED only after" not in built
 
@@ -4749,6 +4771,119 @@ def test_tailoring_prompts_forbid_related_tools_and_minor_stretches() -> None:
     assert "There is no allowance" in judge_prompt
     assert "Audit every complete sentence" in judge_prompt
     assert "Do not turn a JD responsibility into candidate history" in generation_prompt
+
+
+def test_tailoring_judge_profile_evidence_is_narrow_and_user_confirmed() -> None:
+    profile = {
+        "skills_boundary": {"languages": ["Python"]},
+        "application_facts": [
+            {
+                "key": "power_bi_experience_years",
+                "value": 2,
+                "source": "user_confirmed",
+                "confirmed_at": "2026-08-22",
+            },
+            {
+                "key": "full_time_internship_availability",
+                "value": "Full-time from 2026-11-10 through 2027-06-30",
+                "source": "user_confirmed",
+                "confirmed_at": "2026-08-31",
+            },
+            {
+                "key": "secret_token",
+                "value": "must-not-leak",
+                "source": "user_confirmed",
+            },
+            {
+                "key": "tableau_experience_years",
+                "value": 4,
+                "source": "model_inferred",
+            },
+        ],
+        "education": [{
+            "institution": "Example University",
+            "degree": "Master of Applied AI",
+            "status": "Currently enrolled",
+            "expected_graduation": "May 2027",
+            "private_notes": "must-not-leak",
+        }],
+        "resume_facts": {},
+    }
+
+    evidence, confirmed_skills = tailor._build_judge_profile_evidence(profile)
+    judge_prompt = tailor._build_judge_prompt(profile)
+
+    assert "User-confirmed skill experience: Power BI (2 years)." in evidence
+    assert "User-confirmed internship availability: Full-time from 2026-11-10 through 2027-06-30." in evidence
+    assert "Current education: Example University | Master of Applied AI | Currently enrolled | Expected graduation May 2027." in evidence
+    assert confirmed_skills == {"power bi"}
+    assert "must-not-leak" not in evidence
+    assert "must-not-leak" not in judge_prompt
+    assert "Do not report allowed omissions" in judge_prompt
+    assert "at most 5" in judge_prompt
+
+
+def test_tailoring_judge_accepts_exact_user_confirmed_skill_evidence(monkeypatch) -> None:
+    source = (
+        "Ryan Yu\nSUMMARY\nBuilt analytics reports with Python and SQL.\n"
+        "TECHNICAL SKILLS\nPython, SQL\nEDUCATION\nExample University"
+    )
+    summary_sentence = "Data analyst with Power BI experience."
+    tailored_text = (
+        f"Ryan Yu\n\nSUMMARY\n{summary_sentence}\n\n"
+        "EDUCATION\nExample University\n"
+        "Full-time internship availability: Jan-Jun 2027\n\n"
+        "TECHNICAL SKILLS\nData: Python, SQL, Microsoft Power BI (2 years)\n"
+    )
+    profile = {
+        "skills_boundary": {"languages": ["Python", "SQL"]},
+        "resume_facts": {},
+        "application_facts": [
+            {
+                "key": "power_bi_experience_years",
+                "value": 2,
+                "source": "user_confirmed",
+                "confirmed_at": "2026-08-22",
+            },
+            {
+                "key": "full_time_internship_availability",
+                "value": "Full-time from 2026-11-10 through 2027-06-30",
+                "source": "user_confirmed",
+                "confirmed_at": "2026-08-31",
+            },
+        ],
+    }
+
+    class FakeJudgeClient:
+        last_response_meta: ClassVar[dict] = {}
+
+        def chat(self, messages, **kwargs):
+            prompt = "\n".join(message["content"] for message in messages)
+            assert "User-confirmed skill experience: Power BI (2 years)." in prompt
+            assert "User-confirmed internship availability" in prompt
+            return json.dumps({
+                "verdict": "PASS",
+                "issues": [],
+                "summary_claims": [{
+                    "claim": summary_sentence,
+                    "source_quotes": [
+                        "User-confirmed skill experience: Power BI (2 years)."
+                    ],
+                    "supported": True,
+                }],
+            })
+
+    monkeypatch.setattr(tailor, "get_client", lambda: FakeJudgeClient())
+
+    result = tailor.judge_tailored_resume(
+        source,
+        tailored_text,
+        "Data Analyst Intern",
+        profile,
+    )
+
+    assert result["passed"] is True
+    assert result["summary_evidence_complete"] is True
 
 
 def test_cover_letter_email_policy_uses_confirmed_full_time_dates(tmp_path: Path) -> None:

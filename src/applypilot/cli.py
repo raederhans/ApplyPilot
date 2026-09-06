@@ -977,10 +977,24 @@ def radar_explore(
     site: list[str] | None = typer.Option(None, "--site", help="linkedin or indeed; defaults to both."),
     limit: int = typer.Option(5, "--limit", min=1, max=10, help="Results per query and platform."),
     job_type: str | None = typer.Option(None, "--job-type", help="Optional internship/fulltime/parttime/contract filter."),
+    hours: int = typer.Option(
+        24,
+        "--hours",
+        min=1,
+        max=720,
+        help="Optional recent-posting window in hours; use 8 for a narrower search.",
+    ),
 ) -> None:
     """Discover new employers on LinkedIn/Indeed; retain unverified leads."""
     return _command_module("radar").run_radar_explore(
-        sys.modules[__name__], {"query": query, "site": site, "limit": limit, "job_type": job_type},
+        sys.modules[__name__],
+        {
+            "query": query,
+            "site": site,
+            "limit": limit,
+            "job_type": job_type,
+            "hours": hours,
+        },
     )
 
 
@@ -1913,6 +1927,26 @@ def dashboard(
         open_dashboard(str(output) if output else None)
     else:
         generate_dashboard(str(output) if output else None)
+
+
+@app.command("browser-work")
+def browser_work(
+    bridge_dir: Path = typer.Option(..., "--bridge-dir", help="Live attended in-app browser host directory."),
+    task_file: Path = typer.Option(..., "--task-file", exists=True, dir_okay=False, help="Discovery or preparation goal."),
+    phase: str = typer.Option("discovery", "--phase", help="discovery, prepare, or explicitly host-authorized submit."),
+    timeout_seconds: float = typer.Option(600, "--timeout-seconds", help="Total worker deadline."),
+) -> None:
+    """Run one goal on an attached in-app tab, serviced by the current Codex task."""
+    from applypilot.apply.browser_worker import run_browser_worker
+    from applypilot.apply.visual_bridge import VisualBridgeError
+
+    try:
+        code = run_browser_worker(bridge_dir=bridge_dir, task_file=task_file,
+                                  phase=phase, timeout_seconds=timeout_seconds)
+    except (ValueError, OSError, VisualBridgeError) as exc:
+        console.print(str(exc), markup=False)
+        raise typer.Exit(code=2) from exc
+    raise typer.Exit(code=code)
 
 
 @app.command()

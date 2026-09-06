@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -146,6 +147,31 @@ CONTROL_REPORT_ENV_VARS = (
     "APPLYPILOT_AGENT_RUN_ID",
     "APPLYPILOT_TOOL_BROKER_MODE",
 )
+
+
+def bound_visual_bridge_dir(*, phase: str, cdp_port: int, application_url: str) -> str | None:
+    """Opt in only to a live supervisor explicitly bound to this worker page.
+
+    A desktop/browser plugin session is not interchangeable with a worker CDP
+    session. The attending supervisor must verify that binding before attaching.
+    """
+    directory = os.environ.get("APPLYPILOT_VISUAL_BRIDGE_DIR")
+    if phase != "prepare" or not directory:
+        return None
+    from applypilot.apply.visual_bridge import VisualBridgeError, read_active_host
+
+    try:
+        host = read_active_host(Path(directory))
+        target = host.target
+        if (
+            target.get("cdp_port") == cdp_port
+            and target.get("application_url") == application_url
+            and target.get("worker_session_verified") is True
+        ):
+            return str(Path(directory).resolve())
+    except (OSError, ValueError, TypeError, VisualBridgeError):
+        pass
+    return None
 
 
 def _project_python_mcp_env_vars(env_vars: tuple[str, ...]) -> list[str]:
@@ -341,6 +367,7 @@ def make_mcp_config(
     direct_email_send_authorized: bool = False,
     credential_relay_authorized: bool = False,
     identity_relay_authorized: bool = False,
+    visual_bridge_dir: str | None = None,
 ) -> dict:
     """Build MCP config dict for a specific CDP port."""
     spec = resolve_playwright_mcp_spec(playwright_mcp)
@@ -384,6 +411,11 @@ def make_mcp_config(
             ],
         },
     }
+    if visual_bridge_dir:
+        servers["applypilot_visual"] = {
+            "command": python_executable or sys.executable,
+            "args": ["-m", "applypilot.apply.visual_bridge_mcp", "--bridge-dir", visual_bridge_dir],
+        }
     if mailbox_spec.enabled and mailbox_tools:
         servers[mailbox_spec.server_name] = {
             "command": mailbox_spec.command,
@@ -451,14 +483,40 @@ def resolve_claude_command() -> list[str]:
 
 
 def resolve_codex_command() -> list[str]:
-    """Resolve Codex to a native executable suitable for ``Popen``."""
+    """Prefer the newest verified Windows CLI across App and npm installs."""
+    override = os.environ.get("APPLYPILOT_CODEX_EXECUTABLE", "").strip()
+    if override:
+        executable = Path(override).expanduser().resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(f"Configured Codex executable does not exist: {executable}")
+        return [str(executable)]
     if platform.system() == "Windows":
         cmd_shim = shutil.which("codex.cmd")
+        npm_native = None
         if cmd_shim:
             npm_root = Path(cmd_shim).parent / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai"
             native_candidates = sorted(npm_root.glob("codex-win32-*/vendor/*/bin/codex.exe"))
             if native_candidates:
-                return [str(native_candidates[0])]
+                npm_native = native_candidates[0]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        bundled = (
+            list((Path(local_app_data) / "OpenAI" / "Codex" / "bin").glob("*/codex.exe"))
+            if local_app_data else []
+        )
+        if bundled:
+            candidates = [*bundled, *([npm_native] if npm_native else [])]
+            path_native = shutil.which("codex.exe")
+            if path_native:
+                candidates.append(Path(path_native))
+            verified = [(version, path) for path in dict.fromkeys(candidates)
+                        if (version := _codex_executable_version(path)) is not None]
+            if verified:
+                version, executable = max(verified, key=lambda item: item[0])
+                logger.info("Selected Codex %s at %s", ".".join(map(str, version)), executable)
+                return [str(executable)]
+        if npm_native:
+            return [str(npm_native)]
+        if cmd_shim:
             return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", cmd_shim]
         native = shutil.which("codex.exe")
         if native:
@@ -468,6 +526,20 @@ def resolve_codex_command() -> list[str]:
         if native:
             return [native]
     raise FileNotFoundError("Codex CLI was not found on PATH.")
+
+
+def _codex_executable_version(path: Path) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run(
+            [str(path), "--version"], capture_output=True, text=True,
+            timeout=3, check=False,
+        )
+        match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)\s*", result.stdout)
+        if result.returncode == 0 and match:
+            return tuple(map(int, match.groups()))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def _toml_value(value: object) -> str:
@@ -557,6 +629,7 @@ def build_agent_command(
     reasoning_efforts: dict[str, str] | None = None,
     playwright_mcp_url: str | None = None,
     resolved_configuration: AgentRuntimeConfiguration | None = None,
+    visual_bridge_dir: str | None = None,
 ) -> tuple[list[str], Path | None]:
     """Build an isolated browser-agent command for Claude or Codex."""
     spec = resolve_playwright_mcp_spec(playwright_mcp)
@@ -623,6 +696,8 @@ def build_agent_command(
             *(f"mcp__applypilot_control__{name}" for name in control_tool_names),
             *(f"mcp__applypilot_ats__{name}" for name in application_tool_names),
         ]
+        if visual_bridge_dir:
+            allowed_mcp_tools.append("mcp__applypilot_visual__visual_operation")
         if credential_relay_authorized:
             allowed_mcp_tools.append("mcp__credential_relay__fill_ats_credentials")
         if identity_relay_authorized:
@@ -796,6 +871,18 @@ def build_agent_command(
         "-c", f"mcp_servers.applypilot_control.enabled_tools={_toml_value(control_tool_names)}",
         "-c", 'mcp_servers.applypilot_control.default_tools_approval_mode="approve"',
     ])
+    if visual_bridge_dir:
+        command.extend([
+            "-c", f"mcp_servers.applypilot_visual.command={_toml_value(python_executable or sys.executable)}",
+            "-c", f"mcp_servers.applypilot_visual.args={_toml_value(['-m', 'applypilot.apply.visual_bridge_mcp', '--bridge-dir', visual_bridge_dir])}",
+            "-c", "mcp_servers.applypilot_visual.required=true",
+            "-c", "mcp_servers.applypilot_visual.tool_timeout_sec=130",
+            "-c", f"mcp_servers.applypilot_visual.env_vars={_toml_value(_project_python_mcp_env_vars(('APPLYPILOT_VISUAL_BRIDGE_TIMEOUT_SECONDS',)))}",
+            "-c", 'mcp_servers.applypilot_visual.enabled_tools=["visual_operation"]',
+            "-c", 'mcp_servers.applypilot_visual.default_tools_approval_mode="approve"',
+        ])
+        if runtime_metadata is not None:
+            runtime_metadata["visual_bridge"] = {"mode": "supervised", "tools": ["visual_operation"]}
     command.extend([
         "--json",
         "--output-last-message", str(final_message_path),

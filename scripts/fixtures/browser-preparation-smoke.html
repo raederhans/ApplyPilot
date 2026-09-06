@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Browser preparation smoke</title>
+<style>body{font:20px system-ui;max-width:800px;margin:50px auto}a,input{display:block;padding:12px;margin:16px 0}input{border:1px solid #777}</style>
+<h1>Product intern — B-202</h1>
+<p>Local test only. No accounts, network submission or real applicant data.</p>
+<section id="entry">
+  <p>Choose an application method.</p>
+  <a href="browser-preparation-smoke.html?guest=1">Apply as guest</a>
+  <a href="browser-preparation-smoke.html?login=1">Sign in</a>
+</section>
+<section id="guest" hidden>
+  <h2>Guest application for B-202</h2>
+  <label>Test name <input id="name" required autocomplete="off"></label>
+  <p id="preview" aria-live="polite">No test name entered</p>
+  <p>Preparation only. No submit control.</p>
+</section>
+<script>
+const query = new URLSearchParams(location.search);
+if (query.has('guest')) {
+  document.getElementById('entry').hidden = true;
+  document.getElementById('guest').hidden = false;
+}
+if (query.has('login')) document.getElementById('entry').textContent = 'Test login required; no credentials accepted.';
+document.getElementById('name').addEventListener('input', event => {
+  document.getElementById('preview').textContent = 'Prepared test name: ' + event.target.value;
+});
+</script>
+</html>

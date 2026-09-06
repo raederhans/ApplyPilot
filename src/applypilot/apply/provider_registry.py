@@ -122,6 +122,10 @@ _PROVIDERS = (
         application_episode=True,
     ),
     ProviderDescriptor(
+        "cornerstone",
+        detection_hosts=_suffix("csod.com"),
+    ),
+    ProviderDescriptor(
         "linkedin",
         detection_hosts=_suffix("linkedin.com"),
         linkedin_external_handoff_hosts=_suffix("linkedin.com"),
@@ -132,7 +136,11 @@ _PROVIDERS = (
     ProviderDescriptor("oracle", credential_relay_hosts=_suffix("oraclecloud.com")),
     ProviderDescriptor(
         "successfactors",
-        credential_relay_hosts=_suffix("successfactors.com", "successfactors.eu"),
+        credential_relay_hosts=_suffix(
+            "successfactors.com",
+            "successfactors.eu",
+            "sapsf.com",
+        ),
     ),
     ProviderDescriptor("workable", credential_relay_hosts=_suffix("workable.com")),
 )

@@ -210,11 +210,14 @@ def _build_judge_prompt(profile: dict) -> str:
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
 
+    profile_evidence, confirmed_profile_skills = _build_judge_profile_evidence(profile)
+
     # Flatten allowed skills for the judge
     all_skills: list[str] = []
     for items in boundary.values():
         if isinstance(items, list):
             all_skills.extend(items)
+    all_skills.extend(sorted(confirmed_profile_skills))
     skills_str = ", ".join(all_skills) if all_skills else "N/A"
 
     real_metrics = resume_facts.get("real_metrics", [])
@@ -223,9 +226,14 @@ def _build_judge_prompt(profile: dict) -> str:
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch unsupported claims and useless tailoring, not merely obvious lies.
 
 Return only one JSON object matching this schema:
-{{"verdict":"PASS or FAIL","issues":["specific issue"],"summary_claims":[{{"claim":"exact complete sentence copied from the tailored SUMMARY","source_quotes":["one or more exact supporting quotes copied verbatim from the original resume"],"supported":true}}]}}
+{{"verdict":"PASS or FAIL","issues":["specific verdict-changing issue"],"summary_claims":[{{"claim":"exact complete sentence copied from the tailored SUMMARY","source_quotes":["one or more exact supporting quotes copied verbatim from the allowed candidate evidence"],"supported":true}}]}}
 
-Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact original-resume quotes that together support the whole claim. Each quote must be verbatim; do not write an explanation in `source_quotes`. If a summary sentence names a sector or domain such as urban planning, legal, finance, transportation, or healthcare, at least one quoted source line must contain that same sector/domain word; an exact source role, degree, section line, or bullet is valid evidence. Do not omit an obvious sector quote. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL. Target-function labels such as "Data Analyst" may be supported by closely matching source work, but claims such as "analyzed engagement data", "ran experiments", or "turned user behavior into product improvements" require those facts in the original resume.
+Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact quotes from the allowed candidate evidence that together support the whole claim. Allowed candidate evidence consists only of the ORIGINAL RESUME and the narrow ALLOWLISTED USER-CONFIRMED PROFILE EVIDENCE supplied with the request. Each quote must be verbatim; do not write an explanation in `source_quotes`. Use at most 4 non-repeated, shortest sufficient quotes per claim. Profile evidence may support only the explicitly labeled skill experience, internship availability, and education facts; it never supports a work action, metric, outcome, employer, project, or JD responsibility. If a summary sentence names a sector or domain such as urban planning, legal, finance, transportation, or healthcare, at least one quoted source line must contain that same sector/domain word; an exact source role, degree, section line, or bullet is valid evidence. Do not omit an obvious sector quote. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL. Target-function labels such as "Data Analyst" may be supported by closely matching source work, but claims such as "analyzed engagement data", "ran experiments", or "turned user behavior into product improvements" require those facts in the original resume.
+
+The `issues` array must contain at most 5 concise, non-duplicated problems of at most 30 words each that actually require FAIL. Do not report allowed omissions or enumerate accurate reordering, faithful rewording, unchanged facts, or optional evidence that could have been retained anywhere in the response. If there is no verdict-changing problem, return an empty `issues` array.
+
+## ALLOWLISTED USER-CONFIRMED PROFILE EVIDENCE
+{profile_evidence or "None supplied."}
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
 - Use the title field only to select the target function and layout; it is not printed in the header
@@ -237,7 +245,7 @@ Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactl
 - Change tone and wording extensively
 
 ## WHAT IS FABRICATION (FAIL for these):
-1. Adding tools, languages, or frameworks anywhere that aren't in the selected source. The profile-level upper boundary is: {skills_str}
+1. Adding tools, languages, or frameworks anywhere that aren't in the selected source or the allowlisted user-confirmed skill facts. The combined upper boundary is: {skills_str}
 2. Inventing NEW metrics or numbers not in the original. The real metrics are: {metrics_str}
 3. Inventing work that has no basis in any original bullet (completely new achievements).
 4. Adding companies, roles, or degrees that don't exist.
@@ -253,11 +261,84 @@ Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactl
 - Changing the title or summary completely
 
 ## STRICT GROUNDING RULE:
-There is no allowance for "minor stretches" or learnable-but-unlisted skills. A plausible claim is still unsupported if it is absent from the selected source. Fail changed job titles, transferred metrics, stronger ownership, new causal outcomes, and JD facts copied into the candidate's history.
+There is no allowance for "minor stretches" or learnable-but-unlisted skills. A plausible claim is still unsupported if it is absent from the selected source and the narrow allowlisted profile evidence. Fail changed job titles, transferred metrics, stronger ownership, new causal outcomes, and JD facts copied into the candidate's history.
 
 Also judge usefulness: the summary, skill order, leading bullets, and project order should emphasize the strongest source-supported direct or transferable matches without keyword stuffing. Missing JD requirements are honest gaps, not instructions to invent them. Do not fail merely because the candidate lacks A/B tests, DAU/MAU, interviews, a tool, or another responsibility; fail usefulness only when relevant source evidence exists but the tailored resume ignores it, or when the rewrite is so generic it could target an unrelated job.
 
 Be strict about factual support and specific about each issue. Do not fail accurate reordering or faithful wording changes."""
+
+
+def _profile_evidence_value(value: object, *, limit: int = 240) -> str:
+    """Return one bounded line from an allowlisted profile field."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit].rstrip()
+
+
+def _display_skill_name(skill: str) -> str:
+    """Render admitted normalized skill tokens without changing their meaning."""
+    acronyms = {"ai", "api", "aws", "bi", "ci", "css", "gcp", "html", "sql", "ui", "ux"}
+    return " ".join(
+        part.upper() if part in acronyms else part.capitalize()
+        for part in skill.split()
+    )
+
+
+def _build_judge_profile_evidence(profile: dict) -> tuple[str, set[str]]:
+    """Build a non-secret, allowlisted supplement for judge grounding.
+
+    The resume library already admits only positive, known-skill, user-confirmed
+    ``*_experience_years`` facts. Reuse that gate rather than exposing arbitrary
+    application facts. Availability and education use explicit field allowlists.
+    """
+    from applypilot.resume_library import _confirmed_experience_skill_facts
+
+    lines: list[str] = []
+    confirmed_skills = _confirmed_experience_skill_facts(profile)
+    for skill, fact in sorted(confirmed_skills.items()):
+        value = fact.get("value")
+        years = f"{value:g}" if isinstance(value, (int, float)) else str(value)
+        unit = "year" if value == 1 else "years"
+        lines.append(
+            f"User-confirmed skill experience: {_display_skill_name(skill)} ({years} {unit})."
+        )
+
+    facts = profile.get("application_facts", [])
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            if str(fact.get("source") or "").strip().casefold() != "user_confirmed":
+                continue
+            if str(fact.get("key") or "").strip().casefold() != "full_time_internship_availability":
+                continue
+            value = _profile_evidence_value(fact.get("value"))
+            if value:
+                lines.append(f"User-confirmed internship availability: {value}.")
+            break
+
+    education = profile.get("education", [])
+    if isinstance(education, list):
+        for item in education:
+            if not isinstance(item, dict):
+                continue
+            institution = _profile_evidence_value(item.get("institution"))
+            degree = _profile_evidence_value(item.get("degree"))
+            if not institution or not degree:
+                continue
+            parts = [institution, degree]
+            status = _profile_evidence_value(item.get("status"))
+            if status:
+                parts.append(status)
+            expected = _profile_evidence_value(item.get("expected_graduation"))
+            graduation = _profile_evidence_value(item.get("graduation"))
+            if expected:
+                parts.append(f"Expected graduation {expected}")
+            elif graduation:
+                parts.append(f"Graduated {graduation}")
+            prefix = "Current education" if "current" in status.casefold() else "Education"
+            lines.append(f"{prefix}: {' | '.join(parts)}.")
+
+    return "\n".join(lines), set(confirmed_skills)
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -442,6 +523,7 @@ def judge_tailored_resume(
         A structured verdict whose summary evidence is independently checked.
     """
     judge_prompt = _build_judge_prompt(profile)
+    profile_evidence, confirmed_profile_skills = _build_judge_profile_evidence(profile)
 
     messages = [
         {"role": "system", "content": judge_prompt},
@@ -488,7 +570,9 @@ def judge_tailored_resume(
         for sentence in re.split(r"(?<=[.!?])\s+", summary_text)
         if sentence.strip()
     ]
-    normalized_source = re.sub(r"\s+", " ", original_text).strip().casefold()
+    normalized_source = re.sub(
+        r"\s+", " ", f"{original_text}\n{profile_evidence}"
+    ).strip().casefold()
     audited_claims = audit.get("summary_claims", [])
     grounded_claims: set[str] = set()
     sector_terms = {
@@ -503,6 +587,7 @@ def judge_tailored_resume(
         for skill in skills
         if len(str(skill).strip()) >= 2
     }
+    technical_terms.update(confirmed_profile_skills)
     if not isinstance(audited_claims, list):
         issues_list.append("Judge summary_claims field was not a list.")
         audited_claims = []

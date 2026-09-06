@@ -135,12 +135,17 @@ From the local installation directory:
 ```powershell
 .\run-radar.ps1 radar collect
 .\run-radar.ps1 radar explore --limit 5
+.\run-radar.ps1 radar explore --hours 8 --limit 5
 .\run-radar.ps1 radar explore --query "business analyst" --job-type internship --limit 5
 .\run-radar.ps1 radar advance --limit 5
 ```
 
 `explore` defaults to two role queries rotating through the four fields, both
-platforms, and five retained leads per query/platform. Search fetches at most
+platforms, a requested 24-hour window, and five retained leads per query/platform.
+An agent may try `--hours 8` on a promising search or broaden a sparse one.
+These parameters express a recency preference; they do not prove the returned
+cards are inside that window and are not an eligibility or application gate.
+Search fetches at most
 twice that number (capped at ten), then rotates employers before truncating.
 An agent may choose up to three
 queries and ten results, broaden a sparse field, or inspect a directory instead.
@@ -155,10 +160,17 @@ Missing company metadata is explicitly returned for review. Board results create
 unverified `radar_leads`, never verified `jobs` directly. Portal destinations
 such as MyCareersFuture are not silently treated as employer careers URLs.
 
-Use the returned `search_url` in the existing visible browser session when the
+Use the returned `search_url` in the in-app browser session when the
 API gives missing metadata, noisy/empty results or an access error. Read a small
-set of actual job cards, verify the selected location/type/date filters, then
-read job duties and the official link. Browser-visible review by the authorized
+set of actual job cards, optionally scroll or open promising cards, and verify
+that the selected card, visible filters and detail belong together. When recency
+matters, use the visible card and detail dates rather than inferring success from
+the URL. Record `Reposted` separately from a confirmed first-posted date. The
+same page agent may combine DOM reads with screenshot-grounded interaction in
+one tab; do not split work by site or by interaction tool. The agent may also use
+the separate `radar queries` LinkedIn Post queue, job-list exploration or people
+search when it could reveal a hiring lead. These are optional strategies, never
+per-run gates. Browser-visible review by the authorized
 agent can supply a JSON/CSV file to `run-radar.ps1 -AttendedReview radar
 import-leads --source-id linkedin-jobs` (or `indeed-jobs`); it does not require a
 human to review each record. Stop at CAPTCHA/security challenges. Social-content
@@ -170,7 +182,13 @@ filter; the signed-in visible search showed four different internship results
 and confirmed its selected filters. Therefore HTTP success is not evidence that
 LinkedIn honored filters. Indeed's installed adapter cannot combine `hours_old`
 with `job_type`; explicit `--job-type` drops its time filter and records that
-limitation. The agent should verify dates on returned pages.
+limitation. Indeed's visible URL expresses whole days, so an 8-hour API request
+opens a one-day visible review URL. A later visible LinkedIn check also found that
+an 8-hour URL request could still show cards from 10--17 hours ago, while its
+24-hour UI selection behaved as expected. Therefore metadata keeps the requested
+window but leaves the verified window empty until the agent checks the page.
+Indeed public search may work without login, while an individual application can
+still require an account; authentication follows the visible page state.
 
 For smaller employers and organizations, inspect a few CareerAxis/SGInnovate/
 Startup SG entries when a field is sparse, retain the directory URL, employer

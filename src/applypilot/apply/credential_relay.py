@@ -21,7 +21,13 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
 from playwright.sync_api import Frame, Locator, Page, sync_playwright
 
 from applypilot import config
+from applypilot.apply.ats import same_workday_application, workday_application_identity
 from applypilot.apply.provider_registry import host_supports_credential_relay
+from applypilot.apply.successfactors_binding import (
+    successfactors_auth_url_is_bound,
+    successfactors_binding_is_resolved,
+    successfactors_credential_host,
+)
 
 BLOCKED_IDENTITY_HOSTS = {
     "accounts.google.com",
@@ -47,6 +53,30 @@ EMAIL_LABEL_RE = re.compile(
 )
 EMAIL_CONFIRMATION_LABEL_RE = re.compile(
     r"^(?:confirm|retype|re-enter)\s+email(?:\s+address)?(?:\s*[:：*✱])*$",
+    re.IGNORECASE,
+)
+EMAIL_CONFIRMATION_DESCRIPTOR_RE = re.compile(
+    r"(?:confirm(?:ation)?|retype|reenter).*email|email.*confirm(?:ation)?",
+    re.IGNORECASE,
+)
+SECONDARY_EMAIL_DESCRIPTOR_RE = re.compile(
+    r"\b(?:alternate|alternative|backup|secondary)\b",
+    re.IGNORECASE,
+)
+AUTHENTICATION_PATH_RE = re.compile(
+    r"(?:^|/)(?:auth(?:enticate|entication)?|create-?account|log-?in|register|registration|sign-?in|sign-?up)(?:[./]|$)",
+    re.IGNORECASE,
+)
+AUTHENTICATION_QUERY_RE = re.compile(
+    r"auth|createaccount|login|register|registration|signin|signup",
+    re.IGNORECASE,
+)
+APPLICATION_IDENTITY_QUERY_KEY_RE = re.compile(
+    r"job|posting|publication|req(?:uisition)?",
+    re.IGNORECASE,
+)
+APPLICATION_PATH_MARKER_RE = re.compile(
+    r"(?:^|/)(?:job|jobs|position|positions|posting|postings|requisition|requisitions)(?:[/-]|$)",
     re.IGNORECASE,
 )
 PASSWORD_SELECTORS = (
@@ -76,6 +106,7 @@ VOLATILE_QUERY_KEYS = {
     "utm_source",
     "utm_term",
 }
+RELAY_DIAGNOSTIC_FILENAME = "credential-relay-diagnostics.jsonl"
 _IDENTITY_DECRYPTED_ATTEMPTS: set[str] = set()
 
 
@@ -93,6 +124,82 @@ def _is_fin_field_descriptor(value: object) -> bool:
 
 class CredentialRelayError(RuntimeError):
     """Expected, user-safe credential relay failure."""
+
+
+def _safe_diagnostic_identifier(value: object) -> str:
+    raw = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", raw):
+        return raw
+    return f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}" if raw else ""
+
+
+def _sanitized_diagnostic_url(value: object) -> str:
+    """Keep only a credential surface's non-secret origin and path."""
+    parsed = urlparse(str(value or ""))
+    host = (parsed.hostname or "").casefold()
+    scheme = parsed.scheme.casefold()
+    if not host or scheme not in {"http", "https"}:
+        return ""
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        return ""
+    return f"{scheme}://{host}{port}{parsed.path or '/'}"
+
+
+def _record_credential_diagnostic(
+    stage: str,
+    status: str,
+    *,
+    surface: str = "",
+    url: str = "",
+    lineage_bound: bool | None = None,
+    url_bound: bool | None = None,
+    host_bound: bool | None = None,
+    password_host_bound: bool | None = None,
+    visible_email_fields: int | None = None,
+    visible_password_fields: int | None = None,
+    candidate_count: int | None = None,
+) -> None:
+    """Append one secret-free, attempt-local relay decision record."""
+    context_path = os.environ.get("APPLYPILOT_ATS_CONTEXT_PATH", "").strip()
+    if not context_path:
+        return
+    path = Path(context_path).with_name(RELAY_DIAGNOSTIC_FILENAME)
+    record: dict[str, object] = {
+        "schema_version": "1",
+        "attempt_id": _safe_diagnostic_identifier(
+            os.environ.get("APPLYPILOT_CREDENTIAL_ATTEMPT_ID")
+        ),
+        "application_id": _safe_diagnostic_identifier(
+            os.environ.get("APPLYPILOT_CREDENTIAL_APPLICATION_ID")
+        ),
+        "module_source": str(Path(__file__).resolve(strict=False)),
+        "stage": stage,
+        "status": status,
+    }
+    if surface:
+        record["surface"] = surface
+    sanitized_url = _sanitized_diagnostic_url(url)
+    if sanitized_url:
+        record["url"] = sanitized_url
+    for name, value in (
+        ("lineage_bound", lineage_bound),
+        ("url_bound", url_bound),
+        ("host_bound", host_bound),
+        ("password_host_bound", password_host_bound),
+        ("visible_email_fields", visible_email_fields),
+        ("visible_password_fields", visible_password_fields),
+        ("candidate_count", candidate_count),
+    ):
+        if value is not None:
+            record[name] = value
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+    except OSError:
+        # Diagnostics do not grant authority and must not prevent ordinary login.
+        return
 
 
 def _host_matches(host: str, candidate: str) -> bool:
@@ -369,6 +476,37 @@ def _visible_email_confirmation_locator(frame: Frame) -> Locator | None:
     return matches[0] if matches else None
 
 
+def _email_field_descriptor(locator: Locator) -> str:
+    """Return non-secret metadata used to distinguish primary and confirmation email."""
+    label = _accessible_label(locator)
+    attributes = [
+        locator.get_attribute(name) or ""
+        for name in ("name", "id", "placeholder", "autocomplete")
+    ]
+    return " ".join(" ".join((label, *attributes)).split())
+
+
+def _visible_generic_primary_email_locator(frame: Frame) -> Locator | None:
+    """Select one generic primary email field without mistaking confirmation/backup inputs."""
+    matches: list[Locator] = []
+    for candidate in _visible_locators(frame, EMAIL_SELECTORS):
+        try:
+            descriptor = _email_field_descriptor(candidate)
+        except Exception:  # noqa: BLE001, S112 - detached fields are expected during navigation
+            continue
+        compact = re.sub(r"[^a-z0-9]+", "", descriptor.casefold())
+        if EMAIL_CONFIRMATION_DESCRIPTOR_RE.search(compact):
+            continue
+        if SECONDARY_EMAIL_DESCRIPTOR_RE.search(descriptor):
+            continue
+        matches.append(candidate)
+    if len(matches) > 1:
+        raise CredentialRelayError(
+            "Credential relay found multiple generic email fields and refused an ambiguous form."
+        )
+    return matches[0] if matches else None
+
+
 def _fill_password_fields(password_fields: list[Locator], password: str) -> int:
     """Fill an ordinary ATS password plus its optional confirmation field."""
     if len(password_fields) > 2:
@@ -527,28 +665,28 @@ def _application_context_binding() -> dict[str, object]:
     ).strip()
     if not path_value or not expected_digest or not expected_attempt or not expected_application:
         raise CredentialRelayError(
-            "Protected-identity relay is missing its exact application context."
+            "Credential relay is missing its exact application context."
         )
     try:
         raw = Path(path_value).read_bytes()
     except OSError as exc:
         raise CredentialRelayError(
-            "Protected-identity application context is unavailable."
+            "Credential relay application context is unavailable."
         ) from exc
     if hashlib.sha256(raw).hexdigest() != expected_digest:
         raise CredentialRelayError(
-            "Protected-identity application context did not match the launcher digest."
+            "Credential relay application context did not match the launcher digest."
         )
     try:
         context = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CredentialRelayError(
-            "Protected-identity application context is unreadable."
+            "Credential relay application context is unreadable."
         ) from exc
     binding = context.get("credential_binding") if isinstance(context, Mapping) else None
     if not isinstance(binding, Mapping):
         raise CredentialRelayError(
-            "Protected-identity application context has no credential binding."
+            "Credential relay application context has no credential binding."
         )
     if (
         binding.get("schema_version") != "1"
@@ -556,14 +694,14 @@ def _application_context_binding() -> dict[str, object]:
         or str(binding.get("application_id") or "") != expected_application
     ):
         raise CredentialRelayError(
-            "Protected-identity application context does not identify this exact attempt."
+            "Credential relay application context does not identify this exact attempt."
         )
     target_urls = binding.get("target_urls")
     if not isinstance(target_urls, list) or not all(
         isinstance(url, str) and url.strip() for url in target_urls
     ):
         raise CredentialRelayError(
-            "Protected-identity application context has no exact target route."
+            "Credential relay application context has no exact target route."
         )
     return dict(binding)
 
@@ -654,6 +792,10 @@ def _application_url_is_bound(actual_url: str, binding: Mapping[str, object]) ->
     for expected_url in target_urls:
         if not isinstance(expected_url, str):
             continue
+        if workday_application_identity(expected_url) is not None:
+            if same_workday_application(expected_url, actual_url):
+                return True
+            continue
         if _same_exact_application_path(expected_url, actual_url):
             return True
         if _smartrecruiters_application_is_bound(
@@ -661,6 +803,63 @@ def _application_url_is_bound(actual_url: str, binding: Mapping[str, object]) ->
         ):
             return True
     return False
+
+
+def _credential_surface_url_is_bound(
+    actual_url: str, binding: Mapping[str, object]
+) -> bool:
+    """Admit the exact application route or a narrow ordinary auth route in its target lineage."""
+    provider_binding = binding.get("provider_binding")
+    provider_binding = (
+        provider_binding if isinstance(provider_binding, Mapping) else {}
+    )
+    actual_provider_is_successfactors = successfactors_credential_host(
+        urlparse(actual_url).hostname
+    )
+    binding_declares_successfactors = (
+        str(provider_binding.get("provider") or "").casefold() == "successfactors"
+    )
+    if actual_provider_is_successfactors or binding_declares_successfactors:
+        # SuccessFactors company-only sign-in is authorized only by the
+        # independently resolved company/job tuple. Never fall through to the
+        # generic auth heuristic for a SuccessFactors-bound attempt.
+        return bool(
+            successfactors_binding_is_resolved(provider_binding)
+            and successfactors_auth_url_is_bound(actual_url, provider_binding)
+        )
+    if _application_url_is_bound(actual_url, binding):
+        return True
+    target_urls = binding.get("target_urls")
+    parsed = urlparse(actual_url)
+    if parsed.scheme.casefold() != "https" or not parsed.hostname:
+        return False
+    path = unquote(parsed.path)
+    if APPLICATION_PATH_MARKER_RE.search(path):
+        return False
+    actual_query = parse_qsl(parsed.query, keep_blank_values=True)
+    expected_identity_values: dict[str, set[str]] = {}
+    if isinstance(target_urls, list):
+        for target_url in target_urls:
+            if not isinstance(target_url, str):
+                continue
+            expected = urlparse(target_url)
+            if (expected.hostname or "").casefold() != parsed.hostname.casefold():
+                continue
+            for key, value in parse_qsl(expected.query, keep_blank_values=True):
+                normalized_key = key.casefold()
+                if APPLICATION_IDENTITY_QUERY_KEY_RE.search(normalized_key):
+                    expected_identity_values.setdefault(normalized_key, set()).add(value)
+    for key, value in actual_query:
+        normalized_key = key.casefold()
+        if not APPLICATION_IDENTITY_QUERY_KEY_RE.search(normalized_key):
+            continue
+        if value not in expected_identity_values.get(normalized_key, set()):
+            return False
+    query_authentication = any(
+        AUTHENTICATION_QUERY_RE.search(re.sub(r"[^a-z0-9]+", "", key.casefold()))
+        for key, _value in actual_query
+    )
+    return bool(AUTHENTICATION_PATH_RE.search(path) or query_authentication)
 
 
 def _target_descends_from(
@@ -759,6 +958,13 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
         raise CredentialRelayError(
             "Credential relay could not bind this request to the worker's application tab."
         )
+    application_binding = _application_context_binding()
+    provider_binding = application_binding.get("provider_binding")
+    provider_binding = (
+        provider_binding if isinstance(provider_binding, Mapping) else {}
+    )
+    successfactors_bound = successfactors_binding_is_resolved(provider_binding)
+    _record_credential_diagnostic("authorization", "passed")
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
@@ -779,41 +985,151 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                 continue
             target_id = str(target_info.get("targetId") or "")
             target_infos[target_id] = target_info
-            if not _target_descends_from(target_id, root_target_ids, target_infos):
+            lineage_bound = _target_descends_from(
+                target_id, root_target_ids, target_infos
+            )
+            url_bound = _credential_surface_url_is_bound(
+                page.url, application_binding
+            )
+            _record_credential_diagnostic(
+                "page_binding",
+                "evaluated",
+                surface="page",
+                url=page.url,
+                lineage_bound=lineage_bound,
+                url_bound=url_bound,
+            )
+            if not lineage_bound:
+                continue
+            if not url_bound:
                 continue
             page_host = (urlparse(page.url).hostname or "").lower()
             for frame_index, frame in enumerate(page.frames):
+                frame_url_bound = frame is page.main_frame or (
+                    _credential_surface_url_is_bound(frame.url, application_binding)
+                )
+                if not frame_url_bound:
+                    _record_credential_diagnostic(
+                        "frame_binding",
+                        "evaluated",
+                        surface="frame",
+                        url=frame.url,
+                        lineage_bound=True,
+                        url_bound=False,
+                    )
+                    continue
                 frame_host = (urlparse(frame.url).hostname or page_host).lower()
                 target_host = frame_host or page_host
-                if host_is_allowed(target_host, configured_hosts):
+                host_bound = host_is_allowed(target_host, configured_hosts)
+                known_ats_bound = (
+                    _known_ats_redirect_enabled() and host_is_known_ats(target_host)
+                )
+                if successfactors_bound:
+                    known_ats_bound = bool(
+                        successfactors_credential_host(target_host)
+                        and target_host.casefold()
+                        == str(provider_binding.get("ats_host") or "").casefold()
+                    )
+                password_host_bound = field not in {"password", "both"} or (
+                    _password_host_is_allowed(target_host)
+                )
+                if host_bound:
                     match = "exact"
-                elif _known_ats_redirect_enabled() and host_is_known_ats(target_host):
+                elif known_ats_bound:
                     match = "known_ats_redirect"
                 else:
+                    _record_credential_diagnostic(
+                        "frame_binding",
+                        "evaluated",
+                        surface="frame",
+                        url=frame.url,
+                        lineage_bound=True,
+                        url_bound=True,
+                        host_bound=False,
+                        password_host_bound=password_host_bound,
+                    )
                     continue
-                if field in {"password", "both"} and not (
-                    _password_host_is_allowed(target_host)
-                ):
+                if not password_host_bound:
+                    _record_credential_diagnostic(
+                        "frame_binding",
+                        "evaluated",
+                        surface="frame",
+                        url=frame.url,
+                        lineage_bound=True,
+                        url_bound=True,
+                        host_bound=True,
+                        password_host_bound=False,
+                    )
                     continue
 
-                email_locator = None
-                email_confirmation_locator = None
-                if field in {"email", "both"}:
-                    email_locator = _visible_accessible_email_locator(frame)
-                    email_confirmation_locator = _visible_email_confirmation_locator(frame)
-                    if email_locator is None and email_confirmation_locator is None:
-                        email_locator = _visible_locator(frame, EMAIL_SELECTORS)
-                password_locators = (
+                inspect_email = field in {"email", "both"}
+                inspect_password = field in {"password", "both"}
+                observed_email_locator = None
+                observed_email_confirmation_locator = None
+                if inspect_email:
+                    observed_email_locator = _visible_accessible_email_locator(frame)
+                    observed_email_confirmation_locator = (
+                        _visible_email_confirmation_locator(frame)
+                    )
+                    if observed_email_locator is None:
+                        observed_email_locator = _visible_generic_primary_email_locator(
+                            frame
+                        )
+                observed_password_locators = (
                     _visible_locators(frame, PASSWORD_SELECTORS)
+                    if inspect_password
+                    else []
+                )
+                if len(observed_password_locators) > 2:
+                    _record_credential_diagnostic(
+                        "visible_fields",
+                        "rejected",
+                        surface="frame",
+                        url=frame.url,
+                        lineage_bound=True,
+                        url_bound=True,
+                        host_bound=True,
+                        password_host_bound=True,
+                        visible_email_fields=(
+                            int(observed_email_locator is not None)
+                            + int(observed_email_confirmation_locator is not None)
+                        ),
+                        visible_password_fields=len(observed_password_locators),
+                    )
+                    continue
+                visible_email_fields = (
+                    int(observed_email_locator is not None)
+                    + int(observed_email_confirmation_locator is not None)
+                )
+                email_locator = (
+                    observed_email_locator if field in {"email", "both"} else None
+                )
+                email_confirmation_locator = (
+                    observed_email_confirmation_locator
+                    if field in {"email", "both"}
+                    else None
+                )
+                password_locators = (
+                    observed_password_locators
                     if field in {"password", "both"}
                     else []
                 )
-                if len(password_locators) > 2:
-                    continue
+                _record_credential_diagnostic(
+                    "visible_fields",
+                    "evaluated",
+                    surface="frame",
+                    url=frame.url,
+                    lineage_bound=True,
+                    url_bound=True,
+                    host_bound=True,
+                    password_host_bound=True,
+                    visible_email_fields=visible_email_fields,
+                    visible_password_fields=len(observed_password_locators),
+                )
                 if not _requested_fields_present(
                     field,
-                    email_locator is not None,
-                    bool(password_locators),
+                    observed_email_locator is not None,
+                    bool(observed_password_locators),
                 ):
                     continue
                 candidates.append(
@@ -827,8 +1143,7 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                         "match": match,
                         "frame": frame,
                         "field_count": (
-                            int(email_locator is not None)
-                            + int(email_confirmation_locator is not None)
+                            visible_email_fields
                             + len(password_locators)
                         ),
                         "email_locator": email_locator,
@@ -837,21 +1152,69 @@ def _fill_fields(cdp_port: int, field: str, email: str, password: str) -> dict[s
                     }
                 )
 
-        selected = _select_candidate(candidates)
+        _record_credential_diagnostic(
+            "candidate_selection",
+            "evaluated",
+            candidate_count=len(candidates),
+        )
+        try:
+            selected = _select_candidate(candidates)
+        except CredentialRelayError:
+            _record_credential_diagnostic(
+                "candidate_selection",
+                "rejected",
+                candidate_count=len(candidates),
+            )
+            raise
         email_locator = selected["email_locator"]
         email_confirmation_locator = selected["email_confirmation_locator"]
         password_locators = list(selected["password_locators"])
-        (
-            email_filled,
-            _email_confirmation_filled,
-            password_fields_filled,
-        ) = _fill_credential_fields(
-            selected["frame"],
-            email_locator,
-            email_confirmation_locator,
-            password_locators,
-            email,
-            password,
+        try:
+            (
+                email_filled,
+                _email_confirmation_filled,
+                password_fields_filled,
+            ) = _fill_credential_fields(
+                selected["frame"],
+                email_locator,
+                email_confirmation_locator,
+                password_locators,
+                email,
+                password,
+            )
+        except CredentialRelayError:
+            _record_credential_diagnostic(
+                "field_fill",
+                "rejected",
+                surface="frame",
+                url=str(selected["frame_url"]),
+                lineage_bound=True,
+                url_bound=True,
+                host_bound=True,
+                password_host_bound=True,
+                visible_email_fields=(
+                    int(email_locator is not None)
+                    + int(email_confirmation_locator is not None)
+                ),
+                visible_password_fields=len(password_locators),
+                candidate_count=len(candidates),
+            )
+            raise
+        _record_credential_diagnostic(
+            "field_fill",
+            "completed",
+            surface="frame",
+            url=str(selected["frame_url"]),
+            lineage_bound=True,
+            url_bound=True,
+            host_bound=True,
+            password_host_bound=True,
+            visible_email_fields=(
+                int(email_locator is not None)
+                + int(email_confirmation_locator is not None)
+            ),
+            visible_password_fields=len(password_locators),
+            candidate_count=len(candidates),
         )
         return {
             "status": "filled",

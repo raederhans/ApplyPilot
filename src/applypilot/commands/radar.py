@@ -66,6 +66,7 @@ def run_radar_explore(runtime: ModuleType, values: dict[str, object]) -> None:
         sites=values["site"] or ("linkedin", "indeed"),
         results_per_site=values["limit"],
         job_type=values.get("job_type"),
+        hours_old=values["hours"],
     )
     runtime.console.print_json(data=result)
 

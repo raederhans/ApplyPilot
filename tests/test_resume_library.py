@@ -545,6 +545,80 @@ def test_stale_explicit_gpa_artifact_is_not_reused(tmp_path: Path) -> None:
     assert "current profile records 3.46" in error
 
 
+def test_active_stale_gpa_artifact_cannot_outrank_or_bind_before_fresh_candidate(
+    tmp_path: Path,
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        suffix="stale-gpa",
+        content=(
+            "DATA ANALYST\nSQL, Python, data analysis\n"
+            "University of Pennsylvania, Master of City Planning, GPA: 3.6\n"
+            "Built a dashboard and reporting workflow."
+        ),
+    )
+    _validated_history(
+        tmp_path,
+        conn,
+        base,
+        suffix="fresh-gpa",
+        content=(
+            "DATA ANALYST\nSQL, Python, data analysis\n"
+            "University of Pennsylvania, Master of City Planning, GPA: 3.46\n"
+            "Built a dashboard and reporting workflow."
+        ),
+    )
+    profile = _profile(base)
+    profile["education"] = [
+        {
+            "institution": "University of Pennsylvania",
+            "gpa": "3.46/4.0",
+            "gpa_may_be_disclosed": True,
+        }
+    ]
+    sync_resume_library(conn, profile, tmp_path)
+    artifacts = [dict(row) for row in conn.execute(
+        "SELECT artifact_id, text_path, active, validation_status FROM resume_artifacts "
+        "WHERE kind='tailored'"
+    ).fetchall()]
+    stale = next(
+        artifact for artifact in artifacts
+        if "GPA: 3.6" in Path(artifact["text_path"]).read_text(encoding="utf-8")
+    )
+    fresh = next(
+        artifact for artifact in artifacts
+        if "GPA: 3.46" in Path(artifact["text_path"]).read_text(encoding="utf-8")
+    )
+    assert (stale["active"], stale["validation_status"]) == (1, "machine_validated")
+    assert (fresh["active"], fresh["validation_status"]) == (1, "machine_validated")
+    job = {
+        "url": "https://careers.example.test/current-gpa-data",
+        "title": "Data Analyst",
+        "eligibility_status": "eligible",
+        "full_description": "Required: SQL. Build dashboards and reporting for business decisions.",
+    }
+    _insert_job(conn, url=job["url"], title=job["title"], description=job["full_description"])
+
+    route = route_resume_for_job(conn, job, profile)
+
+    assert route["decision"] == "reuse_exact"
+    assert route["artifact_id"] == fresh["artifact_id"]
+    assert [candidate["artifact_id"] for candidate in route["candidates"]] == [fresh["artifact_id"]]
+    assert route["profile_fact_rejections"][0]["artifact_id"] == stale["artifact_id"]
+    assert "current profile records 3.46" in route["profile_fact_rejections"][0]["errors"][0]
+    projected = project_reuse_to_job(conn, job, route)
+    assert projected["artifact_id"] == fresh["artifact_id"]
+    stored = conn.execute(
+        "SELECT tailored_resume_path FROM jobs WHERE url=?", (job["url"],)
+    ).fetchone()
+    assert stored["tailored_resume_path"] == fresh["text_path"]
+
+
 def test_configured_track_source_resolves_equal_artifact_scores(tmp_path: Path) -> None:
     conn = init_db(tmp_path / "library.db")
     preferred_source = tmp_path / "preferred-source.txt"

@@ -152,6 +152,30 @@ def test_temasek_registration_prefers_primary_email_and_fills_in_safe_order() ->
             browser.close()
 
 
+def test_generic_email_fallback_excludes_confirmation_and_secondary_fields() -> None:
+    sync_api = pytest.importorskip("playwright.sync_api")
+    with sync_api.sync_playwright() as playwright:
+        browser, page = _isolated_page(
+            playwright,
+            """
+            <label for="confirmEmail">Confirm email address</label>
+            <input id="confirmEmail" name="emailConfirmation" type="email">
+            <input id="primaryEmail" type="email">
+            <label for="backup">Backup email</label>
+            <input id="backup" name="backupEmail" type="email">
+            """,
+        )
+        try:
+            locator = credential_relay._visible_generic_primary_email_locator(
+                page.main_frame
+            )
+
+            assert locator is not None
+            assert locator.get_attribute("id") == "primaryEmail"
+        finally:
+            browser.close()
+
+
 def test_password_readback_failure_clears_exact_misplaced_secret_in_current_frame() -> None:
     sync_api = pytest.importorskip("playwright.sync_api")
     secret = "test-only-misplaced-secret"

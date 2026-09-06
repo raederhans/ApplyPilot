@@ -61,6 +61,7 @@ from applypilot.apply import runtime_cell as runtime_cell_mod
 from applypilot.apply import runtime_cell_coordinator as runtime_cell_coordinator_mod
 from applypilot.apply import semantic_batch_runtime as semantic_batch_runtime_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
+from applypilot.apply import successfactors_binding as successfactors_binding_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
 from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
 from applypilot.apply.answer_policy import field_risk
@@ -1255,6 +1256,7 @@ def _make_mcp_config(
     direct_email_send_authorized: bool = False,
     credential_relay_authorized: bool = False,
     identity_relay_authorized: bool = False,
+    visual_bridge_dir: str | None = None,
 ) -> dict:
     return agent_runtime_mod.make_mcp_config(
         cdp_port,
@@ -1266,6 +1268,7 @@ def _make_mcp_config(
         direct_email_send_authorized=direct_email_send_authorized,
         credential_relay_authorized=credential_relay_authorized,
         identity_relay_authorized=identity_relay_authorized,
+        visual_bridge_dir=visual_bridge_dir,
     )
 
 
@@ -1907,6 +1910,42 @@ def _runtime_timeout_status(*, submission_phase: str, dry_run: bool) -> str:
     return "failed:agent_runtime_timeout"
 
 
+def _resolve_cli_process_failure(
+    returncode: int | None,
+    status: str,
+    result_source: str,
+    *,
+    submission_phase: str,
+    dry_run: bool,
+    structured_result_present: bool,
+) -> tuple[str, str, dict[str, object] | None]:
+    """Classify a direct CLI failure without erasing admitted result evidence."""
+    if returncode in {None, 0}:
+        return status, result_source, None
+    if structured_result_present or status != "failed:invalid_result_marker":
+        return status, result_source, None
+
+    if submission_phase == "submit" and not dry_run:
+        return (
+            "submission_uncertain",
+            "runtime_provider_failed",
+            {
+                "category": "submission_confirmation_missing",
+                "recoverability": "submission_uncertain",
+                "next_action": "reconcile_receipt_without_resubmitting",
+            },
+        )
+    return (
+        "failed:agent_runtime_process_exit",
+        "runtime_provider_failed",
+        {
+            "category": "agent_runtime_failure",
+            "recoverability": "retry_new_session",
+            "next_action": "inspect_typed_process_exit_before_retry",
+        },
+    )
+
+
 _TOOL_FAILURE_STATUSES = {
     "cancelled",
     "canceled",
@@ -2059,6 +2098,7 @@ def _build_agent_command(
     reasoning_efforts: dict[str, str] | None = None,
     playwright_mcp_url: str | None = None,
     resolved_configuration: agent_runtime_mod.AgentRuntimeConfiguration | None = None,
+    visual_bridge_dir: str | None = None,
 ) -> tuple[list[str], Path | None]:
     return agent_runtime_mod.build_agent_command(
         backend,
@@ -2080,6 +2120,7 @@ def _build_agent_command(
         reasoning_efforts=reasoning_efforts,
         playwright_mcp_url=playwright_mcp_url,
         resolved_configuration=resolved_configuration,
+        visual_bridge_dir=visual_bridge_dir,
     )
 
 
@@ -3233,7 +3274,9 @@ def _resolve_ats_application_binding(
         if value and ats_mod.detect_ats_site(str(value)) == "smartrecruiters"
     )
     if not smartrecruiters_urls:
-        return None
+        return successfactors_binding_mod.resolve_successfactors_application_binding(
+            job, transport=transport
+        )
     unresolved = {
         "provider": "smartrecruiters",
         "tenant": "",
@@ -3340,6 +3383,13 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
     """Run system-seeded deterministic reads before browser/Agent work."""
     provider = ats_mod.detect_ats_site(
         str(job.get("application_url") or job.get("url") or "")
+    )
+    successfactors_probe = bool(
+        provider == "generic"
+        and successfactors_binding_mod.successfactors_probe_candidate(job)
+    )
+    ats_identity_provider = (
+        "successfactors" if successfactors_probe else provider
     )
     try:
         profile = config.load_profile()
@@ -3467,24 +3517,25 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
         coalesce_wait_seconds=2.0,
     )
     if provider == "smartrecruiters":
-        tasks.extend(
-            (
-                TaskSpec(
-                    task_id="duplicate-snapshot",
-                    kind="duplicate-check",
-                    objective="Read the durable application ledger for an exact duplicate.",
-                    inputs={"job_url": str(job.get("url") or "")},
-                    effect_class="read",
-                    resource_claims=(ResourceClaim("database-read"),),
-                ),
-                TaskSpec(
-                    task_id="ats-identity",
-                    kind="ats-identity",
-                    objective="Resolve the immutable public posting identity.",
-                    inputs={"provider": provider},
-                    effect_class="read",
-                    resource_claims=(ResourceClaim("network-read"),),
-                ),
+        tasks.append(
+            TaskSpec(
+                task_id="duplicate-snapshot",
+                kind="duplicate-check",
+                objective="Read the durable application ledger for an exact duplicate.",
+                inputs={"job_url": str(job.get("url") or "")},
+                effect_class="read",
+                resource_claims=(ResourceClaim("database-read"),),
+            )
+        )
+    if provider == "smartrecruiters" or successfactors_probe:
+        tasks.append(
+            TaskSpec(
+                task_id="ats-identity",
+                kind="ats-identity",
+                objective="Resolve the immutable public posting identity.",
+                inputs={"provider": ats_identity_provider},
+                effect_class="read",
+                resource_claims=(ResourceClaim("network-read"),),
             )
         )
 
@@ -3715,6 +3766,7 @@ def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
         background_pool.shutdown()
     result: dict[str, object] = {
         "provider": provider,
+        "ats_identity_provider": ats_identity_provider,
         "task_statuses": outcome.reduced_state.get("task_statuses", {}),
         "specialist_task_statuses": outcome.reduced_state.get(
             "specialist_task_statuses", {}
@@ -5040,12 +5092,7 @@ def _configured_receipt_observers(
     authentication = profile.get("authentication", {})
     if not isinstance(authentication, Mapping):
         return []
-    if not bool(
-        authentication.get(
-            "mailbox_read_authorized",
-            authentication.get("gmail_verification_authorized", False),
-        )
-    ):
+    if not authentication_capability(profile, "mailbox_read_authorized"):
         return []
     configured = authentication.get("receipt_mailboxes")
     observers: list[tuple[str, MailboxMcpSpec]] = []
@@ -5356,9 +5403,18 @@ def _credential_target_urls(
         and runtime_binding.get("lineage_verified") is True
     ):
         candidates.append(runtime_binding.get("target_application_url"))
+    provider_binding = job.get("_ats_application_binding")
+    if successfactors_binding_mod.successfactors_binding_is_resolved(
+        provider_binding
+    ):
+        candidates.append(
+            provider_binding.get("job_application_url")
+        )
     routes: set[str] = set()
     identity_query_keys = {
         "career_job_req_id",
+        "career_ns",
+        "company",
         "gh_jid",
         "job",
         "job_id",
@@ -5799,10 +5855,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         environ=dict(runtime_settings.environ),
     )
     mailbox_access_authorized = bool(
-        authentication.get(
-            "mailbox_read_authorized",
-            authentication.get("gmail_verification_authorized", False),
-        )
+        authentication_capability(profile, "mailbox_read_authorized")
         and (
             authentication.get("mailbox")
             or authentication.get("gmail_verification_mailbox")
@@ -6128,6 +6181,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     ats_context_json = json.dumps(ats_context, ensure_ascii=False, sort_keys=True)
     job["_ats_adapter_context"] = ats_context
     prompt_started = time.perf_counter()
+    visual_bridge_dir = agent_runtime_mod.bound_visual_bridge_dir(
+        phase=submission_phase,
+        cdp_port=port,
+        application_url=str(job.get("application_url") or job.get("url") or ""),
+    )
+    job["_visual_bridge_enabled"] = bool(visual_bridge_dir)
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
@@ -6215,6 +6274,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         direct_email_send_authorized=direct_email_send_authorized,
         credential_relay_authorized=credential_relay_authorized,
         identity_relay_authorized=identity_relay_authorized,
+        visual_bridge_dir=visual_bridge_dir,
     )
     mcp_config_path.write_text(
         json.dumps(mcp_config),
@@ -6243,6 +6303,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         ),
         workload_class=resolved_configuration.reasoning.workload_class,
         resolved_configuration=resolved_configuration,
+        visual_bridge_dir=visual_bridge_dir,
     )
     setup_metrics["turn_setup_ms"] = round(
         (time.perf_counter() - setup_started) * 1000,
@@ -7756,6 +7817,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 submission_phase=submission_phase,
             )
         )
+        process_failure_context = None
+        if runtime_backend == "codex-cli":
+            status, result_source, process_failure_context = (
+                _resolve_cli_process_failure(
+                    returncode,
+                    status,
+                    result_source,
+                    submission_phase=submission_phase,
+                    dry_run=dry_run,
+                    structured_result_present=structured_result is not None,
+                )
+            )
         if conflict_classification is not None:
             conflict_status_families = agent_output_mod.conflict_status_families(
                 contract_output,
@@ -7807,7 +7880,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             job["_mailbox_runtime_evidence"] = dict(mailbox_runtime_evidence)
         if structured_report_invalid:
             result_source = f"legacy_after_invalid_structured:{result_source}"
-        failure_context = _parse_failure_context(contract_output)
+        failure_context = (
+            process_failure_context
+            or _parse_failure_context(contract_output)
+        )
         normalized_status, failure_context = _normalize_browser_runtime_failure(
             status,
             browser_tool_call_count=browser_tool_call_count,

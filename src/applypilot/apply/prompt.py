@@ -888,8 +888,8 @@ def _build_login_steps(
     account_creation_authorized = allow_account_creation and authentication_capability(
         profile, "ats_account_creation_authorized"
     )
-    gmail_verification_authorized = bool(
-        authentication.get("gmail_verification_authorized", False)
+    gmail_verification_authorized = authentication_capability(
+        profile, "gmail_verification_authorized"
     )
     email = authentication.get(
         "ats_signup_email",
@@ -904,6 +904,14 @@ def _build_login_steps(
         ".linkedin.com"
     )
 
+    entry_rule = (
+        "First use the available application form, Apply as guest, Continue without an account, "
+        "or the employer's explicit direct-email route. Login and registration are optional unless "
+        "the application actually requires them. A visible Sign in or Create account link is not "
+        "evidence that authentication is required. Do not leave a usable form to register or sign in; "
+        "keep an existing session without logging out to seek a guest route. An email/contact field "
+        "alone is not an account requirement. Direct-email applications stay on the mailbox route. "
+    )
     if (
         ordinary_sign_in_authorized
         or credential_relay_authorized
@@ -917,7 +925,7 @@ def _build_login_steps(
             else "reuse an existing first-party employer ATS session when present. "
         )
         attempt_rule = (
-            "When an authentication page appears, first "
+            "Only when authentication is required and no guest/application form can continue, first "
             + session_rule
             + "Otherwise make one bounded authentication attempt using the "
             "branch supported by the observed page: click the ordinary Sign in, Log in, or Continue "
@@ -951,8 +959,11 @@ def _build_login_steps(
             f"{relay_instruction}. Never type, print, read aloud, copy into the prompt, or expose the password. "
             "On a registration form, the same relay may fill the email plus one password field or the two "
             "matching password and confirmation fields. "
+            "Request field=email for an email-first login step and field=password for its password step; "
+            "request both only when both fields are visible. Never invoke credential relay for a guest form. "
             "The trusted profile authorizes this relay without a separate confirmation. "
-            "The relay fills credentials directly and must not click Sign in, Continue, Apply, or Submit. If the relay "
+            "The relay fills credentials directly and must not click Sign in, Continue, Apply, or Submit. "
+            "Only if credentials are required to continue and the relay "
             "is missing, unconfigured, rejects the current host, or fails, stop with "
             "RESULT:FAILED:credential_relay_required and FAILURE_CONTEXT category credential_relay_required."
             if credential_relay_authorized
@@ -960,8 +971,8 @@ def _build_login_steps(
         )
         signup_rule = (
             f"For an ordinary employer ATS only, account creation with {email} is authorized as one bounded branch. "
-            "Use it only when the observed page clearly shows there is no account for this flow, or exposes "
-            "an ordinary Create account or Sign up entry and there is no evidence of an existing account. "
+            "Use it only when this application requires an account, no guest route is offered, and "
+            "the observed page offers registration with no evidence of an existing account. "
             "In that bounded case, proactively select the observed Create account or Sign up control once. "
             "Fill only required registration fields, using the real APPLICANT PROFILE values; leave optional "
             "registration fields blank unless the form requires them. Use credential relay only when it is "
@@ -1001,6 +1012,7 @@ def _build_login_steps(
         )
         return (
             "5. Authentication policy: "
+            + entry_rule
             + attempt_rule
             + linkedin_rule
             + google_rule
@@ -1021,7 +1033,8 @@ def _build_login_steps(
             "documents, or grant abnormal permissions."
         )
     return (
-        "5. If login, sign-up, email/SMS verification, SSO, OAuth, or account creation is required, do not "
+        "5. " + entry_rule
+        + "If login, sign-up, email/SMS verification, SSO, OAuth, or account creation is required, do not "
         "authenticate or create an account. Output RESULT:LOGIN_ISSUE and stop."
     )
 
@@ -1032,7 +1045,7 @@ def _login_issue_result_description(
     allow_account_creation: bool,
     allow_credential_relay: bool,
 ) -> str:
-    """Describe LOGIN_ISSUE without implying an authorized login may be skipped."""
+    """Describe a required authentication failure, not an optional account offer."""
     attempt_authorized = (
         authentication_capability(profile, "ordinary_ats_sign_in_authorized")
         or authentication_capability(
@@ -1048,7 +1061,8 @@ def _login_issue_result_description(
     )
     if attempt_authorized:
         return (
-            "one bounded authorized authentication attempt failed, or MFA/identity-provider security challenge, recovery, "
+            "authentication is required with no guest route, and one bounded authorized authentication attempt failed, "
+            "or MFA/identity-provider security challenge, recovery, "
             "unavailable authorized credentials, or abnormal OAuth scope blocked it"
         )
     return "authentication or account creation is required but is not authorized"
@@ -1348,7 +1362,26 @@ Observe the current page, resolve uncertain ordinary answers through the profile
     computer_use_handoff_enabled = (
         "computer_use" in control_contract.get("requestable_handoffs", [])
     )
-    if computer_use_handoff_enabled:
+    visual_bridge_enabled = bool(job.get("_visual_bridge_enabled")) and submission_phase == "prepare"
+    visual_control_instruction = (
+        "You may also use the attached applypilot_visual.visual_operation tool for "
+        "supervised visual operations on this same bound page. Start with observe; "
+        "inspect its visible state and use its observation_id for one input, then "
+        "inspect the returned fresh observation. You may choose visual or structured "
+        "control when useful; a fixed selector recipe is not required. Execute one "
+        "tool at a time, never Playwright and visual input in parallel. After any "
+        "Playwright action, obtain a new visual observe before visual input. After "
+        "visual input, refresh Playwright before reusing browser refs or auditing. "
+        "If an operation times out with outcome_unknown, re-observe before deciding "
+        "what happened; never repeat an input blindly. This bridge is prepare-only: "
+        "no final submission, credential entry, CAPTCHA, permissions or assessments. "
+        "Use the existing supported authentication path when needed."
+        if visual_bridge_enabled else
+        "No live visual bridge is attached to this turn."
+    )
+    if visual_bridge_enabled:
+        computer_use_handoff_instruction = "Use the attached visual tool after a fresh observe."
+    elif computer_use_handoff_enabled:
         computer_use_handoff_instruction = (
             "Request the external Computer Use handoff with "
             "RESULT:FAILED:computer_use_handoff_required and "
@@ -1611,10 +1644,10 @@ Otherwise output exactly one RESULT:LOGIN_ISSUE or RESULT:FAILED:linkedin_login_
             "bounded retry, output RESULT:FAILED:resume_upload for this job so the batch can continue."
         )
     else:
-        resume_step = "6. Upload the bound Resume PDF from FILES. If an old resume is visibly attached, remove it first; if the field is empty, do not look for a delete control. Do not select an existing cloud resume during a real submission because its bytes are not bound to this attempt. Click the upload control once, call browser_file_upload with the PDF path above, wait for parsing, then snapshot and verify that an uploaded filename or replacement/remove control is visible. Once verified, never click the upload control again. This is the tailored resume for THIS job. Non-negotiable."
-    field_review_steps = """8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
+        resume_step = "6. Upload the bound Resume PDF from FILES. If an old resume is visibly attached, remove it first; if the field is empty, do not look for a delete control. Do not select an existing cloud resume during a real submission because its bytes are not bound to this attempt. Click the upload control once, call browser_file_upload with the PDF path above, wait for parsing, then snapshot and verify that an uploaded filename or replacement/remove control is visible. Keep the accepted matching attachment unless visible evidence shows it was removed, rejected or replaced. This is the tailored resume for THIS job. Non-negotiable."
+    field_review_steps = """8. Review pre-filled fields against the supplied materials; parsing may be correct or may need correction.
    - \"Current Job Title\" or \"Most Recent Title\" -> use the Current Employment title from APPLICANT PROFILE, NOT the target job title or a resume-parser guess.
-   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
+   - Preserve correct values. Correct observed name, company/title, education or project/employment mismatches from the profile and resume; fill required gaps and leave unnecessary optional fields alone.
 9. Answer screening questions using the rules above."""
 
     if dry_run:
@@ -2031,16 +2064,17 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         "in one browser_fill_form call; exclude Institution and School location/city. Handle "
         "those autocomplete fields strictly serially under the SmartRecruiters rule below."
         if "ats_smartrecruiters" in selected_fragments
-        else "- Fill ALL fields in ONE browser_fill_form call, except Workday "
-        "segmented/composite controlled dates; those dates must follow the dedicated Workday "
-        "date rule below. Do not fill other fields one at a time."
+        else "- Prefer bulk filling ordinary fields when their current refs are reliable. "
+        "Use individual clicks or field fills when the page changes or a control needs them. "
+        "Follow the Workday date guidance for segmented/composite controlled dates."
     )
 
     prompt = f"""You are a job application assistant. {mission_instruction}
 
 == REQUIRED BROWSER CONTROL ==
 CONTROL_CONTRACT: {control_contract_json}
-The current driver is Playwright and the current browser runtime is assigned by the launcher. Use only the attached playwright browser_* MCP tools for page interaction in this isolated turn; applypilot_ats is read/proposal-only, and applypilot_control may be used only for the final structured report described below. Do not invoke shell commands, Skills, agent-browser, npx, Playwright CLI, browser-use, computer-use, or start/switch browsers yourself. The launcher, not this agent turn, owns runtime transitions.
+The primary driver is Playwright and the browser session is assigned by the launcher. Use attached playwright browser_* tools and any explicitly attached visual bridge for page interaction; applypilot_ats is read/proposal-only, and applypilot_control records the final report. Do not launch shell commands, Skills, browser CLIs or independent browsers. The launcher owns browser-session transitions.
+{visual_control_instruction}
 If Playwright can observe the page but one prepare-phase control is genuinely visual-only or native and has no stable browser ref, do not guess coordinates. {computer_use_handoff_instruction}
 Use RESULT:FAILED:browser_mcp_unavailable only when the attached Playwright MCP cannot start or no browser_* tool can execute successfully at all. If any browser_* tool has already succeeded, report the exact later page, interaction, validation, upload, or adapter failure instead; do not claim that the MCP itself is unavailable. A different driver/runtime must make a fresh observation; never reuse element refs, screenshot ids, coordinates, or assumed page state across a handoff. Once submit phase starts, no driver or runtime switch is allowed.
 
@@ -2053,6 +2087,7 @@ Use RESULT:FAILED:browser_mcp_unavailable only when the attached Playwright MCP 
 == LOADED GUIDANCE FRAGMENTS ==
 {json.dumps(selected_fragments, ensure_ascii=False)}
 Only the guidance relevant to this turn is loaded. Use an attached resolver, ATS adapter, credential, or mailbox capability only when it is exposed and the current page actually requires it; absence of an optional helper is not itself an application failure.
+Follow visible Apply, Sign in and Continue controls from the selected job. Normal changes in language, location text, title slug or application step do not by themselves mean a different job. Confirm the employer and job identity from the current page; do not guess application URLs or stop merely because the URL shape changed.
 
 == JOB ==
 URL: {job.get('application_url') or job['url']}
@@ -2152,13 +2187,17 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 == FORM TRICKS ==
 {linkedin_form_trick}
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
+- Asynchronous page loading before submission: a first blank, Loading..., or cookie-only snapshot is not a page failure. After a navigation or entry click, make one bounded condition wait (up to 10 seconds) for the expected visible job, login, or application form, then take a fresh snapshot before classifying page_error. Stop the wait on an explicit closed-job, access-denied, or interactive verification state and follow its existing boundary. Do not reload, loop, or change application identity to recover. After any final submission action, missing confirmation remains submission_uncertain; this loading allowance never authorizes another submit.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 {smartrecruiters_form_trick}
 {greenhouse_form_trick}
 - Identity-provider/MFA/security-challenge verification: an 8-character code split across one-character inputs is an identity-verification gate. Do not scrape, guess, auto-fill, retry, or resubmit it. Output RESULT:CAPTCHA and preserve the page for the configured manual handoff. This rule does not cover an exact employer ATS mailbox OTP admitted by the narrow Authentication policy; enter that OTP only through its authorized mailbox-tool flow. After handoff, continue only when the page itself shows that verification succeeded; an enabled Submit button or non-empty boxes alone is not a receipt.
 - Video/audio upload contradiction: if a field is labelled optional but native/site validation blocks submission until a recording or media file is provided, the validation behaviour is authoritative. Stop with RESULT:FAILED:unsafe_verification; never activate camera/microphone or fabricate media to satisfy it.
 - Required document preflight: before uploading anything, identify every visible file field by its own label and whether it is required. FILES authorizes only the named Resume/CV and cover-letter materials. Never upload the resume into Transcript, Portfolio, Supporting documents, Certificates, or a generic optional attachment field to satisfy another requirement. Leave unavailable optional materials blank and continue. If a required non-resume document is not supplied, stop this job before submission with `RESULT:FAILED:manual_review_required:required_document`, emit `UNANSWERED_QUESTIONS` for that exact field, and emit `FAILURE_CONTEXT: {{"category":"required_document","field_label":"<visible label>","blocking_material":"<required material>","visible_state":"required file not supplied","attempts":0}}`. This job-level material stop must not halt replacement work elsewhere in the batch.
-- File upload recovery and verification: bind every attempt and proof to the same labelled field container. First use the directly labelled file input when exposed; otherwise start the browser file-chooser wait before clicking the associated upload control. If the provider exposes a browser-native drop area, Attach button, or equivalent second control for the same field, try one distinct fallback rather than repeating an identical failed click. After each attempt, wait for parsing and snapshot. Accept proof only when that same field shows the expected filename, remove/replace control, parsed-resume state, or review-page attachment. A filename under another attachment field is not proof. Once proof exists, never click the upload control again.
+- Upload and form state: when convenient, upload before detailed entry if the page offers resume parsing; this is a preference, not a required order. Uploads do not necessarily reset answers. After an upload or reactive form change, inspect the settled visible state and repair only values that actually changed or failed validation. A transient alert, empty snapshot, or temporarily missing filename alone does not prove failure. Use the current labelled field or final review attachment list to confirm acceptance before retrying; do not restart or refill the whole form. Preserve an accepted matching attachment unless the page shows it was removed, rejected or replaced.
+- Dynamic controls: use the current visible control and confirm its resulting value. Search text is not necessarily a selected option; choose the matching result when needed. If a date or text control loses focus during rerender, re-observe and use its normal input or calendar UI instead of repeating the whole entry sequence.
+- Recency preferences include reposted jobs. Keep reviewing relevant reposts without an extra eligibility gate; exact previously submitted job IDs or canonical URLs still prevent duplicate submission.
+- File upload recovery and verification: bind every attempt and proof to the same labelled field container. First use the directly labelled file input when exposed; otherwise start the browser file-chooser wait before clicking the associated upload control. If the provider exposes a browser-native drop area, Attach button, or equivalent second control for the same field, try one distinct fallback rather than repeating an identical failed click. After each attempt, wait for parsing and snapshot. Accept proof only when that same field shows the expected filename, remove/replace control, parsed-resume state, or review-page attachment. A filename under another attachment field is not proof. Preserve that accepted matching attachment; retry only if later visible evidence shows it was removed, rejected or replaced.
 - Resume text fallback: if PDF upload still lacks proof and the provider itself offers `Enter manually`, `Paste resume`, or an equivalent resume-text mode, use the supplied RESUME TEXT to complete it without asking the user to retype anything. If the resume field is optional and all automated paths fail, leave it blank and continue. If the resume is required and neither a verified file nor provider-supported resume text is accepted, output `RESULT:FAILED:resume_upload` for this job with `FAILURE_CONTEXT: {{"category":"resume_upload","field_label":"<visible resume label>","visible_state":"<what remained empty>","attempts":2}}`; then let the batch continue to a replacement job.
 - Browser upload boundary: keep browser uploads inside browser-native file input, file-chooser, drop-area, or provider resume-text mechanisms. Never switch to Windows Computer Use or an OS-native picker as a workaround. A bounded upload failure belongs only to the affected job and must not stop unrelated jobs in the batch.
 - Native dropdown and custom combobox: use browser_select_option for a native select. For an ARIA/custom combobox, open it, read only the current bounded listbox/tree options, choose the exact fact or registered alias, and click the option; if option clicking is unstable but the widget exposes standard combobox keyboard behavior, use ArrowDown/ArrowUp plus Enter once. Re-snapshot and require the selected value to persist and `aria-expanded`/the popup to close before moving on. For a multi-select, add one option at a time and verify its chip, checked state, or selected marker after each addition. Low-impact required fields such as application source use the configured simple truthful default and never block the application.
@@ -2178,7 +2217,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 == WHEN TO GIVE UP ==
 - Same page signature after one corrective attempt with no progress -> RESULT:FAILED:stuck
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
-- Page is broken/500 error/blank -> RESULT:FAILED:page_error
+- Before submission, an explicit broken/500 page or a blank page that persists after the single bounded loading wait and fresh snapshot -> RESULT:FAILED:page_error. After submission, use RESULT:SUBMISSION_UNCERTAIN when confirmation is missing.
 For any failure, also emit a compact FAILURE_CONTEXT with category, recoverability, missing_capability or missing_material when applicable, next_action, visible_state, and bounded attempts. Never include secrets or full mailbox content. Stop immediately after the bounded attempt. Output your RESULT code. Do not loop."""
 
     return prompt

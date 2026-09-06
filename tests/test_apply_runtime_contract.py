@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 import pytest
 
@@ -22,6 +23,7 @@ from applypilot.apply import (
     performance_attribution,
     prompt,
     router,
+    successfactors_binding,
     worker_orchestration,
 )
 from applypilot.apply.capabilities import (
@@ -1923,6 +1925,214 @@ def test_worker_runs_one_read_only_provenance_child_between_host_audits(
     )
 
 
+def _qualified_prepared_audit_report(
+    *,
+    disposition: str = "clear",
+    lossy_answer_mappings: list[dict] | None = None,
+) -> dict:
+    lossy = list(lossy_answer_mappings or [])
+    return {
+        "status": "clear",
+        "disposition": disposition,
+        "page_url": "https://jobs.example.test/role/apply",
+        "issues": [],
+        "blocking_issues": [],
+        "repairable_issues": [],
+        "advisory_issues": [],
+        "lossy_answer_mappings": lossy,
+        "answer_provenance": {
+            "blocked_count": 0,
+            "coverage_ratio": 1.0,
+        },
+        "advisory_only": disposition == "proceed_with_advisories",
+        "submission_gate": True,
+        "required_unfilled_count": 0,
+        "resume_field_present": False,
+        "resume_uploaded": False,
+        "agent_resume_upload_verified": True,
+        "submit_control_count": 1,
+        "captcha_token_present": False,
+        "assessment_visible": False,
+        "verification_visible": False,
+        "sensitive_required_unknown_count": 0,
+        "ats_adapter_context": {"fields": []},
+    }
+
+
+@pytest.mark.parametrize(
+    ("disposition", "lossy_answer_mappings"),
+    [
+        ("clear", []),
+        ("proceed_with_advisories", []),
+        (
+            "proceed_with_advisories",
+            [
+                {
+                    "field_semantic": "education_degree",
+                    "relation": "same_level_credential",
+                    "selected_option": "Master's Degree",
+                },
+                {
+                    "field_semantic": "education_degree",
+                    "relation": "same_level_credential",
+                    "selected_option": "Bachelor's Degree",
+                },
+            ],
+        ),
+    ],
+)
+def test_worker_reaudits_qualified_prepared_state_before_reservation_and_submit(
+    monkeypatch,
+    disposition: str,
+    lossy_answer_mappings: list[dict],
+) -> None:
+    audits: list[dict] = []
+    reservations: list[dict] = []
+
+    def audit(current_job: dict) -> tuple[None, dict]:
+        audits.append(dict(current_job))
+        return None, _qualified_prepared_audit_report(
+            disposition=disposition,
+            lossy_answer_mappings=lossy_answer_mappings,
+        )
+
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_hook=audit,
+        reservation_calls=reservations,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert len(audits) == 2
+    assert len(reservations) == 1
+
+
+@pytest.mark.parametrize(
+    ("report_update", "audit_signal"),
+    [
+        (
+            {
+                "status": "attention",
+                "disposition": "block",
+                "issues": ["unexpected_application_url"],
+                "blocking_issues": ["unexpected_application_url"],
+                "submission_gate": False,
+            },
+            "pre_submit_audit:unexpected_application_url",
+        ),
+        (
+            {
+                "sensitive_required_unknown_count": 1,
+            },
+            None,
+        ),
+    ],
+)
+def test_worker_never_reserves_or_submits_unqualified_prepared_state(
+    monkeypatch,
+    report_update: dict,
+    audit_signal: str | None,
+) -> None:
+    report = _qualified_prepared_audit_report(
+        disposition="proceed_with_advisories",
+        lossy_answer_mappings=[
+            {
+                "field_semantic": "education_degree",
+                "relation": "same_level_credential",
+                "selected_option": "Master's Degree",
+            }
+        ],
+    )
+    report.update(report_update)
+    reservations: list[dict] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_results=[(audit_signal, report)],
+        reservation_calls=reservations,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert reservations == []
+    assert marked[0][1]["evidence"]["pre_submit_audit"] == report
+
+
+def test_guest_form_needs_no_account_or_credential_authorization(monkeypatch) -> None:
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        profile_overrides={"authentication": {
+            "ordinary_ats_sign_in_authorized": False,
+            "ats_account_creation_authorized": False,
+            "credential_relay_authorized": False,
+        }},
+        prepare_results=["prepared_for_audit"],
+        audit_results=[(None, _qualified_prepared_audit_report())] * 2,
+    )
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+
+
+def test_worker_accepts_normal_navigation_and_nonblocking_audit_metadata(monkeypatch) -> None:
+    first = _qualified_prepared_audit_report()
+    first["page_url"] = (
+        "https://tenant.wd5.myworkdayjobs.com/en-US/Careers/job/Analyst_R123/apply/autofillWithResume"
+    )
+    # These are explanatory fields, not separate authorizations.
+    first.pop("lossy_answer_mappings")
+    first.pop("advisory_only")
+    first["captcha_token_present"] = True  # A completed challenge is not a visible challenge.
+    second = _qualified_prepared_audit_report()
+    second["page_url"] = (
+        "https://tenant.wd5.myworkdayjobs.com/en-GB/Careers/job/Singapore/Analyst_R123/apply"
+    )
+    reservations = []
+    result, phases, _ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_results=[(None, first), (None, second)],
+        reservation_calls=reservations,
+    )
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert len(reservations) == 1
+
+
+def test_worker_stops_on_page_drift_after_qualified_prepared_audit(
+    monkeypatch,
+) -> None:
+    first = _qualified_prepared_audit_report(
+        disposition="proceed_with_advisories",
+        lossy_answer_mappings=[
+            {
+                "field_semantic": "education_degree",
+                "relation": "same_level_credential",
+                "selected_option": "Master's Degree",
+            }
+        ],
+    )
+    drifted = _qualified_prepared_audit_report()
+    drifted["page_url"] = "https://jobs.example.test/other/apply"
+    reservations: list[dict] = []
+
+    result, phases, _ledger, marked = _run_worker_contract(
+        monkeypatch,
+        prepare_results=["prepared_for_audit"],
+        audit_results=[(None, first), (None, drifted)],
+        reservation_calls=reservations,
+    )
+
+    assert result == (0, 1)
+    assert phases == ["prepare"]
+    assert reservations == []
+    assert marked[0][1]["evidence"]["pre_submit_audit"]["blocking_issues"] == [
+        "page_drift"
+    ]
+
+
 def test_worker_fails_closed_on_clear_empty_provenance_without_control_coverage(
     monkeypatch,
 ) -> None:
@@ -2675,6 +2885,189 @@ def test_worker_rejects_unresolved_direct_smartrecruiters_identity_before_browse
     assert ledger == []
     assert marked[0][0][1] == "failed"
     assert "smartrecruiters_provider_identity_unresolved" in marked[0][0][2]
+    assert marked[0][1]["evidence"]["ats_application_binding"] == unresolved
+
+
+@pytest.mark.parametrize(
+    ("job_url", "description", "company", "req_id", "ats_host"),
+    [
+        (
+            (
+                "https://jobs.temasek.com.sg/job/Data-Engineer-Intern%2C-Technology-"
+                "%28Jan-Jun-2027%29-238891/1369169257/"
+            ),
+            "Data Engineer Intern\nReq ID: 12189",
+            "temasekcapP2",
+            "12189",
+            "career2.successfactors.eu",
+        ),
+        (
+            "https://careers.ntuchealth.sg/job/Intern,-Data-Analyst/959-en_GB",
+            "Intern, Data Analyst\nReq ID: 959",
+            "ntuchealth",
+            "959",
+            "career44.sapsf.com",
+        ),
+    ],
+)
+def test_successfactors_preflight_binding_is_installed_before_worker_browser(
+    monkeypatch,
+    job_url: str,
+    description: str,
+    company: str,
+    req_id: str,
+    ats_host: str,
+) -> None:
+    posting_id = successfactors_binding._PUBLIC_POSTING_PATH_RE.search(
+        urlparse(job_url).path
+    ).group(1)
+    html = f"""
+        <!doctype html><html><head><script>
+        window.config = {{
+          "ssoCompanyId" : '{company}',
+          "ssoUrl" : 'https://{ats_host}'
+        }};
+        </script></head><body>
+        <span>Req ID: {req_id}</span>
+        <a href="/talentcommunity/apply/{posting_id}/?locale=en_GB">Apply now</a>
+        </body></html>
+    """
+    monkeypatch.setattr(
+        successfactors_binding,
+        "_default_public_page_transport",
+        lambda url: {"status_code": 200, "final_url": url, "html": html},
+    )
+    monkeypatch.setattr(
+        config,
+        "load_profile",
+        lambda: {
+            "agent_runtime": {
+                "orchestration": {
+                    "production_specialist_modes": {
+                        "provider-classifier-v1": "off",
+                        "application-facts-v1": "off",
+                        "work-authorization-v1": "off",
+                        "field-semantic-v1": "off",
+                        "page-failure-v1": "off",
+                    }
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        launcher,
+        "BackgroundWorkerPool",
+        lambda *_args, **_kwargs: SimpleNamespace(shutdown=lambda: None),
+    )
+
+    def execute_preflight_tasks(tasks, runner, reducer, **_kwargs):
+        task_list = list(tasks)
+        assert "ats-identity" in {task.task_id for task in task_list}
+        results = {}
+        state = {}
+        context = SimpleNamespace(
+            heartbeat=lambda _payload: None,
+            checkpoint=lambda _payload: None,
+            cancelled=lambda: False,
+            remaining_seconds=lambda: 10.0,
+        )
+        for task in task_list:
+            if task.task_id == "material-readiness":
+                task_result = launcher.TaskResult(
+                    task_id=task.task_id,
+                    status="completed",
+                    output={
+                        "material_readiness": None,
+                        "mode": "shadow",
+                        "enforced": False,
+                        "proposal_feedback": [],
+                        "replay": False,
+                        "task_id": None,
+                        "proposal_id": None,
+                    },
+                )
+            else:
+                task_result = runner(task, context)
+            results[task.task_id] = task_result
+            reducer(state, task, task_result)
+        return SimpleNamespace(results=results, reduced_state=state)
+
+    monkeypatch.setattr(
+        launcher.orchestration_mod,
+        "execute_task_graph",
+        execute_preflight_tasks,
+    )
+    job = {
+        "url": job_url,
+        "application_url": job_url,
+        "title": "Data role",
+        "company_name": company,
+        "full_description": description,
+    }
+    preflight = launcher._run_read_only_preflight(job)
+
+    assert preflight["provider"] == "generic"
+    assert preflight["ats_identity_provider"] == "successfactors"
+    assert preflight["ats_binding"]["resolved"] is True
+    assert preflight["ats_binding"]["job_req_id"] == req_id
+
+    monkeypatch.setattr(
+        launcher,
+        "_run_read_only_preflight",
+        lambda _job: preflight,
+    )
+    run_calls: list[dict] = []
+    result, phases, ledger, _marked = _run_worker_contract(
+        monkeypatch,
+        job_overrides=job,
+        run_job_calls=run_calls,
+    )
+
+    assert result == (1, 0)
+    assert phases == ["prepare", "submit"]
+    assert ledger[0][0] == "applied"
+    assert run_calls[0]["_ats_application_binding"] == preflight["ats_binding"]
+
+
+def test_worker_rejects_unresolved_successfactors_identity_before_browser(
+    monkeypatch,
+) -> None:
+    job_url = (
+        "https://jobs.temasek.com.sg/job/Data-Engineer-Intern%2C-Technology-"
+        "%28Jan-Jun-2027%29-238891/1369169257/"
+    )
+    unresolved = {
+        "provider": "successfactors",
+        "resolved": False,
+        "reason": "official_job_http_unavailable",
+    }
+    monkeypatch.setattr(
+        launcher,
+        "_run_read_only_preflight",
+        lambda _job: {
+            "provider": "generic",
+            "ats_identity_provider": "successfactors",
+            "ats_binding": unresolved,
+            "material_enforced_block": False,
+        },
+    )
+    launch_calls: list[tuple[tuple, dict]] = []
+
+    result, phases, ledger, marked = _run_worker_contract(
+        monkeypatch,
+        job_overrides={
+            "url": job_url,
+            "application_url": job_url,
+            "full_description": "Req ID: 12189",
+        },
+        launch_calls=launch_calls,
+    )
+
+    assert result == (0, 1)
+    assert phases == []
+    assert launch_calls == []
+    assert ledger == []
+    assert "successfactors_provider_identity_unresolved" in marked[0][0][2]
     assert marked[0][1]["evidence"]["ats_application_binding"] == unresolved
 
 

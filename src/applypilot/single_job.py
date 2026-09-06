@@ -13,7 +13,7 @@ from urllib.parse import urlparse, urlunparse
 
 from applypilot import config
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
-from applypilot.database import get_connection
+from applypilot.database import canonicalize_job_url, extract_platform_job_id, get_connection
 from applypilot.eligibility import refresh_job_eligibility
 from applypilot.scoring.cover_letter import (
     CoverLetterValidationError,
@@ -57,6 +57,9 @@ def import_exact_job(
 
     from applypilot.eligibility import evaluate_job_eligibility
 
+    identity_url = application_target or url
+    platform_job_id = extract_platform_job_id(identity_url) or None
+    canonical_job_url = canonicalize_job_url(identity_url) or None
     now = datetime.now(UTC).isoformat()
     description_text = str(description or "").strip()
     eligibility_status, eligibility_reason = evaluate_job_eligibility({
@@ -65,14 +68,46 @@ def import_exact_job(
         "full_description": description_text,
     })
     conn = get_connection()
+    existing = conn.execute("SELECT url FROM jobs WHERE url=? LIMIT 1", (url,)).fetchone()
+    if existing is None and platform_job_id:
+        existing = conn.execute(
+            "SELECT url FROM jobs WHERE platform_job_id=? LIMIT 1",
+            (platform_job_id,),
+        ).fetchone()
+    if existing is None and canonical_job_url:
+        existing = conn.execute(
+            "SELECT url FROM jobs WHERE canonical_job_url=? LIMIT 1",
+            (canonical_job_url,),
+        ).fetchone()
+    if existing is None and (platform_job_id or canonical_job_url):
+        # Imports made before identity fields were populated cannot match the
+        # indexed lookups above. Compare only those incomplete legacy rows,
+        # keeping a distinct platform/requisition identity distinct.
+        for candidate in conn.execute(
+            "SELECT url, application_url FROM jobs "
+            "WHERE platform_job_id IS NULL OR canonical_job_url IS NULL"
+        ).fetchall():
+            candidate_identity_url = str(
+                candidate["application_url"] or candidate["url"] or ""
+            )
+            if (
+                platform_job_id
+                and extract_platform_job_id(candidate_identity_url) == platform_job_id
+            ) or (
+                canonical_job_url
+                and canonicalize_job_url(candidate_identity_url) == canonical_job_url
+            ):
+                existing = candidate
+                break
+    stored_url = str(existing["url"]) if existing is not None else url
     conn.execute(
         """
         INSERT INTO jobs (
             url, title, location, company_name, source_site, site, strategy,
             description, full_description, application_url, detail_scraped_at,
             discovered_at, eligibility_status, eligibility_reason,
-            eligibility_evaluated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            eligibility_evaluated_at, platform_job_id, canonical_job_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET
             title=excluded.title,
             location=excluded.location,
@@ -92,10 +127,12 @@ def import_exact_job(
                 THEN excluded.detail_scraped_at ELSE jobs.detail_scraped_at END,
             eligibility_status=excluded.eligibility_status,
             eligibility_reason=excluded.eligibility_reason,
-            eligibility_evaluated_at=excluded.eligibility_evaluated_at
+            eligibility_evaluated_at=excluded.eligibility_evaluated_at,
+            platform_job_id=COALESCE(excluded.platform_job_id, jobs.platform_job_id),
+            canonical_job_url=COALESCE(excluded.canonical_job_url, jobs.canonical_job_url)
         """,
         (
-            url,
+            stored_url,
             title.strip(),
             location.strip(),
             company.strip(),
@@ -110,21 +147,23 @@ def import_exact_job(
             eligibility_status,
             eligibility_reason,
             now,
+            platform_job_id,
+            canonical_job_url,
         ),
     )
     conn.commit()
-    row = conn.execute("SELECT * FROM jobs WHERE url=?", (url,)).fetchone()
+    row = conn.execute("SELECT * FROM jobs WHERE url=?", (stored_url,)).fetchone()
     result = dict(row)
     from applypilot.enrichment.detail import sanitize_application_url
 
     sanitized_application_url = sanitize_application_url(
-        url,
+        stored_url,
         result.get("application_url"),
     )
     if sanitized_application_url != result.get("application_url"):
         conn.execute(
             "UPDATE jobs SET application_url=? WHERE url=?",
-            (sanitized_application_url, url),
+            (sanitized_application_url, stored_url),
         )
         conn.commit()
         result["application_url"] = sanitized_application_url
