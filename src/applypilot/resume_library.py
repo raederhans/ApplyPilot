@@ -27,8 +27,8 @@ from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
 from applypilot.scoring.cover_letter import read_resume_source
 from applypilot.scoring.validator import current_profile_resume_fact_errors
 
-TAXONOMY_VERSION = "resume-library-v5"
-POLICY_VERSION = "reuse-policy-v3"
+TAXONOMY_VERSION = "resume-library-v7"
+POLICY_VERSION = "reuse-policy-v4"
 
 REUSE_REQUIRED_COVERAGE = 0.90
 REUSE_OVERALL_SCORE = 0.85
@@ -54,7 +54,7 @@ _REQUIRED_MARKERS = re.compile(
     r"(?i)\b(?:must|required|requirements?|qualifications?|you have|proficien(?:t|cy)|experience with)\b"
 )
 _PREFERRED_MARKERS = re.compile(
-    r"(?i)\b(?:preferred|optional|nice to have|bonus|plus|ideally)\b"
+    r"(?i)\b(?:preferred|optional|nice[- ]to[- ]have|good[- ]to[- ]have|bonus|plus|ideally)\b"
 )
 
 _KNOWN_SKILLS = {
@@ -167,6 +167,90 @@ def _skill_requirement_status(line: str, skill: str) -> str | None:
     return preceding[-1][2] if preceding else None
 
 
+def _requirement_sentences(description: str) -> list[tuple[str, str | None]]:
+    """Keep section intent when a posting puts optional skills in bullet lists."""
+    section: str | None = None
+    sentences: list[tuple[str, str | None]] = []
+    for line in description.splitlines():
+        heading = _normalise_text(line).strip(" #:*-")
+        if re.fullmatch(
+            r"(?:preferred|optional)(?: qualifications| requirements| skills)?|"
+            r"(?:good|nice)[- ]to[- ]have(?: skills)?|bonus(?: points)?", heading
+        ):
+            section = "preferred"
+            continue
+        if heading in {
+            "requirements", "qualifications", "required skills", "minimum qualifications",
+            "what you'll bring", "what you’ll bring", "what you bring",
+            "what we're looking for", "what we’re looking for", "what we are looking for",
+            "who you are", "who should apply", "what you need",
+        }:
+            section = "required"
+            continue
+        if heading in {
+            "responsibilities", "about the role", "about your role", "benefits", "apply now",
+            "what you'll do", "what you’ll do", "what you will do", "about us",
+            "what we offer", "what you will gain", "application instructions",
+        }:
+            section = None
+            continue
+        sentences.extend(
+            (part.strip(), section)
+            for part in re.split(r"[.;]+", line) if part.strip()
+        )
+    return sentences
+
+
+def _section_skill_status(line: str, skill: str, section: str | None) -> str | None:
+    status = _skill_requirement_status(line, skill)
+    # Generic "experience with"/"proficiency" wording under Good to have is
+    # still optional. An explicit must/required clause retains its hard gate.
+    if section == "preferred" and not re.search(
+        r"(?i)\b(?:must|required|mandatory)\b", line
+    ):
+        return "preferred"
+    return status or section
+
+
+def _explicit_skill_options(
+    line: str, known_skills: set[str]
+) -> tuple[list[list[str]], set[str]]:
+    """Recognize explicit alternatives/examples, without inferring equivalence."""
+    text = _normalise_text(line)
+    skill_pattern = "(?:" + "|".join(
+        re.escape(skill) for skill in sorted(known_skills, key=lambda value: (-len(value), value))
+    ) + ")"
+    groups: list[list[str]] = []
+    # Restrict this to two named skills joined by explicit OR. Conjunctions,
+    # slash notation and unknown skill names retain conservative treatment.
+    pattern = (
+        rf"(?<!\w)({skill_pattern})(?!\w)"
+        rf"(?:\s*,?\s+or\s+({skill_pattern})(?!\w)|"
+        rf"\s*,\s*({skill_pattern})(?!\w)\s*,?\s+or both\b)"
+    )
+    for match in re.finditer(pattern, text):
+        # Do not silently carve a binary choice out of a longer OR list.
+        # Longer lists remain conservative until parsed as one complete group.
+        if re.search(
+            rf"(?<!\w){skill_pattern}(?!\w)\s*(?:,|or)\s*$", text[:match.start()]
+        ) or re.match(rf"\s*(?:,|or)\s*{skill_pattern}(?!\w)", text[match.end():]):
+            continue
+        group = sorted({match.group(1), match.group(2) or match.group(3)})
+        outside = text[:match.start()] + text[match.end():]
+        if not any(re.search(rf"(?<!\w){re.escape(skill)}(?!\w)", outside) for skill in group):
+            groups.append(group)
+    examples: set[str] = set()
+    for match in re.finditer(r"\btools? such as (.*?)\bor similar(?: tools)?\b", text):
+        examples.update(
+            skill for skill in known_skills
+            if re.search(rf"(?<!\w){re.escape(skill)}(?!\w)", match.group(1))
+            and not re.search(
+                rf"(?<!\w){re.escape(skill)}(?!\w)", text[:match.start()] + text[match.end():]
+            )
+        )
+    return groups, examples
+
+
 _DELIVERABLE_TERMS = {
     "dashboard",
     "reporting",
@@ -199,7 +283,8 @@ _RESUME_SUBTYPE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "ai_solutions",
         "ai_implementation",
-        ("machine learning engineer", "artificial intelligence engineer", "ai engineer"),
+        ("machine learning engineer", "artificial intelligence engineer", "ai engineer",
+         "ai agent engineer", "ai developer"),
     ),
     (
         "workflow_automation",
@@ -347,6 +432,14 @@ def _unsupported_required_skills(
     unsupported: list[str] = []
     fact_support: list[dict[str, object]] = []
     for gap in hard_gaps:
+        if gap.startswith("one of: "):
+            options = gap.removeprefix("one of: ").split(" | ")
+            if any(re.search(rf"(?<!\w){re.escape(option)}(?!\w)", all_source_text) for option in options):
+                continue
+            fact = next((confirmed_facts[option] for option in options if option in confirmed_facts), None)
+            if fact is not None:
+                fact_support.append(fact)
+                continue
         if _contains_phrase(all_source_text, gap):
             continue
         fact = confirmed_facts.get(_normalise_text(gap))
@@ -558,7 +651,11 @@ def extract_job_profile(
             term_scores[subtype] = max(term_scores.get(subtype, 0), 5 if title_hit else 1)
 
     lowered_title = title.casefold()
-    if re.search(r"\b(?:intern|internship|trainee|co-op|graduate programme)\b", lowered_title):
+    if re.search(r"\b(?:intern|internship|trainee|co-op|graduate programme)\b", lowered_title) or re.search(
+        r"(?im)^\s*(?:full[- ]time\s+)?internship\s*$|"
+        r"\b(?:as an?|we are (?:hiring|seeking|looking for) an?)\s+(?:[\w-]+\s+){0,5}intern\b|"
+        r"\bthis (?:role|position|opportunity) is an? internship\b", description
+    ):
         employment_type = "internship"
     elif re.search(r"\b(?:contract|temporary|freelance)\b", combined):
         employment_type = "contract"
@@ -577,19 +674,33 @@ def extract_job_profile(
     required: set[str] = set()
     preferred: set[str] = set()
     mentioned: set[str] = set()
-    sentences = [part.strip() for part in re.split(r"[\n\r.;]+", description) if part.strip()]
+    sentences = _requirement_sentences(description)
+    required_groups: list[list[str]] = []
+    statuses: dict[str, set[str | None]] = {skill: set() for skill in known_skills}
+    for line, section in sentences:
+        groups, examples = _explicit_skill_options(line, known_skills)
+        active_groups = [
+            group for group in groups
+            if not examples.intersection(group)
+            and all(_section_skill_status(line, skill, section) == "required" for skill in group)
+        ]
+        for group in active_groups:
+            if group not in required_groups:
+                required_groups.append(group)
+        alternatives = {skill for group in active_groups for skill in group}
+        for skill in known_skills:
+            if not _contains_phrase(_normalise_text(line), skill):
+                continue
+            if skill in examples or skill in alternatives:
+                continue
+            statuses[skill].add(_section_skill_status(line, skill, section))
     for skill in known_skills:
         if not _contains_phrase(combined, skill):
             continue
         mentioned.add(skill)
-        skill_statuses = {
-            _skill_requirement_status(line, skill)
-            for line in sentences
-            if _contains_phrase(_normalise_text(line), skill)
-        }
-        if "required" in skill_statuses:
+        if "required" in statuses[skill]:
             required.add(skill)
-        elif "preferred" in skill_statuses:
+        elif "preferred" in statuses[skill]:
             preferred.add(skill)
 
     deliverables = sorted(term for term in _DELIVERABLE_TERMS if _contains_phrase(combined, term))
@@ -597,6 +708,7 @@ def extract_job_profile(
     features = {
         "complete_description": bool(description),
         "mentioned_skills": sorted(mentioned),
+        "required_skill_groups": required_groups,
         "title_matches": list(title_matches),
         "subtype_scores": term_scores,
         "max_required_years": max(years) if years else None,
@@ -665,6 +777,14 @@ def _register_artifact(
     text = read_resume_source(text_path)
     digest = _content_digest(text)
     artifact_id = f"resume:{digest[:24]}"
+    existing = conn.execute(
+        "SELECT artifact_id, validation_status FROM resume_artifacts WHERE content_sha256=?",
+        (digest,),
+    ).fetchone()
+    if existing and existing["validation_status"] == "retired_profile_correction":
+        # Historical job projections may still reference these immutable bytes.
+        # Sync must preserve the correction tombstone and its supersession data.
+        return str(existing["artifact_id"]), False
     pdf_path = original_pdf_path
     if (
         kind == "tailored"
@@ -705,10 +825,6 @@ def _register_artifact(
     else:
         pdf_path = None
     now = _now()
-    existing = conn.execute(
-        "SELECT artifact_id, validation_status FROM resume_artifacts WHERE content_sha256=?",
-        (digest,),
-    ).fetchone()
     created = existing is None
     if created:
         conn.execute(
@@ -896,6 +1012,8 @@ def record_content_revalidation(
         return False
 
     artifact = dict(artifact_row)
+    if artifact["validation_status"] == "retired_profile_correction":
+        return False
     now = _now()
     effective_status = status
     active = 0
@@ -1000,6 +1118,11 @@ def register_tailored_artifact(
         validated_at=str(job.get("tailored_at") or _now()),
         metadata={"registered_from_job": job_profile["job_url"]},
     )
+    stored_status = conn.execute(
+        "SELECT validation_status FROM resume_artifacts WHERE artifact_id=?", (artifact_id,)
+    ).fetchone()["validation_status"]
+    if stored_status == "retired_profile_correction":
+        raise ValueError("Resume artifact was retired after a profile correction; use its corrected successor")
     coverage_added = _add_coverage_cell(conn, artifact_id, job_profile, str(job.get("tailored_at") or ""))
     if created or coverage_added:
         artifact = conn.execute(
@@ -1190,7 +1313,15 @@ def _candidate_score(
     text = _normalise_text(read_resume_source(Path(str(artifact["text_path"]))))
     required = list(job_profile.get("required_skills", []))
     required_hits = [skill for skill in required if _contains_phrase(text, str(skill))]
-    required_coverage = len(required_hits) / len(required) if required else 1.0
+    features = job_profile.get("features", {})
+    groups = features.get("required_skill_groups", []) if isinstance(features, Mapping) else []
+    group_hits = [
+        group for group in groups
+        if any(re.search(rf"(?<!\w){re.escape(str(skill))}(?!\w)", text) for skill in group)
+    ]
+    missing_groups = ["one of: " + " | ".join(group) for group in groups if group not in group_hits]
+    required_count = len(required) + len(groups)
+    required_coverage = (len(required_hits) + len(group_hits)) / required_count if required_count else 1.0
     preferred = list(job_profile.get("preferred_skills", []))
     deliverables = list(job_profile.get("deliverables", []))
     signals = [*preferred, *deliverables]
@@ -1210,7 +1341,8 @@ def _candidate_score(
         "signal_coverage": round(signal_coverage, 6),
         "overall_score": round(overall, 6),
         "exact_job_validation": exact_job_validation,
-        "missing_required": sorted(set(required) - set(required_hits)),
+        "missing_required": sorted(set(required) - set(required_hits)) + missing_groups,
+        "matched_required_skill_groups": group_hits,
         "matched_signals": sorted(signal_hits),
     }
 
@@ -1242,6 +1374,11 @@ def route_resume_for_job(
         "job_profile": job_profile,
         "candidates": [],
         "profile_fact_rejections": profile_fact_rejections,
+        "reuse_thresholds": {
+            "required_coverage": REUSE_REQUIRED_COVERAGE,
+            "overall_score": REUSE_OVERALL_SCORE,
+            "runner_up_margin_is_gate": False,
+        },
     }
 
     fit_score = job.get("fit_score")
@@ -1355,11 +1492,20 @@ def route_resume_for_job(
                 scored["route_preference_score"] = (
                     int(source_is_configured) + int(artifact_track_matches)
                 )
+                unsupported, _ = _unsupported_required_skills(
+                    conn, profile, scored["missing_required"]
+                )
+                scored["reuse_qualified"] = bool(scored["exact_job_validation"]) or (
+                    scored["required_coverage"] >= REUSE_REQUIRED_COVERAGE
+                    and scored["overall_score"] >= REUSE_OVERALL_SCORE
+                    and not unsupported
+                )
                 scored["artifact"] = artifact
                 candidates.append(scored)
         candidates.sort(
             key=lambda item: (
                 not item["exact_job_validation"],
+                not item["reuse_qualified"],
                 -item["overall_score"],
                 -item["route_preference_score"],
                 item["artifact_id"],
@@ -1435,21 +1581,10 @@ def route_resume_for_job(
             elif not top["exact_job_validation"] and overall_score < REUSE_OVERALL_SCORE:
                 decision = "create_variant"
                 reason = "The best artifact is below the conservative exact-reuse score."
-            elif not top["exact_job_validation"] and margin < REUSE_MIN_MARGIN:
-                manual_selection_allowed = True
-                if fit_gate_passed:
-                    decision = "create_variant"
-                    reason = (
-                        "Two validated artifacts are too close for exact reuse; create and "
-                        "validate a job-specific variant from factual source material."
-                    )
-                else:
-                    decision = "manual_review"
-                    reason = (
-                        "Two validated artifacts are too close, and the configured fit-score "
-                        "gate was not proven to pass."
-                    )
             elif not top["exact_job_validation"]:
+                # Candidate proximity is diagnostic, not a reason to generate
+                # new material when the best artifact independently qualifies.
+                manual_selection_allowed = margin < REUSE_MIN_MARGIN
                 decision = "reuse_exact"
                 if route_preference_resolved_tie:
                     reason = (
@@ -1475,7 +1610,7 @@ def route_resume_for_job(
             raise ValueError(
                 "The requested resume artifact is not a current candidate for this exact job"
             )
-        if decision not in {"manual_review", "create_variant"} or not manual_selection_allowed:
+        if decision not in {"manual_review", "create_variant", "reuse_exact"} or not manual_selection_allowed:
             raise ValueError(
                 "Manual selection cannot resolve this route decision"
             )
@@ -1507,7 +1642,7 @@ def route_resume_for_job(
         decision = "manual_selection"
         reason = (
             "An explicit operator or agent selected one current qualified candidate "
-            "from an otherwise unresolved tie."
+            "from closely ranked candidates that independently clear the reuse thresholds."
         )
         components["manual_selection"] = {
             "artifact_id": artifact_id,
@@ -1539,6 +1674,7 @@ def route_resume_for_job(
         "job_profile": job_profile,
         "candidates": components["candidates"],
         "profile_fact_rejections": profile_fact_rejections,
+        "reuse_thresholds": components["reuse_thresholds"],
     }
     if decision in {"reuse_exact", "manual_selection"} and artifact_id:
         artifact = dict(

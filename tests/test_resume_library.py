@@ -23,7 +23,7 @@ from applypilot.scoring import tailor
 
 
 def test_resume_taxonomy_version_tracks_routing_term_changes() -> None:
-    assert TAXONOMY_VERSION == "resume-library-v5"
+    assert TAXONOMY_VERSION == "resume-library-v7"
 
 
 def test_resume_route_cli_exposes_explicit_candidate_selection() -> None:
@@ -464,7 +464,7 @@ def test_taxonomy_v5_ignores_v4_coverage_until_sync_rebuilds_it(tmp_path: Path) 
             "SELECT taxonomy_version FROM resume_coverage_cells"
         ).fetchall()
     }
-    assert versions == {"resume-library-v4", "resume-library-v5"}
+    assert versions == {"resume-library-v4", "resume-library-v7"}
     artifact = conn.execute(
         "SELECT track FROM resume_artifacts WHERE kind='tailored'"
     ).fetchone()
@@ -1168,7 +1168,7 @@ def test_manual_selection_uses_confirmed_skill_experience_for_unsupported_gap(
         minimum_fit_score=7,
     )
 
-    assert automatic["decision"] == "create_variant"
+    assert automatic["decision"] == "reuse_exact"
     assert automatic_components["unsupported_required_skills"] == []
     assert automatic_components["confirmed_required_skill_facts"][0]["fact_key"] == (
         "aws_experience_years"
@@ -1220,7 +1220,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
 
     unresolved = route_resume_for_job(conn, job, profile, minimum_fit_score=7)
 
-    assert unresolved["decision"] == "create_variant"
+    assert unresolved["decision"] == "reuse_exact"
     assert len(unresolved["candidates"]) == 2
     selected_artifact_id = unresolved["candidates"][1]["artifact_id"]
 
@@ -1460,4 +1460,204 @@ def test_batch_tailoring_still_skips_jobs_with_existing_material(
         "failed": 0,
         "errors": 0,
         "elapsed": 0.0,
+    }
+
+
+@pytest.mark.parametrize("heading", ["Good to have", "Nice-to-have", "Preferred Qualifications"])
+def test_optional_section_does_not_promote_generic_experience(heading: str) -> None:
+    result = extract_job_profile({
+        "title": "AI Developer Intern",
+        "full_description": (
+            "Requirements\nStrong Python proficiency.\n"
+            + heading + "\nExperience with cloud platforms (GCP, AWS).\n"
+            "Hands-on experience with RAG.\n"
+            "Responsibilities\nBuild workflows."
+        ),
+    })
+    assert result["required_skills"] == ["python"]
+    assert result["preferred_skills"] == ["aws", "gcp", "rag"]
+    assert result["track"] == "ai_implementation"
+
+
+def test_explicit_required_clause_survives_optional_section() -> None:
+    result = extract_job_profile({
+        "title": "AI Developer Intern",
+        "full_description": "Good to have\nAWS is preferred.\nPython is required.",
+    })
+    assert result["required_skills"] == ["python"]
+    assert result["preferred_skills"] == ["aws"]
+
+
+@pytest.mark.parametrize("description", [
+    "As an AI Agent Intern, you will help us build and evaluate agent workflows.",
+    "Full Time Internship\nBuild AI agent workflows.",
+    "This role is an internship. Build AI agent workflows.",
+])
+def test_explicit_description_internship_and_agent_title(description: str) -> None:
+    result = extract_job_profile({"title": "AI Agent Engineer", "full_description": description})
+    assert result["employment_type"] == "internship"
+    assert result["track"] == "ai_implementation"
+    assert result["subtype"] == "ai_solutions"
+
+
+def test_past_internship_experience_does_not_make_role_an_internship() -> None:
+    result = extract_job_profile({
+        "title": "AI Agent Engineer",
+        "full_description": "Previous internship experience is preferred. You will mentor interns.",
+    })
+    assert result["employment_type"] == "full_time_or_unspecified"
+
+
+@pytest.mark.parametrize("heading", ["What you'll bring", "What we’re looking for", "Who should apply"])
+def test_new_requirement_heading_ends_optional_section(heading: str) -> None:
+    profile = extract_job_profile({
+        "title": "AI Developer Intern",
+        "full_description": f"Preferred Qualifications\nAWS\n{heading}\nExperience with Python",
+    })
+    assert profile["required_skills"] == ["python"]
+    assert profile["preferred_skills"] == ["aws"]
+
+
+def test_neutral_heading_ends_optional_section() -> None:
+    profile = extract_job_profile({
+        "title": "AI Developer Intern",
+        "full_description": "Preferred Qualifications\nAWS\nWhat you will do\nBuild Python pipelines",
+    })
+    assert profile["required_skills"] == []
+    assert profile["preferred_skills"] == ["aws"]
+    assert "python" in profile["features"]["mentioned_skills"]
+
+
+def test_profile_correction_retirement_survives_sync_registration_and_revalidation(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    history_url = _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    artifact = dict(conn.execute("SELECT * FROM resume_artifacts WHERE kind='tailored'").fetchone())
+    conn.execute(
+        "UPDATE resume_artifacts SET active=0, validation_status='retired_profile_correction', "
+        "metadata_json=? WHERE artifact_id=?",
+        (json.dumps({"superseded_by": "resume:corrected"}), artifact["artifact_id"]),
+    )
+    conn.commit()
+    counts = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in (
+        "resume_coverage_cells", "job_resume_assignments", "resume_validation_runs",
+    )}
+    result = sync_resume_library(conn, profile, tmp_path)
+    assert result["skipped"] == 1
+    job = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (history_url,)).fetchone())
+    with pytest.raises(ValueError, match="retired"):
+        resume_library.register_tailored_artifact(
+            conn, job=job, text_path=job["tailored_resume_path"],
+            source_resume_path=str(base), report_path=job["tailor_report_path"], profile=profile,
+        )
+    assert resume_library.record_content_revalidation(
+        conn, text=Path(artifact["text_path"]).read_text(encoding="utf-8"),
+        status="machine_validated", job=job,
+    ) is False
+    stored = conn.execute("SELECT * FROM resume_artifacts WHERE artifact_id=?", (artifact["artifact_id"],)).fetchone()
+    assert stored["active"] == 0
+    assert stored["validation_status"] == "retired_profile_correction"
+    assert json.loads(stored["metadata_json"])["superseded_by"] == "resume:corrected"
+    for table, count in counts.items():
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count
+
+
+
+def test_qualified_resume_outranks_higher_scoring_candidate_with_hard_gap(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base, suffix="missing-required", content=(
+        "DATA ANALYST\nPython SQL R Git React TypeScript JavaScript GCP Azure\n"
+        "Dashboard reporting analysis automation workflow prototype integration"
+    ))
+    _validated_history(tmp_path, conn, base, suffix="complete", content="DATA ANALYST\nPython SQL R Git React TypeScript JavaScript GCP Azure AWS")
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    job = {
+        "url": "https://careers.example.test/qualified-first", "title": "Data Analyst",
+        "full_description": "Required: Python, SQL, R, Git, React, TypeScript, JavaScript, GCP, Azure, AWS. "
+        "Dashboard reporting analysis automation workflow prototype integration.",
+        "eligibility_status": "eligible",
+    }
+    result = route_resume_for_job(conn, job, profile)
+    assert result["decision"] == "reuse_exact"
+    assert result["required_coverage"] == 1.0
+    assert result["candidates"][0]["reuse_qualified"] is True
+    assert result["candidates"][1]["reuse_qualified"] is False
+    assert result["candidates"][1]["overall_score"] > result["candidates"][0]["overall_score"]
+    assert "Python SQL" in Path(result["artifact"]["text_path"]).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("description", [
+    "Proficiency in Python, SQL, or both.",
+    "Proficiency in Python or SQL.",
+])
+def test_explicit_required_alternatives_are_one_group(description: str) -> None:
+    profile = extract_job_profile({"title": "Data Analyst", "full_description": description})
+    assert profile["required_skills"] == []
+    assert profile["features"]["required_skill_groups"] == [["python", "sql"]]
+
+
+@pytest.mark.parametrize("description", [
+    "Python, SQL, or R are required.",
+    "Python or SQL or R are required.",
+])
+def test_longer_alternative_list_is_not_partially_grouped(description: str) -> None:
+    profile = extract_job_profile({"title": "Data Analyst", "full_description": description})
+    assert profile["features"]["required_skill_groups"] == []
+    assert profile["required_skills"] == ["python", "r", "sql"]
+
+
+def test_example_tools_do_not_replace_underlying_capability_requirement() -> None:
+    profile = extract_job_profile({
+        "title": "AI Agent Engineer",
+        "full_description": (
+            "Requirements\nExperience with data analysis tools such as pandas, Jupyter, Excel, "
+            "Tableau, Power BI, Metabase, or similar tools.\nAWS is required."
+        ),
+    })
+    assert profile["required_skills"] == ["aws", "data analysis"]
+    assert profile["features"]["required_skill_groups"] == []
+
+
+@pytest.mark.parametrize("description", [
+    "Python and SQL are required.",
+    "Python or SQL, but Python is required.",
+    "Python or UnregisteredLanguage are required.",
+])
+def test_alternative_parser_does_not_relax_conjunctions_unknown_names_or_explicit_requirements(description: str) -> None:
+    profile = extract_job_profile({"title": "Data Analyst", "full_description": description})
+    assert "python" in profile["required_skills"]
+    assert profile["features"]["required_skill_groups"] == []
+
+
+@pytest.mark.parametrize(("content", "decision", "missing"), [
+    ("DATA ANALYST\nPython, data analysis", "reuse_exact", []),
+    ("DATA ANALYST\nSQL, data analysis", "reuse_exact", []),
+    ("DATA ANALYST\nNoSQL, data analysis", "create_variant", ["one of: python | sql"]),
+    ("DATA ANALYST\nPython", "create_variant", ["data analysis"]),
+])
+def test_alternative_coverage_requires_one_named_skill_and_underlying_capability(
+    tmp_path: Path, content: str, decision: str, missing: list[str]
+) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: Python and SQL.", encoding="utf-8")
+    _validated_history(tmp_path, conn, base, content=content)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    result = route_resume_for_job(conn, {
+        "url": "https://careers.example.test/alternative",
+        "title": "Data Analyst", "eligibility_status": "eligible", "fit_score": 8,
+        "full_description": "Proficiency in Python, SQL, or both. "
+        "Experience with data analysis tools such as Excel, Tableau, Power BI, or similar tools.",
+    }, profile, minimum_fit_score=7)
+    assert result["decision"] == decision
+    assert result["hard_gaps"] == missing
+    assert result["reuse_thresholds"] == {
+        "required_coverage": 0.9, "overall_score": 0.85, "runner_up_margin_is_gate": False,
     }
