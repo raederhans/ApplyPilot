@@ -4,12 +4,23 @@ All notable changes to CapyPilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
 ### Changed
 
 - Renamed the public product identity to **CapyPilot** while retaining the
   `applypilot-local` distribution, `applypilot` package and CLI,
   `APPLYPILOT_*` environment variables, local storage identifiers, and
   repository URLs for compatibility.
+
+### Added
+
+- CapyPilot visual identity and bilingual product documentation.
+- Expanded employer discovery with independent employer review before board
+  leads enter the verified opportunity pipeline.
+- Qualified resume reuse and safeguards against stale profile facts.
+- Browser runtime and receipt reconciliation improvements that preserve
+  application progress across verification and feedback failures.
 
 ### Fixed
 

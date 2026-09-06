@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish CapyPilot
 
 on:
   push:
@@ -88,5 +88,5 @@ jobs:
             dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "$GITHUB_REF_NAME" \
+            --title "CapyPilot $GITHUB_REF_NAME" \
             --generate-notes

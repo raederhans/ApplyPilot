@@ -1,1 +1,1 @@
-"""Developer and release automation for ApplyPilot Local."""
+"""Developer and release automation for CapyPilot."""

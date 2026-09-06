@@ -1,8 +1,18 @@
 # CapyPilot
 
+<p align="center">
+  <img src="src/applypilot/frontend/assets/capypilot/capypilot-lockup-light.png" alt="CapyPilot" width="560">
+</p>
+
+[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=CapyPilot)](https://github.com/raederhans/ApplyPilot/releases/latest)
+[![CI](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**A local-first, evidence-driven workspace for running a careful job search.**
+**Your next chapter, one confident step at a time.**
+
+A local-first career workspace: discover opportunities, prepare truthful
+applications, and keep a clear record of every outcome.
 
 CapyPilot helps one job seeker discover verifiable openings, compare fit,
 prepare truthful materials, complete supported application forms under explicit
@@ -29,10 +39,9 @@ matched to the exact job can create a durable submitted record.
   CAPTCHA or MFA, assessments, identity or financial documents, account
   recovery, security changes, and uncertain submission outcomes stop for
   review.
-- **The CapyPilot identity is unreleased.** The latest public release is v0.4.0
-  under the former **ApplyPilot Local** name. The current repository contains
-  the CapyPilot brand migration and keeps existing technical identifiers for
-  compatibility.
+- **CapyPilot v0.5.0** introduces our independent product brand, with a capybara
+  identity and a calm, deliberate approach to career progress. Existing commands
+  and local data remain compatible.
 
 ## Product workflow
 
@@ -62,10 +71,12 @@ There is currently no `applypilot-local` release on PyPI. Install from the
 directly from the repository:
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git"
+pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.0"
 ```
 
-A release bundle or source checkout also provides a guided installer:
+For a reproducible local deployment, download the v0.5.0 bundle and
+`SHA256SUMS` from the release page, verify the archive checksum, then extract
+the bundle and run the guided installer:
 
 ```bash
 python install.py

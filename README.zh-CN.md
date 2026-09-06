@@ -1,8 +1,17 @@
 # CapyPilot
 
+<p align="center">
+  <img src="src/applypilot/frontend/assets/capypilot/capypilot-lockup-light.png" alt="CapyPilot" width="560">
+</p>
+
+[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=CapyPilot)](https://github.com/raederhans/ApplyPilot/releases/latest)
+[![CI](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**一个本地优先、以证据为准的个人求职工作台。**
+**从容向前，让下一步更有把握。**
+
+一个本地优先的个人求职工作台：发现机会、准备可信申请、清楚记录每一次结果。
 
 CapyPilot 帮助求职者发现真实可核验的职位、判断匹配度、准备可信材料、
 在明确授权后协助填写受支持的申请表，并确认一次申请究竟有没有真正提交成功。
@@ -24,9 +33,8 @@ CapyPilot 面向有监督的执行流程，而不是不加判断地批量海投�
 - **人工复核仍然是产品流程的一部分。** 缺乏事实依据的材料问题、CAPTCHA、
   MFA、在线测评、身份或财务文件、账户恢复、安全设置变更，以及无法确认的
   提交结果，都会停下来交给用户处理。
-- **CapyPilot 品牌尚未正式发布。** 当前公开的最新版本仍是使用旧名称
-  **ApplyPilot Local** 的 v0.4.0。当前仓库正在完成 CapyPilot 品牌迁移，
-  同时保留原有技术标识以维持兼容性。
+- **CapyPilot v0.5.0** 正式采用独立产品品牌，以水豚形象传达从容、可靠的
+  求职体验。原有命令与本地数据保持兼容。
 
 ## 产品流程
 
@@ -56,10 +64,11 @@ Python 3.13。
 安装，或者直接安装当前仓库：
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git"
+pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.0"
 ```
 
-Release 安装包或源码检出中也提供了引导式安装器：
+需要固定版本的本地部署时，从 Release 页面下载 v0.5.0 bundle 和
+`SHA256SUMS`，校验压缩包的 SHA-256 后解压，再运行引导式安装器：
 
 ```bash
 python install.py
