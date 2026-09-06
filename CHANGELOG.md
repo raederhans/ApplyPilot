@@ -4,6 +4,14 @@ All notable changes to CapyPilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-06
+
+### Fixed
+
+- Install Chromium in the tagged-release runner before executing browser tests.
+  The v0.5.0 tag failed verification because the runner lacked Chromium; no
+  v0.5.0 release artifacts were published. v0.5.1 includes the brand changes below.
+
 ## [0.5.0] - 2026-09-06
 
 ### Changed

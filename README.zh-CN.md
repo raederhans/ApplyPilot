@@ -33,7 +33,7 @@ CapyPilot 面向有监督的执行流程，而不是不加判断地批量海投�
 - **人工复核仍然是产品流程的一部分。** 缺乏事实依据的材料问题、CAPTCHA、
   MFA、在线测评、身份或财务文件、账户恢复、安全设置变更，以及无法确认的
   提交结果，都会停下来交给用户处理。
-- **CapyPilot v0.5.0** 正式采用独立产品品牌，以水豚形象传达从容、可靠的
+- **CapyPilot v0.5.1** 正式采用独立产品品牌，以水豚形象传达从容、可靠的
   求职体验。原有命令与本地数据保持兼容。
 
 ## 产品流程
@@ -64,10 +64,10 @@ Python 3.13。
 安装，或者直接安装当前仓库：
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.0"
+pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.1"
 ```
 
-需要固定版本的本地部署时，从 Release 页面下载 v0.5.0 bundle 和
+需要固定版本的本地部署时，从 Release 页面下载 v0.5.1 bundle 和
 `SHA256SUMS`，校验压缩包的 SHA-256 后解压，再运行引导式安装器：
 
 ```bash

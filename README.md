@@ -39,7 +39,7 @@ matched to the exact job can create a durable submitted record.
   CAPTCHA or MFA, assessments, identity or financial documents, account
   recovery, security changes, and uncertain submission outcomes stop for
   review.
-- **CapyPilot v0.5.0** introduces our independent product brand, with a capybara
+- **CapyPilot v0.5.1** introduces our independent product brand, with a capybara
   identity and a calm, deliberate approach to career progress. Existing commands
   and local data remain compatible.
 
@@ -71,10 +71,10 @@ There is currently no `applypilot-local` release on PyPI. Install from the
 directly from the repository:
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.0"
+pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.1"
 ```
 
-For a reproducible local deployment, download the v0.5.0 bundle and
+For a reproducible local deployment, download the v0.5.1 bundle and
 `SHA256SUMS` from the release page, verify the archive checksum, then extract
 the bundle and run the guided installer:
 

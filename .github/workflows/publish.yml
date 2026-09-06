@@ -27,6 +27,9 @@ jobs:
       - name: Install verification dependencies
         run: python -m pip install -e ".[dev,jobboards]"
 
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Verify tag matches package version
         run: |
           python -c "import os, pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']; actual = os.environ['GITHUB_REF_NAME']; assert actual == f'v{version}', f'tag {actual} does not match v{version}'"
