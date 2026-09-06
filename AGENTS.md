@@ -20,6 +20,59 @@
 
 ## Discovery and employer coverage
 
+- With a reviewed job description but an unusable application entry, consider
+  the employer careers page, its official ATS link, or another listing of the
+  same role. This is an optional recovery strategy, not a fixed provider order.
+  Match employer, title, location and available requisition ID, then check the
+  cross-platform application history before submitting. Reconcile an uncertain
+  earlier submission before trying another entry. A login/security barrier on
+  one site does not prohibit using a legitimate alternative entry; it does not
+  authorize defeating that site's challenge or inventing required answers.
+- Choose page feedback according to the unresolved question: current DOM and
+  accessible names, screenshots, selected states, navigation and exact receipts
+  can complement each other. An empty file-property read or missing filename in
+  text alone need not mean upload failure. Consider another observation before
+  repeating an action; there is no requirement to collect every channel or use
+  them in a fixed order. Report once the requested facts or a decisive blocker
+  are established.
+
+- CAPTCHA handling: distinguish passive badges/background frames from a visible
+  blocking challenge or an explicit verification rejection. Passive infrastructure
+  alone need not block normal preparation or an otherwise authorized final click.
+  Let the normal verification callback settle and inspect the actual outcome;
+  never submit merely to probe, repeatedly retry, manipulate tokens or use solvers.
+  Preserve the tab, prepared values, visible error and whether Submit was clicked.
+  A blocking challenge can be handed off while the batch continues elsewhere.
+  After manual clearance, observe again and check whether the application already
+  completed before resuming. For a confirmed rejected attempt, consider the
+  exact job's official entry or listing-authorized email after duplicate checks;
+  an ambiguous attempted submission still needs reconciliation before another
+  route is used. Direct email stays on the mailbox audit/send/receipt route.
+- Phone reminder (soft check): inspect the rendered country/flag and number for
+  a duplicated prefix or incorrect inferred country. A separate prefix selector
+  usually takes the national number; an international-number widget can require
+  the full profile number even when it also displays a flag. Recheck when useful
+  after resume parsing or country changes. If DOM values are inconclusive, a
+  screenshot can help. This adds no hard gate or mandatory observation sequence.
+
+- Indeed popup recovery (observed 2026-09-06): a signed-in job page may emit a
+  `Page.windowOpen` request for SmartApply without the in-app browser creating a
+  tab. Missing navigation alone is not an authentication failure. If needed,
+  inspect the supported browser's new-tab/window evidence and consider opening
+  the exact freshly observed application URL in a new tab, or using Edge when
+  the user's browser choice allows it. Verify the resulting employer/job and
+  form before continuing; never synthesize application IDs or replay a final
+  submission. This is a situational recovery option, not a required CDP step
+  for every application. Check prefilled surname/given-name fields against the
+  configured profile rather than assuming the account's saved order is correct.
+  Also review saved contact details: for a separate country-code selector use
+  `phone_country_code` there and `phone_national_number` in the number field.
+  A signed-in Indeed profile may still prefill an old number or duplicate its
+  prefix; check the rendered field if the DOM snapshot omits phone values.
+  Resume replacement can reparse and overwrite saved contacts (observed: phone
+  reverted to US +1 and city cleared). Recheck contact fields after the resume
+  has finished saving, and correct from the configured profile when authorized.
+
 - For a broad search, preserve useful official-company monitoring and spend a
   bounded part of the run discovering employers outside the current shortlist.
   Use `..\run-radar.ps1 radar explore` (default two rotating role queries on both

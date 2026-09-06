@@ -60,6 +60,16 @@ app.add_typer(batches_app, name="batches")
 console = Console()
 log = logging.getLogger(__name__)
 
+
+def _print_json(*, data: Any) -> None:
+    """Keep structured output lossless on Windows legacy-encoded streams.
+
+    JSON Unicode escapes avoid a presentation failure after a mutation commits,
+    without changing the process encoding or replacing unsupported characters.
+    """
+    console.print_json(data=data, ensure_ascii=True)
+
+
 # Valid pipeline stages (in execution order)
 VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
@@ -349,7 +359,7 @@ def _exception_view(item: Any, *, include_context: bool = False) -> dict[str, ob
 
 
 def _operator_error(message: str) -> None:
-    console.print_json(data={"ok": False, "error": message})
+    _print_json(data={"ok": False, "error": message})
     raise typer.Exit(code=2)
 
 
@@ -451,7 +461,7 @@ def exceptions_list(
         items = runtime.list_exceptions(status=status, limit=limit)
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(
+    _print_json(
         data={
             "ok": True,
             "count": len(items),
@@ -472,7 +482,7 @@ def exceptions_show(
         _operator_error(str(exc))
     if item is None:
         _operator_error(f"operator exception was not found: {exception_id}")
-    console.print_json(data={"ok": True, "exception": _exception_view(item, include_context=True)})
+    _print_json(data={"ok": True, "exception": _exception_view(item, include_context=True)})
 
 
 @exceptions_app.command("group")
@@ -484,7 +494,7 @@ def exceptions_group(
         groups = _operator_runtime(db_path).group_exceptions()
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "read_only": True, "groups": _json_safe(groups)})
+    _print_json(data={"ok": True, "read_only": True, "groups": _json_safe(groups)})
 
 
 @exceptions_app.command("resolve")
@@ -503,7 +513,7 @@ def exceptions_resolve(
         result = runtime.resolve(command)
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "result": _json_safe(result)})
+    _print_json(data={"ok": True, "result": _json_safe(result)})
 
 
 @exceptions_app.command("resume")
@@ -534,7 +544,7 @@ def exceptions_resume(
         result = runtime.resume(command, request_id=request_id)
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "result": _json_safe(result)})
+    _print_json(data={"ok": True, "result": _json_safe(result)})
 
 
 @runs_app.command("inspect")
@@ -547,7 +557,7 @@ def runs_inspect(
         inspection = _operator_runtime(db_path).inspect_run(actor_id)
     except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "run": _json_safe(inspection)})
+    _print_json(data={"ok": True, "run": _json_safe(inspection)})
 
 
 @runs_app.command("cohort")
@@ -569,7 +579,7 @@ def runs_cohort(
         evidence = inspect_cohort_report(report_path)
     except (json.JSONDecodeError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "evidence": evidence})
+    _print_json(data={"ok": True, "evidence": evidence})
 
 
 @runs_app.command("reconcile")
@@ -616,7 +626,7 @@ def runs_reconcile(
         )
     except (json.JSONDecodeError, LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
         _operator_error(str(exc))
-    console.print_json(data={"ok": True, "result": _json_safe(result)})
+    _print_json(data={"ok": True, "result": _json_safe(result)})
 
 
 @app.command()
@@ -807,7 +817,7 @@ def sync_linkedin_applied(
     from applypilot.database import import_linkedin_applied_export
 
     result = import_linkedin_applied_export(file)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("reconcile-receipts")
@@ -835,7 +845,7 @@ def reconcile_receipts(
         raise typer.Exit(code=2)
 
     results = [reconcile_submission_receipt(item) for item in items]
-    console.print_json(data={
+    _print_json(data={
         "processed": len(results),
         "applied": sum(result.get("status") == "applied" for result in results),
         "changed": sum(result.get("changed") is True for result in results),
@@ -1612,7 +1622,7 @@ def prepare_cover(
     from applypilot.single_job import prepare_cover_letter_for_url
 
     result = prepare_cover_letter_for_url(url, company, validation, resume)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("import-job")
@@ -1655,7 +1665,7 @@ def import_job(
         site,
         **import_kwargs,
     )
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("import-listings")
@@ -1674,7 +1684,7 @@ def import_listings(
     from applypilot.single_job import import_portal_listings
 
     result = import_portal_listings(file, portal)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("rekey-email-job")
@@ -1708,7 +1718,7 @@ def rekey_email_job_command(
         description=description_file.read_text(encoding="utf-8"),
         location=location,
     )
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("portal-list")
@@ -1754,7 +1764,7 @@ def resume_library_sync_command() -> None:
     conn = get_connection()
     result = sync_resume_library(conn, load_profile())
     result["library"] = library_status(conn)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("resume-library-status")
@@ -1764,7 +1774,7 @@ def resume_library_status_command() -> None:
     from applypilot.database import get_connection
     from applypilot.resume_library import library_status
 
-    console.print_json(data=library_status(get_connection()))
+    _print_json(data=library_status(get_connection()))
 
 
 @app.command("resume-route")
@@ -1820,11 +1830,11 @@ def resume_route_command(
     )
     if project_reuse:
         if result["decision"] not in {"reuse_exact", "manual_selection"}:
-            console.print_json(data=result)
+            _print_json(data=result)
             console.print("[red]Only a validated reuse route can be projected.[/red]")
             raise typer.Exit(code=2)
         result["legacy_projection"] = project_reuse_to_job(conn, job, result)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("score-job")
@@ -1837,7 +1847,7 @@ def score_job_command(
     from applypilot.single_job import score_exact_job_for_url
 
     result = score_exact_job_for_url(url, resume)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("tailor-job")
@@ -1860,7 +1870,7 @@ def tailor_job_command(
         validation_mode=validation,
         target_url=url,
     )
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("revalidate-tailored-job")
@@ -1872,7 +1882,7 @@ def revalidate_tailored_job_command(
     from applypilot.single_job import revalidate_tailored_resume_for_url
 
     result = revalidate_tailored_resume_for_url(url)
-    console.print_json(data=result)
+    _print_json(data=result)
     if result["status"] != "machine_validated":
         raise typer.Exit(code=2)
 
@@ -1887,7 +1897,7 @@ def approve_cover(
     from applypilot.single_job import approve_cover_letter_for_url
 
     result = approve_cover_letter_for_url(url, approved_by=approved_by)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command("mark-cover-not-required")
@@ -1904,7 +1914,7 @@ def mark_cover_not_required(
     from applypilot.single_job import mark_cover_letter_not_required_for_url
 
     result = mark_cover_letter_not_required_for_url(url, verified_by=verified_by)
-    console.print_json(data=result)
+    _print_json(data=result)
 
 
 @app.command()

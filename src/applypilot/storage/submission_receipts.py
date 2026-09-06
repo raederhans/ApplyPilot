@@ -222,6 +222,27 @@ _STRONG_SUBMISSION_RECEIPT = re.compile(
     r"申请已提交|投递成功|申请成功",
     re.IGNORECASE,
 )
+# LinkedIn uses this completed-action sentence instead of "submitted". Match
+# the entire message and recipient, so instructions, questions, and future or
+# negated actions cannot become evidence through a substring match.
+_SENT_SUBMISSION_RECEIPT = re.compile(
+    r"your application (?:was|has been) (?:successfully )?sent to (?P<company>[^\r\n!?]+?)[!.]?",
+    re.IGNORECASE,
+)
+_SUCCESS_HEADING_RECEIPT = re.compile(r"submission successful[.!]?", re.IGNORECASE)
+
+
+def _sent_receipt_matches_company(text: str, company: str) -> bool:
+    match = _SENT_SUBMISSION_RECEIPT.fullmatch(text.strip())
+    if match is None:
+        return False
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[^\w]+", " ", value.casefold()).strip()
+
+    return bool(normalize(company)) and normalize(match["company"]) == normalize(company)
+
+
 _PORTAL_SUBMITTED_STATES = {
     "applied",
     "submitted",
@@ -318,7 +339,14 @@ def reconcile_submission_receipt(
     portal_status = " ".join(
         str(evidence.get("portal_status") or "").casefold().split()
     )[:200]
-    positive = bool(_STRONG_SUBMISSION_RECEIPT.search(confirmation_text))
+    positive = bool(_STRONG_SUBMISSION_RECEIPT.search(confirmation_text)) or (
+        _sent_receipt_matches_company(confirmation_text, observed_company)
+    )
+    # Accept the observed standalone success heading only from the browser
+    # envelope already bound above to the exact job and employer. Do not turn
+    # instructions, quoted headings, or a generic email subject into receipts.
+    if source == "browser_receipt":
+        positive = positive or bool(_SUCCESS_HEADING_RECEIPT.fullmatch(confirmation_text))
     if source == "candidate_portal":
         positive = positive or portal_status in _PORTAL_SUBMITTED_STATES
     if not positive:

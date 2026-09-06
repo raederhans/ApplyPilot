@@ -95,6 +95,62 @@ A transient alert alone should not trigger a second upload or whole-form refill.
 Use current controls to recover from focus changes and verify actual selected
 options. No employer-specific reset rule or fixed action-count test is needed.
 
+### Feedback choices and completion boundaries
+
+Choose observations to answer the remaining question. DOM/accessibility is
+useful for exact accessible names, required markers and selected values; a
+screenshot can resolve a native attachment display or ambiguous layout. A page
+URL, settled status or matching receipt establishes outcomes that a successful
+click cannot establish. These sources complement each other; there is no fixed
+sequence or requirement to collect every source after every action. In this
+bridge, an action already returns a fresh observation, which can ground the next
+action without another `observe` call.
+
+In the AI Agent batch, an attachment filename was visible in a screenshot even
+though DOM text and a file-property read did not expose it. That absent readout
+was inconclusive, not evidence to upload again. A button's accessible name also
+differed from its short visible text, and required labels included an asterisk.
+Inspect current controls when a locator misses, and check actual checkbox or
+selection state before choosing another supported interaction.
+
+Return once the requested facts or a decisive blocker are established. Further
+scrolling or screenshots should answer a remaining question. The Infineon
+inspection reached a guest form but expired at its configured 180-second total
+deadline. The retained final bridge request was a screenshot scroll with a
+successful response; retained evidence does not isolate model time, host service
+latency or redundant observation as the cause. The prompt now makes feedback
+reuse and completion boundaries explicit; the timeout is unchanged, and improved
+live completion time remains unverified. Employer login, Singpass and required
+identity information remain external handoffs.
+
+When a JD is already known but its current platform cannot accept an application,
+consider the employer careers site, its official application entry, or another
+recruiting platform carrying the same opening. This is a flexible search option,
+not a required platform list or sequence. A worker restricted to its bound tab
+hands broader searches to the host/coordinator. Before progressing, match the
+company, title, location and available requisition ID, and consult the application
+ledger across platforms. Reconcile any uncertain prior submission before another
+attempt anywhere; changing platforms does not remove that uncertainty. Using a
+normal official alternative does not bypass the original site's login or CAPTCHA,
+and that site's barrier need not stop legitimate application paths elsewhere.
+
+The 2026-09-06 small-platform test also informs CAPTCHA handling: passive badges
+and background frames are not themselves blocking challenges. After an authorized
+submit, observe the site's own verification outcome. An explicit rejection should
+retain the error and prepared page for host handling; an ambiguous outcome needs
+receipt reconciliation before another attempt. Manual clearance requires a fresh
+observation, including whether the form already submitted. The worker does not
+solve challenges or manipulate tokens. A confirmed rejected route can be handed
+to the coordinator for a same-job official alternative without halting the batch.
+
+Phone formatting is a soft reminder in both visual-worker and CLI prompts.
+Inspect the rendered prefix/flag and number: some controls separate the country
+code, while others infer it from a full international number. The Cynapse widget
+interpreted a bare national number as another country's number, then displayed
+Singapore correctly with the full +65 number. Consider visual feedback when DOM
+values are inconclusive, and recheck after parsing or country changes when useful.
+This guidance adds no hard gate, fixed observation sequence or extra required field.
+
 ### Upload migration check, 2026-09-06
 
 The actual IAB adapter selected the existing 93,208-byte resume PDF through

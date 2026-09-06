@@ -845,7 +845,7 @@ Cover-letter state: {'verified to have no cover-letter field' if job.get('cover_
 - Lever ordinary application form and similar ordinary forms: preserve completed fields; never declare progress without visible state change.
 - Click the authorized final control exactly once. Absence of a receipt never authorizes a second click, browser restart, runtime switch, or new Agent turn.
 - RESULT:APPLIED requires an independently visible receipt or Applied marker with non-empty confirmation text. Otherwise use RESULT:SUBMISSION_UNCERTAIN.
-- Phone fields with a separate country prefix use digits {phone_digits}.
+- Lightweight phone check: a genuinely separate country prefix uses digits {phone_digits}; an international-number widget may instead expect the full profile number and infer the country. Check the rendered flag/prefix and number for duplication or a wrong country, particularly after resume parsing. Inconclusive DOM values may be checked visually; this reminder adds no hard gate or mandatory extra tool call.
 
 == CURRENT TURN ==
 {mission_body}
@@ -1100,7 +1100,8 @@ A hidden/background CAPTCHA iframe, badge, script, or protected-by-reCAPTCHA not
 Only when an interactive verification challenge is actually visible and prevents the next ordinary form action:
 1. Snapshot the page and save captcha-blocked.png.
 2. Do not click, solve, inject tokens, call a solver service, or use Submit to probe it.
-3. Output RESULT:CAPTCHA immediately so the application is blocked for manual review."""
+3. Output RESULT:CAPTCHA immediately so the application is blocked for manual review.
+An explicit CAPTCHA verification rejection can occur after Submit without an interactive puzzle. Allow the site's normal callback to settle and inspect the visible error and any matching receipt; record whether final submission was attempted. Do not repeatedly submit, reload away prepared answers, or manipulate verification tokens. If the result is ambiguous, report submission_uncertain under the reporting contract and reconcile it before any new submission. For a confirmed rejected attempt, preserve the exact job and ask the coordinator to consider its official careers entry or listing-authorized recruitment email after cross-platform duplicate checks; the blocked site need not halt the rest of the batch. Keep direct-email preparation and sending on the mailbox route. After manual verification clears, observe the same page afresh and determine whether it already submitted before resuming; clearance alone is not a receipt or permission to replay Submit."""
 
 
 def _build_browser_observation_section(job: dict) -> str:
@@ -2205,7 +2206,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - React/controlled text and number inputs: after a bulk fill, verify the visible value or the review-page answer. If one field clears itself or reports a format error despite a supported answer, retry only that field once by focusing it, selecting any existing text, and typing the value sequentially. Do not repeat the whole form, use DOM value injection, or loop. A review page that displays the intended answer is decisive persistence evidence even when the form snapshot omits raw input values.
 {lever_form_trick}
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
-- Phone field with country prefix: just type digits {phone_digits}
+- Lightweight phone check: for a genuinely separate country prefix use digits {phone_digits}; for a widget that parses an international number use the full profile number as the control requires. Check the rendered flag/prefix and number for a duplicated prefix or wrong inferred country, including after resume parsing or country changes. A screenshot can clarify inconclusive DOM values. This reminder adds no hard gate or mandatory extra tool call; correct observed mismatches only.
 - Date fields: {datetime.now().astimezone().strftime('%m/%d/%Y')}
 - Workday segmented/composite dates: never bulk-fill a segmented date or put a complete date into one segment. If an accessible calendar/date picker is available, it is mandatory: select the date only through that control and never use keyboard or per-segment typing. Only when no accessible calendar/date picker exists may you focus and type each segment separately, verifying focus and the visible value before moving to the next segment. If any segment loses focus, changes another segment, clears, or shows an unexpected value, stop immediately for manual review; never retry, patch, guess, refill, or loop over the date.
 - {form_validation_tip}

@@ -2956,7 +2956,9 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "2026-11-10" in built
     assert "2026-10-15" not in built
     assert "full-time credit-bearing availability begins January 2027" not in built
-    assert "Phone field with country prefix: just type digits 90000000" in built
+    assert "genuinely separate country prefix use digits 90000000" in built
+    assert "widget that parses an international number use the full profile number" in built
+    assert "This reminder adds no hard gate or mandatory extra tool call" in built
     assert "UNANSWERED_QUESTIONS: []" in built
     assert "Current Employment title from APPLICANT PROFILE" in built
     assert "target job title" in built
