@@ -550,13 +550,60 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         if not source_path.is_file():
             raise FileNotFoundError(f"Tailoring source resume not found: {source_path}")
 
-        from applypilot.resume_library import record_content_revalidation
-        from applypilot.scoring.pdf import convert_to_pdf
+        from applypilot.resume_library import extract_job_profile, record_content_revalidation
+        from applypilot.scoring.pdf import convert_to_pdf, parse_entries, parse_resume, parse_skills
+        from applypilot.scoring.resume_plan import build_content_plan
         from applypilot.scoring.tailor import judge_tailored_resume
-        from applypilot.scoring.validator import validate_tailored_resume
+        from applypilot.scoring.validator import validate_json_fields, validate_tailored_resume
 
         profile = load_profile()
         source_text = read_resume_source(source_path)
+        previous_report: dict = {}
+        if report_path.is_file():
+            try:
+                previous_report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous_report = {}
+        parsed = parse_resume(tailored_text)
+        sections = parsed.get("sections", {})
+        structured_data = {
+            "title": str(job.get("title") or "Current target role"),
+            "summary": sections.get("SUMMARY", ""),
+            "skills": dict(parse_skills(sections.get("TECHNICAL SKILLS", ""))),
+            "experience": [
+                {
+                    "header": entry["title"],
+                    "subtitle": entry["subtitle"],
+                    "bullets": entry["bullets"],
+                }
+                for entry in parse_entries(sections.get("EXPERIENCE", ""))
+            ],
+            "projects": [
+                {
+                    "header": entry["title"],
+                    "subtitle": entry["subtitle"],
+                    "bullets": entry["bullets"],
+                }
+                for entry in parse_entries(sections.get("PROJECTS", ""))
+            ],
+            "education": sections.get("EDUCATION", ""),
+            "evidence_map": previous_report.get("evidence_map", []),
+        }
+        content_plan = build_content_plan(
+            source_text,
+            extract_job_profile(job, profile),
+            previous_report.get("route_context"),
+        )
+        structured = validate_json_fields(
+            structured_data,
+            profile,
+            mode=str(previous_report.get("validation_mode") or "normal"),
+            original_text=source_text,
+            selection_source_text=source_text,
+            job_description=str(job.get("full_description") or ""),
+            job_title=str(job.get("title") or ""),
+            target_company=str(job.get("company_name") or ""),
+        )
         deterministic = validate_tailored_resume(
             tailored_text,
             profile,
@@ -564,15 +611,19 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         )
         judge = None
         status = "failed_validation"
-        error = "; ".join(deterministic.get("errors", [])) or "validation failed"
+        error = "; ".join(
+            [*structured.get("errors", []), *deterministic.get("errors", [])]
+        ) or "validation failed"
         pdf_path = None
-        if deterministic.get("passed"):
+        if structured.get("passed") and deterministic.get("passed"):
             judge = judge_tailored_resume(
                 source_text,
                 tailored_text,
                 str(job.get("title") or ""),
                 profile,
                 job_description=str(job.get("full_description") or ""),
+                cross_review=True,
+                content_plan=content_plan,
             )
             if judge.get("passed"):
                 temporary_pdf = final_pdf.with_name(
@@ -606,8 +657,11 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         report = {
             "status": status,
             "source_resume_path": str(source_path),
+            "validator": structured,
             "full_validator": deterministic,
             "judge": judge,
+            "evidence_map": structured_data["evidence_map"],
+            "content_plan": content_plan,
             "render_error": (
                 error.removeprefix("Render: ")
                 if error and status == "failed_render"
@@ -624,7 +678,13 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
             text=tailored_text,
             status=status,
             job=job,
-            evidence={"report_path": str(report_path), "error": error},
+            evidence={
+                "report_path": str(report_path),
+                "error": error,
+                "judge_review_mode": (
+                    judge.get("review_mode") if isinstance(judge, dict) else None
+                ),
+            },
         )
         now = datetime.now(UTC).isoformat()
         conn.execute(

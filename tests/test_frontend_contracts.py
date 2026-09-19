@@ -301,6 +301,26 @@ def test_prepare_contract_requires_a_current_gap_free_bound_route() -> None:
     assert build_prepare_job(job, current)["state"] == "ready"
 
 
+def test_prepare_contract_does_not_treat_historical_sync_as_ready_route() -> None:
+    job = _job()
+    historical = {
+        "job_fingerprint": compute_job_fingerprint(job),
+        "decision": "historical_validated",
+        "reason": "Imported from application history.",
+        "hard_gaps_json": "[]",
+        "artifact_validation_status": "machine_validated",
+        "artifact_pdf_path": "C:/private/resume.pdf",
+        "artifact_pdf_sha256": "a" * 64,
+        "artifact_pdf_size": 12_345,
+    }
+
+    result = build_prepare_job(job, historical)
+
+    assert result["state"] == "review"
+    assert result["route"]["ready"] is False
+    assert result["route"]["resolution"] == "not_recorded"
+
+
 def test_prepare_contract_marks_old_fingerprint_route_as_stale() -> None:
     job = _job()
     assignment = {

@@ -25,14 +25,37 @@ from applypilot.apply.authorization import compute_file_binding, compute_job_fin
 from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
 from applypilot.scoring.cover_letter import read_resume_source
-from applypilot.scoring.validator import current_profile_resume_fact_errors
+from applypilot.scoring.validator import (
+    current_profile_resume_fact_errors,
+    validate_tailored_resume,
+)
 
-TAXONOMY_VERSION = "resume-library-v7"
-POLICY_VERSION = "reuse-policy-v4"
+TAXONOMY_VERSION = "resume-library-v8"
+POLICY_VERSION = "reuse-policy-v5"
+HEALTH_POLICY_VERSION = "resume-health-v2"
 
 REUSE_REQUIRED_COVERAGE = 0.90
 REUSE_OVERALL_SCORE = 0.85
 REUSE_MIN_MARGIN = 0.08
+REORDER_OVERALL_SCORE = 0.70
+PATCH_OVERALL_SCORE = 0.42
+DEFAULT_CANDIDATE_LIMIT = 5
+
+RESUME_RESOLUTIONS = {
+    "reuse_as_is",
+    "reuse_with_reorder",
+    "patch_existing",
+    "create_new",
+}
+
+_CONTENT_STOPWORDS = {
+    "about", "across", "after", "also", "among", "and", "are", "based",
+    "build", "candidate", "company", "develop", "experience", "for", "from",
+    "have", "into", "intern", "internship", "job", "looking", "must", "our",
+    "preferred", "required", "requirements", "role", "skills", "support", "team",
+    "that", "the", "their", "this", "through", "using", "what", "will", "with",
+    "work", "you", "your",
+}
 
 _PROFILE_TRACK_ALIASES = {
     "general_product_consulting": "general_product_consulting",
@@ -475,6 +498,26 @@ def _configured_source_paths_for_track(
     return paths
 
 
+def _content_terms(title: str, description: str, *, limit: int = 28) -> list[str]:
+    """Extract explainable JD terms for content-level resume comparison."""
+    normalized = _normalise_text(f"{title}\n{description}")
+    phrases = {
+        phrase for phrase in (*_KNOWN_SKILLS, *_DELIVERABLE_TERMS)
+        if " " in phrase and _contains_phrase(normalized, phrase)
+    }
+    counts: dict[str, int] = {}
+    title_words = set(re.findall(r"[a-z][a-z0-9+#.-]{2,}", _normalise_text(title)))
+    for token in re.findall(r"[a-z][a-z0-9+#.-]{2,}", normalized):
+        if token in _CONTENT_STOPWORDS or token.isdigit():
+            continue
+        counts[token] = counts.get(token, 0) + 1
+    ranked = sorted(
+        counts,
+        key=lambda token: (-(counts[token] + (2 if token in title_words else 0)), token),
+    )
+    return sorted(phrases) + [term for term in ranked if term not in phrases][:limit]
+
+
 def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
     """Create the additive resume-library schema without changing job rows."""
     conn.executescript(
@@ -573,6 +616,37 @@ def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_resume_validation_runs_artifact
             ON resume_validation_runs(artifact_id, recorded_at);
+
+        CREATE TABLE IF NOT EXISTS resume_route_outcomes (
+            outcome_id              TEXT PRIMARY KEY,
+            assignment_id           TEXT NOT NULL,
+            resolution              TEXT NOT NULL,
+            source_artifact_id      TEXT,
+            output_artifact_id      TEXT,
+            status                  TEXT NOT NULL,
+            evidence_json           TEXT NOT NULL,
+            recorded_at             TEXT NOT NULL,
+            FOREIGN KEY (assignment_id) REFERENCES job_resume_assignments(assignment_id),
+            FOREIGN KEY (source_artifact_id) REFERENCES resume_artifacts(artifact_id),
+            FOREIGN KEY (output_artifact_id) REFERENCES resume_artifacts(artifact_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_resume_route_outcomes_assignment
+            ON resume_route_outcomes(assignment_id, recorded_at);
+
+        CREATE TABLE IF NOT EXISTS resume_artifact_health_checks (
+            health_id               TEXT PRIMARY KEY,
+            artifact_id             TEXT NOT NULL,
+            policy_version          TEXT NOT NULL,
+            status                  TEXT NOT NULL,
+            reasons_json            TEXT NOT NULL,
+            metrics_json            TEXT NOT NULL,
+            checked_at              TEXT NOT NULL,
+            FOREIGN KEY (artifact_id) REFERENCES resume_artifacts(artifact_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_resume_artifact_health_lookup
+            ON resume_artifact_health_checks(artifact_id, policy_version, checked_at);
         """
     )
 
@@ -713,6 +787,7 @@ def extract_job_profile(
         "subtype_scores": term_scores,
         "max_required_years": max(years) if years else None,
         "location": str(job.get("location") or "").strip(),
+        "content_terms": _content_terms(title, description),
     }
     return {
         "job_url": str(job.get("url") or ""),
@@ -989,6 +1064,42 @@ def _record_validation(
     return validation_id
 
 
+def record_route_outcome(
+    conn: sqlite3.Connection,
+    *,
+    assignment_id: str,
+    resolution: str,
+    status: str,
+    source_artifact_id: str | None = None,
+    output_artifact_id: str | None = None,
+    evidence: Mapping[str, object] | None = None,
+) -> str:
+    """Append the observed result of a four-tier routing decision."""
+    ensure_resume_library_schema(conn)
+    if resolution not in RESUME_RESOLUTIONS:
+        raise ValueError(f"Unsupported resume resolution: {resolution}")
+    outcome_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO resume_route_outcomes (
+            outcome_id, assignment_id, resolution, source_artifact_id,
+            output_artifact_id, status, evidence_json, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            outcome_id,
+            assignment_id,
+            resolution,
+            source_artifact_id,
+            output_artifact_id,
+            status,
+            _json(evidence or {}),
+            _now(),
+        ),
+    )
+    return outcome_id
+
+
 def record_content_revalidation(
     conn: sqlite3.Connection,
     *,
@@ -1036,6 +1147,16 @@ def record_content_revalidation(
         ),
     )
     job_url = str(job.get("url") or "").strip()
+    validation_evidence = {
+        "requested_status": status,
+        **dict(evidence or {}),
+    }
+    if (
+        effective_status == "machine_validated"
+        and validation_evidence.get("judge_review_mode")
+        == "independent_factual_and_quality_cross_review"
+    ):
+        validation_evidence["quality_policy_version"] = POLICY_VERSION
     _record_validation(
         conn,
         artifact_id=str(artifact["artifact_id"]),
@@ -1045,7 +1166,7 @@ def record_content_revalidation(
             "job_url": job_url,
             "job_fingerprint": compute_job_fingerprint(dict(job)),
         },
-        evidence={"requested_status": status, **dict(evidence or {})},
+        evidence=validation_evidence,
     )
     return active == 1
 
@@ -1124,7 +1245,7 @@ def register_tailored_artifact(
     if stored_status == "retired_profile_correction":
         raise ValueError("Resume artifact was retired after a profile correction; use its corrected successor")
     coverage_added = _add_coverage_cell(conn, artifact_id, job_profile, str(job.get("tailored_at") or ""))
-    if created or coverage_added:
+    if created or coverage_added or validation_kind != "historical_machine_validation":
         artifact = conn.execute(
             "SELECT pdf_sha256, pdf_size FROM resume_artifacts WHERE artifact_id=?",
             (artifact_id,),
@@ -1139,6 +1260,11 @@ def register_tailored_artifact(
                 "report_path": report_path,
                 "pdf_sha256": artifact["pdf_sha256"] if artifact else None,
                 "pdf_size": artifact["pdf_size"] if artifact else None,
+                "quality_policy_version": (
+                    POLICY_VERSION
+                    if validation_kind != "historical_machine_validation"
+                    else None
+                ),
             },
         )
     _record_assignment(
@@ -1248,6 +1374,161 @@ def _artifact_is_current(artifact: Mapping[str, object]) -> bool:
     return digest == artifact.get("pdf_sha256") and size == artifact.get("pdf_size")
 
 
+_HEALTH_QUARANTINE_PREFIXES = (
+    "Missing required section:",
+    "Every retained experience entry",
+    "Every retained project entry",
+    "The leading experience entry",
+    "The leading project entry",
+    "Experience entries must remain",
+    "Projects entries must remain",
+    "The most recent experience entry",
+    "The most recent project entry",
+    "Experience bullet allocation",
+    "Projects bullet allocation",
+    "The oldest retained experience entry",
+    "The oldest retained projects entry",
+    "No experience entry may exceed",
+    "No projects entry may exceed",
+    "Resume header must",
+    "Repeated or near-duplicate resume bullets",
+    "Project resume is under-evidenced",
+    "No-project resume is under-evidenced",
+    "Education '",
+)
+
+
+def assess_resume_artifact_health(
+    artifact: Mapping[str, object], profile: Mapping[str, object]
+) -> dict[str, object]:
+    """Identify only high-confidence defects that make an artifact unsafe to route.
+
+    Historical bytes remain immutable. A quarantine result removes the artifact
+    from candidate search under the current health policy, but never deletes it
+    or breaks its application-history provenance.
+    """
+    text_path = Path(str(artifact.get("text_path") or ""))
+    reasons: list[str] = []
+    metrics: dict[str, object] = {"text_path": str(text_path)}
+    if not text_path.is_file():
+        reasons.append("Artifact text file is missing.")
+        return {"status": "quarantined", "reasons": reasons, "metrics": metrics}
+    try:
+        text = read_resume_source(text_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reasons.append(f"Artifact text is unreadable: {exc}")
+        return {"status": "quarantined", "reasons": reasons, "metrics": metrics}
+
+    metrics["word_count"] = len(text.split())
+    metrics["has_projects"] = bool(
+        re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", text)
+    )
+    validation = validate_tailored_resume(text, dict(profile), original_text=text)
+    reasons.extend(
+        str(error)
+        for error in validation.get("errors", [])
+        if str(error).startswith(_HEALTH_QUARANTINE_PREFIXES)
+    )
+    fact_errors = current_profile_resume_fact_errors(text, dict(profile))
+    reasons.extend(str(error) for error in fact_errors if str(error) not in reasons)
+    binding_invalid = (
+        artifact.get("validation_status") == "machine_validated"
+        and not _artifact_is_current(artifact)
+    )
+    if binding_invalid:
+        reasons.append("Validated PDF binding is missing or no longer matches the artifact record.")
+    return {
+        "status": (
+            "quarantined" if binding_invalid else "repair_required" if reasons else "eligible"
+        ),
+        "reasons": reasons,
+        "metrics": metrics,
+    }
+
+
+def _record_artifact_health(
+    conn: sqlite3.Connection,
+    *,
+    artifact_id: str,
+    assessment: Mapping[str, object],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO resume_artifact_health_checks (
+            health_id, artifact_id, policy_version, status,
+            reasons_json, metrics_json, checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"health:{uuid.uuid4().hex}",
+            artifact_id,
+            HEALTH_POLICY_VERSION,
+            str(assessment.get("status") or "quarantined"),
+            _json(assessment.get("reasons", [])),
+            _json(assessment.get("metrics", {})),
+            _now(),
+        ),
+    )
+
+
+def _latest_artifact_health(
+    conn: sqlite3.Connection, artifact_id: str
+) -> dict[str, object] | None:
+    row = conn.execute(
+        """
+        SELECT status, reasons_json, metrics_json, checked_at
+        FROM resume_artifact_health_checks
+        WHERE artifact_id=? AND policy_version=?
+        ORDER BY checked_at DESC LIMIT 1
+        """,
+        (artifact_id, HEALTH_POLICY_VERSION),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "status": row["status"],
+        "reasons": json.loads(str(row["reasons_json"] or "[]")),
+        "metrics": json.loads(str(row["metrics_json"] or "{}")),
+        "checked_at": row["checked_at"],
+    }
+
+
+def audit_resume_library_health(
+    conn: sqlite3.Connection, profile: Mapping[str, object]
+) -> dict[str, object]:
+    """Assess active candidates and persist reversible quarantine evidence."""
+    ensure_resume_library_schema(conn)
+    details: list[dict[str, object]] = []
+    rows = conn.execute(
+        """
+        SELECT * FROM resume_artifacts
+        WHERE active=1 AND (
+            validation_status='machine_validated'
+            OR (kind='base' AND validation_status='source_only')
+        )
+        ORDER BY artifact_id
+        """
+    ).fetchall()
+    for row in rows:
+        artifact = dict(row)
+        assessment = assess_resume_artifact_health(artifact, profile)
+        _record_artifact_health(
+            conn,
+            artifact_id=str(artifact["artifact_id"]),
+            assessment=assessment,
+        )
+        details.append({"artifact_id": artifact["artifact_id"], **assessment})
+    conn.commit()
+    return {
+        "policy_version": HEALTH_POLICY_VERSION,
+        "checked": len(details),
+        "eligible": sum(item["status"] == "eligible" for item in details),
+        "repair_required": sum(item["status"] == "repair_required" for item in details),
+        "quarantined": sum(item["status"] == "quarantined" for item in details),
+        "details": details,
+    }
+
+
 def _write_reuse_route_report(
     job_profile: Mapping[str, object],
     artifact: Mapping[str, object],
@@ -1267,6 +1548,7 @@ def _write_reuse_route_report(
     payload = {
         "status": "machine_validated",
         "decision": decision,
+        "resolution": result.get("resolution") or "reuse_as_is",
         "policy_version": POLICY_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
         "assignment_id": assignment_id,
@@ -1280,6 +1562,14 @@ def _write_reuse_route_report(
         "required_coverage": result.get("required_coverage"),
         "overall_score": result.get("overall_score"),
         "runner_up_margin": result.get("runner_up_margin"),
+        "score_components": next(
+            (
+                candidate.get("score_components")
+                for candidate in result.get("candidates", [])
+                if candidate.get("artifact_id") == artifact["artifact_id"]
+            ),
+            None,
+        ),
         "reason": result.get("reason"),
         "recorded_at": _now(),
     }
@@ -1309,6 +1599,7 @@ def _candidate_score(
     artifact: Mapping[str, object],
     *,
     exact_job_validation: bool = False,
+    covered_subtypes: Iterable[str] = (),
 ) -> dict:
     text = _normalise_text(read_resume_source(Path(str(artifact["text_path"]))))
     required = list(job_profile.get("required_skills", []))
@@ -1323,28 +1614,112 @@ def _candidate_score(
     required_count = len(required) + len(groups)
     required_coverage = (len(required_hits) + len(group_hits)) / required_count if required_count else 1.0
     preferred = list(job_profile.get("preferred_skills", []))
+    preferred_hits = [skill for skill in preferred if _contains_phrase(text, str(skill))]
+    preferred_coverage = len(preferred_hits) / len(preferred) if preferred else None
     deliverables = list(job_profile.get("deliverables", []))
-    signals = [*preferred, *deliverables]
-    signal_hits = [signal for signal in signals if _contains_phrase(text, str(signal))]
-    signal_coverage = len(signal_hits) / len(signals) if signals else 1.0
-    taxonomy_score = 1.0
-    overall = 0.55 * taxonomy_score + 0.30 * required_coverage + 0.15 * signal_coverage
+    deliverable_hits = [item for item in deliverables if _contains_phrase(text, str(item))]
+    deliverable_coverage = len(deliverable_hits) / len(deliverables) if deliverables else None
+    features = job_profile.get("features", {})
+    content_terms = list(features.get("content_terms", [])) if isinstance(features, Mapping) else []
+    content_hits = [term for term in content_terms if _contains_phrase(text, str(term))]
+    content_coverage = len(content_hits) / len(content_terms) if content_terms else None
+
+    subtypes = set(covered_subtypes)
+    target_subtype = str(job_profile.get("subtype") or "")
+    target_track = str(job_profile.get("track") or "")
+    artifact_track = str(artifact.get("track") or "")
+    kind = str(artifact.get("kind") or "")
+    if target_subtype and target_subtype in subtypes:
+        taxonomy_score = 1.0
+        candidate_scope = "exact_subtype"
+    elif target_track and artifact_track in {target_track, "multi_track"}:
+        taxonomy_score = 0.78 if kind == "tailored" else 0.72
+        candidate_scope = "same_track" if kind == "tailored" else "same_track_base"
+    elif kind == "base":
+        taxonomy_score = 0.45
+        candidate_scope = "cross_track_base"
+    else:
+        taxonomy_score = 0.35
+        candidate_scope = "cross_track"
+
+    evidence_quality = 1.0 if artifact.get("validation_status") == "machine_validated" else 0.62
+    dimensions: list[tuple[str, float, float | None]] = [
+        ("required_coverage", 0.30, required_coverage if required_count else None),
+        ("preferred_coverage", 0.10, preferred_coverage),
+        ("deliverable_coverage", 0.15, deliverable_coverage),
+        ("content_coverage", 0.20, content_coverage),
+        ("taxonomy_score", 0.15, taxonomy_score),
+        ("evidence_quality", 0.10, evidence_quality),
+    ]
+    active = [(name, weight, value) for name, weight, value in dimensions if value is not None]
+    weight_total = sum(weight for _, weight, _ in active) or 1.0
+    overall = sum(weight * float(value) for _, weight, value in active) / weight_total
     if exact_job_validation:
         # A machine-validated artifact bound to this exact unchanged JD already
         # passed the stricter job-specific content and render gates. Generalised
         # cross-job similarity thresholds must not demote that exact evidence.
         overall = 1.0
         required_coverage = 1.0
+        candidate_scope = "exact_job"
     return {
         "artifact_id": artifact["artifact_id"],
+        "artifact_kind": kind,
+        "validation_status": artifact.get("validation_status"),
         "required_coverage": round(required_coverage, 6),
-        "signal_coverage": round(signal_coverage, 6),
+        "preferred_coverage": round(preferred_coverage, 6) if preferred_coverage is not None else None,
+        "deliverable_coverage": round(deliverable_coverage, 6) if deliverable_coverage is not None else None,
+        "content_coverage": round(content_coverage, 6) if content_coverage is not None else None,
+        "signal_coverage": round(
+            (len(preferred_hits) + len(deliverable_hits)) / (len(preferred) + len(deliverables)), 6
+        ) if preferred or deliverables else 1.0,
+        "taxonomy_score": taxonomy_score,
+        "evidence_quality": evidence_quality,
+        "candidate_scope": candidate_scope,
         "overall_score": round(overall, 6),
         "exact_job_validation": exact_job_validation,
         "missing_required": sorted(set(required) - set(required_hits)) + missing_groups,
         "matched_required_skill_groups": group_hits,
-        "matched_signals": sorted(signal_hits),
+        "matched_preferred": sorted(preferred_hits),
+        "matched_deliverables": sorted(deliverable_hits),
+        "matched_content_terms": sorted(content_hits),
+        "score_components": {
+            name: {"weight": weight, "score": value}
+            for name, weight, value in dimensions
+        },
     }
+
+
+def _has_current_exact_quality_validation(
+    conn: sqlite3.Connection,
+    *,
+    artifact_id: str,
+    job_url: str,
+    job_fingerprint: str,
+) -> bool:
+    """Return whether this exact binding passed the current unified quality gate."""
+    rows = conn.execute(
+        """
+        SELECT validation_kind, evidence_json
+        FROM resume_validation_runs
+        WHERE artifact_id=? AND job_url=? AND job_fingerprint=?
+          AND status='machine_validated'
+        ORDER BY recorded_at DESC
+        """,
+        (artifact_id, job_url, job_fingerprint),
+    ).fetchall()
+    for row in rows:
+        if row["validation_kind"] not in {
+            "generated_strict_validation",
+            "job_specific_revalidation",
+        }:
+            continue
+        try:
+            evidence = json.loads(str(row["evidence_json"] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if evidence.get("quality_policy_version") == POLICY_VERSION:
+            return True
+    return False
 
 
 def route_resume_for_job(
@@ -1354,15 +1729,22 @@ def route_resume_for_job(
     *,
     artifact_id: str | None = None,
     minimum_fit_score: int | None = None,
+    top_k: int = DEFAULT_CANDIDATE_LIMIT,
 ) -> dict:
-    """Choose reuse/create/review/ignore for one exact job, without LLM calls."""
+    """Rank a broad artifact pool and choose one of four editing resolutions.
+
+    ``decision`` remains a compatibility projection for older callers. The
+    canonical decision is ``resolution``: reuse_as_is, reuse_with_reorder,
+    patch_existing, or create_new.
+    """
     ensure_resume_library_schema(conn)
     job_profile = extract_job_profile(job, profile)
     persist_job_profile(conn, job_profile)
 
     requested_artifact_id = str(artifact_id or "").strip() or None
     decision = "manual_review"
-    artifact_id: str | None = None
+    resolution: str | None = None
+    selected_artifact_id: str | None = None
     required_coverage: float | None = None
     overall_score: float | None = None
     margin: float | None = None
@@ -1370,15 +1752,30 @@ def route_resume_for_job(
     manual_selection_allowed = False
     candidates: list[dict] = []
     profile_fact_rejections: list[dict[str, object]] = []
+    health_rejections: list[dict[str, object]] = []
+    health_enforced = bool(
+        profile.get("tailoring", {}).get("resume_layout", {})
+        if isinstance(profile.get("tailoring", {}), Mapping)
+        else False
+    )
     components: dict[str, object] = {
         "job_profile": job_profile,
         "candidates": [],
         "profile_fact_rejections": profile_fact_rejections,
+        "health_rejections": health_rejections,
+        "health_policy_version": HEALTH_POLICY_VERSION,
+        "health_enforced": health_enforced,
         "reuse_thresholds": {
             "required_coverage": REUSE_REQUIRED_COVERAGE,
             "overall_score": REUSE_OVERALL_SCORE,
             "runner_up_margin_is_gate": False,
         },
+        "resolution_thresholds": {
+            "reuse_as_is": REUSE_OVERALL_SCORE,
+            "reuse_with_reorder": REORDER_OVERALL_SCORE,
+            "patch_existing": PATCH_OVERALL_SCORE,
+        },
+        "candidate_limit": max(1, int(top_k)),
     }
 
     fit_score = job.get("fit_score")
@@ -1399,134 +1796,170 @@ def route_resume_for_job(
         reason = f"Job is ineligible: {job.get('eligibility_reason') or 'explicit eligibility failure'}"
     elif not str(job.get("full_description") or "").strip():
         reason = "Full job description is missing; subtype and hard requirements cannot be verified."
-    elif not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55:
-        usable_base_sources = []
-        for row in conn.execute(
-            "SELECT artifact_id, text_path FROM resume_artifacts "
-            "WHERE active=1 AND kind='base' ORDER BY created_at, artifact_id"
-        ).fetchall():
-            source_path = Path(str(row["text_path"] or ""))
-            if not source_path.is_file():
-                continue
-            fact_errors = current_profile_resume_fact_errors(
-                read_resume_source(source_path), dict(profile)
-            )
-            if not fact_errors:
-                usable_base_sources.append(
-                    {"artifact_id": row["artifact_id"], "text_path": str(source_path)}
-                )
-        components["usable_base_sources"] = usable_base_sources
-        if not fit_gate_passed:
-            reason = (
-                "No sufficiently confident fine-grained role subtype was found, and the "
-                "configured fit-score gate was not proven to pass."
-            )
-        elif not usable_base_sources:
-            reason = (
-                "The job passed the configured fit-score gate, but no current factual base "
-                "resume is available for tailoring."
-            )
-        else:
-            decision = "create_variant"
-            reason = (
-                "The job passed the configured fit-score gate; use a current factual base "
-                "resume and validate a new variant because subtype classification is uncertain."
-            )
     else:
         configured_source_paths = _configured_source_paths_for_track(
             profile, str(job_profile.get("track") or "") or None
         )
         rows = conn.execute(
             """
-            SELECT DISTINCT a.*
+            SELECT a.*
             FROM resume_artifacts AS a
-            JOIN resume_coverage_cells AS c ON c.artifact_id=a.artifact_id
-            WHERE a.active=1 AND a.validation_status='machine_validated'
-              AND c.taxonomy_version=? AND c.subtype=?
+            WHERE a.active=1
+              AND (
+                a.validation_status='machine_validated'
+                OR (a.kind='base' AND a.validation_status='source_only')
+              )
+            ORDER BY a.updated_at DESC, a.artifact_id
             """,
-            (TAXONOMY_VERSION, job_profile["subtype"]),
         ).fetchall()
         for row in rows:
             artifact = dict(row)
-            if _artifact_is_current(artifact):
-                artifact_text = read_resume_source(Path(str(artifact["text_path"])))
-                fact_errors = current_profile_resume_fact_errors(artifact_text, dict(profile))
-                if fact_errors:
-                    profile_fact_rejections.append(
+            artifact_health_status = "eligible"
+            text_path = Path(str(artifact.get("text_path") or ""))
+            if not text_path.is_file():
+                continue
+            if health_enforced:
+                health = _latest_artifact_health(conn, str(artifact["artifact_id"]))
+                if health is None:
+                    health = assess_resume_artifact_health(artifact, profile)
+                    _record_artifact_health(
+                        conn,
+                        artifact_id=str(artifact["artifact_id"]),
+                        assessment=health,
+                    )
+                artifact_health_status = str(health.get("status") or "quarantined")
+                if artifact_health_status != "eligible":
+                    health_rejections.append(
                         {
                             "artifact_id": artifact["artifact_id"],
-                            "errors": fact_errors,
+                            "status": health.get("status"),
+                            "reasons": health.get("reasons", []),
                         }
                     )
-                    continue
-                exact_evidence = conn.execute(
-                    """
-                    SELECT 1 FROM resume_coverage_cells
-                    WHERE artifact_id=? AND taxonomy_version=?
-                      AND evidence_job_url=? AND evidence_job_fingerprint=?
-                    LIMIT 1
-                    """,
-                    (
-                        artifact["artifact_id"],
-                        TAXONOMY_VERSION,
-                        job_profile["job_url"],
-                        job_profile["job_fingerprint"],
-                    ),
-                ).fetchone()
-                scored = _candidate_score(
-                    job_profile,
-                    artifact,
-                    exact_job_validation=exact_evidence is not None,
+                    if artifact_health_status == "quarantined":
+                        continue
+            if artifact["validation_status"] == "machine_validated" and not _artifact_is_current(artifact):
+                continue
+            artifact_text = read_resume_source(text_path)
+            fact_errors = current_profile_resume_fact_errors(artifact_text, dict(profile))
+            if fact_errors:
+                profile_fact_rejections.append(
+                    {"artifact_id": artifact["artifact_id"], "errors": fact_errors}
                 )
-                source_path = str(artifact.get("source_resume_path") or "").strip()
-                source_is_configured = bool(source_path) and (
-                    str(Path(source_path).resolve()).casefold()
-                    in configured_source_paths
-                )
-                artifact_track_matches = (
-                    str(artifact.get("track") or "")
-                    == str(job_profile.get("track") or "")
-                )
-                scored["configured_source_preference"] = source_is_configured
-                scored["artifact_track_matches"] = artifact_track_matches
-                scored["route_preference_score"] = (
-                    int(source_is_configured) + int(artifact_track_matches)
-                )
-                unsupported, _ = _unsupported_required_skills(
-                    conn, profile, scored["missing_required"]
-                )
-                scored["reuse_qualified"] = bool(scored["exact_job_validation"]) or (
-                    scored["required_coverage"] >= REUSE_REQUIRED_COVERAGE
-                    and scored["overall_score"] >= REUSE_OVERALL_SCORE
-                    and not unsupported
-                )
-                scored["artifact"] = artifact
-                candidates.append(scored)
+                continue
+            coverage_rows = conn.execute(
+                "SELECT subtype, evidence_job_url, evidence_job_fingerprint "
+                "FROM resume_coverage_cells WHERE artifact_id=? AND taxonomy_version=?",
+                (artifact["artifact_id"], TAXONOMY_VERSION),
+            ).fetchall()
+            covered_subtypes = [str(item["subtype"]) for item in coverage_rows]
+            exact_coverage = any(
+                item["evidence_job_url"] == job_profile["job_url"]
+                and item["evidence_job_fingerprint"] == job_profile["job_fingerprint"]
+                for item in coverage_rows
+            )
+            exact_evidence = exact_coverage and _has_current_exact_quality_validation(
+                conn,
+                artifact_id=str(artifact["artifact_id"]),
+                job_url=str(job_profile["job_url"]),
+                job_fingerprint=str(job_profile["job_fingerprint"]),
+            )
+            scored = _candidate_score(
+                job_profile,
+                artifact,
+                exact_job_validation=exact_evidence,
+                covered_subtypes=covered_subtypes,
+            )
+            source_path = str(artifact.get("source_resume_path") or artifact.get("text_path") or "").strip()
+            source_is_configured = bool(source_path) and (
+                str(Path(source_path).resolve()).casefold() in configured_source_paths
+            )
+            artifact_track_matches = str(artifact.get("track") or "") in {
+                str(job_profile.get("track") or ""), "multi_track"
+            }
+            scored["configured_source_preference"] = source_is_configured
+            scored["artifact_track_matches"] = artifact_track_matches
+            scored["artifact_health_status"] = artifact_health_status
+            scored["route_preference_score"] = int(source_is_configured) + int(artifact_track_matches)
+            unsupported, confirmed_support = _unsupported_required_skills(
+                conn, profile, scored["missing_required"]
+            )
+            scored["unsupported_required_skills"] = unsupported
+            scored["confirmed_required_skill_facts"] = confirmed_support
+            validated = artifact["validation_status"] == "machine_validated"
+            if artifact_health_status == "repair_required":
+                recommended_resolution = "patch_existing"
+            elif exact_evidence or (
+                validated
+                and scored["required_coverage"] >= REUSE_REQUIRED_COVERAGE
+                and scored["overall_score"] >= REUSE_OVERALL_SCORE
+                and not unsupported
+            ):
+                recommended_resolution = "reuse_as_is"
+            elif (
+                validated
+                and scored["required_coverage"] >= REUSE_REQUIRED_COVERAGE
+                and scored["overall_score"] >= REORDER_OVERALL_SCORE
+                and not unsupported
+            ):
+                recommended_resolution = "reuse_with_reorder"
+            elif scored["overall_score"] >= PATCH_OVERALL_SCORE or artifact_track_matches:
+                recommended_resolution = "patch_existing"
+            else:
+                recommended_resolution = "create_new"
+            scored["recommended_resolution"] = recommended_resolution
+            scored["reuse_qualified"] = recommended_resolution == "reuse_as_is"
+            scored["artifact"] = artifact
+            candidates.append(scored)
         candidates.sort(
             key=lambda item: (
                 not item["exact_job_validation"],
-                not item["reuse_qualified"],
+                item["recommended_resolution"] != "reuse_as_is",
+                bool(item["unsupported_required_skills"]),
                 -item["overall_score"],
                 -item["route_preference_score"],
                 item["artifact_id"],
             )
         )
+        total_candidates = len(candidates)
+        candidates = candidates[:max(1, int(top_k))]
+        components["candidate_count_total"] = total_candidates
+        components["usable_base_sources"] = [
+            {
+                "artifact_id": candidate["artifact_id"],
+                "text_path": candidate["artifact"]["text_path"],
+            }
+            for candidate in candidates
+            if candidate["artifact"].get("kind") == "base"
+        ]
         components["candidates"] = [
             {key: value for key, value in candidate.items() if key != "artifact"}
             for candidate in candidates
         ]
         if not candidates:
-            decision = "create_variant"
-            if profile_fact_rejections:
+            if (
+                (not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55)
+                and not fit_gate_passed
+            ):
+                decision = "manual_review"
+                resolution = None
                 reason = (
-                    "Validated artifacts for this subtype conflict with current profile facts; "
-                    "create a corrected variant."
+                    "No factual candidate was found, and subtype confidence and the configured "
+                    "fit-score gate are both insufficient for automatic generation."
+                )
+            elif profile_fact_rejections:
+                decision = "create_variant"
+                resolution = "create_new"
+                reason = (
+                    "Available artifacts conflict with current profile facts; create a corrected resume."
                 )
             else:
-                reason = "This fine-grained role subtype has no current validated resume artifact."
+                decision = "create_variant"
+                resolution = "create_new"
+                reason = "No current factual resume artifact is available; create a new validated resume."
         else:
             top = candidates[0]
-            artifact_id = str(top["artifact_id"])
+            selected_artifact_id = str(top["artifact_id"])
             required_coverage = float(top["required_coverage"])
             overall_score = float(top["overall_score"])
             route_preference_resolved_tie = False
@@ -1546,56 +1979,48 @@ def route_resume_for_job(
                 margin = 1.0
             components["route_preference_resolved_tie"] = route_preference_resolved_tie
             hard_gaps = list(top["missing_required"])
-            if top["exact_job_validation"]:
-                margin = 1.0
-                decision = "reuse_exact"
+            components["unsupported_required_skills"] = top["unsupported_required_skills"]
+            components["confirmed_required_skill_facts"] = top["confirmed_required_skill_facts"]
+            resolution = str(top["recommended_resolution"])
+            if (
+                (not job_profile.get("subtype") or float(job_profile.get("confidence") or 0) < 0.55)
+                and not fit_gate_passed
+            ):
+                decision = "manual_review"
+                resolution = None
                 reason = (
-                    "This current artifact was machine-validated for the exact unchanged job fingerprint."
+                    "The Top-K search found candidates, but subtype confidence and the configured "
+                    "fit-score gate are both insufficient for automatic editing."
                 )
-                components["unsupported_required_skills"] = []
-                components["confirmed_required_skill_facts"] = []
-            else:
-                unsupported, confirmed_fact_support = _unsupported_required_skills(
-                    conn,
-                    profile,
-                    hard_gaps,
+            elif top["unsupported_required_skills"] and not fit_gate_passed:
+                decision = "manual_review"
+                resolution = None
+                reason = (
+                    "Named required skills are unsupported and the fit-score gate was not proven to pass."
                 )
-                components["unsupported_required_skills"] = unsupported
-                components["confirmed_required_skill_facts"] = confirmed_fact_support
-            if not top["exact_job_validation"] and unsupported:
-                if fit_gate_passed:
-                    decision = "create_variant"
-                    reason = (
-                        "A required named skill is absent from registered factual sources; "
-                        "create and validate a variant without claiming unsupported experience."
-                    )
-                else:
-                    decision = "manual_review"
-                    reason = (
-                        "A required named skill is unsupported, and the configured fit-score "
-                        "gate was not proven to pass."
-                    )
-            elif not top["exact_job_validation"] and required_coverage < REUSE_REQUIRED_COVERAGE:
-                decision = "create_variant"
-                reason = "The best artifact does not expose enough required skills for exact reuse."
-            elif not top["exact_job_validation"] and overall_score < REUSE_OVERALL_SCORE:
-                decision = "create_variant"
-                reason = "The best artifact is below the conservative exact-reuse score."
-            elif not top["exact_job_validation"]:
-                # Candidate proximity is diagnostic, not a reason to generate
-                # new material when the best artifact independently qualifies.
-                manual_selection_allowed = margin < REUSE_MIN_MARGIN
+            elif resolution == "reuse_as_is":
                 decision = "reuse_exact"
+                margin = 1.0 if top["exact_job_validation"] else margin
+                reason = (
+                    "The exact unchanged job already validated this artifact."
+                    if top["exact_job_validation"] else
+                    "The best current validated artifact clears the content and factual reuse gates."
+                )
                 if route_preference_resolved_tie:
-                    reason = (
-                        "A current validated artifact uses the explicitly configured source "
-                        "for this track and clears all reuse gates."
-                    )
-                else:
-                    reason = (
-                        "A current validated artifact covers the same subtype and clears all "
-                        "reuse gates."
-                    )
+                    reason += " An explicitly configured source resolved the score tie."
+            elif resolution == "reuse_with_reorder":
+                decision = "create_variant"
+                reason = "The best validated artifact has strong content coverage; reorder it and revalidate."
+            elif resolution == "patch_existing":
+                decision = "create_variant"
+                reason = "The best artifact is a credible base but needs targeted content additions or strengthening."
+            else:
+                decision = "create_variant"
+                selected_artifact_id = None
+                reason = "No artifact is sufficiently close for bounded editing; create a new validated resume."
+            if profile_fact_rejections:
+                reason += " Higher-ranked artifacts were rejected because they conflict with current profile facts."
+            manual_selection_allowed = margin is not None and margin < REUSE_MIN_MARGIN
 
     if requested_artifact_id:
         selected = next(
@@ -1616,44 +2041,39 @@ def route_resume_for_job(
             )
         selected_required_coverage = float(selected["required_coverage"])
         selected_overall_score = float(selected["overall_score"])
-        if (
-            selected_required_coverage < REUSE_REQUIRED_COVERAGE
-            or selected_overall_score < REUSE_OVERALL_SCORE
-        ):
-            raise ValueError("The requested candidate does not clear the existing reuse gates")
         selected_hard_gaps = list(selected["missing_required"])
-        unsupported, confirmed_fact_support = _unsupported_required_skills(
-            conn,
-            profile,
-            selected_hard_gaps,
-        )
+        unsupported = list(selected["unsupported_required_skills"])
+        confirmed_fact_support = list(selected["confirmed_required_skill_facts"])
         components["unsupported_required_skills"] = unsupported
         components["confirmed_required_skill_facts"] = confirmed_fact_support
-        if unsupported:
+        selected_resolution = str(selected["recommended_resolution"])
+        if unsupported and selected_resolution == "reuse_as_is":
             raise ValueError(
                 "Manual selection cannot resolve unsupported required skill review"
             )
-        artifact_id = requested_artifact_id
+        selected_artifact_id = requested_artifact_id
         required_coverage = selected_required_coverage
         overall_score = selected_overall_score
         hard_gaps = selected_hard_gaps
         original_decision = decision
         original_reason = reason
-        decision = "manual_selection"
-        reason = (
-            "An explicit operator or agent selected one current qualified candidate "
-            "from closely ranked candidates that independently clear the reuse thresholds."
-        )
+        resolution = selected_resolution
+        decision = "manual_selection" if resolution == "reuse_as_is" else "create_variant"
+        reason = "An explicit operator or agent selected a Top-K candidate for the bounded resolution."
         components["manual_selection"] = {
-            "artifact_id": artifact_id,
+            "artifact_id": selected_artifact_id,
             "original_decision": original_decision,
             "original_reason": original_reason,
+            "resolution": resolution,
         }
+
+    components["resolution"] = resolution
+    components["selected_source_artifact_id"] = selected_artifact_id
 
     assignment_id = _record_assignment(
         conn,
         job_profile=job_profile,
-        artifact_id=artifact_id,
+        artifact_id=selected_artifact_id,
         decision=decision,
         required_coverage=required_coverage,
         overall_score=overall_score,
@@ -1665,8 +2085,9 @@ def route_resume_for_job(
     result = {
         "assignment_id": assignment_id,
         "decision": decision,
+        "resolution": resolution,
         "reason": reason,
-        "artifact_id": artifact_id,
+        "artifact_id": selected_artifact_id,
         "required_coverage": required_coverage,
         "overall_score": overall_score,
         "runner_up_margin": margin,
@@ -1674,18 +2095,21 @@ def route_resume_for_job(
         "job_profile": job_profile,
         "candidates": components["candidates"],
         "profile_fact_rejections": profile_fact_rejections,
+        "health_rejections": health_rejections,
         "reuse_thresholds": components["reuse_thresholds"],
+        "resolution_thresholds": components["resolution_thresholds"],
     }
-    if decision in {"reuse_exact", "manual_selection"} and artifact_id:
+    if selected_artifact_id:
         artifact = dict(
             conn.execute(
-                "SELECT * FROM resume_artifacts WHERE artifact_id=?", (artifact_id,)
+                "SELECT * FROM resume_artifacts WHERE artifact_id=?", (selected_artifact_id,)
             ).fetchone()
         )
         result["artifact"] = artifact
+    if decision in {"reuse_exact", "manual_selection"} and selected_artifact_id:
         _record_validation(
             conn,
-            artifact_id=artifact_id,
+            artifact_id=selected_artifact_id,
             validation_kind=(
                 "manual_selection_route_binding"
                 if decision == "manual_selection"
@@ -1703,6 +2127,15 @@ def route_resume_for_job(
         )
         result["reuse_report_path"] = str(
             _write_reuse_route_report(job_profile, artifact, assignment_id, result)
+        )
+        record_route_outcome(
+            conn,
+            assignment_id=assignment_id,
+            resolution="reuse_as_is",
+            status="machine_validated",
+            source_artifact_id=selected_artifact_id,
+            output_artifact_id=selected_artifact_id,
+            evidence={"reuse_report_path": result["reuse_report_path"]},
         )
     conn.commit()
     return result
@@ -1763,6 +2196,8 @@ def library_status(conn: sqlite3.Connection) -> dict:
         "job_profiles": "job_resume_profiles",
         "assignments": "job_resume_assignments",
         "validation_runs": "resume_validation_runs",
+        "route_outcomes": "resume_route_outcomes",
+        "health_checks": "resume_artifact_health_checks",
     }.items():
         where = " WHERE active=1 AND validation_status='machine_validated'" if key == "active_validated_artifacts" else ""
         counts[key] = conn.execute(f"SELECT COUNT(*) FROM {table}{where}").fetchone()[0]
@@ -1770,6 +2205,37 @@ def library_status(conn: sqlite3.Connection) -> dict:
         row["decision"]: row["count"]
         for row in conn.execute(
             "SELECT decision, COUNT(*) AS count FROM job_resume_assignments GROUP BY decision"
+        ).fetchall()
+    }
+    counts["resolutions"] = {
+        row["resolution"]: row["count"]
+        for row in conn.execute(
+            "SELECT resolution, COUNT(*) AS count FROM resume_route_outcomes GROUP BY resolution"
+        ).fetchall()
+    }
+    counts["outcome_statuses"] = {
+        row["status"]: row["count"]
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM resume_route_outcomes GROUP BY status"
+        ).fetchall()
+    }
+    counts["latest_health_statuses"] = {
+        row["status"]: row["count"]
+        for row in conn.execute(
+            """
+            SELECT checks.status, COUNT(*) AS count
+            FROM resume_artifact_health_checks AS checks
+            JOIN (
+                SELECT artifact_id, MAX(checked_at) AS checked_at
+                FROM resume_artifact_health_checks
+                WHERE policy_version=? GROUP BY artifact_id
+            ) AS latest
+              ON latest.artifact_id=checks.artifact_id
+             AND latest.checked_at=checks.checked_at
+            WHERE checks.policy_version=?
+            GROUP BY checks.status
+            """,
+            (HEALTH_POLICY_VERSION, HEALTH_POLICY_VERSION),
         ).fetchall()
     }
     counts["covered_subtypes"] = [
@@ -1782,4 +2248,5 @@ def library_status(conn: sqlite3.Connection) -> dict:
     ]
     counts["taxonomy_version"] = TAXONOMY_VERSION
     counts["policy_version"] = POLICY_VERSION
+    counts["health_policy_version"] = HEALTH_POLICY_VERSION
     return counts

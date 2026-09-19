@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -1688,7 +1689,31 @@ def test_pdf_renderer_preserves_education_rows() -> None:
         }
     )
 
-    assert "NTU | MCAAI<br>UPenn | MCP &amp; Analytics" in rendered
+    assert '<div class="edu-entry"><span class="edu-school">NTU | MCAAI</span></div>' in rendered
+    assert '<div class="edu-entry"><span class="edu-school">UPenn | MCP &amp; Analytics</span></div>' in rendered
+
+
+def test_pdf_renderer_adds_restrained_bullet_emphasis_without_changing_text() -> None:
+    rendered = pdf_renderer.build_html(
+        {
+            "name": "Ryan Yu",
+            "title": "",
+            "location": "",
+            "contact": "candidate@example.com",
+            "sections": {
+                "EXPERIENCE": (
+                    "Example Company\nAnalyst | 2026\n"
+                    "- Built a validated reporting workflow, covering 5 teams and 20+ recurring outputs.\n"
+                    "- Reduced review effort across 3 delivery cycles through repeatable SQL checks."
+                ),
+            },
+        }
+    )
+
+    assert '<strong class="bullet-lead">Built a validated reporting workflow</strong>' in rendered
+    assert '<strong class="metric">5</strong>' in rendered
+    assert '<strong class="metric">20+</strong>' in rendered
+    assert "Built a validated reporting workflow, covering" in re.sub(r"<[^>]+>", "", rendered)
 
 
 def test_pdf_renderer_supports_contact_directly_below_name_and_source_section_order() -> None:
@@ -4762,6 +4787,20 @@ def _grounded_tailor_payload() -> tuple[str, dict, dict]:
     return source, job, data
 
 
+def _passing_section_reviews(text: str) -> list[dict]:
+    return [
+        {
+            "section": section,
+            "verdict": "PASS",
+            "issues": [],
+            "relevance": "high",
+            "density": "adequate",
+        }
+        for section in ("SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION")
+        if re.search(rf"(?m)^\s*{re.escape(section)}\s*$", text)
+    ]
+
+
 def test_tailoring_prompts_forbid_related_tools_and_minor_stretches() -> None:
     profile = {"skills_boundary": {"languages": ["Python"]}, "resume_facts": {}}
 
@@ -4822,7 +4861,7 @@ def test_tailoring_judge_profile_evidence_is_narrow_and_user_confirmed() -> None
     assert "must-not-leak" not in evidence
     assert "must-not-leak" not in judge_prompt
     assert "Do not report allowed omissions" in judge_prompt
-    assert "at most 5" in judge_prompt
+    assert "at most 8" in judge_prompt
 
 
 def test_tailoring_judge_accepts_exact_user_confirmed_skill_evidence(monkeypatch) -> None:
@@ -4866,7 +4905,8 @@ def test_tailoring_judge_accepts_exact_user_confirmed_skill_evidence(monkeypatch
             return json.dumps({
                 "verdict": "PASS",
                 "issues": [],
-                "summary_claims": [{
+                "section_reviews": _passing_section_reviews(tailored_text),
+                "claim_audits": [{
                     "claim": summary_sentence,
                     "source_quotes": [
                         "User-confirmed skill experience: Power BI (2 years)."
@@ -4988,7 +5028,8 @@ def test_tailoring_judge_accepts_exact_clause_with_semicolon_boundary(monkeypatc
             return json.dumps({
                 "verdict": "PASS",
                 "issues": [],
-                "summary_claims": [{
+                "section_reviews": _passing_section_reviews(tailored_text),
+                "claim_audits": [{
                     "claim": summary_sentence,
                     "source_quotes": [
                         "Processed public data in Python/PostgreSQL and scheduled refreshes in Python."
@@ -5030,7 +5071,8 @@ def test_tailoring_judge_ignores_extra_non_exact_quote_when_exact_evidence_exist
                 {
                     "verdict": "PASS",
                     "issues": [],
-                    "summary_claims": [
+                    "section_reviews": _passing_section_reviews(tailored_text),
+                    "claim_audits": [
                         {
                             "claim": summary_sentence,
                             "source_quotes": [
@@ -5076,7 +5118,8 @@ def test_tailoring_judge_stops_summary_before_internship_education_section(
                 {
                     "verdict": "PASS",
                     "issues": [],
-                    "summary_claims": [
+                    "section_reviews": _passing_section_reviews(tailored_text),
+                    "claim_audits": [
                         {
                             "claim": sentence,
                             "source_quotes": [sentence],
@@ -5119,7 +5162,8 @@ def test_tailoring_judge_treats_urban_planning_as_one_sector_phrase(monkeypatch)
                 {
                     "verdict": "PASS",
                     "issues": [],
-                    "summary_claims": [
+                    "section_reviews": _passing_section_reviews(tailored_text),
+                    "claim_audits": [
                         {
                             "claim": sentence,
                             "source_quotes": [
@@ -5417,6 +5461,96 @@ def test_tailoring_evidence_map_keeps_honest_gaps_but_requires_two_matches() -> 
     assert not any("empty source_quote" in error for error in validation["errors"])
 
 
+def test_resume_selection_budget_keeps_recent_entries_and_allows_one_retirement() -> None:
+    source = """EXPERIENCE
+Recent Company
+Recent Role | 2026
+- Built Python automation for reporting workflows.
+- Validated SQL outputs through repeatable checks.
+Middle Company
+Analyst | 2025
+- Produced dashboards for planning decisions.
+Old Company
+Assistant | 2024
+- Cleaned public datasets.
+PROJECTS
+Recent Project
+Builder | 2026
+- Built a Python workflow for public data.
+- Documented repeatable validation checks.
+Old Project
+Builder | 2024
+- Produced a compact dashboard.
+EDUCATION
+Example University"""
+    data = {
+        "title": "Data Analyst Intern",
+        "summary": "Data analyst focused on Python automation and validated SQL reporting.",
+        "skills": {"Data": "Python, SQL"},
+        "experience": [
+            {
+                "header": "Recent Company",
+                "subtitle": "Recent Role | 2026",
+                "bullets": [
+                    "Built Python automation for reporting workflows.",
+                    "Validated SQL outputs through repeatable checks.",
+                ],
+            },
+            {
+                "header": "Middle Company",
+                "subtitle": "Analyst | 2025",
+                "bullets": ["Produced dashboards for planning decisions."],
+            },
+        ],
+        "projects": [{
+            "header": "Recent Project",
+            "subtitle": "Builder | 2026",
+            "bullets": [
+                "Built a Python workflow for public data.",
+                "Documented repeatable validation checks.",
+            ],
+        }],
+        "education": "Example University",
+        "evidence_map": [
+            {
+                "requirement": "Python automation",
+                "support_level": "direct",
+                "source_quote": "Built Python automation for reporting workflows.",
+            },
+            {
+                "requirement": "SQL reporting",
+                "support_level": "direct",
+                "source_quote": "Validated SQL outputs through repeatable checks.",
+            },
+        ],
+    }
+    job_description = "Use Python automation and SQL reporting for dashboards."
+
+    accepted = validate_json_fields(
+        data,
+        {"resume_facts": {}},
+        mode="strict",
+        original_text=source,
+        selection_source_text=source,
+        job_description=job_description,
+        job_title="Data Analyst Intern",
+    )
+    assert accepted["passed"] is True
+
+    data["experience"] = data["experience"][1:]
+    rejected = validate_json_fields(
+        data,
+        {"resume_facts": {}},
+        mode="strict",
+        original_text=source,
+        selection_source_text=source,
+        job_description=job_description,
+        job_title="Data Analyst Intern",
+    )
+    assert rejected["passed"] is False
+    assert any("most recent experience" in error for error in rejected["errors"])
+
+
 def test_strict_tailoring_never_approves_failed_judge(monkeypatch) -> None:
     source, job, data = _grounded_tailor_payload()
 
@@ -5447,6 +5581,62 @@ def test_strict_tailoring_never_approves_failed_judge(monkeypatch) -> None:
 
     assert text
     assert report["status"] == "failed_judge"
+
+
+def test_tailoring_retries_actual_layout_failure_before_judge(monkeypatch) -> None:
+    source, job, data = _grounded_tailor_payload()
+    prompts: list[str] = []
+
+    class FakeClient:
+        def chat(self, messages, **kwargs):
+            prompts.append(messages[-1]["content"])
+            return json.dumps(data)
+
+    render_calls = 0
+
+    def fake_pdf(text_path, output_path=None, **kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls == 1:
+            raise ValueError("Sparse final PDF page: rendered fill ratio 20%")
+        output = Path(output_path)
+        output.write_bytes(b"%PDF-layout-pass")
+        return output
+
+    from applypilot.scoring import pdf as pdf_renderer
+
+    monkeypatch.setattr(tailor, "get_client", lambda: FakeClient())
+    monkeypatch.setattr(pdf_renderer, "convert_to_pdf", fake_pdf)
+    monkeypatch.setattr(
+        tailor,
+        "judge_tailored_resume",
+        lambda *args, **kwargs: {
+            "passed": True,
+            "verdict": "PASS",
+            "issues": "none",
+        },
+    )
+
+    text, report = tailor.tailor_resume(
+        source,
+        job,
+        {
+            "personal": {},
+            "resume_facts": {},
+            "skills_boundary": {},
+            "tailoring": {"resume_layout": {}},
+        },
+        max_retries=1,
+        validation_mode="strict",
+        validate_layout=True,
+    )
+
+    assert text
+    assert render_calls == 2
+    assert len(prompts) == 2
+    assert "Rendered layout failed" in prompts[1]
+    assert report["status"] == "machine_validated"
+    assert report["layout_validation"] == {"passed": True, "error": None}
 
 
 def test_no_project_source_does_not_gain_project_section() -> None:
@@ -5648,6 +5838,11 @@ def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
     monkeypatch.setattr(single_job, "read_resume_source", lambda path: "source resume")
     monkeypatch.setattr(
         validator_module,
+        "validate_json_fields",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        validator_module,
         "validate_tailored_resume",
         lambda *args, **kwargs: {"passed": True, "errors": []},
     )
@@ -5739,6 +5934,11 @@ def test_revalidation_recovers_edited_rejected_text_after_render_failure(
     monkeypatch.setattr(single_job, "get_connection", lambda: conn)
     monkeypatch.setattr(single_job, "load_profile", dict)
     monkeypatch.setattr(single_job, "read_resume_source", lambda path: "source resume")
+    monkeypatch.setattr(
+        validator_module,
+        "validate_json_fields",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
     monkeypatch.setattr(
         validator_module,
         "validate_tailored_resume",

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.cover_letter import read_resume_source
+from applypilot.scoring.resume_plan import build_content_plan, format_content_plan
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     current_profile_resume_fact_errors,
@@ -42,6 +44,34 @@ def _keyword_hits(text: str, keyword: str) -> int:
     if re.fullmatch(r"[a-z0-9+#.]+", keyword):
         return len(re.findall(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text))
     return text.count(keyword)
+
+
+def _normalize_evidence_map_quotes(value: object, evidence_text: str) -> object:
+    """Expand a short exact phrase to its shortest containing source line."""
+    if not isinstance(value, list):
+        return value
+    source_lines = [
+        re.sub(r"^\s*[-\u2022]\s*", "", line).strip()
+        for line in evidence_text.splitlines()
+        if line.strip()
+    ]
+    normalized: list[object] = []
+    for raw_item in value:
+        if not isinstance(raw_item, dict):
+            normalized.append(raw_item)
+            continue
+        item = dict(raw_item)
+        quote = str(item.get("source_quote") or "").strip()
+        if quote and len(quote.split()) < 6:
+            containing = [
+                line
+                for line in source_lines
+                if quote.casefold() in line.casefold() and len(line.split()) >= 6
+            ]
+            if containing:
+                item["source_quote"] = min(containing, key=lambda line: (len(line.split()), len(line)))
+        normalized.append(item)
+    return normalized
 
 
 def select_resume_source(job: dict, profile: dict) -> tuple[Path, dict]:
@@ -129,12 +159,12 @@ def _build_tailor_prompt(profile: dict, source_has_projects: bool = True) -> str
     # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
-    multi_page_min_fill = float(
+    multi_page_min_fill = max(0.55, float(
         profile.get("tailoring", {})
         .get("resume_layout", {})
         .get("multi_page_last_page_min_fill_ratio", 0.4)
         or 0.4
-    )
+    ))
     length_guidance = (
         "This selected source includes projects. Preserve only the projects that materially improve "
         "the match. For an internship or current-student application, prefer one readable page when "
@@ -161,7 +191,7 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-The selected source resume is the only factual source for this tailored version. Do not add even a closely related or learnable tool unless that exact tool already appears in the selected source.
+The selected source resume is the structural baseline. Any separately supplied SUPPLEMENTAL CANDIDATE EVIDENCE is also factual evidence, but use it only to complement a retained entry or add a clearly supported candidate fact. Do not blend employers, roles, projects, dates, metrics, or outcomes across entries. Do not add even a closely related or learnable tool unless that exact tool appears in the supplied candidate evidence.
 
 ## TAILORING RULES:
 
@@ -173,15 +203,19 @@ SUMMARY: Rewrite from scratch. Lead with the 1-2 source-proven skills that matte
 
 SECTION ORDER: For an internship, trainee, co-op, or current-student target, use Summary, Education, Technical Skills, Experience, Projects. For other roles, use Summary, Technical Skills, Experience, Projects, Education. The renderer applies this rule automatically; keep all education facts in `education`.
 
+EDUCATION: Return a JSON array with exactly one complete institution/degree/date record per item, in source order. Never combine multiple schools into one string or paragraph. Preserve only source-supported GPA/status details.
+
 TECHNICAL SKILLS LAYOUT: Keep each category compact enough to use the available line width efficiently. Avoid a wrapped row whose final rendered line contains only one to four words. Prefer removing lower-priority source skills, shortening a category label, or rebalancing source-grounded items across categories; never shrink typography or invent a skill to fill space.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
-Reorder bullets by relevance. Rephrase only where the new wording is more useful and preserves exactly the same action, ownership, scope, tools, metric, and outcome. Verbatim source wording is allowed and preferred when rewriting would weaken factual precision.
+Order EXPERIENCE and PROJECT entries from current/most recent to oldest using their preserved dates; do not blindly copy a misordered older artifact. Reorder bullets inside each entry by relevance. Rephrase only where the new wording is more useful and preserves exactly the same action, ownership, scope, tools, metric, and outcome. Verbatim source wording is allowed and preferred when rewriting would weaken factual precision.
 
-PROJECTS: {"Keep the most relevant source projects and preserve each project identity." if source_has_projects else "Return an empty projects list because the selected source has no project section."}
+EXPERIENCE AND PROJECT SELECTION: In each section, retire at most one low-relevance source entry. Never retire the first and most recent source entry. Keep at least one entry in each source-present section, and give every retained entry at least one substantive bullet. Allocate detail by recency first: newer entries must have at least as many bullets as older retained entries, and with three or more entries the oldest must have fewer bullets than the newest. The newest experience normally receives 3-4 bullets; use supplemental source evidence to find distinct, truthful angles before allowing it to remain thin. JD relevance decides which supported facts lead within each entry, not whether an old entry dominates the page.
 
-BULLETS: Most relevant first. Use only source-supported verbs and outcomes. Do not force every bullet into an impact formula, do not manufacture causal results, and do not add a number copied from the JD. Keep at most 4 bullets per experience or project.
+PROJECTS: {"Keep the most relevant source projects and preserve each project identity." if source_has_projects else "Return an empty projects list unless supplemental candidate evidence contains a clearly identified real project."}
+
+BULLETS: Most relevant first. Write complete recruiter-readable statements, not keyword inventories. Each bullet should normally connect at least two and preferably three of: context/problem, owned action, concrete artifact/method, and result/user/decision impact. Preserve useful source detail about scope and constraints instead of over-compressing it into a tool list. Use only source-supported verbs and outcomes. Do not force every bullet into an impact formula, do not manufacture causal results, and do not add a number copied from the JD. Keep at most 4 bullets per experience or project.
 
 JD EVIDENCE MAP: Before drafting, identify exactly 3 high-priority JD requirements. Classify each as `direct`, `transferable`, or `gap`. `direct` means the selected source proves substantially the same task, skill, or outcome. `transferable` means the source proves adjacent capability but you must not write the unsatisfied JD task as candidate history. `gap` means there is no honest support. For direct or transferable items, copy a source_quote of at least 6 words verbatim from the selected resume. For gaps, use an empty source_quote. At least 2 mappings must be direct or transferable. Do not place citations or gap labels in the visible resume.
 
@@ -202,10 +236,10 @@ JD EVIDENCE MAP: Before drafting, identify exactly 3 high-priority JD requiremen
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Target function used for routing only","summary":"1-2 compact tailored sentences.","skills":{{"Source category":"comma-separated source skills"}},"experience":[{{"header":"Exact Company","subtitle":"Exact Source Role | Exact Source Dates","bullets":["source-grounded bullet"]}}],"projects":[{{"header":"Exact Source Project","subtitle":"Exact Source Role | Exact Source Dates","bullets":["source-grounded bullet"]}}],"education":"All source schools and degrees","evidence_map":[{{"requirement":"JD requirement","support_level":"direct or transferable or gap","source_quote":"verbatim source quote, or empty for gap"}}]}}"""
+{{"title":"Target function used for routing only","summary":"1-2 compact tailored sentences.","skills":{{"Source category":"comma-separated source skills"}},"experience":[{{"header":"Exact Company","subtitle":"Exact Source Role | Exact Source Dates","bullets":["source-grounded complete narrative bullet"]}}],"projects":[{{"header":"Exact Source Project","subtitle":"Exact Source Role | Exact Source Dates","bullets":["source-grounded complete narrative bullet"]}}],"education":["Institution 1, degree, date","Institution 2, degree, date"],"evidence_map":[{{"requirement":"JD requirement","support_level":"direct or transferable or gap","source_quote":"verbatim source quote, or empty for gap"}}]}}"""
 
 
-def _build_judge_prompt(profile: dict) -> str:
+def _build_judge_prompt(profile: dict, *, factual_only: bool = False) -> str:
     """Build the LLM judge prompt from the user's profile."""
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
@@ -222,15 +256,41 @@ def _build_judge_prompt(profile: dict) -> str:
 
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
+    section_review_instruction = (
+        "Separately inspect every visible section (SUMMARY, TECHNICAL SKILLS, EXPERIENCE, "
+        "PROJECTS when present, and EDUCATION) for factual consistency, changed identities, "
+        "unsupported claims, or contradictions. Do not score relevance, allocation, density, or "
+        "style; an independent reviewer handles those. Return exactly one section_reviews item "
+        "for each visible section."
+        if factual_only else
+        "Separately review every visible section (SUMMARY, TECHNICAL SKILLS, EXPERIENCE, PROJECTS "
+        "when present, and EDUCATION). Fail a section when it is materially thin, generic, poorly "
+        "allocated, internally inconsistent, or misses stronger supplied evidence for the target "
+        "job. The leading relevant experience and project should normally have 2-4 substantive "
+        "bullets, while every retained entry must have at least one. Return exactly one "
+        "section_reviews item for each visible section."
+    )
+    usefulness_instruction = (
+        "Do not judge usefulness or writing preference in this factual-only pass."
+        if factual_only else
+        "Also judge usefulness: the summary, skill order, leading bullets, and project order should "
+        "emphasize the strongest source-supported direct or transferable matches without keyword "
+        "stuffing. Missing JD requirements are honest gaps, not instructions to invent them. Do not "
+        "fail merely because the candidate lacks A/B tests, DAU/MAU, interviews, a tool, or another "
+        "responsibility; fail usefulness only when relevant source evidence exists but the tailored "
+        "resume ignores it, or when the rewrite is so generic it could target an unrelated job."
+    )
 
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch unsupported claims and useless tailoring, not merely obvious lies.
 
 Return only one JSON object matching this schema:
-{{"verdict":"PASS or FAIL","issues":["specific verdict-changing issue"],"summary_claims":[{{"claim":"exact complete sentence copied from the tailored SUMMARY","source_quotes":["one or more exact supporting quotes copied verbatim from the allowed candidate evidence"],"supported":true}}]}}
+{{"verdict":"PASS or FAIL","issues":["specific verdict-changing issue"],"section_reviews":[{{"section":"SUMMARY","verdict":"PASS or FAIL","issues":[],"relevance":"high, medium, or low","density":"strong, adequate, or thin"}}],"claim_audits":[{{"section":"SUMMARY or EXPERIENCE or PROJECTS","claim":"exact complete summary sentence or bullet copied from the tailored resume","source_quotes":["one or more exact supporting quotes copied verbatim from the allowed candidate evidence"],"supported":true}}]}}
 
-Audit every complete sentence in the tailored SUMMARY. Copy each sentence exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact quotes from the allowed candidate evidence that together support the whole claim. Allowed candidate evidence consists only of the ORIGINAL RESUME and the narrow ALLOWLISTED USER-CONFIRMED PROFILE EVIDENCE supplied with the request. Each quote must be verbatim; do not write an explanation in `source_quotes`. Use at most 4 non-repeated, shortest sufficient quotes per claim. Profile evidence may support only the explicitly labeled skill experience, internship availability, and education facts; it never supports a work action, metric, outcome, employer, project, or JD responsibility. If a summary sentence names a sector or domain such as urban planning, legal, finance, transportation, or healthcare, at least one quoted source line must contain that same sector/domain word; an exact source role, degree, section line, or bullet is valid evidence. Do not omit an obvious sector quote. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL. Target-function labels such as "Data Analyst" may be supported by closely matching source work, but claims such as "analyzed engagement data", "ran experiments", or "turned user behavior into product improvements" require those facts in the original resume.
+Audit every complete sentence in SUMMARY and every bullet in EXPERIENCE and PROJECTS. Copy each exactly into `claim`. For every factual action, experience, domain, user, experiment, data, ownership, tool, metric, or outcome statement, provide one or more exact quotes from the allowed candidate evidence that together support the whole claim. Allowed candidate evidence consists only of the ORIGINAL RESUME and the narrow ALLOWLISTED USER-CONFIRMED PROFILE EVIDENCE supplied with the request. Each quote must be verbatim; do not write an explanation in `source_quotes`. Use at most 4 non-repeated, shortest sufficient quotes per claim. Profile evidence may support only the explicitly labeled skill experience, internship availability, and education facts; it never supports a work action, metric, outcome, employer, project, or JD responsibility. A JD sentence is never candidate evidence. If the quote set does not support the whole claim, set `supported` false, explain it in `issues`, and FAIL.
 
-The `issues` array must contain at most 5 concise, non-duplicated problems of at most 30 words each that actually require FAIL. Do not report allowed omissions or enumerate accurate reordering, faithful rewording, unchanged facts, or optional evidence that could have been retained anywhere in the response. If there is no verdict-changing problem, return an empty `issues` array.
+{section_review_instruction}
+
+The `issues` array must contain at most 8 concise, non-duplicated problems of at most 30 words each that actually require FAIL. Do not report allowed omissions or enumerate accurate reordering, faithful rewording, unchanged facts, or optional evidence that could have been retained anywhere in the response. If there is no verdict-changing problem, return an empty `issues` array.
 
 ## ALLOWLISTED USER-CONFIRMED PROFILE EVIDENCE
 {profile_evidence or "None supplied."}
@@ -263,7 +323,7 @@ The `issues` array must contain at most 5 concise, non-duplicated problems of at
 ## STRICT GROUNDING RULE:
 There is no allowance for "minor stretches" or learnable-but-unlisted skills. A plausible claim is still unsupported if it is absent from the selected source and the narrow allowlisted profile evidence. Fail changed job titles, transferred metrics, stronger ownership, new causal outcomes, and JD facts copied into the candidate's history.
 
-Also judge usefulness: the summary, skill order, leading bullets, and project order should emphasize the strongest source-supported direct or transferable matches without keyword stuffing. Missing JD requirements are honest gaps, not instructions to invent them. Do not fail merely because the candidate lacks A/B tests, DAU/MAU, interviews, a tool, or another responsibility; fail usefulness only when relevant source evidence exists but the tailored resume ignores it, or when the rewrite is so generic it could target an unrelated job.
+{usefulness_instruction}
 
 Be strict about factual support and specific about each issue. Do not fail accurate reordering or faithful wording changes."""
 
@@ -453,7 +513,31 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
             lines.append("")
 
     def append_education() -> None:
-        lines.extend(["EDUCATION", sanitize_text(str(data.get("education", ""))), ""])
+        value = data.get("education", "")
+        if isinstance(value, list):
+            education_lines = [sanitize_text(str(item)) for item in value if str(item).strip()]
+        else:
+            raw = sanitize_text(str(value))
+            education_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+            profile_schools = [
+                str(item.get("institution") or "").strip()
+                for item in profile.get("education", [])
+                if isinstance(item, dict) and str(item.get("institution") or "").strip()
+            ]
+            if len(education_lines) == 1 and len(profile_schools) > 1:
+                source_line = education_lines[0]
+                positions = [
+                    (source_line.casefold().find(school.casefold()), school)
+                    for school in profile_schools
+                ]
+                if all(position >= 0 for position, _school in positions):
+                    ordered = sorted(positions)
+                    education_lines = [
+                        source_line[start : ordered[index + 1][0] if index + 1 < len(ordered) else None]
+                        .strip(" ;")
+                        for index, (start, _school) in enumerate(ordered)
+                    ]
+        lines.extend(["EDUCATION", *education_lines, ""])
 
     title = str(data.get("title") or "")
     is_internship = bool(
@@ -504,12 +588,145 @@ def _is_exact_source_quote(quote: str, normalized_source: str) -> bool:
     return any(f"{clause}{boundary}" in normalized_source for boundary in (";", ":"))
 
 
+_QUALITY_DIMENSION_WEIGHTS = {
+    "jd_alignment": 0.20,
+    "section_allocation": 0.20,
+    "content_density": 0.15,
+    "narrative_completeness": 0.20,
+    "specificity": 0.10,
+    "redundancy_control": 0.05,
+    "professional_style": 0.10,
+}
+_QUALITY_OVERALL_GATE = 72.0
+_QUALITY_DIMENSION_FLOOR = 55.0
+
+
+def _quality_judge_tailored_resume(
+    original_text: str,
+    tailored_text: str,
+    job_title: str,
+    job_description: str,
+    content_plan: dict | None,
+) -> dict:
+    """Run one independent usefulness/density review with conservative gates."""
+    prompt = """You are the independent resume usefulness reviewer. Do not audit factual truth; a
+separate reviewer handles that. Score whether the supplied, fact-preserving resume uses its limited
+space well for the target job. Treat the content plan as guidance, not a quota. Do not penalize an
+honest skills gap, and do not demand invented metrics, tools, or responsibilities.
+
+Return only JSON:
+{"verdict":"PASS or FAIL","dimensions":{"jd_alignment":0,"section_allocation":0,
+"content_density":0,"narrative_completeness":0,"specificity":0,
+"redundancy_control":0,"professional_style":0},
+"issues":[{"section":"SUMMARY or TECHNICAL SKILLS or EXPERIENCE or PROJECTS or EDUCATION",
+"code":"short_code","severity":"blocking or advisory","message":"specific problem",
+"repairable":true}],"section_reviews":[{"section":"SUMMARY","score":0,"comment":"brief"}]}
+
+Use integer scores from 0 to 100. Judge section allocation as a whole: retained experience and
+project entries must be ordered current/most-recent first from their preserved dates; newer entries should receive equal or greater
+detail than older entries, and the oldest must not rival the newest when three or more are retained.
+Relevance should select and order facts within that hierarchy, not make a distant entry dominate.
+Judge narrative completeness by whether bullets connect an owned action to a concrete artifact or
+method and a supported context/result/user impact. A long list of tools or noun phrases is not a
+complete bullet. Education must show one institution per separate item/line. A blocking issue must
+identify a visible section and a concrete problem that materially reduces interview usefulness.
+Style preferences, optional additions, and minor wording improvements are advisory. FAIL only for
+materially poor allocation, thin evidence, incomplete/fragmentary bullets, heavy repetition,
+generic writing, or weak JD focus despite stronger supplied evidence."""
+    messages = [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": (
+                f"JOB TITLE: {job_title}\n\nJOB DESCRIPTION:\n{job_description[:8000]}\n\n"
+                f"CONTENT PLAN:\n{json.dumps(content_plan or {}, ensure_ascii=False)}\n\n"
+                f"CANDIDATE EVIDENCE:\n{original_text[:16000]}\n\n"
+                f"TAILORED RESUME:\n{tailored_text}\n\nReview once and return JSON."
+            ),
+        },
+    ]
+    client = get_client()
+    response = client.chat(
+        messages,
+        max_tokens=int(os.environ.get("APPLYPILOT_QUALITY_JUDGE_MAX_TOKENS", "2048")),
+        temperature=0.15,
+        response_format={"type": "json_object"},
+        thinking={"type": os.environ.get("APPLYPILOT_JUDGE_THINKING", "disabled")},
+    )
+    try:
+        audit = extract_json(response)
+    except ValueError as exc:
+        return {
+            "passed": False,
+            "verdict": "FAIL",
+            "issues": [{
+                "section": "",
+                "code": "invalid_review_json",
+                "severity": "blocking",
+                "message": str(exc),
+                "repairable": False,
+            }],
+            "dimensions": {},
+            "overall_score": 0.0,
+            "raw": response,
+        }
+
+    raw_dimensions = audit.get("dimensions", {})
+    dimensions: dict[str, float] = {}
+    for name in _QUALITY_DIMENSION_WEIGHTS:
+        value = raw_dimensions.get(name) if isinstance(raw_dimensions, dict) else None
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            score = -1.0
+        dimensions[name] = max(0.0, min(100.0, score)) if score >= 0 else 0.0
+    complete = all(
+        isinstance(raw_dimensions, dict) and name in raw_dimensions
+        for name in _QUALITY_DIMENSION_WEIGHTS
+    )
+    overall = sum(
+        dimensions[name] * weight
+        for name, weight in _QUALITY_DIMENSION_WEIGHTS.items()
+    )
+    raw_issues = audit.get("issues", [])
+    issues = [item for item in raw_issues if isinstance(item, dict)] if isinstance(raw_issues, list) else []
+    blocking = [
+        item for item in issues
+        if str(item.get("severity") or "").casefold() == "blocking"
+        and str(item.get("section") or "").upper()
+        in {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
+    ]
+    passed = (
+        complete
+        and overall >= _QUALITY_OVERALL_GATE
+        and min(dimensions.values(), default=0.0) >= _QUALITY_DIMENSION_FLOOR
+        and not blocking
+    )
+    return {
+        "passed": passed,
+        "verdict": "PASS" if passed else "FAIL",
+        "issues": issues,
+        "dimensions": dimensions,
+        "overall_score": round(overall, 2),
+        "section_reviews": audit.get("section_reviews", []),
+        "thresholds": {
+            "overall": _QUALITY_OVERALL_GATE,
+            "dimension_floor": _QUALITY_DIMENSION_FLOOR,
+        },
+        "raw": response,
+        "response_meta": dict(getattr(client, "last_response_meta", {}) or {}),
+    }
+
+
 def judge_tailored_resume(
     original_text: str,
     tailored_text: str,
     job_title: str,
     profile: dict,
     job_description: str = "",
+    *,
+    cross_review: bool = False,
+    content_plan: dict | None = None,
 ) -> dict:
     """LLM judge layer: catches subtle fabrication that programmatic checks miss.
 
@@ -522,7 +739,7 @@ def judge_tailored_resume(
     Returns:
         A structured verdict whose summary evidence is independently checked.
     """
-    judge_prompt = _build_judge_prompt(profile)
+    judge_prompt = _build_judge_prompt(profile, factual_only=cross_review)
     profile_evidence, confirmed_profile_skills = _build_judge_profile_evidence(profile)
 
     messages = [
@@ -537,7 +754,7 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    max_tokens = int(os.environ.get("APPLYPILOT_JUDGE_MAX_TOKENS", "1024"))
+    max_tokens = int(os.environ.get("APPLYPILOT_JUDGE_MAX_TOKENS", "4096"))
     response = client.chat(
         messages,
         max_tokens=max_tokens,
@@ -549,7 +766,12 @@ def judge_tailored_resume(
     try:
         audit = extract_json(response)
     except ValueError as exc:
-        audit = {"verdict": "FAIL", "issues": [f"Judge returned invalid JSON: {exc}"], "summary_claims": []}
+        audit = {
+            "verdict": "FAIL",
+            "issues": [f"Judge returned invalid JSON: {exc}"],
+            "section_reviews": [],
+            "claim_audits": [],
+        }
 
     raw_issues = audit.get("issues", [])
     if isinstance(raw_issues, str):
@@ -570,10 +792,16 @@ def judge_tailored_resume(
         for sentence in re.split(r"(?<=[.!?])\s+", summary_text)
         if sentence.strip()
     ]
+    bullet_claims = [
+        re.sub(r"\s+", " ", line.strip()[2:]).strip()
+        for line in tailored_text.splitlines()
+        if line.strip().startswith("- ")
+    ]
+    expected_claims = [*summary_sentences, *bullet_claims]
     normalized_source = re.sub(
         r"\s+", " ", f"{original_text}\n{profile_evidence}"
     ).strip().casefold()
-    audited_claims = audit.get("summary_claims", [])
+    audited_claims = audit.get("claim_audits", audit.get("summary_claims", []))
     grounded_claims: set[str] = set()
     sector_terms = {
         "banking", "energy", "finance", "financial", "healthcare", "hospitality",
@@ -589,8 +817,9 @@ def judge_tailored_resume(
     }
     technical_terms.update(confirmed_profile_skills)
     if not isinstance(audited_claims, list):
-        issues_list.append("Judge summary_claims field was not a list.")
+        issues_list.append("Judge claim_audits field was not a list.")
         audited_claims = []
+    failed_claim_sections: set[str] = set()
     for item in audited_claims:
         if not isinstance(item, dict):
             continue
@@ -628,6 +857,20 @@ def judge_tailored_resume(
             if re.search(rf"\b{re.escape(term)}\b", combined_quotes, flags=re.IGNORECASE)
         }
         missing_sector_evidence = sorted(claim_sectors - quote_sectors)
+        source_units = [
+            unit
+            for unit in re.split(r"[\n.!?]+", original_text.casefold())
+            if unit.strip()
+        ]
+        if missing_sector_evidence and any(
+            all(re.search(rf"\b{re.escape(term)}\b", unit) for term in claim_sectors)
+            for unit in source_units
+        ):
+            # A reviewer can omit one of several exact quotes even when a
+            # single source bullet already proves the claimed domain pairing.
+            # Deterministically verify co-occurrence before treating that
+            # omission as candidate fabrication.
+            missing_sector_evidence = []
         if missing_sector_evidence:
             issues_list.append(
                 "Summary evidence quote does not support claimed sector(s): "
@@ -671,35 +914,204 @@ def judge_tailored_resume(
             and not missing_technical_evidence
         ):
             grounded_claims.add(claim.casefold())
+        elif claim:
+            section = str(item.get("section") or "").strip().upper()
+            if section:
+                failed_claim_sections.add(section)
 
-    missing_summary_evidence = [
-        sentence for sentence in summary_sentences
-        if sentence.casefold() not in grounded_claims
+    missing_claim_evidence = [
+        claim for claim in expected_claims
+        if claim.casefold() not in grounded_claims
     ]
     if not summary_sentences:
         issues_list.append("Tailored SUMMARY could not be parsed for claim auditing.")
-    elif missing_summary_evidence:
+    elif missing_claim_evidence:
         issues_list.append(
-            "Judge did not provide exact source evidence for every summary sentence: "
-            + " | ".join(missing_summary_evidence[:3])
+            "Judge did not provide exact source evidence for every summary sentence and bullet: "
+            + " | ".join(missing_claim_evidence[:3])
+        )
+
+    visible_sections = [
+        section
+        for section in ("SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION")
+        if re.search(rf"(?m)^\s*{re.escape(section)}\s*$", tailored_text)
+    ]
+    raw_section_reviews = audit.get("section_reviews", [])
+    reviewed_sections: set[str] = set()
+    if not isinstance(raw_section_reviews, list):
+        issues_list.append("Judge section_reviews field was not a list.")
+        raw_section_reviews = []
+    for review in raw_section_reviews:
+        if not isinstance(review, dict):
+            continue
+        section = str(review.get("section") or "").strip().upper()
+        if section not in visible_sections or section in reviewed_sections:
+            continue
+        reviewed_sections.add(section)
+        review_issues = review.get("issues", [])
+        if str(review.get("verdict") or "").strip().upper() != "PASS" or review_issues:
+            issues_list.append(f"Section review failed for {section}.")
+    missing_section_reviews = [
+        section for section in visible_sections if section not in reviewed_sections
+    ]
+    if missing_section_reviews:
+        issues_list.append(
+            "Judge omitted section review(s): " + ", ".join(missing_section_reviews)
         )
 
     passed = (
         str(audit.get("verdict", "")).strip().upper() == "PASS"
         and not issues_list
         and bool(summary_sentences)
-        and not missing_summary_evidence
+        and not missing_claim_evidence
+        and not missing_section_reviews
     )
     issues = "none" if not issues_list else "; ".join(issues_list)
 
-    return {
+    factual_result = {
         "passed": passed,
         "verdict": "PASS" if passed else "FAIL",
         "issues": issues,
         "raw": response,
         "audit": audit,
         "summary_sentences": summary_sentences,
-        "summary_evidence_complete": bool(summary_sentences) and not missing_summary_evidence,
+        "audited_claim_count": len(expected_claims),
+        "claim_evidence_complete": bool(expected_claims) and not missing_claim_evidence,
+        "summary_evidence_complete": bool(summary_sentences) and not any(
+            sentence in missing_claim_evidence for sentence in summary_sentences
+        ),
+        "section_reviews_complete": not missing_section_reviews,
+        "failed_sections": sorted(failed_claim_sections),
+        "response_meta": dict(getattr(client, "last_response_meta", {}) or {}),
+    }
+    if not cross_review:
+        return factual_result
+
+    quality_result = _quality_judge_tailored_resume(
+        original_text,
+        tailored_text,
+        job_title,
+        job_description,
+        content_plan,
+    )
+    combined_passed = factual_result["passed"] and quality_result["passed"]
+    failed_sections = {
+        str(item.get("section") or "").strip().upper()
+        for item in quality_result.get("issues", [])
+        if isinstance(item, dict)
+        and str(item.get("severity") or "").casefold() == "blocking"
+    }
+    failed_sections.update(factual_result.get("failed_sections", []))
+    return {
+        "passed": combined_passed,
+        "verdict": "PASS" if combined_passed else "FAIL",
+        "issues": {
+            "factual": factual_result.get("issues"),
+            "quality": quality_result.get("issues", []),
+        },
+        "failed_sections": sorted(section for section in failed_sections if section),
+        "factual_review": factual_result,
+        "quality_review": quality_result,
+        "quality_dimensions": quality_result.get("dimensions", {}),
+        "quality_overall_score": quality_result.get("overall_score"),
+        "review_mode": "independent_factual_and_quality_cross_review",
+    }
+
+
+# ── Bounded local repair ─────────────────────────────────────────────────
+
+_SECTION_DATA_KEYS = {
+    "SUMMARY": "summary",
+    "TECHNICAL SKILLS": "skills",
+    "EXPERIENCE": "experience",
+    "PROJECTS": "projects",
+    "EDUCATION": "education",
+    "EVIDENCE MAP": "evidence_map",
+}
+
+
+def _repair_sections_for_errors(errors: list[object]) -> set[str]:
+    sections: set[str] = set()
+    for raw_error in errors:
+        error = str(raw_error).casefold()
+        if "summary" in error:
+            sections.add("SUMMARY")
+        if "skill" in error or "tool" in error:
+            sections.add("TECHNICAL SKILLS")
+        if "experience" in error or "company" in error or "employer" in error:
+            sections.add("EXPERIENCE")
+        if "project" in error:
+            sections.add("PROJECTS")
+        if "education" in error or "school" in error or "degree" in error or "gpa" in error:
+            sections.add("EDUCATION")
+        if "evidence map" in error or "grounded jd priorities" in error:
+            sections.add("EVIDENCE MAP")
+    return sections
+
+
+def _repair_resume_sections(
+    data: dict,
+    *,
+    allowed_sections: set[str],
+    evidence_text: str,
+    job_text: str,
+    issues: object,
+    content_plan: dict,
+) -> tuple[dict, dict]:
+    """Ask once for section-scoped repairs and enforce the scope in code."""
+    allowed_keys = {
+        _SECTION_DATA_KEYS[section]
+        for section in allowed_sections
+        if section in _SECTION_DATA_KEYS
+    }
+    if not allowed_keys:
+        return data, {"attempted": False, "reason": "no_repairable_section"}
+    prompt = """You are repairing a resume after independent review. Return the same JSON schema as
+the supplied resume data. Change only the explicitly allowed fields. Preserve every other field
+byte-for-byte in meaning and structure. Resolve only the listed issues, obey the content plan,
+and use candidate evidence only. Do not add employers, projects, titles, dates, tools, metrics,
+ownership, or outcomes. This is one bounded repair pass, not a complete rewrite."""
+    client = get_client()
+    response = client.chat(
+        [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"ALLOWED SECTIONS: {', '.join(sorted(allowed_sections))}\n\n"
+                    f"REVIEW ISSUES:\n{json.dumps(issues, ensure_ascii=False)}\n\n"
+                    f"CONTENT PLAN:\n{json.dumps(content_plan, ensure_ascii=False)}\n\n"
+                    f"CURRENT RESUME DATA:\n{json.dumps(data, ensure_ascii=False)}\n\n"
+                    f"CANDIDATE EVIDENCE:\n{evidence_text[:18000]}\n\n"
+                    f"TARGET JOB:\n{job_text}\n\nReturn repaired JSON."
+                ),
+            },
+        ],
+        max_tokens=int(os.environ.get("APPLYPILOT_REPAIR_MAX_TOKENS", "3072")),
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        thinking={"type": os.environ.get("APPLYPILOT_TAILOR_THINKING", "disabled")},
+    )
+    try:
+        proposed = extract_json(response)
+    except ValueError as exc:
+        return data, {
+            "attempted": True,
+            "applied": False,
+            "sections": sorted(allowed_sections),
+            "error": f"Repair returned invalid JSON: {exc}",
+        }
+    repaired = json.loads(json.dumps(data))
+    changed: list[str] = []
+    for key in allowed_keys:
+        if key in proposed and proposed[key] != repaired.get(key):
+            repaired[key] = proposed[key]
+            changed.append(key)
+    return repaired, {
+        "attempted": True,
+        "applied": bool(changed),
+        "sections": sorted(allowed_sections),
+        "changed_fields": sorted(changed),
         "response_meta": dict(getattr(client, "last_response_meta", {}) or {}),
     }
 
@@ -708,8 +1120,11 @@ def judge_tailored_resume(
 
 def tailor_resume(
     resume_text: str, job: dict, profile: dict,
-    max_retries: int = 3, validation_mode: str = "normal",
+    max_retries: int = 1, validation_mode: str = "normal",
     source_resume_path: str | None = None,
+    route_context: dict | None = None,
+    supplemental_evidence: str = "",
+    validate_layout: bool = False,
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -745,19 +1160,57 @@ def tailor_resume(
         "status": "pending", "validation_mode": validation_mode,
         "source_resume_path": source_resume_path or "runtime_source",
         "generation_diagnostics": [],
+        "supplemental_evidence_used": bool(supplemental_evidence.strip()),
+        "layout_validation": None,
+        "local_repair": None,
     }
     avoid_notes: list[str] = []
     if str(job.get("tailor_error") or "").strip():
         avoid_notes.append(str(job["tailor_error"]).strip())
     tailored = ""
     client = get_client()
+    repair_limit = max(
+        0, int(os.environ.get("APPLYPILOT_LOCAL_REPAIR_LIMIT", "1"))
+    )
+    local_repairs_used = 0
     source_has_projects = bool(
         re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", resume_text)
+        or re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", supplemental_evidence)
     )
+    route_context = dict(route_context or {})
+    job_profile = route_context.get("job_profile")
+    if not isinstance(job_profile, dict):
+        from applypilot.resume_library import extract_job_profile
+
+        job_profile = extract_job_profile(job, profile)
+    content_plan = build_content_plan(resume_text, job_profile, route_context)
+    report["content_plan"] = content_plan
     tailor_prompt_base = _build_tailor_prompt(
         profile,
         source_has_projects=source_has_projects,
     )
+    tailor_prompt_base += (
+        "\n\n## CONTENT ALLOCATION PLAN\n" + format_content_plan(content_plan)
+    )
+    resolution = str(route_context.get("resolution") or "create_new")
+    strategy_guidance = {
+        "reuse_with_reorder": (
+            "ROUTING RESOLUTION: REORDER ONLY. Preserve the selected resume's factual content and "
+            "bullet substance. Improve section, skill, and bullet ordering for the target job; make only "
+            "minor wording edits needed for coherence. The result must still pass every normal gate."
+        ),
+        "patch_existing": (
+            "ROUTING RESOLUTION: PATCH THE SELECTED RESUME. Keep its strong relevant evidence, then "
+            "strengthen thin high-priority sections using only supplied candidate evidence. Prefer focused "
+            "bullet improvements over rebuilding the document from scratch."
+        ),
+        "create_new": (
+            "ROUTING RESOLUTION: CREATE A NEW COMPOSITION. Select the strongest supplied evidence for "
+            "this job, while preserving identities, dates, metrics, and factual scope."
+        ),
+    }.get(resolution)
+    if strategy_guidance:
+        tailor_prompt_base += "\n\n## ROUTING STRATEGY\n" + strategy_guidance
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
@@ -782,7 +1235,11 @@ def tailor_resume(
             {"role": "system", "content": prompt},
             {"role": "user", "content": (
                 retry_feedback
-                + f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\n"
+                + f"SELECTED SOURCE RESUME:\n{resume_text}\n\n---\n\n"
+                + (
+                    f"SUPPLEMENTAL CANDIDATE EVIDENCE:\n{supplemental_evidence[:16000]}\n\n---\n\n"
+                    if supplemental_evidence.strip() else ""
+                )
                 + f"TARGET JOB:\n{job_text}\n\nReturn the JSON:"
             )},
         ]
@@ -812,11 +1269,19 @@ def tailor_resume(
             continue
 
         # Layer 1: Validate JSON fields
+        combined_evidence = resume_text + (
+            "\n\nSUPPLEMENTAL CANDIDATE EVIDENCE\n" + supplemental_evidence
+            if supplemental_evidence.strip() else ""
+        )
+        data["evidence_map"] = _normalize_evidence_map_quotes(
+            data.get("evidence_map"), combined_evidence
+        )
         validation = validate_json_fields(
             data,
             profile,
             mode=validation_mode,
-            original_text=resume_text,
+            original_text=combined_evidence,
+            selection_source_text=resume_text,
             job_description=job.get("full_description") or "",
             job_title=job.get("title") or "",
             target_company=job.get("company_name") or "",
@@ -825,14 +1290,42 @@ def tailor_resume(
         report["evidence_map"] = data.get("evidence_map", [])
 
         if not validation["passed"]:
-            # Only retry if there are hard errors (warnings never block)
-            avoid_notes.extend(validation["errors"])
-            if attempt < max_retries:
-                continue
-            # Last attempt: return the rejected text for diagnostics only.
-            tailored = assemble_resume_text(data, profile)
-            report["status"] = "failed_validation"
-            return tailored, report
+            repair_sections = _repair_sections_for_errors(validation["errors"])
+            if local_repairs_used < repair_limit and repair_sections:
+                repaired_data, repair_report = _repair_resume_sections(
+                    data,
+                    allowed_sections=repair_sections,
+                    evidence_text=combined_evidence,
+                    job_text=job_text,
+                    issues=validation["errors"],
+                    content_plan=content_plan,
+                )
+                local_repairs_used += 1
+                report["local_repair"] = repair_report
+                if repair_report.get("applied"):
+                    repaired_validation = validate_json_fields(
+                        repaired_data,
+                        profile,
+                        mode=validation_mode,
+                        original_text=combined_evidence,
+                        selection_source_text=resume_text,
+                        job_description=job.get("full_description") or "",
+                        job_title=job.get("title") or "",
+                        target_company=job.get("company_name") or "",
+                    )
+                    report["repair_validation"] = repaired_validation
+                    if repaired_validation["passed"]:
+                        data = repaired_data
+                        validation = repaired_validation
+                        report["validator"] = validation
+                        report["evidence_map"] = data.get("evidence_map", [])
+            if not validation["passed"]:
+                avoid_notes.extend(validation["errors"])
+                if attempt < max_retries and not repair_sections:
+                    continue
+                tailored = assemble_resume_text(data, profile)
+                report["status"] = "failed_validation"
+                return tailored, report
 
         # Assemble text (header injected by code, em dashes auto-fixed)
         tailored = assemble_resume_text(data, profile)
@@ -850,6 +1343,44 @@ def tailor_resume(
             report["status"] = "failed_validation"
             return tailored, report
 
+        # Production generation must close the loop on actual pagination, not
+        # merely word counts. Render to an isolated temporary directory so a
+        # sparse one-page draft or a barely-started second page becomes retry
+        # feedback before the semantic judge and before any live artifact is
+        # registered.
+        if validate_layout:
+            try:
+                from applypilot.scoring.pdf import convert_to_pdf
+
+                with tempfile.TemporaryDirectory(prefix="applypilot-resume-layout-") as temp_dir:
+                    text_path = Path(temp_dir) / "resume.txt"
+                    text_path.write_text(tailored, encoding="utf-8")
+                    convert_to_pdf(
+                        text_path,
+                        output_path=text_path.with_suffix(".pdf"),
+                        layout_override=(
+                            profile.get("tailoring", {}).get("resume_layout", {})
+                        ),
+                    )
+                report["layout_validation"] = {"passed": True, "error": None}
+            except Exception as exc:
+                layout_error = str(exc)
+                report["layout_validation"] = {
+                    "passed": False,
+                    "error": layout_error,
+                }
+                avoid_notes.append(
+                    "Rendered layout failed: "
+                    + layout_error
+                    + " Adjust content allocation, not facts or typography. If a second page is "
+                    "only partly used, retain more distinct relevant evidence; otherwise make the "
+                    "strongest evidence concise enough for one full page."
+                )
+                if attempt < max_retries:
+                    continue
+                report["status"] = "failed_layout"
+                return tailored, report
+
         # Layer 3: LLM judge catches semantic drift that deterministic checks
         # cannot prove. A skipped or failed judge is never a usable success.
         if validation_mode == "lenient":
@@ -858,18 +1389,94 @@ def tailor_resume(
             return tailored, report
 
         judge = judge_tailored_resume(
-            resume_text,
+            combined_evidence,
             tailored,
             job.get("title", ""),
             profile,
             job_description=job.get("full_description") or "",
+            cross_review=True,
+            content_plan=content_plan,
         )
         report["judge"] = judge
 
         if not judge["passed"]:
-            avoid_notes.append(f"Judge rejected: {judge['issues']}")
-            if attempt < max_retries:
-                continue
+            repair_sections = {
+                str(section).strip().upper()
+                for section in judge.get("failed_sections", [])
+                if str(section).strip().upper() in _SECTION_DATA_KEYS
+            }
+            if local_repairs_used < repair_limit and repair_sections:
+                repaired_data, repair_report = _repair_resume_sections(
+                    data,
+                    allowed_sections=repair_sections,
+                    evidence_text=combined_evidence,
+                    job_text=job_text,
+                    issues=judge.get("issues"),
+                    content_plan=content_plan,
+                )
+                local_repairs_used += 1
+                report["local_repair"] = repair_report
+                if repair_report.get("applied"):
+                    repaired_validation = validate_json_fields(
+                        repaired_data,
+                        profile,
+                        mode=validation_mode,
+                        original_text=combined_evidence,
+                        selection_source_text=resume_text,
+                        job_description=job.get("full_description") or "",
+                        job_title=job.get("title") or "",
+                        target_company=job.get("company_name") or "",
+                    )
+                    repaired_text = assemble_resume_text(repaired_data, profile)
+                    repaired_full_validation = validate_tailored_resume(
+                        repaired_text,
+                        profile,
+                        original_text=resume_text,
+                    )
+                    repaired_layout = {"passed": True, "error": None}
+                    if repaired_validation["passed"] and repaired_full_validation["passed"] and validate_layout:
+                        try:
+                            from applypilot.scoring.pdf import convert_to_pdf
+
+                            with tempfile.TemporaryDirectory(
+                                prefix="applypilot-resume-repair-layout-"
+                            ) as temp_dir:
+                                text_path = Path(temp_dir) / "resume.txt"
+                                text_path.write_text(repaired_text, encoding="utf-8")
+                                convert_to_pdf(
+                                    text_path,
+                                    output_path=text_path.with_suffix(".pdf"),
+                                    layout_override=(
+                                        profile.get("tailoring", {}).get("resume_layout", {})
+                                    ),
+                                )
+                        except Exception as exc:
+                            repaired_layout = {"passed": False, "error": str(exc)}
+                    report["repair_validation"] = repaired_validation
+                    report["repair_full_validator"] = repaired_full_validation
+                    report["repair_layout_validation"] = repaired_layout
+                    if (
+                        repaired_validation["passed"]
+                        and repaired_full_validation["passed"]
+                        and repaired_layout["passed"]
+                    ):
+                        repaired_judge = judge_tailored_resume(
+                            combined_evidence,
+                            repaired_text,
+                            job.get("title", ""),
+                            profile,
+                            job_description=job.get("full_description") or "",
+                            cross_review=True,
+                            content_plan=content_plan,
+                        )
+                        report["judge_after_repair"] = repaired_judge
+                        if repaired_judge["passed"]:
+                            report["validator"] = repaired_validation
+                            report["full_validator"] = repaired_full_validation
+                            report["layout_validation"] = repaired_layout
+                            report["judge"] = repaired_judge
+                            report["status"] = "machine_validated"
+                            return repaired_text, report
             report["status"] = "failed_judge"
             return tailored, report
 
@@ -917,6 +1524,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     conn = get_connection()
     from applypilot.resume_library import (
+        RESUME_RESOLUTIONS,
+        record_route_outcome,
         register_tailored_artifact,
         route_resume_for_job,
         sync_resume_library,
@@ -990,6 +1599,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
     for job in jobs:
         completed += 1
+        route_resolution = None
+        library_route: dict = {}
         try:
             library_route = (
                 route_resume_for_job(
@@ -997,6 +1608,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                     job,
                     profile,
                     minimum_fit_score=min_score,
+                    top_k=max(1, int(os.environ.get("APPLYPILOT_RESUME_TOP_K", "5"))),
                 )
                 if library_enabled
                 else {
@@ -1006,7 +1618,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 }
             )
             route_decision = library_route["decision"]
-            if route_decision == "reuse_exact":
+            route_resolution = library_route.get("resolution") or (
+                "reuse_as_is" if route_decision == "reuse_exact" else "create_new"
+            )
+            if route_resolution == "reuse_as_is":
                 artifact = library_route["artifact"]
                 result = {
                     "url": job["url"],
@@ -1024,6 +1639,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                     "status": "machine_validated",
                     "attempts": 0,
                     "resume_library_decision": "reuse_exact",
+                    "resume_library_resolution": "reuse_as_is",
                     "resume_artifact_id": artifact["artifact_id"],
                     "resume_library_assignment_id": library_route["assignment_id"],
                 }
@@ -1066,9 +1682,46 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 )
                 continue
 
-            source_path, routing = select_resume_source(job, profile)
+            selected_artifact = library_route.get("artifact")
+            if (
+                route_resolution in {"reuse_with_reorder", "patch_existing"}
+                and isinstance(selected_artifact, dict)
+                and selected_artifact.get("text_path")
+            ):
+                source_path = Path(str(selected_artifact["text_path"])).expanduser().resolve()
+                routing = {
+                    "method": "resume_library_top_k",
+                    "track": library_route.get("job_profile", {}).get("track"),
+                    "score": library_route.get("overall_score"),
+                    "artifact_id": selected_artifact.get("artifact_id"),
+                    "resolution": route_resolution,
+                }
+            else:
+                source_path, routing = select_resume_source(job, profile)
             resume_text = read_resume_source(source_path)
-            document_retries = max(0, int(os.environ.get("APPLYPILOT_DOCUMENT_MAX_RETRIES", "3")))
+            supplemental_parts: list[str] = []
+            for candidate in library_route.get("candidates", [])[:4]:
+                candidate_id = str(candidate.get("artifact_id") or "")
+                if not candidate_id or candidate_id == library_route.get("artifact_id"):
+                    continue
+                row = conn.execute(
+                    "SELECT text_path FROM resume_artifacts WHERE artifact_id=? AND active=1",
+                    (candidate_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                candidate_path = Path(str(row["text_path"])).expanduser().resolve()
+                if not candidate_path.is_file() or candidate_path == source_path:
+                    continue
+                candidate_text = read_resume_source(candidate_path).strip()
+                if candidate_text:
+                    supplemental_parts.append(
+                        f"SOURCE ARTIFACT {candidate_id}\n{candidate_text[:5000]}"
+                    )
+                if sum(len(part) for part in supplemental_parts) >= 12000:
+                    break
+            supplemental_evidence = "\n\n".join(supplemental_parts)
+            document_retries = max(0, int(os.environ.get("APPLYPILOT_DOCUMENT_MAX_RETRIES", "1")))
             tailored, report = tailor_resume(
                 resume_text,
                 job,
@@ -1076,6 +1729,15 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 max_retries=document_retries,
                 validation_mode=validation_mode,
                 source_resume_path=str(source_path),
+                route_context={
+                    "resolution": route_resolution,
+                    "assignment_id": library_route.get("assignment_id"),
+                    "source_artifact_id": library_route.get("artifact_id"),
+                    "candidates": library_route.get("candidates", []),
+                    "job_profile": library_route.get("job_profile", {}),
+                },
+                supplemental_evidence=supplemental_evidence,
+                validate_layout=True,
             )
             report["resume_routing"] = routing
 
@@ -1153,6 +1815,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "status": report["status"],
                 "attempts": report["attempts"],
                 "resume_library_decision": "create_variant",
+                "resume_library_resolution": route_resolution,
+                "resume_source_artifact_id": library_route.get("artifact_id"),
                 "resume_library_assignment_id": library_route["assignment_id"],
             }
         except Exception as e:
@@ -1164,6 +1828,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "rejected_path": None, "report_path": None,
                 "source_resume_path": None, "error": str(e),
                 "resume_library_decision": "error",
+                "resume_library_resolution": route_resolution,
+                "resume_source_artifact_id": library_route.get("artifact_id"),
+                "resume_library_assignment_id": library_route.get("assignment_id"),
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
@@ -1185,7 +1852,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     now = datetime.now(UTC).isoformat()
     for r in results:
         if r["status"] == "machine_validated":
-            attempt_increment = 0 if r.get("resume_library_decision") == "reuse_exact" else 1
+            attempt_increment = 0 if r.get("resume_library_resolution") == "reuse_as_is" else 1
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
                 "tailor_status='machine_validated', tailor_error=NULL, "
@@ -1223,7 +1890,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             library_enabled
             and
             r["status"] == "machine_validated"
-            and r.get("resume_library_decision") == "create_variant"
+            and r.get("resume_library_resolution") in {
+                "reuse_with_reorder", "patch_existing", "create_new"
+            }
         ):
             stored = conn.execute("SELECT * FROM jobs WHERE url=?", (r["url"],)).fetchone()
             if stored is not None:
@@ -1233,9 +1902,35 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                     text_path=r["path"],
                     source_resume_path=r.get("source_resume_path"),
                     report_path=r.get("report_path"),
+                    assignment_decision=f"{r.get('resume_library_resolution')}_validated",
                     profile=profile,
                 )
                 r["resume_artifact_id"] = registration["artifact_id"]
+                record_route_outcome(
+                    conn,
+                    assignment_id=r["resume_library_assignment_id"],
+                    resolution=r["resume_library_resolution"],
+                    status="machine_validated",
+                    source_artifact_id=r.get("resume_source_artifact_id"),
+                    output_artifact_id=registration["artifact_id"],
+                    evidence={
+                        "report_path": r.get("report_path"),
+                        "attempts": r.get("attempts"),
+                    },
+                )
+        elif (
+            library_enabled
+            and r.get("resume_library_assignment_id")
+            and r.get("resume_library_resolution") in RESUME_RESOLUTIONS
+        ):
+            record_route_outcome(
+                conn,
+                assignment_id=r["resume_library_assignment_id"],
+                resolution=r["resume_library_resolution"],
+                status=r.get("status") or "error",
+                source_artifact_id=r.get("resume_source_artifact_id"),
+                evidence={"error": r.get("error"), "report_path": r.get("report_path")},
+            )
     conn.commit()
 
     elapsed = time.time() - t0

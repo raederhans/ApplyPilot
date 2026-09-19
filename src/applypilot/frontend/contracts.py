@@ -224,9 +224,32 @@ def _route_contract(job: Mapping[str, object], assignment: Mapping[str, object] 
         ),
         "hasValidationReport": bool(assignment.get("artifact_validation_report_path")),
     }
+    decision = _text(assignment.get("decision"), limit=80) or "not_recorded"
+    components, _ = _json_mapping(assignment.get("components_json"))
+    resolution = _text(components.get("resolution"), limit=80)
+    validated_variant_decisions = {
+        "reuse_with_reorder_validated",
+        "patch_existing_validated",
+        "create_new_validated",
+    }
+    if not resolution and decision in validated_variant_decisions:
+        resolution = decision.removesuffix("_validated")
+    if not resolution and decision in {"reuse_exact", "manual_selection"}:
+        resolution = "reuse_as_is"
+    ready = (
+        artifact["validationStatus"] == "machine_validated"
+        and artifact["hasPdfBinding"] is True
+        and not _string_list(assignment.get("hard_gaps_json"))
+        and (
+            decision in {"reuse_exact", "manual_selection"}
+            or decision in validated_variant_decisions
+        )
+    )
     return {
         "state": "current",
-        "decision": _text(assignment.get("decision"), limit=80) or "not_recorded",
+        "decision": decision,
+        "resolution": resolution or "not_recorded",
+        "ready": ready,
         "reason": _text(assignment.get("reason")),
         "gaps": _string_list(assignment.get("hard_gaps_json")),
         "requiredCoverage": assignment.get("required_coverage"),
@@ -242,13 +265,9 @@ def build_prepare_job(job: Mapping[str, object], assignment: Mapping[str, object
     cover = _cover_contract(job)
     route = _route_contract(job, assignment)
     material_states = {resume["state"], cover["state"]}
-    route_artifact = route.get("artifact", {})
     route_ready = (
         route.get("state") == "current"
-        and route.get("decision") == "reuse_exact"
-        and route_artifact.get("validationStatus") == "machine_validated"
-        and route_artifact.get("hasPdfBinding") is True
-        and not route.get("gaps")
+        and route.get("ready") is True
     )
     if material_states == {"ready"} and route_ready:
         material_state = "ready"

@@ -16,6 +16,7 @@ from applypilot.resume_library import (
     extract_job_profile,
     library_status,
     project_reuse_to_job,
+    register_tailored_artifact,
     route_resume_for_job,
     sync_resume_library,
 )
@@ -23,7 +24,7 @@ from applypilot.scoring import tailor
 
 
 def test_resume_taxonomy_version_tracks_routing_term_changes() -> None:
-    assert TAXONOMY_VERSION == "resume-library-v7"
+    assert TAXONOMY_VERSION == "resume-library-v8"
 
 
 def test_resume_route_cli_exposes_explicit_candidate_selection() -> None:
@@ -291,7 +292,8 @@ def test_senior_or_high_experience_role_is_routed_after_fit_scoring(tmp_path: Pa
     )
 
     assert result["job_profile"]["seniority"] == "senior_or_high_experience"
-    assert result["decision"] == "reuse_exact"
+    assert result["decision"] == "create_variant"
+    assert result["resolution"] == "reuse_with_reorder"
 
 
 def test_resume_taxonomy_extends_discovery_for_real_work_natures() -> None:
@@ -464,7 +466,7 @@ def test_taxonomy_v5_ignores_v4_coverage_until_sync_rebuilds_it(tmp_path: Path) 
             "SELECT taxonomy_version FROM resume_coverage_cells"
         ).fetchall()
     }
-    assert versions == {"resume-library-v4", "resume-library-v7"}
+    assert versions == {"resume-library-v4", "resume-library-v8"}
     artifact = conn.execute(
         "SELECT track FROM resume_artifacts WHERE kind='tailored'"
     ).fetchone()
@@ -472,7 +474,8 @@ def test_taxonomy_v5_ignores_v4_coverage_until_sync_rebuilds_it(tmp_path: Path) 
     assert library_status(conn)["covered_subtypes"] == ["data_analytics"]
 
     after_rebuild = route_resume_for_job(conn, new_job, profile)
-    assert after_rebuild["decision"] == "reuse_exact"
+    assert after_rebuild["decision"] == "create_variant"
+    assert after_rebuild["resolution"] == "reuse_with_reorder"
 
 
 def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
@@ -495,9 +498,80 @@ def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
     result = route_resume_for_job(conn, job, profile)
 
     assert result["decision"] == "reuse_exact"
+    assert result["resolution"] == "reuse_as_is"
     assert result["required_coverage"] == 1.0
     assert result["overall_score"] >= 0.85
     assert result["artifact"]["validation_status"] == "machine_validated"
+
+
+def test_top_k_search_includes_base_artifacts_with_content_scores(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text(
+        "DATA ANALYST\nPython SQL data analysis dashboard reporting automation workflow",
+        encoding="utf-8",
+    )
+    for index in range(3):
+        _validated_history(
+            tmp_path,
+            conn,
+            base,
+            suffix=f"candidate-{index}",
+            content=(
+                "DATA ANALYST\nPython SQL data analysis dashboard reporting "
+                f"automation workflow candidate {index}"
+            ),
+        )
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": "https://careers.example.test/top-k",
+            "title": "Data Analyst",
+            "full_description": "Required: Python and SQL. Build dashboard reporting automation workflows.",
+            "eligibility_status": "eligible",
+            "fit_score": 8,
+        },
+        profile,
+        minimum_fit_score=7,
+        top_k=2,
+    )
+
+    assert len(result["candidates"]) == 2
+    components = _route_components(conn, result)
+    assert components["candidate_count_total"] >= 4
+    assert all(candidate["score_components"] for candidate in result["candidates"])
+
+
+def test_configured_base_artifact_drives_patch_resolution(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text(
+        "DATA ANALYST\nPython SQL data analysis dashboard reporting",
+        encoding="utf-8",
+    )
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+
+    result = route_resume_for_job(
+        conn,
+        {
+            "url": "https://careers.example.test/base-patch",
+            "title": "Data Analyst Intern",
+            "full_description": "Required: Python and SQL. Build dashboards and reporting workflows.",
+            "eligibility_status": "eligible",
+            "fit_score": 8,
+        },
+        profile,
+        minimum_fit_score=7,
+    )
+
+    assert result["decision"] == "create_variant"
+    assert result["resolution"] == "patch_existing"
+    assert result["artifact"]["kind"] == "base"
+    assert result["candidates"][0]["artifact_kind"] == "base"
 
 
 def test_stale_explicit_gpa_artifact_is_not_reused(tmp_path: Path) -> None:
@@ -538,7 +612,8 @@ def test_stale_explicit_gpa_artifact_is_not_reused(tmp_path: Path) -> None:
     )
 
     assert result["decision"] == "create_variant"
-    assert result["candidates"] == []
+    assert result["candidates"]
+    assert all(candidate["candidate_scope"].endswith("base") for candidate in result["candidates"])
     assert "conflict with current profile facts" in result["reason"]
     assert result["profile_fact_rejections"][0]["artifact_id"].startswith("resume:")
     error = result["profile_fact_rejections"][0]["errors"][0]
@@ -608,7 +683,7 @@ def test_active_stale_gpa_artifact_cannot_outrank_or_bind_before_fresh_candidate
 
     assert route["decision"] == "reuse_exact"
     assert route["artifact_id"] == fresh["artifact_id"]
-    assert [candidate["artifact_id"] for candidate in route["candidates"]] == [fresh["artifact_id"]]
+    assert route["candidates"][0]["artifact_id"] == fresh["artifact_id"]
     assert route["profile_fact_rejections"][0]["artifact_id"] == stale["artifact_id"]
     assert "current profile records 3.46" in route["profile_fact_rejections"][0]["errors"][0]
     projected = project_reuse_to_job(conn, job, route)
@@ -690,7 +765,19 @@ def test_exact_unchanged_job_keeps_its_machine_validated_artifact(
     result = route_resume_for_job(conn, job, profile)
 
     assert result["decision"] == "reuse_exact"
-    assert result["overall_score"] == 1.0
+    assert result["overall_score"] >= 0.85
+    assert result["candidates"][0]["exact_job_validation"] is False
+    outcome = conn.execute(
+        "SELECT resolution, status, source_artifact_id, output_artifact_id "
+        "FROM resume_route_outcomes WHERE assignment_id=?",
+        (result["assignment_id"],),
+    ).fetchone()
+    assert tuple(outcome) == (
+        "reuse_as_is",
+        "machine_validated",
+        result["artifact_id"],
+        result["artifact_id"],
+    )
     artifact_path = Path(result["artifact"]["text_path"])
     assert artifact_path.parent.name == "artifacts"
     assert artifact_path.name.startswith("resume-")
@@ -716,6 +803,31 @@ def test_exact_unchanged_job_keeps_its_machine_validated_artifact(
     assert pdf_path.read_bytes() == pdf_before
 
 
+def test_current_quality_policy_exact_validation_gets_exact_reuse_priority(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    history_url = _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    job = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (history_url,)).fetchone())
+    register_tailored_artifact(
+        conn,
+        job=job,
+        text_path=job["tailored_resume_path"],
+        source_resume_path=str(base),
+        report_path=job["tailor_report_path"],
+        profile=profile,
+    )
+
+    result = route_resume_for_job(conn, job, profile)
+
+    assert result["decision"] == "reuse_exact"
+    assert result["resolution"] == "reuse_as_is"
+    assert result["overall_score"] == 1.0
+    assert result["candidates"][0]["exact_job_validation"] is True
+
+
 def test_failed_job_revalidation_deactivates_same_content_library_artifact(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -733,6 +845,11 @@ def test_failed_job_revalidation_deactivates_same_content_library_artifact(
 
     monkeypatch.setattr(single_job, "get_connection", lambda: conn)
     monkeypatch.setattr(single_job, "load_profile", lambda: profile)
+    monkeypatch.setattr(
+        validator_module,
+        "validate_json_fields",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
     monkeypatch.setattr(
         validator_module,
         "validate_tailored_resume",
@@ -764,7 +881,8 @@ def test_failed_job_revalidation_deactivates_same_content_library_artifact(
     route = route_resume_for_job(conn, new_job, profile)
 
     assert route["decision"] == "create_variant"
-    assert route["candidates"] == []
+    assert route["candidates"]
+    assert all(candidate["candidate_scope"].endswith("base") for candidate in route["candidates"])
 
     restore_conn = init_db(database_path)
     monkeypatch.setattr(single_job, "get_connection", lambda: restore_conn)
@@ -791,6 +909,206 @@ def test_failed_job_revalidation_deactivates_same_content_library_artifact(
     assert tuple(artifact) == (1, "machine_validated")
     restored_route = route_resume_for_job(verify, new_job, profile)
     assert restored_route["decision"] == "reuse_exact"
+
+
+def test_revalidation_uses_cross_review_and_preserves_evidence_map_across_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.scoring import pdf as pdf_renderer
+    from applypilot.scoring import tailor as tailor_module
+    from applypilot.scoring import validator as validator_module
+
+    database_path = tmp_path / "library.db"
+    conn = init_db(database_path)
+    source_path = tmp_path / "source.txt"
+    tailored_path = tmp_path / "tailored.txt"
+    report_path = tmp_path / "tailored_REPORT.json"
+    source_text = """Ryan Yu
+
+SUMMARY
+Data analyst building validated workflows.
+
+TECHNICAL SKILLS
+Data: Python, SQL
+
+EXPERIENCE
+Current Company
+Data Analyst | 2025 - Present
+- Built Python reporting workflows with validated SQL outputs for stakeholder review.
+
+PROJECTS
+Analytics Project
+Developer | 2026
+- Built a documented analytics workflow with repeatable validation checks.
+
+EDUCATION
+Example University, Master of Computing, 2027
+"""
+    source_path.write_text(source_text, encoding="utf-8")
+    tailored_path.write_text(source_text, encoding="utf-8")
+    evidence_map = [
+        {
+            "requirement": "Python workflows",
+            "support_level": "direct",
+            "source_quote": "Built Python reporting workflows",
+        },
+        {
+            "requirement": "SQL validation",
+            "support_level": "direct",
+            "source_quote": "validated SQL outputs",
+        },
+    ]
+    report_path.write_text(json.dumps({"evidence_map": evidence_map}), encoding="utf-8")
+    url = "https://careers.example.test/revalidate-cross-review"
+    _insert_job(
+        conn,
+        url=url,
+        title="Data Analyst",
+        description="Use Python and SQL to build validated reporting workflows.",
+        tailored_resume_path=str(tailored_path),
+        tailor_source_resume_path=str(source_path),
+        tailor_report_path=str(report_path),
+        tailor_status="machine_validated",
+        tailored_at="2026-08-25T00:00:00+00:00",
+    )
+
+    monkeypatch.setattr(single_job, "get_connection", lambda: init_db(database_path))
+    monkeypatch.setattr(single_job, "load_profile", lambda: {"resume_facts": {}})
+    monkeypatch.setattr(
+        validator_module,
+        "validate_json_fields",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        validator_module,
+        "validate_tailored_resume",
+        lambda *args, **kwargs: {"passed": True, "errors": []},
+    )
+    judge_calls: list[dict] = []
+
+    def cross_review_judge(*args, **kwargs):
+        judge_calls.append(kwargs)
+        return {
+            "passed": True,
+            "issues": [],
+            "review_mode": "independent_factual_and_quality_cross_review",
+        }
+
+    monkeypatch.setattr(tailor_module, "judge_tailored_resume", cross_review_judge)
+
+    def render_to_requested_path(path, output_path=None):
+        output = Path(output_path)
+        output.write_bytes(b"%PDF-cross-reviewed")
+        return output
+
+    monkeypatch.setattr(pdf_renderer, "convert_to_pdf", render_to_requested_path)
+
+    first = single_job.revalidate_tailored_resume_for_url(url)
+    second = single_job.revalidate_tailored_resume_for_url(url)
+    persisted_report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert first["status"] == "machine_validated", first
+    assert second["status"] == "machine_validated", second.get("error")
+    assert persisted_report["evidence_map"] == evidence_map
+    assert len(judge_calls) == 2
+    assert all(call["cross_review"] is True for call in judge_calls)
+    assert all(call["content_plan"]["version"] == "resume-content-plan-v2" for call in judge_calls)
+
+
+def test_revalidation_policy_stamp_requires_independent_cross_review(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    history_url = _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    sync_resume_library(conn, profile, tmp_path)
+    job = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (history_url,)).fetchone())
+    artifact = dict(conn.execute("SELECT * FROM resume_artifacts WHERE kind='tailored'").fetchone())
+    text = Path(artifact["text_path"]).read_text(encoding="utf-8")
+
+    assert resume_library.record_content_revalidation(
+        conn,
+        text=text,
+        status="machine_validated",
+        job=job,
+        evidence={"judge_review_mode": "factual_only"},
+    )
+    first_evidence = json.loads(
+        conn.execute(
+            "SELECT evidence_json FROM resume_validation_runs "
+            "WHERE validation_kind='job_specific_revalidation' ORDER BY recorded_at DESC LIMIT 1"
+        ).fetchone()[0]
+    )
+    assert "quality_policy_version" not in first_evidence
+
+    assert resume_library.record_content_revalidation(
+        conn,
+        text=text,
+        status="machine_validated",
+        job=job,
+        evidence={
+            "judge_review_mode": "independent_factual_and_quality_cross_review"
+        },
+    )
+    second_evidence = json.loads(
+        conn.execute(
+            "SELECT evidence_json FROM resume_validation_runs "
+            "WHERE validation_kind='job_specific_revalidation' ORDER BY recorded_at DESC LIMIT 1"
+        ).fetchone()[0]
+    )
+    assert second_evidence["quality_policy_version"] == resume_library.POLICY_VERSION
+
+
+def test_recency_inverted_exact_artifact_cannot_route_as_reuse_as_is(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / "library.db")
+    base = tmp_path / "base.txt"
+    base.write_text("MASTER SOURCE: SQL and Python.", encoding="utf-8")
+    malformed = """Ryan Yu
+
+SUMMARY
+Data analyst building validated workflows for business reporting.
+
+TECHNICAL SKILLS
+Data: Python, SQL
+
+EXPERIENCE
+Current Company
+Data Analyst | 2025 - Present
+- Built Python reporting workflows with validated SQL outputs.
+- Produced recurring dashboards for stakeholder planning decisions.
+- Documented validation checks for repeatable monthly reporting.
+
+Middle Company
+Analyst Intern | 2024
+- Cleaned source data for recurring operational reports.
+
+Old Company
+Assistant | 2023
+- Built legacy reporting workflows for planning teams.
+- Produced recurring dashboards for stakeholder review.
+- Documented source-data checks for monthly delivery.
+
+PROJECTS
+Analytics Project
+Developer | 2026
+- Built a Python analytics workflow with repeatable validation checks.
+- Documented outputs for stakeholder review and release decisions.
+
+EDUCATION
+Example University, Master of Computing, 2027
+"""
+    history_url = _validated_history(tmp_path, conn, base, content=malformed)
+    profile = _profile(base)
+    profile["tailoring"]["resume_layout"] = {"project_resume_min_words": 1}
+    sync_resume_library(conn, profile, tmp_path)
+    job = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (history_url,)).fetchone())
+
+    route = route_resume_for_job(conn, job, profile)
+
+    candidate = next(item for item in route["candidates"] if item["artifact_kind"] == "tailored")
+    assert candidate["artifact_health_status"] == "repair_required"
+    assert candidate["recommended_resolution"] == "patch_existing"
+    assert route["decision"] != "reuse_exact"
 
 
 def test_new_subtype_and_unsupported_hard_skill_create_truthful_variants(
@@ -1221,7 +1539,7 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
     unresolved = route_resume_for_job(conn, job, profile, minimum_fit_score=7)
 
     assert unresolved["decision"] == "reuse_exact"
-    assert len(unresolved["candidates"]) == 2
+    assert len(unresolved["candidates"]) == 3
     selected_artifact_id = unresolved["candidates"][1]["artifact_id"]
 
     selected = route_resume_for_job(
@@ -1253,14 +1571,15 @@ def test_manual_selection_resolves_only_a_current_qualified_candidate_tie(
         "url": "https://careers.example.test/tied-unsupported",
         "full_description": "Required: AWS. Build dashboards.",
     }
-    with pytest.raises(ValueError, match="cannot resolve"):
-        route_resume_for_job(
-            conn,
-            unsupported_job,
-            profile,
-            artifact_id=selected_artifact_id,
-            minimum_fit_score=7,
-        )
+    patched = route_resume_for_job(
+        conn,
+        unsupported_job,
+        profile,
+        artifact_id=selected_artifact_id,
+        minimum_fit_score=7,
+    )
+    assert patched["decision"] == "create_variant"
+    assert patched["resolution"] == "patch_existing"
 
     with pytest.raises(ValueError, match="candidate"):
         route_resume_for_job(
@@ -1584,9 +1903,10 @@ def test_qualified_resume_outranks_higher_scoring_candidate_with_hard_gap(tmp_pa
         "eligibility_status": "eligible",
     }
     result = route_resume_for_job(conn, job, profile)
-    assert result["decision"] == "reuse_exact"
+    assert result["decision"] == "create_variant"
+    assert result["resolution"] == "reuse_with_reorder"
     assert result["required_coverage"] == 1.0
-    assert result["candidates"][0]["reuse_qualified"] is True
+    assert result["candidates"][0]["unsupported_required_skills"] == []
     assert result["candidates"][1]["reuse_qualified"] is False
     assert result["candidates"][1]["overall_score"] > result["candidates"][0]["overall_score"]
     assert "Python SQL" in Path(result["artifact"]["text_path"]).read_text(encoding="utf-8")
@@ -1636,8 +1956,8 @@ def test_alternative_parser_does_not_relax_conjunctions_unknown_names_or_explici
 
 
 @pytest.mark.parametrize(("content", "decision", "missing"), [
-    ("DATA ANALYST\nPython, data analysis", "reuse_exact", []),
-    ("DATA ANALYST\nSQL, data analysis", "reuse_exact", []),
+    ("DATA ANALYST\nPython, data analysis", "create_variant", []),
+    ("DATA ANALYST\nSQL, data analysis", "create_variant", []),
     ("DATA ANALYST\nNoSQL, data analysis", "create_variant", ["one of: python | sql"]),
     ("DATA ANALYST\nPython", "create_variant", ["data analysis"]),
 ])

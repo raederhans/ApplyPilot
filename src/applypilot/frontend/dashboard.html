@@ -1220,6 +1220,10 @@
         "not_recorded": "未记录",
         "needs_review": "需要审核",
         "reuse_exact": "精确复用",
+        "reuse_as_is": "原样复用",
+        "reuse_with_reorder": "重排复用",
+        "patch_existing": "补强现有版本",
+        "create_new": "全新生成",
         "machine_validated": "机器验证通过",
         "historical_validated": "历史验证",
         "not_required": "不需要",
@@ -1658,15 +1662,12 @@
           materialStatus(t("Cover letter"), prepare.coverLetter),
           materialStatus(t("Resume route"), {
             state: prepare.route?.state === "current"
-              && prepare.route?.decision === "reuse_exact"
-              && prepare.route?.artifact?.validationStatus === "machine_validated"
-              && prepare.route?.artifact?.hasPdfBinding === true
-              && !(prepare.route?.gaps || []).length
+              && prepare.route?.ready === true
               ? "ready" : "review",
             label: prepare.route?.state === "current"
               ? (locale === "zh"
-                ? `${translateRuntimeText(prepare.route.decision || "recorded")}路由`
-                : `${prepare.route.decision || "recorded"} route`)
+                ? `${translateRuntimeText(prepare.route.resolution || prepare.route.decision || "recorded")}路由`
+                : `${prepare.route.resolution || prepare.route.decision || "recorded"} route`)
               : translateRuntimeText(prepare.route?.reason || "No current route recorded"),
           }),
         );

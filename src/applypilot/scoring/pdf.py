@@ -5,6 +5,7 @@ and exports to PDF using headless Chromium via Playwright.
 """
 
 import logging
+import re
 from html import escape
 from pathlib import Path
 
@@ -21,6 +22,38 @@ SECTION_HEADERS = {
 }
 SUMMARY_TAIL_MIN_WORDS = 5
 SKILL_TAIL_MIN_WORDS = 5
+
+
+def _highlight_metrics(text: str) -> str:
+    """Bold compact numeric evidence without changing the extracted text."""
+    return re.sub(
+        r"(?<![A-Za-z0-9])(~?\d[\d,.]*(?:%|\+|x)?(?:-\d[\d,.]*(?:%|\+|x)?)?)",
+        r'<strong class="metric">\1</strong>',
+        text,
+    )
+
+
+def _format_bullet(text: str, *, emphasize_lead: bool) -> str:
+    """Escape a bullet and add one restrained visual anchor when requested."""
+    cleaned = str(text).strip()
+    if not cleaned:
+        return ""
+    if not emphasize_lead:
+        return _highlight_metrics(escape(cleaned))
+
+    clause_match = re.match(r"^(.{1,78}?)(?=[,;:]\s)", cleaned)
+    lead = clause_match.group(1) if clause_match else ""
+    if not 3 <= len(re.findall(r"\b[\w+#./-]+\b", lead)) <= 10:
+        word_matches = list(re.finditer(r"\S+", cleaned))
+        if len(word_matches) >= 4:
+            lead = cleaned[: word_matches[3].end()]
+        else:
+            lead = cleaned
+    remainder = cleaned[len(lead) :]
+    return (
+        f'<strong class="bullet-lead">{escape(lead)}</strong>'
+        + _highlight_metrics(escape(remainder))
+    )
 
 
 def _tail_is_dense(line_word_counts: list[int], min_words: int) -> bool:
@@ -226,7 +259,10 @@ def build_html(resume: dict) -> str:
         skills = parse_skills(sections["TECHNICAL SKILLS"])
         rows = ""
         for cat, val in skills:
-            rows += f'<div class="skill-row"><span class="skill-cat">{cat}:</span> {val}</div>\n'
+            rows += (
+                f'<div class="skill-row"><span class="skill-cat">{escape(cat)}:</span> '
+                f'{escape(val)}</div>\n'
+            )
         skills_html = f'<div class="section"><div class="section-title">Technical Skills</div>{rows}</div>'
 
     # Experience
@@ -235,9 +271,19 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["EXPERIENCE"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(
+                f'<li>{_format_bullet(bullet, emphasize_lead=index == 0)}</li>'
+                for index, bullet in enumerate(e["bullets"])
+            )
+            subtitle = (
+                f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>'
+                if e["subtitle"]
+                else ""
+            )
+            items += (
+                f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
+                f"{subtitle}<ul>{bullets}</ul></div>"
+            )
         exp_html = f'<div class="section"><div class="section-title">Experience</div>{items}</div>'
 
     # Projects
@@ -246,25 +292,51 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["PROJECTS"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(
+                f'<li>{_format_bullet(bullet, emphasize_lead=index == 0)}</li>'
+                for index, bullet in enumerate(e["bullets"])
+            )
+            subtitle = (
+                f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>'
+                if e["subtitle"]
+                else ""
+            )
+            items += (
+                f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
+                f"{subtitle}<ul>{bullets}</ul></div>"
+            )
         proj_html = f'<div class="section"><div class="section-title">Projects</div>{items}</div>'
 
     # Education
     edu_html = ""
     if "EDUCATION" in sections:
-        edu_text = "<br>".join(
-            escape(line.strip())
-            for line in sections["EDUCATION"].splitlines()
-            if line.strip()
+        education_rows: list[str] = []
+        for line in sections["EDUCATION"].splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            school, separator, detail = line.partition(",")
+            if separator:
+                education_rows.append(
+                    '<div class="edu-entry"><span class="edu-school">'
+                    f"{escape(school.strip())}</span>, {escape(detail.strip())}</div>"
+                )
+            else:
+                education_rows.append(
+                    f'<div class="edu-entry"><span class="edu-school">{escape(line)}</span></div>'
+                )
+        edu_html = (
+            '<div class="section"><div class="section-title">Education</div>'
+            f'<div class="edu">{"".join(education_rows)}</div></div>'
         )
-        edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
 
     # Summary
     summary_html = ""
     if "SUMMARY" in sections:
-        summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
+        summary_html = (
+            '<div class="section"><div class="section-title">Summary</div>'
+            f'<div class="summary">{escape(sections["SUMMARY"].strip())}</div></div>'
+        )
 
     section_html = {
         "SUMMARY": summary_html,
@@ -281,12 +353,18 @@ def build_html(resume: dict) -> str:
 
     # Contact line parsing
     contact = resume["contact"]
-    contact_parts = [p.strip() for p in contact.split("|")] if contact else []
+    contact_parts = [escape(p.strip()) for p in contact.split("|")] if contact else []
     contact_html = " &nbsp;|&nbsp; ".join(contact_parts)
 
     # Location line (may be empty)
-    location_html = f'<div class="location">{resume["location"]}</div>' if resume["location"] else ""
-    title_html = f'<div class="title">{resume["title"]}</div>' if resume["title"] else ""
+    location_html = (
+        f'<div class="location">{escape(resume["location"])}</div>'
+        if resume["location"]
+        else ""
+    )
+    title_html = (
+        f'<div class="title">{escape(resume["title"])}</div>' if resume["title"] else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -295,7 +373,7 @@ def build_html(resume: dict) -> str:
 <style>
 @page {{
     size: letter;
-    margin: 0.35in 0.5in;
+    margin: 0.45in 0.5in;
 }}
 * {{
     margin: 0;
@@ -305,24 +383,24 @@ def build_html(resume: dict) -> str:
 body {{
     font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
     font-size: 10pt;
-    line-height: 1.35;
-    color: #1a1a1a;
+    line-height: 1.22;
+    color: #111827;
 }}
 .header {{
     text-align: center;
-    margin-bottom: 4px;
-    padding-bottom: 4px;
-    border-bottom: 1.5px solid #2a7ab5;
+    margin-bottom: 3px;
+    padding-bottom: 3px;
+    border-bottom: 1.25px solid #24364b;
 }}
 .name {{
     font-size: 18pt;
     font-weight: 700;
-    color: #1a3a5c;
-    letter-spacing: 0.5px;
+    color: #172033;
+    letter-spacing: 0.35px;
 }}
 .title {{
     font-size: 10.5pt;
-    color: #3a6b8c;
+    color: #374151;
     margin: 1px 0;
 }}
 .location {{
@@ -339,67 +417,84 @@ body {{
     text-decoration: none;
 }}
 .section {{
-    margin-top: 5px;
+    margin-top: 4px;
 }}
 .section-title {{
-    font-size: 10pt;
+    font-size: 10.5pt;
     font-weight: 700;
-    color: #1a3a5c;
+    color: #172033;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    border-bottom: 1.5px solid #2a7ab5;
+    border-bottom: 1px solid #4b5563;
     padding-bottom: 1px;
     margin-bottom: 3px;
     break-after: avoid;
 }}
 .summary {{
-    font-size: 9.5pt;
-    color: #333;
-    line-height: 1.4;
+    font-size: 10pt;
+    color: #1f2937;
+    line-height: 1.24;
     text-wrap: pretty;
 }}
 .skill-row {{
-    font-size: 9.5pt;
+    font-size: 10pt;
     margin: 0;
-    line-height: 1.35;
+    line-height: 1.22;
     text-wrap: pretty;
 }}
 .skill-cat {{
-    font-weight: 600;
-    color: #1a3a5c;
+    font-weight: 700;
+    color: #172033;
 }}
 .entry {{
-    margin-bottom: 4px;
-    break-inside: avoid;
+    margin-bottom: 3px;
+    break-inside: auto;
 }}
 .entry-title {{
     font-weight: 600;
     font-size: 10pt;
-    color: #1a3a5c;
+    color: #172033;
 }}
 .entry-subtitle {{
-    font-size: 9pt;
-    color: #4a7a9b;
-    font-style: italic;
+    font-size: 9.5pt;
+    color: #374151;
+    font-style: normal;
     margin-bottom: 1px;
+}}
+.bullet-lead,
+.metric {{
+    font-weight: 700;
+    color: #172033;
 }}
 ul {{
     margin-left: 14px;
     padding: 0;
 }}
 li {{
-    font-size: 9.5pt;
-    margin-bottom: 1px;
-    line-height: 1.35;
+    font-size: 10pt;
+    margin-bottom: 0.5px;
+    line-height: 1.22;
 }}
 .edu {{
     font-size: 10pt;
+}}
+.edu-entry {{
+    line-height: 1.2;
+    margin-bottom: 1px;
+    text-wrap: pretty;
+}}
+.edu-entry:last-child {{
+    margin-bottom: 0;
+}}
+.edu-school {{
+    font-weight: 700;
+    color: #172033;
 }}
 </style>
 </head>
 <body>
 <div class="header">
-    <div class="name">{resume['name']}</div>
+    <div class="name">{escape(resume['name'])}</div>
     {title_html}
     {location_html}
     <div class="contact">{contact_html}</div>
@@ -417,6 +512,8 @@ def render_pdf(
     summary_tail_min_words: int = SUMMARY_TAIL_MIN_WORDS,
     skill_tail_min_words: int = SKILL_TAIL_MIN_WORDS,
     last_page_min_fill_ratio: float = 0.4,
+    one_page_min_fill_ratio: float = 0.78,
+    _allow_compact_retry: bool = True,
 ) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
 
@@ -489,6 +586,16 @@ def render_pdf(
                 f"{failed_row['lineWordCounts'][-1]} words; minimum "
                 f"{skill_tail_min_words}."
             )
+        content_fill_ratio = float(page.evaluate(
+            """() => {
+                const nodes = Array.from(document.body.querySelectorAll('.header, .section'));
+                if (!nodes.length) return 0;
+                const top = Math.min(...nodes.map(node => node.getBoundingClientRect().top));
+                const bottom = Math.max(...nodes.map(node => node.getBoundingClientRect().bottom));
+                const printableHeight = 11 * 96 - 2 * 0.45 * 96;
+                return Math.max(0, (bottom - top) / printableHeight);
+            }"""
+        ))
         page.pdf(
             path=output_path,
             format="Letter",
@@ -497,11 +604,69 @@ def render_pdf(
         )
         browser.close()
         page_spans = _pdf_page_text_spans(output_path)
+        if len(page_spans) == 1 and content_fill_ratio < one_page_min_fill_ratio:
+            Path(output_path).unlink(missing_ok=True)
+            raise ValueError(
+                "Sparse one-page PDF: rendered content fill ratio "
+                f"{content_fill_ratio:.0%} is below the configured "
+                f"{one_page_min_fill_ratio:.0%}. Retain or strengthen more role-relevant evidence."
+            )
         if not _last_page_is_usefully_filled(
             page_spans, min_ratio=last_page_min_fill_ratio
         ):
             Path(output_path).unlink(missing_ok=True)
             fill_ratio = page_spans[-1] / max(page_spans[:-1])
+            if _allow_compact_retry:
+                compact_override = """
+<style>
+@page { margin: 0.38in 0.44in; }
+body { font-size: 9.4pt; line-height: 1.15; }
+.header { margin-bottom: 2px; padding-bottom: 2px; }
+.name { font-size: 17pt; }
+.section { margin-top: 3px; }
+.section-title { font-size: 10pt; margin-bottom: 2px; }
+.summary { font-size: 9.4pt; line-height: 1.17; }
+.skill-row { font-size: 9.4pt; line-height: 1.15; }
+.entry { margin-bottom: 2px; }
+.entry-title { font-size: 9.4pt; }
+.entry-subtitle { font-size: 9pt; margin-bottom: 0; }
+li { font-size: 9.4pt; line-height: 1.15; margin-bottom: 0.5px; }
+.edu { font-size: 9.4pt; }
+</style>
+"""
+                compact_html = html.replace("</head>", compact_override + "</head>")
+                compact_browser = p.chromium.launch()
+                compact_page = compact_browser.new_page(
+                    viewport={"width": 816, "height": 1056}
+                )
+                compact_page.emulate_media(media="print")
+                compact_page.set_content(compact_html, wait_until="networkidle")
+                compact_fill_ratio = float(compact_page.evaluate(
+                    """() => {
+                        const nodes = Array.from(document.body.querySelectorAll('.header, .section'));
+                        if (!nodes.length) return 0;
+                        const top = Math.min(...nodes.map(node => node.getBoundingClientRect().top));
+                        const bottom = Math.max(...nodes.map(node => node.getBoundingClientRect().bottom));
+                        const printableHeight = 11 * 96 - 2 * 0.38 * 96;
+                        return Math.max(0, (bottom - top) / printableHeight);
+                    }"""
+                ))
+                compact_page.pdf(
+                    path=output_path,
+                    format="Letter",
+                    margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                    print_background=True,
+                )
+                compact_browser.close()
+                compact_spans = _pdf_page_text_spans(output_path)
+                if len(compact_spans) == 1:
+                    if compact_fill_ratio >= one_page_min_fill_ratio:
+                        return
+                elif _last_page_is_usefully_filled(
+                    compact_spans, min_ratio=last_page_min_fill_ratio
+                ):
+                    return
+                Path(output_path).unlink(missing_ok=True)
             raise ValueError(
                 "Sparse final PDF page: rendered fill ratio "
                 f"{fill_ratio:.0%} is below the configured "
@@ -513,7 +678,10 @@ def render_pdf(
 # ── Public API ───────────────────────────────────────────────────────────
 
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    text_path: Path,
+    output_path: Path | None = None,
+    html_only: bool = False,
+    layout_override: dict | None = None,
 ) -> Path:
     """Convert a text resume/cover letter to PDF.
 
@@ -540,7 +708,11 @@ def convert_to_pdf(
 
     out = output_path or text_path.with_suffix(".pdf")
     out = Path(out)
-    layout = load_profile().get("tailoring", {}).get("resume_layout", {})
+    layout = (
+        dict(layout_override)
+        if layout_override is not None
+        else load_profile().get("tailoring", {}).get("resume_layout", {})
+    )
     summary_tail_min_words = int(
         layout.get("summary_min_rendered_tail_words", SUMMARY_TAIL_MIN_WORDS)
         or SUMMARY_TAIL_MIN_WORDS
@@ -549,8 +721,11 @@ def convert_to_pdf(
         layout.get("technical_skill_min_rendered_tail_words", SKILL_TAIL_MIN_WORDS)
         or SKILL_TAIL_MIN_WORDS
     )
-    last_page_min_fill_ratio = float(
+    last_page_min_fill_ratio = max(0.55, float(
         layout.get("multi_page_last_page_min_fill_ratio", 0.4) or 0.4
+    ))
+    one_page_min_fill_ratio = float(
+        layout.get("one_page_min_fill_ratio", 0.78) or 0.78
     )
     render_pdf(
         html,
@@ -558,6 +733,7 @@ def convert_to_pdf(
         summary_tail_min_words=summary_tail_min_words,
         skill_tail_min_words=skill_tail_min_words,
         last_page_min_fill_ratio=last_page_min_fill_ratio,
+        one_page_min_fill_ratio=one_page_min_fill_ratio,
     )
     log.info("PDF generated: %s", out)
     return out
