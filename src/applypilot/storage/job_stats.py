@@ -22,6 +22,16 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     """
     from applypilot.eligibility import ELIGIBLE_SQL, refresh_job_eligibility
     refresh_job_eligibility(conn)
+    from applypilot.config import DEFAULTS, load_profile
+
+    try:
+        policy = load_profile().get("submission_policy", {})
+    except FileNotFoundError:
+        # Explicit DB statistics also work before a workspace profile exists.
+        policy = {}
+    fit_floor = policy.get("minimum_fit_score", DEFAULTS["min_score"])
+    if type(fit_floor) is not int or not 1 <= fit_floor <= 10:
+        fit_floor = DEFAULTS["min_score"]
 
     stats: dict = {}
 
@@ -79,8 +89,9 @@ def get_stats(conn: sqlite3.Connection) -> dict:
 
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        f"AND tailored_resume_path IS NULL AND {ELIGIBLE_SQL}"
+        "WHERE fit_score >= ? AND full_description IS NOT NULL "
+        f"AND tailored_resume_path IS NULL AND {ELIGIBLE_SQL}",
+        (fit_floor,),
     ).fetchone()[0]
 
     stats["tailor_exhausted"] = conn.execute(

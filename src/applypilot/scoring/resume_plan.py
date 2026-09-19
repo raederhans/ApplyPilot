@@ -194,56 +194,50 @@ def _entry_budgets(
     secondary_range: list[int],
     target_total: int,
 ) -> list[dict[str, object]]:
-    """Allocate a front-loaded, relevance-informed bullet budget.
+    """Allocate a relevance-informed bullet budget without hard recency hierarchy constraints.
 
-    Source order is treated as recency order.  Relevance decides which facts lead
-    inside an entry and which entry is labelled primary, but it must not invert
-    the document hierarchy by giving an older entry more space than a newer one.
+    Relevance controls bullet allocation across entries: high-relevance entries
+    receive more detail regardless of age, with no hard newer>=older or oldest-shorter
+    constraints.
     """
     if not entries:
         return []
     scored = [(_entry_score(entry, terms, index), index, entry) for index, entry in enumerate(entries)]
     primary_index = max(scored, key=lambda item: (item[0], -item[1]))[1]
     entry_count = len(entries)
-    recent_floor = int(primary_range[0])
-    newest_cap = int(primary_range[1])
-    oldest_cap = int(secondary_range[0])
-
-    recency_caps: list[int] = []
-    for index in range(entry_count):
-        if entry_count == 1:
-            cap = newest_cap
-        else:
-            progress = index / (entry_count - 1)
-            cap = round(newest_cap - progress * (newest_cap - oldest_cap))
-        recency_caps.append(max(oldest_cap, min(newest_cap, cap)))
+    max_bullets = int(primary_range[1])
+    min_bullets = max(1, int(secondary_range[0]))
 
     budgets: list[dict[str, object]] = []
     for score, index, entry in scored:
-        desired = recent_floor if index == 0 else int(secondary_range[0])
-        desired = min(desired, recency_caps[index])
+        is_primary = (index == primary_index)
+        initial = int(primary_range[0]) if is_primary else min_bullets
+        initial = min(initial, max_bullets)
         budgets.append(
             {
                 "header": str(entry.get("title") or ""),
                 "source_index": index,
                 "recency_rank": index + 1,
                 "relevance_score": score,
-                "priority": "primary" if index == primary_index else "supporting",
-                "bullet_budget": desired,
-                "recency_cap": recency_caps[index],
+                "priority": "primary" if is_primary else "supporting",
+                "bullet_budget": initial,
+                "recency_cap": max_bullets,
                 "retirement_allowed": index != 0,
             }
         )
 
     current_total = sum(int(item["bullet_budget"]) for item in budgets)
-    # Add detail in recency rounds.  This lets JD relevance choose the facts
-    # within an entry without producing pathological sequences such as 3-1-2-3.
+    # Distribute remaining bullets in order of relevance (highest relevance first)
+    by_relevance = sorted(
+        range(entry_count),
+        key=lambda i: (float(budgets[i]["relevance_score"]), -i),
+        reverse=True,
+    )
     while current_total < target_total:
         changed = False
-        for item in budgets:
-            cap = int(item["recency_cap"])
-            if int(item["bullet_budget"]) < cap:
-                item["bullet_budget"] = int(item["bullet_budget"]) + 1
+        for i in by_relevance:
+            if int(budgets[i]["bullet_budget"]) < max_bullets:
+                budgets[i]["bullet_budget"] = int(budgets[i]["bullet_budget"]) + 1
                 current_total += 1
                 changed = True
                 if current_total >= target_total:
@@ -251,18 +245,6 @@ def _entry_budgets(
         if not changed:
             break
 
-    # Make the hierarchy explicit even when several caps are equal.
-    for index in range(1, len(budgets)):
-        budgets[index]["bullet_budget"] = min(
-            int(budgets[index]["bullet_budget"]),
-            int(budgets[index - 1]["bullet_budget"]),
-        )
-    if len(budgets) >= 3 and int(budgets[-1]["bullet_budget"]) >= int(
-        budgets[0]["bullet_budget"]
-    ):
-        budgets[-1]["bullet_budget"] = max(
-            1, int(budgets[0]["bullet_budget"]) - 1
-        )
     return sorted(budgets, key=lambda item: int(item["source_index"]))
 
 
@@ -275,10 +257,16 @@ def build_content_plan(
     route_context = dict(route_context or {})
     parsed = parse_resume(resume_text)
     sections = parsed.get("sections", {})
-    experience = order_entries_by_recency(
-        parse_entries(str(sections.get("EXPERIENCE") or ""))
-    )
-    projects = order_entries_by_recency(parse_entries(str(sections.get("PROJECTS") or "")))
+    experience_text = ""
+    projects_text = ""
+    for k, v in sections.items():
+        k_upper = k.strip().upper()
+        if not experience_text and ("EXPERIENCE" in k_upper or "HISTORY" in k_upper):
+            experience_text = v
+        if not projects_text and "PROJECTS" in k_upper:
+            projects_text = v
+    experience = order_entries_by_recency(parse_entries(experience_text))
+    projects = parse_entries(projects_text)
     source_bullets = sum(len(entry.get("bullets", [])) for entry in [*experience, *projects])
     preset_name, reasons = _choose_preset(
         job_profile,
@@ -314,6 +302,12 @@ def build_content_plan(
         secondary_range=list(preset["secondary_project_bullets"]),
         target_total=project_target,
     )
+    # Projects may freely reorder by relevance: present project budgets sorted by relevance descending
+    project_budgets = sorted(
+        project_budgets,
+        key=lambda item: (float(item["relevance_score"]), -int(item["source_index"])),
+        reverse=True,
+    )
 
     def retirement_candidate(items: list[dict[str, object]]) -> str | None:
         eligible = [item for item in items if item["retirement_allowed"]]
@@ -332,9 +326,12 @@ def build_content_plan(
         "target_words": preset["target_words"],
         "target_total_bullets": preset["target_total_bullets"],
         "allocation_policy": {
-            "entry_order": "preserved_dates_current_then_recent",
-            "recent_entries_receive_equal_or_more_detail": True,
-            "oldest_entry_must_be_shorter_than_newest_when_three_or_more": True,
+            "entry_order": "experience_reverse_chronological_projects_relevance",
+            "experience_order": "reverse_chronological_by_actual_dates",
+            "project_order": "freely_reordered_by_relevance",
+            "bullet_allocation": "relevance_driven_no_recency_hierarchy_constraint",
+            "recent_entries_receive_equal_or_more_detail": False,
+            "oldest_entry_must_be_shorter_than_newest_when_three_or_more": False,
             "relevance_controls_fact_selection_not_recency_inversion": True,
         },
         "experience": experience_budgets,
@@ -376,11 +373,10 @@ def format_content_plan(plan: Mapping[str, object]) -> str:
             f"projects={retirements.get('projects') or 'none'}"
         )
     lines.append(
-        "Order entries from current/most recent to oldest using preserved dates, even when an older "
-        "artifact is misordered. A later/older retained entry may tie but must not exceed "
-        "the bullet count of an earlier/newer entry; with three or more entries, the oldest must be "
-        "shorter than the newest. Relevance controls which supported facts lead inside each entry, not "
-        "whether an old entry dominates the page. Treat budgets as directional: never invent or pad "
+        "EXPERIENCE entries must remain in reverse chronological order (newest/current first) using preserved dates. "
+        "PROJECTS entries may freely reorder by relevance to the target role. "
+        "Relevance controls detail and bullet allocation; more relevant entries may receive more bullets "
+        "without hard recency hierarchy constraints. Treat budgets as directional: never invent or pad "
         "content to hit a number. Actual PDF fit and factual evidence override the preset."
     )
     return "\n".join(lines)

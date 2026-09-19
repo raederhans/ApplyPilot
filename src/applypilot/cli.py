@@ -1777,6 +1777,36 @@ def resume_library_status_command() -> None:
     _print_json(data=library_status(get_connection()))
 
 
+@app.command("resume-library-review")
+def resume_library_review_command() -> None:
+    """Inspect reusable editions, factual freshness, and refinement candidates."""
+    _bootstrap()
+    from applypilot.config import load_profile
+    from applypilot.database import get_connection
+    from applypilot.resume_curation import refine_existing_text
+    from applypilot.resume_library import assess_resume_artifact_health, ensure_resume_library_schema
+    from applypilot.scoring.cover_letter import read_resume_source
+
+    conn = get_connection()
+    ensure_resume_library_schema(conn)
+    profile = load_profile()
+    rows = conn.execute("SELECT * FROM resume_artifacts WHERE active=1 AND kind='tailored'").fetchall()
+    details = []
+    for row in rows:
+        artifact = dict(row)
+        health = assess_resume_artifact_health(artifact, profile)
+        path = Path(artifact["text_path"])
+        changes = refine_existing_text(read_resume_source(path))["changes"] if path.is_file() else []
+        metadata = json.loads(artifact.get("metadata_json") or "{}")
+        details.append({"artifact_id": artifact["artifact_id"], "track": artifact["track"],
+                        "label": metadata.get("library_label"), "family": metadata.get("library_family"),
+                        "page_count": metadata.get("page_count"), "selection_notes": metadata.get("selection_notes"),
+                        "text_path": str(path), "pdf_path": artifact["pdf_path"],
+                        "health": health, "suggested_changes": changes})
+    _print_json(data={"mode": "reuse_first", "max_variants": profile.get("tailoring", {}).get(
+        "library_policy", {}).get("max_variants", 50), "artifacts": details})
+
+
 @app.command("resume-route")
 def resume_route_command(
     url: str = typer.Option(..., "--url", help="Exact job or application URL."),
@@ -1862,10 +1892,13 @@ def tailor_job_command(
     if validation not in {"strict", "normal", "lenient"}:
         console.print("[red]--validation must be strict, normal, or lenient.[/red]")
         raise typer.Exit(code=2)
+    from applypilot import config as app_config
     from applypilot.scoring.tailor import run_tailoring
 
     result = run_tailoring(
-        min_score=0,
+        min_score=int(app_config.load_profile().get(
+            "submission_policy", {}
+        ).get("minimum_fit_score", app_config.DEFAULTS["min_score"])),
         limit=1,
         validation_mode=validation,
         target_url=url,

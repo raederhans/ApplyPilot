@@ -11,6 +11,7 @@ import os
 import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from applypilot import config as _config
 from applypilot.config import load_profile
@@ -25,7 +26,29 @@ log = logging.getLogger(__name__)
 # Kept as a public compatibility alias for callers that historically patched
 # this value. Scoring now selects a per-job source through ``select_resume_source``.
 RESUME_PATH = _config.RESUME_PATH
-PROMPT_REVISION = "requirements-review-v1"
+PROMPT_REVISION = "requirements-review-v2-full-jd"
+
+
+def build_score_input_binding(job: dict, source_path: str | Path, resume_text: str, *,
+                              profile: dict | None = None, evidence_sources: list[dict] | None = None) -> dict:
+    """Bind an assessment to its job and the selected resume evidence."""
+    from applypilot.apply.authorization import compute_job_fingerprint
+    from applypilot.resume_versions import text_digest
+
+    binding = {
+        "job_fingerprint": compute_job_fingerprint(job),
+        "source_path": str(Path(source_path).expanduser().resolve()),
+        "source_text_digest": text_digest(resume_text),
+        "prompt_revision": PROMPT_REVISION,
+    }
+    if profile is not None:
+        binding["profile_facts_digest"] = text_digest(json.dumps(
+            _confirmed_scoring_facts(profile), sort_keys=True, ensure_ascii=False,
+        ))
+    if evidence_sources is not None:
+        binding["context_mode"] = "registered_evidence_sources"
+        binding["context_text_digest"] = text_digest("\n\n".join(source["text"] for source in evidence_sources))
+    return binding
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -203,7 +226,7 @@ def score_job(
         f"COMPANY: {job.get('company_name') or 'Unknown employer'}\n"
         f"SOURCE BOARD: {job.get('source_site') or job.get('site') or 'Unknown'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{job.get('full_description') or ''}"
     )
 
     messages = [
@@ -308,7 +331,7 @@ def score_job_with_review(
         "schema_version": 1, "prompt_revision": PROMPT_REVISION,
         "initial_assessment": initial, "review_status": "not_requested",
         "jd_chars": len(job.get("full_description") or ""),
-        "jd_sent_chars": min(6000, len(job.get("full_description") or "")),
+        "jd_sent_chars": len(job.get("full_description") or ""),
     }
     floor = profile.get("submission_policy", {}).get("minimum_fit_score", _config.DEFAULTS["min_score"])
     if type(floor) is not int or not 1 <= floor <= 10:
@@ -395,6 +418,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, review_limit: int = 2) ->
             )
             if result["score_evidence"]["review_status"] in {"completed", "failed"}:
                 reviewed_count += 1
+            result["score_evidence"]["input_binding"] = build_score_input_binding(job, source_path, resume_text, profile=profile)
             result["source_resume_path"] = str(source_path)
             result["resume_routing"] = routing
         except Exception as exc:
@@ -427,8 +451,42 @@ def run_scoring(limit: int = 0, rescore: bool = False, review_limit: int = 2) ->
 
     # Write scores to DB. Provider/parser failures remain NULL so they are
     # distinguishable from a genuine low score and can be retried later.
+    from applypilot.apply.authorization import compute_job_fingerprint
+    from applypilot.resume_library import _score_binding_error
+
+    # Hold the writer lock only while checking and persisting the completed
+    # assessments, never during provider calls. Preserve newer worker results.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     now = datetime.now(UTC).isoformat()
-    for r in results:
+    persisted = 0
+    score_fields = (
+        "fit_score", "scored_at", "score_status", "score_attempts",
+        "score_evidence_json", "score_reasoning", "score_error",
+        "tailor_source_resume_path",
+    )
+    for original, r in zip(jobs, results):
+        row = conn.execute("SELECT * FROM jobs WHERE url = ?", (r["url"],)).fetchone()
+        current = dict(row) if row is not None else None
+        error = None
+        if current is None:
+            error = "The job was removed or its URL changed during scoring."
+        elif compute_job_fingerprint(current) != compute_job_fingerprint(original):
+            error = "The JD changed during scoring."
+        elif any(current.get(key) != original.get(key) for key in score_fields):
+            error = "The job's scoring state changed during scoring."
+        else:
+            try:
+                error = _score_binding_error({
+                    **current, "score_evidence_json": json.dumps(r["score_evidence"], ensure_ascii=False),
+                }, profile)
+            except Exception as exc:
+                error = f"Could not validate current scoring inputs: {exc}"
+        if error:
+            log.error("Discarding stale score for '%s': %s", r["url"], error)
+            if r["score"] != 0:
+                errors += 1
+            continue
         if r["score"] == 0:
             conn.execute(
                 "UPDATE jobs SET fit_score = NULL, scored_at = NULL, "
@@ -452,10 +510,11 @@ def run_scoring(limit: int = 0, rescore: bool = False, review_limit: int = 2) ->
                     r["url"],
                 ),
             )
+        persisted += 1
     conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", persisted, elapsed, persisted / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -466,7 +525,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, review_limit: int = 2) ->
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
+        "scored": persisted,
         "errors": errors,
         "reviewed": reviewed_count,
         "elapsed": elapsed,

@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
@@ -24,6 +23,16 @@ import yaml
 from applypilot.apply.authorization import compute_file_binding, compute_job_fingerprint
 from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
+from applypilot.resume_versions import (
+    changed_used_facts,
+    ensure_version_schema,
+    freeze_render,
+    health_input_digest,
+    library_root,
+    profile_fact_snapshot,
+    register_render,
+    text_digest,
+)
 from applypilot.scoring.cover_letter import read_resume_source
 from applypilot.scoring.validator import (
     current_profile_resume_fact_errors,
@@ -32,7 +41,8 @@ from applypilot.scoring.validator import (
 
 TAXONOMY_VERSION = "resume-library-v8"
 POLICY_VERSION = "reuse-policy-v5"
-HEALTH_POLICY_VERSION = "resume-health-v2"
+HEALTH_POLICY_VERSION = "resume-health-v3"
+RANKING_VERSION = "resume-ranking-v2"
 
 REUSE_REQUIRED_COVERAGE = 0.90
 REUSE_OVERALL_SCORE = 0.85
@@ -81,6 +91,7 @@ _PREFERRED_MARKERS = re.compile(
 )
 
 _KNOWN_SKILLS = {
+    "cuda", "tensorrt", "kubernetes", "pytorch", "tensorflow", "spark",
     "python",
     "sql",
     "r",
@@ -198,7 +209,8 @@ def _requirement_sentences(description: str) -> list[tuple[str, str | None]]:
         heading = _normalise_text(line).strip(" #:*-")
         if re.fullmatch(
             r"(?:preferred|optional)(?: qualifications| requirements| skills)?|"
-            r"(?:good|nice)[- ]to[- ]have(?: skills)?|bonus(?: points)?", heading
+            r"(?:good|nice)[- ]to[- ]have(?: skills)?|bonus(?: points)?|"
+            r"advantageous(?:,? but not required)?", heading
         ):
             section = "preferred"
             continue
@@ -219,7 +231,7 @@ def _requirement_sentences(description: str) -> list[tuple[str, str | None]]:
             continue
         sentences.extend(
             (part.strip(), section)
-            for part in re.split(r"[.;]+", line) if part.strip()
+            for part in re.split(r"[.]+", line) if part.strip()
         )
     return sentences
 
@@ -303,11 +315,14 @@ _DELIVERABLE_TERMS = {
 # validated material for adjacent technical work already present in the local
 # application history.  Rules are ordered from specific to general.
 _RESUME_SUBTYPE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("ai_research", "ai_implementation", ("ai research", "machine learning research", "model evaluation")),
+    ("geospatial", "spatial", ("geospatial", "spatial analytics", "gis analyst")),
+    ("data_analytics", "data_bi_decision", ("market data", "data services")),
     (
         "ai_solutions",
         "ai_implementation",
         ("machine learning engineer", "artificial intelligence engineer", "ai engineer",
-         "ai agent engineer", "ai developer"),
+         "ai agent engineer", "ai developer", "ai application", "ai engineering"),
     ),
     (
         "workflow_automation",
@@ -463,7 +478,7 @@ def _unsupported_required_skills(
             if fact is not None:
                 fact_support.append(fact)
                 continue
-        if _contains_phrase(all_source_text, gap):
+        if _evidence_contains(all_source_text, gap):
             continue
         fact = confirmed_facts.get(_normalise_text(gap))
         if fact is None:
@@ -506,8 +521,8 @@ def _content_terms(title: str, description: str, *, limit: int = 28) -> list[str
         if " " in phrase and _contains_phrase(normalized, phrase)
     }
     counts: dict[str, int] = {}
-    title_words = set(re.findall(r"[a-z][a-z0-9+#.-]{2,}", _normalise_text(title)))
-    for token in re.findall(r"[a-z][a-z0-9+#.-]{2,}", normalized):
+    title_words = set(re.findall(r"[a-z][a-z0-9+#]{2,}", _normalise_text(title)))
+    for token in re.findall(r"[a-z][a-z0-9+#]{2,}", normalized):
         if token in _CONTENT_STOPWORDS or token.isdigit():
             continue
         counts[token] = counts.get(token, 0) + 1
@@ -516,6 +531,100 @@ def _content_terms(title: str, description: str, *, limit: int = 28) -> list[str
         key=lambda token: (-(counts[token] + (2 if token in title_words else 0)), token),
     )
     return sorted(phrases) + [term for term in ranked if term not in phrases][:limit]
+
+
+def _requested_resume_pages(description: str) -> int | None:
+    """Only explicit resume/CV length language constrains artifact selection."""
+    match = re.search(
+        r"\b(one|two|1|2)[ -]page\s+(?:resume|cv)\b|"
+        r"\b(?:resume|cv)\s+(?:must be|of)\s+(one|two|1|2)\s+pages?\b",
+        description, re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return {"one": 1, "two": 2, "1": 1, "2": 2}[(match[1] or match[2]).lower()]
+
+
+def _maximum_resume_pages(description: str) -> int | None:
+    match = re.search(
+        r"\b(?:resume|cv)\s*:?\s*(?:(?:must be|should be|should|must|of)\s+)?"
+        r"(?:limited to|limit is|no more than|at most|not exceed|maximum(?: of)?)\s+(one|two|1|2)\s+pages?\b",
+        description, re.IGNORECASE,
+    )
+    return {"one": 1, "two": 2, "1": 1, "2": 2}[match[1].lower()] if match else None
+
+
+_EVIDENCE_ALIASES = {
+    "machine learning": ("ml", "machine-learning"),
+    "llm": ("llms", "large language model", "large language models"),
+    "rest": ("restful", "rest api", "rest apis"),
+    "rag": ("retrieval-augmented generation", "retrieval augmented generation"),
+    "javascript": ("js",), "typescript": ("ts",),
+}
+
+
+def _evidence_contains(text: str, term: str, *, inflections: bool = False) -> bool:
+    if _contains_phrase(text, term) or any(
+        _contains_phrase(text, alias) for alias in _EVIDENCE_ALIASES.get(term, ())
+    ):
+        return True
+    # Limited noun plurals, never substring matches (e.g. R in research).
+    if inflections and len(term) > 3:
+        forms = [term + "s", term.removesuffix("s")]
+        return any(_contains_phrase(text, form) for form in forms)
+    return False
+
+
+_CURATED_FAMILY_TRACKS = {
+    "AI 工程与自动化": {"ai_implementation", "technical_engineering"},
+    "AI 研究与评估": {"ai_implementation"},
+    "数据分析与 BI": {"data_bi_decision"},
+    "产品与业务运营": {"general_product_consulting"},
+    "咨询与业务交付": {"general_product_consulting", "spatial"},
+    "软件测试与质量": {"technical_engineering"},
+}
+
+
+def _artifact_metadata(artifact: Mapping[str, object]) -> dict:
+    try:
+        value = json.loads(str(artifact.get("metadata_json") or "{}"))
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _score_binding_error(job: Mapping[str, object], profile: Mapping[str, object] | None = None) -> str | None:
+    """Legacy scores remain readable; new evidence must match its actual inputs."""
+    raw = job.get("score_evidence_json")
+    if not raw:
+        return None
+    try:
+        evidence = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return "Score evidence is malformed; rescore before routing."
+    if not isinstance(evidence, dict) or "input_binding" not in evidence:
+        return None
+    binding = evidence["input_binding"]
+    if not isinstance(binding, dict) or binding.get("job_fingerprint") != compute_job_fingerprint(dict(job)):
+        return "The JD changed since scoring; rescore before routing."
+    source = Path(str(binding.get("source_path") or ""))
+    if not source.is_file() or text_digest(read_resume_source(source)) != binding.get("source_text_digest"):
+        return "The scored resume source changed or is unavailable; rescore before routing."
+    from applypilot.scoring.scorer import PROMPT_REVISION, _confirmed_scoring_facts
+
+    if binding.get("prompt_revision") != PROMPT_REVISION:
+        return "The scoring policy changed; rescore before routing."
+    if binding.get("profile_facts_digest") and binding["profile_facts_digest"] != text_digest(json.dumps(
+        _confirmed_scoring_facts(dict(profile or {})), sort_keys=True, ensure_ascii=False,
+    )):
+        return "The confirmed scoring facts changed; rescore before routing."
+    if binding.get("context_mode") == "registered_evidence_sources":
+        from applypilot.scoring.cover_letter import load_evidence_sources
+
+        sources = load_evidence_sources(dict(profile or {}), source, read_resume_source(source))
+        if text_digest("\n\n".join(item["text"] for item in sources)) != binding.get("context_text_digest"):
+            return "The supplemental scoring evidence changed or is unavailable; rescore before routing."
+    return None
 
 
 def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
@@ -650,6 +759,8 @@ def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+    ensure_version_schema(conn)
+
 
 def extract_job_profile(
     job: Mapping[str, object],
@@ -745,6 +856,12 @@ def extract_job_profile(
         seniority = "unspecified"
 
     known_skills = _profile_skills(profile or {})
+    # Narrow fallback for explicit lists of named tools outside the vocabulary.
+    # Free-form duties/degree/eligibility clauses remain model-scoring evidence.
+    for match in re.finditer(r"(?im)(?:^|[.;])\s*(?:required|mandatory)(?: skills| technologies| tools)?\s*:\s*([^\n.]+)", description):
+        items = [item.strip() for item in re.split(r"[,;]|\s+(?:and|or)\s+", match[1])]
+        if all(re.fullmatch(r"[A-Z][A-Za-z0-9+#/-]{1,35}(?: [A-Z][A-Za-z0-9+#/-]{1,35}){0,2}", item) for item in items):
+            known_skills.update(item.casefold() for item in items)
     required: set[str] = set()
     preferred: set[str] = set()
     mentioned: set[str] = set()
@@ -781,6 +898,8 @@ def extract_job_profile(
     fingerprint = compute_job_fingerprint(dict(job))
     features = {
         "complete_description": bool(description),
+        "requested_resume_pages": _requested_resume_pages(description),
+        "maximum_resume_pages": _maximum_resume_pages(description),
         "mentioned_skills": sorted(mentioned),
         "required_skill_groups": required_groups,
         "title_matches": list(title_matches),
@@ -845,6 +964,7 @@ def _register_artifact(
     report_path: str | None = None,
     validated_at: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    promote: bool = True,
 ) -> tuple[str, bool]:
     text_path = text_path.expanduser().resolve()
     original_text_path = text_path
@@ -853,46 +973,25 @@ def _register_artifact(
     digest = _content_digest(text)
     artifact_id = f"resume:{digest[:24]}"
     existing = conn.execute(
-        "SELECT artifact_id, validation_status FROM resume_artifacts WHERE content_sha256=?",
+        "SELECT artifact_id, validation_status, metadata_json FROM resume_artifacts WHERE content_sha256=?",
         (digest,),
     ).fetchone()
-    if existing and existing["validation_status"] == "retired_profile_correction":
+    if existing and existing["validation_status"] in {"retired_profile_correction", "superseded_editorial"}:
         # Historical job projections may still reference these immutable bytes.
         # Sync must preserve the correction tombstone and its supersession data.
         return str(existing["artifact_id"]), False
     pdf_path = original_pdf_path
+    render = None
     if (
-        kind == "tailored"
-        and validation_status == "machine_validated"
-        and text_path.suffix.casefold() == ".txt"
-        and original_pdf_path.is_file()
+        kind == "tailored" and validation_status == "machine_validated"
+        and text_path.suffix.casefold() == ".txt" and original_pdf_path.is_file()
     ):
-        parent = original_text_path.parent
-        if (
-            parent.name.casefold() == "artifacts"
-            and parent.parent.name.casefold() == "resume-library"
-        ):
-            # A library sync may revisit jobs that already project to the
-            # canonical content-addressed artifact. Keep that root stable
-            # instead of creating resume-library/artifacts recursively.
-            artifact_root = parent.resolve()
-        else:
-            storage_base = (
-                parent.parent
-                if parent.name.casefold() == "tailored_resumes"
-                else parent
-            )
-            artifact_root = (storage_base / "resume-library" / "artifacts").resolve()
-        artifact_root.mkdir(parents=True, exist_ok=True)
-        neutral_stem = artifact_id.replace(":", "-")
-        neutral_text = artifact_root / f"{neutral_stem}.txt"
-        neutral_pdf = artifact_root / f"{neutral_stem}.pdf"
-        if not neutral_text.exists():
-            shutil.copyfile(original_text_path, neutral_text)
-        if not neutral_pdf.exists():
-            shutil.copyfile(original_pdf_path, neutral_pdf)
-        text_path = neutral_text
-        pdf_path = neutral_pdf
+        # Separate a text identity from its immutable PDF editions. Never reuse
+        # an older PDF merely because the normalized text is identical.
+        render = freeze_render(original_text_path, text, artifact_id, report_path)
+        text_path = Path(render["text_path"])
+        pdf_path = Path(render["pdf_path"])
+        report_path = render["validation_report_path"]
     pdf_sha256: str | None = None
     pdf_size: int | None = None
     if pdf_path.is_file():
@@ -900,6 +999,10 @@ def _register_artifact(
     else:
         pdf_path = None
     now = _now()
+    metadata = {**(json.loads(existing["metadata_json"] or "{}") if existing else {}), **dict(metadata or {})}
+    source_file = Path(str(source_resume_path or ""))
+    if promote and source_file.is_file():
+        metadata["source_evidence_sha256"] = hashlib.sha256(source_file.read_bytes()).hexdigest()
     created = existing is None
     if created:
         conn.execute(
@@ -929,7 +1032,7 @@ def _register_artifact(
                 now,
             ),
         )
-    elif validation_status == "machine_validated" and pdf_path is not None:
+    elif promote and validation_status == "machine_validated" and pdf_path is not None:
         artifact_id = str(existing["artifact_id"])
         conn.execute(
             """
@@ -958,6 +1061,8 @@ def _register_artifact(
         )
     else:
         artifact_id = str(existing["artifact_id"])
+    if render is not None:
+        register_render(conn, render)
     conn.execute(
         """
         INSERT OR IGNORE INTO resume_artifact_aliases (
@@ -1123,7 +1228,7 @@ def record_content_revalidation(
         return False
 
     artifact = dict(artifact_row)
-    if artifact["validation_status"] == "retired_profile_correction":
+    if artifact["validation_status"] in {"retired_profile_correction", "superseded_editorial"}:
         return False
     now = _now()
     effective_status = status
@@ -1228,6 +1333,16 @@ def register_tailored_artifact(
     job_profile = extract_job_profile(job, profile)
     persist_job_profile(conn, job_profile)
     path = Path(text_path)
+    evidence_metadata = {}
+    if report_path and Path(report_path).is_file():
+        try:
+            saved_report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+            generation_path = Path(str(saved_report.get("generation_record") or ""))
+            supplemental_path = generation_path.with_name("supplemental.txt") if generation_path.name else None
+            if supplemental_path is not None and supplemental_path.is_file():
+                evidence_metadata["supplemental_evidence_path"] = str(supplemental_path)
+        except (OSError, ValueError):
+            pass
     artifact_id, created = _register_artifact(
         conn,
         text_path=path,
@@ -1237,19 +1352,28 @@ def register_tailored_artifact(
         validation_status="machine_validated",
         report_path=report_path,
         validated_at=str(job.get("tailored_at") or _now()),
-        metadata={"registered_from_job": job_profile["job_url"]},
+        promote=validation_kind != "historical_machine_validation",
+        metadata={"registered_from_job": job_profile["job_url"],
+                  **evidence_metadata,
+                  **({"fact_snapshot": profile_fact_snapshot(profile or {})}
+                     if validation_kind != "historical_machine_validation" else {})},
     )
     stored_status = conn.execute(
         "SELECT validation_status FROM resume_artifacts WHERE artifact_id=?", (artifact_id,)
     ).fetchone()["validation_status"]
-    if stored_status == "retired_profile_correction":
+    if stored_status in {"retired_profile_correction", "superseded_editorial"}:
         raise ValueError("Resume artifact was retired after a profile correction; use its corrected successor")
     coverage_added = _add_coverage_cell(conn, artifact_id, job_profile, str(job.get("tailored_at") or ""))
     if created or coverage_added or validation_kind != "historical_machine_validation":
         artifact = conn.execute(
-            "SELECT pdf_sha256, pdf_size FROM resume_artifacts WHERE artifact_id=?",
+            "SELECT pdf_sha256, pdf_size, validation_report_path FROM resume_artifacts WHERE artifact_id=?",
             (artifact_id,),
         ).fetchone()
+        # A historical import may observe an older render of current content.
+        # Bind its validation to the observed PDF, not the convenience pointer.
+        observed = dict(artifact) if artifact else {}
+        if path.suffix.casefold() == ".txt" and path.with_suffix(".pdf").is_file():
+            observed = freeze_render(path, read_resume_source(path), artifact_id, report_path)
         _record_validation(
             conn,
             artifact_id=artifact_id,
@@ -1257,12 +1381,12 @@ def register_tailored_artifact(
             status="machine_validated",
             job_profile=job_profile,
             evidence={
-                "report_path": report_path,
-                "pdf_sha256": artifact["pdf_sha256"] if artifact else None,
-                "pdf_size": artifact["pdf_size"] if artifact else None,
+                "report_path": observed.get("validation_report_path", report_path),
+                "pdf_sha256": observed.get("pdf_sha256"),
+                "pdf_size": observed.get("pdf_size"),
                 "quality_policy_version": (
                     POLICY_VERSION
-                    if validation_kind != "historical_machine_validation"
+                    if validation_kind in {"generated_strict_validation", "job_specific_revalidation"}
                     else None
                 ),
             },
@@ -1371,10 +1495,21 @@ def _artifact_is_current(artifact: Mapping[str, object]) -> bool:
         digest, size = compute_file_binding(pdf_path)
     except OSError:
         return False
-    return digest == artifact.get("pdf_sha256") and size == artifact.get("pdf_size")
+    if digest != artifact.get("pdf_sha256") or size != artifact.get("pdf_size"):
+        return False
+    expected_text = artifact.get("content_sha256")
+    if expected_text:
+        try:
+            return text_digest(read_resume_source(text_path)) == expected_text
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return True
 
 
 _HEALTH_QUARANTINE_PREFIXES = (
+    "Duplicate project entry:",
+    "Experience entry '",
+    "Project entry '",
     "Missing required section:",
     "Every retained experience entry",
     "Every retained project entry",
@@ -1409,7 +1544,7 @@ def assess_resume_artifact_health(
     """
     text_path = Path(str(artifact.get("text_path") or ""))
     reasons: list[str] = []
-    metrics: dict[str, object] = {"text_path": str(text_path)}
+    metrics: dict[str, object] = {"text_path": str(text_path), "input_digest": health_input_digest(artifact, profile)}
     if not text_path.is_file():
         reasons.append("Artifact text file is missing.")
         return {"status": "quarantined", "reasons": reasons, "metrics": metrics}
@@ -1423,7 +1558,30 @@ def assess_resume_artifact_health(
     metrics["has_projects"] = bool(
         re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", text)
     )
-    validation = validate_tailored_resume(text, dict(profile), original_text=text)
+    source_text = text
+    if artifact.get("kind") != "base":
+        source = Path(str(artifact.get("source_resume_path") or ""))
+        if source.is_file():
+            source_text = read_resume_source(source)
+            metrics["source_state"] = "available"
+        else:
+            metrics["source_state"] = "missing"
+            reasons.append("Source evidence is unavailable; review before reuse.")
+    metadata = json.loads(str(artifact.get("metadata_json") or "{}"))
+    if (artifact.get("kind") != "base" and metadata.get("source_evidence_sha256") and source.is_file()
+            and hashlib.sha256(source.read_bytes()).hexdigest() != metadata["source_evidence_sha256"]):
+        reasons.append("Source evidence changed since this edition; review its affected claims before reuse.")
+    if "fact_snapshot" in metadata:
+        affected = changed_used_facts(metadata["fact_snapshot"], profile_fact_snapshot(profile), text)
+        if affected:
+            metrics["changed_used_facts"] = affected
+            reasons.append("Used profile facts changed; review: " + ", ".join(affected))
+    supplemental_path = Path(str(metadata.get("supplemental_evidence_path") or ""))
+    evidence = source_text
+    if supplemental_path.is_file():
+        evidence += "\n\nSUPPLEMENTAL CANDIDATE EVIDENCE\n" + supplemental_path.read_text(encoding="utf-8")
+    validation = validate_tailored_resume(text, dict(profile), original_text=evidence,
+                                         selection_source_text=source_text)
     reasons.extend(
         str(error)
         for error in validation.get("errors", [])
@@ -1537,19 +1695,19 @@ def _write_reuse_route_report(
 ) -> Path:
     """Write a job-specific immutable report without mutating shared artifacts."""
     artifact_path = Path(str(artifact["text_path"])).resolve()
-    route_root = (artifact_path.parent.parent / "routes").resolve()
+    route_root = library_root(artifact_path) / "routes"
     route_root.mkdir(parents=True, exist_ok=True)
-    artifact_token = str(artifact["artifact_id"]).replace(":", "-")
     decision = str(result.get("decision") or "reuse_exact")
     decision_suffix = "-manual-selection" if decision == "manual_selection" else ""
     report_path = route_root / (
-        f"{job_profile['job_fingerprint']}-{artifact_token}{decision_suffix}.json"
+        f"{uuid.uuid4().hex}{decision_suffix}.json"
     )
     payload = {
         "status": "machine_validated",
         "decision": decision,
         "resolution": result.get("resolution") or "reuse_as_is",
         "policy_version": POLICY_VERSION,
+        "ranking_version": RANKING_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
         "assignment_id": assignment_id,
         "job_url": job_profile["job_url"],
@@ -1603,7 +1761,7 @@ def _candidate_score(
 ) -> dict:
     text = _normalise_text(read_resume_source(Path(str(artifact["text_path"]))))
     required = list(job_profile.get("required_skills", []))
-    required_hits = [skill for skill in required if _contains_phrase(text, str(skill))]
+    required_hits = [skill for skill in required if _evidence_contains(text, str(skill))]
     features = job_profile.get("features", {})
     groups = features.get("required_skill_groups", []) if isinstance(features, Mapping) else []
     group_hits = [
@@ -1614,14 +1772,14 @@ def _candidate_score(
     required_count = len(required) + len(groups)
     required_coverage = (len(required_hits) + len(group_hits)) / required_count if required_count else 1.0
     preferred = list(job_profile.get("preferred_skills", []))
-    preferred_hits = [skill for skill in preferred if _contains_phrase(text, str(skill))]
+    preferred_hits = [skill for skill in preferred if _evidence_contains(text, str(skill))]
     preferred_coverage = len(preferred_hits) / len(preferred) if preferred else None
     deliverables = list(job_profile.get("deliverables", []))
-    deliverable_hits = [item for item in deliverables if _contains_phrase(text, str(item))]
+    deliverable_hits = [item for item in deliverables if _evidence_contains(text, str(item), inflections=True)]
     deliverable_coverage = len(deliverable_hits) / len(deliverables) if deliverables else None
     features = job_profile.get("features", {})
     content_terms = list(features.get("content_terms", [])) if isinstance(features, Mapping) else []
-    content_hits = [term for term in content_terms if _contains_phrase(text, str(term))]
+    content_hits = [term for term in content_terms if _evidence_contains(text, str(term), inflections=True)]
     content_coverage = len(content_hits) / len(content_terms) if content_terms else None
 
     subtypes = set(covered_subtypes)
@@ -1629,6 +1787,9 @@ def _candidate_score(
     target_track = str(job_profile.get("track") or "")
     artifact_track = str(artifact.get("track") or "")
     kind = str(artifact.get("kind") or "")
+    metadata = _artifact_metadata(artifact)
+    family = str(metadata.get("library_family") or "")
+    curated_tracks = _CURATED_FAMILY_TRACKS.get(family)
     if target_subtype and target_subtype in subtypes:
         taxonomy_score = 1.0
         candidate_scope = "exact_subtype"
@@ -1642,13 +1803,27 @@ def _candidate_score(
         taxonomy_score = 0.35
         candidate_scope = "cross_track"
 
+    if curated_tracks:
+        # Editorial families describe the current content; inherited job tracks
+        # describe its ancestry and can be null or misleading after consolidation.
+        taxonomy_score = 0.9 if target_track in curated_tracks else 0.35
+        candidate_scope = "curated_family" if target_track in curated_tracks else "cross_family"
+        if target_subtype == "product_management":
+            taxonomy_score = 1.0 if family == "产品与业务运营" else 0.35
+        elif target_subtype == "ai_research":
+            taxonomy_score = 1.0 if family == "AI 研究与评估" else 0.35
+        elif target_subtype == "software_quality_validation":
+            taxonomy_score = 1.0 if family == "软件测试与质量" else 0.35
+        elif target_track == "ai_implementation" and family == "AI 研究与评估":
+            taxonomy_score = 0.55
+
     evidence_quality = 1.0 if artifact.get("validation_status") == "machine_validated" else 0.62
     dimensions: list[tuple[str, float, float | None]] = [
         ("required_coverage", 0.30, required_coverage if required_count else None),
         ("preferred_coverage", 0.10, preferred_coverage),
         ("deliverable_coverage", 0.15, deliverable_coverage),
-        ("content_coverage", 0.20, content_coverage),
-        ("taxonomy_score", 0.15, taxonomy_score),
+        ("content_coverage", 0.10 if curated_tracks else 0.20, content_coverage),
+        ("taxonomy_score", 0.25 if curated_tracks else 0.15, taxonomy_score),
         ("evidence_quality", 0.10, evidence_quality),
     ]
     active = [(name, weight, value) for name, weight, value in dimensions if value is not None]
@@ -1758,12 +1933,21 @@ def route_resume_for_job(
         if isinstance(profile.get("tailoring", {}), Mapping)
         else False
     )
+    library_policy = profile.get("tailoring", {}).get("library_policy", {})
+    ceiling = max(1, int(library_policy.get("max_variants", 50)))
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM resume_artifacts WHERE active=1 AND kind='tailored' "
+        "AND validation_status='machine_validated'"
+    ).fetchone()[0]
     components: dict[str, object] = {
+        "library_policy": {"mode": "reuse_first", "max_variants": ceiling,
+                           "active_variants": active_count, "at_capacity": active_count >= ceiling},
         "job_profile": job_profile,
         "candidates": [],
         "profile_fact_rejections": profile_fact_rejections,
         "health_rejections": health_rejections,
         "health_policy_version": HEALTH_POLICY_VERSION,
+        "ranking_version": RANKING_VERSION,
         "health_enforced": health_enforced,
         "reuse_thresholds": {
             "required_coverage": REUSE_REQUIRED_COVERAGE,
@@ -1779,10 +1963,15 @@ def route_resume_for_job(
     }
 
     fit_score = job.get("fit_score")
+    score_binding_error = _score_binding_error(job, profile)
+    score_status = str(job.get("score_status") or "").casefold()
+    numeric_fit = isinstance(fit_score, (int, float)) and not isinstance(fit_score, bool)
     fit_gate_passed = (
         minimum_fit_score is not None
-        and isinstance(fit_score, (int, float))
-        and not isinstance(fit_score, bool)
+        and numeric_fit
+        and 1 <= fit_score <= 10
+        and score_status in {"", "scored"}
+        and not score_binding_error
         and fit_score >= minimum_fit_score
     )
     components["fit_gate"] = {
@@ -1796,6 +1985,13 @@ def route_resume_for_job(
         reason = f"Job is ineligible: {job.get('eligibility_reason') or 'explicit eligibility failure'}"
     elif not str(job.get("full_description") or "").strip():
         reason = "Full job description is missing; subtype and hard requirements cannot be verified."
+    elif score_binding_error:
+        reason = score_binding_error
+    elif score_status not in {"", "scored"} or (
+        minimum_fit_score is not None and (fit_score is not None or score_status == "scored")
+        and not fit_gate_passed
+    ):
+        reason = "The available fit score is invalid, failed or below the configured admission threshold; review or rescore before routing."
     else:
         configured_source_paths = _configured_source_paths_for_track(
             profile, str(job_profile.get("track") or "") or None
@@ -1814,13 +2010,21 @@ def route_resume_for_job(
         ).fetchall()
         for row in rows:
             artifact = dict(row)
+            requested_pages = job_profile["features"].get("requested_resume_pages")
+            maximum_pages = job_profile["features"].get("maximum_resume_pages")
+            page_count = _artifact_metadata(artifact).get("page_count")
+            if (requested_pages and page_count != requested_pages) or (
+                maximum_pages and (not isinstance(page_count, int) or page_count > maximum_pages)
+            ):
+                components.setdefault("page_rejections", []).append(artifact["artifact_id"])
+                continue
             artifact_health_status = "eligible"
             text_path = Path(str(artifact.get("text_path") or ""))
             if not text_path.is_file():
                 continue
             if health_enforced:
                 health = _latest_artifact_health(conn, str(artifact["artifact_id"]))
-                if health is None:
+                if health is None or health["metrics"].get("input_digest") != health_input_digest(artifact, profile):
                     health = assess_resume_artifact_health(artifact, profile)
                     _record_artifact_health(
                         conn,
@@ -1893,7 +2097,7 @@ def route_resume_for_job(
                 validated
                 and scored["required_coverage"] >= REUSE_REQUIRED_COVERAGE
                 and scored["overall_score"] >= REUSE_OVERALL_SCORE
-                and not unsupported
+                and not scored["missing_required"]
             ):
                 recommended_resolution = "reuse_as_is"
             elif (
@@ -1915,7 +2119,7 @@ def route_resume_for_job(
             key=lambda item: (
                 not item["exact_job_validation"],
                 item["recommended_resolution"] != "reuse_as_is",
-                bool(item["unsupported_required_skills"]),
+                bool(item["unsupported_required_skills"]) and not fit_gate_passed,
                 -item["overall_score"],
                 -item["route_preference_score"],
                 item["artifact_id"],
@@ -2020,7 +2224,9 @@ def route_resume_for_job(
                 reason = "No artifact is sufficiently close for bounded editing; create a new validated resume."
             if profile_fact_rejections:
                 reason += " Higher-ranked artifacts were rejected because they conflict with current profile facts."
-            manual_selection_allowed = margin is not None and margin < REUSE_MIN_MARGIN
+            manual_selection_allowed = (
+                resolution is not None and margin is not None and margin < REUSE_MIN_MARGIN
+            )
 
     if requested_artifact_id:
         selected = next(
@@ -2067,6 +2273,12 @@ def route_resume_for_job(
             "resolution": resolution,
         }
 
+    if active_count >= ceiling and resolution and resolution != "reuse_as_is":
+        components["capacity_proposed_resolution"] = resolution
+        decision = "manual_review"
+        resolution = None
+        reason = "The active library is at its size ceiling; consolidate or replace an existing variant before adding another."
+    components["new_variant_reason"] = reason if resolution in {"create_new", "patch_existing"} else None
     components["resolution"] = resolution
     components["selected_source_artifact_id"] = selected_artifact_id
 
@@ -2084,6 +2296,7 @@ def route_resume_for_job(
     )
     result = {
         "assignment_id": assignment_id,
+        "ranking_version": RANKING_VERSION,
         "decision": decision,
         "resolution": resolution,
         "reason": reason,
@@ -2106,6 +2319,18 @@ def route_resume_for_job(
             ).fetchone()
         )
         result["artifact"] = artifact
+        raw_score_evidence = job.get("score_evidence_json")
+        score_evidence = json.loads(str(raw_score_evidence)) if raw_score_evidence and not score_binding_error else {}
+        binding = score_evidence.get("input_binding", {}) if isinstance(score_evidence, dict) else {}
+        if binding:
+            result["score_alignment"] = {
+                "scored_source_path": binding.get("source_path"),
+                "selected_text_path": artifact.get("text_path"),
+                "same_content": binding.get("source_text_digest") == text_digest(
+                    read_resume_source(Path(str(artifact["text_path"])))
+                ),
+                "meaning": "Candidate fit is based on the scored source; routing score measures the selected resume's JD coverage.",
+            }
     if decision in {"reuse_exact", "manual_selection"} and selected_artifact_id:
         _record_validation(
             conn,
@@ -2198,6 +2423,7 @@ def library_status(conn: sqlite3.Connection) -> dict:
         "validation_runs": "resume_validation_runs",
         "route_outcomes": "resume_route_outcomes",
         "health_checks": "resume_artifact_health_checks",
+        "render_versions": "resume_render_versions",
     }.items():
         where = " WHERE active=1 AND validation_status='machine_validated'" if key == "active_validated_artifacts" else ""
         counts[key] = conn.execute(f"SELECT COUNT(*) FROM {table}{where}").fetchone()[0]

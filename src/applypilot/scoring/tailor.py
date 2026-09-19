@@ -21,6 +21,7 @@ from pathlib import Path
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.resume_versions import finish_resume_run, start_resume_run
 from applypilot.scoring.cover_letter import read_resume_source
 from applypilot.scoring.resume_plan import build_content_plan, format_content_plan
 from applypilot.scoring.validator import (
@@ -159,16 +160,16 @@ def _build_tailor_prompt(profile: dict, source_has_projects: bool = True) -> str
     # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
-    multi_page_min_fill = max(0.55, float(
+    multi_page_min_fill = float(
         profile.get("tailoring", {})
         .get("resume_layout", {})
         .get("multi_page_last_page_min_fill_ratio", 0.4)
         or 0.4
-    ))
+    )
     length_guidance = (
         "This selected source includes projects. Preserve only the projects that materially improve "
         "the match. For an internship or current-student application, prefer one readable page when "
-        "the strongest evidence fits. A genuinely high-threshold role may use two pages when multiple "
+        "the strongest evidence fits. Use two pages when multiple "
         "distinct evidence areas are needed, but the final page must contain enough role-relevant content "
         f"to occupy at least {multi_page_min_fill:.0%} of a normally filled page. Otherwise select more "
         "aggressively and use one page. Word counts are guidance, never a reason to pad, shrink fonts, "
@@ -199,7 +200,7 @@ TARGET FUNCTION: Return the target function in `title` for routing and internshi
 
 EXPERIENCE IDENTITY: Never rename an employer or employment title. In every experience object, copy the exact company into `header` and preserve the exact source role in `subtitle`. Preserve dates and seniority. Target-job language belongs in the summary and bullets, not in past titles.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 source-proven skills that matter most for THIS role. Prefer one or two compact sentences, normally about 26-45 words total. Use the full line width efficiently: do not add a very short closing sentence, and ensure the final sentence contains at least 8 words. Every statement about work performed, data analyzed, experiments run, users served, domains covered, or outcomes achieved must be supported by the selected source. Do not turn a JD responsibility into candidate history. Target-role framing is allowed; invented experience is not. In particular, do not copy a JD-only action or domain term into the summary unless that term, or the same factual work, appears in the selected source. Never join two sector domains (for example, legal and planning) into one work claim unless a single source bullet explicitly contains both domains; split the facts into separate sentences or omit the weaker domain.
+SUMMARY: Optional; use an empty string when it adds no distinct value. Source resumes may intentionally omit it; do not add generic filler. When present, tailor it to the role. Lead with the 1-2 source-proven skills that matter most for THIS role. Prefer one or two compact sentences, normally about 26-45 words total. Use the full line width efficiently: do not add a very short closing sentence, and ensure the final sentence contains at least 8 words. Every statement about work performed, data analyzed, experiments run, users served, domains covered, or outcomes achieved must be supported by the selected source. Do not turn a JD responsibility into candidate history. Target-role framing is allowed; invented experience is not. In particular, do not copy a JD-only action or domain term into the summary unless that term, or the same factual work, appears in the selected source. Never join two sector domains (for example, legal and planning) into one work claim unless a single source bullet explicitly contains both domains; split the facts into separate sentences or omit the weaker domain.
 
 SECTION ORDER: For an internship, trainee, co-op, or current-student target, use Summary, Education, Technical Skills, Experience, Projects. For other roles, use Summary, Technical Skills, Experience, Projects, Education. The renderer applies this rule automatically; keep all education facts in `education`.
 
@@ -209,13 +210,15 @@ TECHNICAL SKILLS LAYOUT: Keep each category compact enough to use the available 
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
-Order EXPERIENCE and PROJECT entries from current/most recent to oldest using their preserved dates; do not blindly copy a misordered older artifact. Reorder bullets inside each entry by relevance. Rephrase only where the new wording is more useful and preserves exactly the same action, ownership, scope, tools, metric, and outcome. Verbatim source wording is allowed and preferred when rewriting would weaken factual precision.
+Order EXPERIENCE entries from current/most recent to oldest using their preserved dates. PROJECT entries may be freely reordered by JD relevance; project dates must remain accurate. Reorder bullets inside each entry by relevance. Rephrase only where the new wording is more useful and preserves exactly the same action, ownership, scope, tools, metric, and outcome. Verbatim source wording is allowed and preferred when rewriting would weaken factual precision.
 
-EXPERIENCE AND PROJECT SELECTION: In each section, retire at most one low-relevance source entry. Never retire the first and most recent source entry. Keep at least one entry in each source-present section, and give every retained entry at least one substantive bullet. Allocate detail by recency first: newer entries must have at least as many bullets as older retained entries, and with three or more entries the oldest must have fewer bullets than the newest. The newest experience normally receives 3-4 bullets; use supplemental source evidence to find distinct, truthful angles before allowing it to remain thin. JD relevance decides which supported facts lead within each entry, not whether an old entry dominates the page.
+PAGE LENGTH: One or two readable pages are both acceptable. Never sacrifice a relevant, supported project just to force one page. The source resume may omit projects; add a clearly sourced project from supplemental evidence when it materially helps this role.
+
+EXPERIENCE AND PROJECT SELECTION: In EXPERIENCE, retire at most one low-relevance source entry and preserve the most recent experience. Choose PROJECTS by relevance; a newer project is not automatically more valuable. Keep at least one entry in each source-present section, and give every retained entry at least one substantive bullet. Allocate detail by JD relevance and the strength of sourced evidence. A relevant older experience may receive more bullets than a newer entry. Bullet counts and word targets are guidance, not reasons to invent, pad, or delete decisive evidence.
 
 PROJECTS: {"Keep the most relevant source projects and preserve each project identity." if source_has_projects else "Return an empty projects list unless supplemental candidate evidence contains a clearly identified real project."}
 
-BULLETS: Most relevant first. Write complete recruiter-readable statements, not keyword inventories. Each bullet should normally connect at least two and preferably three of: context/problem, owned action, concrete artifact/method, and result/user/decision impact. Preserve useful source detail about scope and constraints instead of over-compressing it into a tool list. Use only source-supported verbs and outcomes. Do not force every bullet into an impact formula, do not manufacture causal results, and do not add a number copied from the JD. Keep at most 4 bullets per experience or project.
+BULLETS: Most relevant first. Write complete recruiter-readable statements, not keyword inventories. Each bullet should normally connect at least two and preferably three of: context/problem, owned action, concrete artifact/method, and result/user/decision impact. Preserve useful source detail about scope and constraints instead of over-compressing it into a tool list. Use only source-supported verbs and outcomes. Do not force every bullet into an impact formula, do not manufacture causal results, and do not add a number copied from the JD. Usually use 2-4 bullets per experience or project; preserve additional decisive evidence when useful.
 
 JD EVIDENCE MAP: Before drafting, identify exactly 3 high-priority JD requirements. Classify each as `direct`, `transferable`, or `gap`. `direct` means the selected source proves substantially the same task, skill, or outcome. `transferable` means the source proves adjacent capability but you must not write the unsatisfied JD task as candidate history. `gap` means there is no honest support. For direct or transferable items, copy a source_quote of at least 6 words verbatim from the selected resume. For gaps, use an empty source_quote. At least 2 mappings must be direct or transferable. Do not place citations or gap labels in the visible resume.
 
@@ -491,7 +494,8 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append("")
 
     def append_summary() -> None:
-        lines.extend(["SUMMARY", sanitize_text(data["summary"]), ""])
+        if str(data.get("summary") or "").strip():
+            lines.extend(["SUMMARY", sanitize_text(data["summary"]), ""])
 
     def append_skills() -> None:
         lines.append("TECHNICAL SKILLS")
@@ -622,9 +626,8 @@ Return only JSON:
 "code":"short_code","severity":"blocking or advisory","message":"specific problem",
 "repairable":true}],"section_reviews":[{"section":"SUMMARY","score":0,"comment":"brief"}]}
 
-Use integer scores from 0 to 100. Judge section allocation as a whole: retained experience and
-project entries must be ordered current/most-recent first from their preserved dates; newer entries should receive equal or greater
-detail than older entries, and the oldest must not rival the newest when three or more are retained.
+Use integer scores from 0 to 100. Judge section allocation as a whole: retained experience entries must stay current/most-recent first with preserved dates; project entries may follow relevance.
+Detail allocation follows source strength and JD relevance, not recency. Summary is optional.
 Relevance should select and order facts within that hierarchy, not make a distant entry dominate.
 Judge narrative completeness by whether bullets connect an owned action to a concrete artifact or
 method and a supported context/result/user impact. A long list of tools or noun phrases is not a
@@ -923,7 +926,7 @@ def judge_tailored_resume(
         claim for claim in expected_claims
         if claim.casefold() not in grounded_claims
     ]
-    if not summary_sentences:
+    if summary_text and not summary_sentences:
         issues_list.append("Tailored SUMMARY could not be parsed for claim auditing.")
     elif missing_claim_evidence:
         issues_list.append(
@@ -962,7 +965,7 @@ def judge_tailored_resume(
     passed = (
         str(audit.get("verdict", "")).strip().upper() == "PASS"
         and not issues_list
-        and bool(summary_sentences)
+        and bool(expected_claims)
         and not missing_claim_evidence
         and not missing_section_reviews
     )
@@ -977,7 +980,7 @@ def judge_tailored_resume(
         "summary_sentences": summary_sentences,
         "audited_claim_count": len(expected_claims),
         "claim_evidence_complete": bool(expected_claims) and not missing_claim_evidence,
-        "summary_evidence_complete": bool(summary_sentences) and not any(
+        "summary_evidence_complete": not any(
             sentence in missing_claim_evidence for sentence in summary_sentences
         ),
         "section_reviews_complete": not missing_section_reviews,
@@ -1044,7 +1047,7 @@ def _repair_sections_for_errors(errors: list[object]) -> set[str]:
             sections.add("PROJECTS")
         if "education" in error or "school" in error or "degree" in error or "gpa" in error:
             sections.add("EDUCATION")
-        if "evidence map" in error or "grounded jd priorities" in error:
+        if re.search(r"\bevidence map\b", error) or "grounded jd priorities" in error:
             sections.add("EVIDENCE MAP")
     return sections
 
@@ -1333,7 +1336,8 @@ def tailor_resume(
         full_validation = validate_tailored_resume(
             tailored,
             profile,
-            original_text=resume_text,
+            original_text=combined_evidence,
+            selection_source_text=resume_text,
         )
         report["full_validator"] = full_validation
         if not full_validation["passed"]:
@@ -1431,7 +1435,8 @@ def tailor_resume(
                     repaired_full_validation = validate_tailored_resume(
                         repaired_text,
                         profile,
-                        original_text=resume_text,
+                        original_text=combined_evidence,
+                        selection_source_text=resume_text,
                     )
                     repaired_layout = {"passed": True, "error": None}
                     if repaired_validation["passed"] and repaired_full_validation["passed"] and validate_layout:
@@ -1601,6 +1606,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         completed += 1
         route_resolution = None
         library_route: dict = {}
+        run_dir: Path | None = None
         try:
             library_route = (
                 route_resume_for_job(
@@ -1699,7 +1705,17 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             else:
                 source_path, routing = select_resume_source(job, profile)
             resume_text = read_resume_source(source_path)
+            run_dir = start_resume_run(TAILORED_DIR.parent, job, kind="tailoring")
             supplemental_parts: list[str] = []
+            # A short selected source may omit projects. Supply the configured
+            # factual sources so page length does not silently erase that evidence.
+            for variant in profile.get("tailoring", {}).get("resume_variants", []):
+                evidence_path = Path(str(variant.get("path") or "")).expanduser().resolve()
+                if evidence_path == source_path or not evidence_path.is_file():
+                    continue
+                supplemental_parts.append(
+                    f"SOURCE DOCUMENT {evidence_path.name}\n{read_resume_source(evidence_path)}"
+                )
             for candidate in library_route.get("candidates", [])[:4]:
                 candidate_id = str(candidate.get("artifact_id") or "")
                 if not candidate_id or candidate_id == library_route.get("artifact_id"):
@@ -1747,11 +1763,11 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             prefix = f"{safe_company}_{safe_title}"
 
             success = report["status"] == "machine_validated"
-            validated_txt_path = TAILORED_DIR / f"{prefix}.txt"
+            validated_txt_path = run_dir / f"{prefix}.txt"
             if success:
                 txt_path = validated_txt_path
             else:
-                rejected_dir = TAILORED_DIR / "rejected"
+                rejected_dir = run_dir / "rejected"
                 rejected_dir.mkdir(parents=True, exist_ok=True)
                 txt_path = rejected_dir / f"{prefix}_REJECTED.txt"
                 if validated_txt_path.exists():
@@ -1765,7 +1781,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 txt_path.write_text(tailored, encoding="utf-8")
 
             # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+            job_path = run_dir / f"{prefix}_JOB.txt"
             job_desc = (
                 f"Title: {job['title']}\n"
                 f"Company: {job['company_name']}\n"
@@ -1787,7 +1803,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                     log.warning("PDF generation failed for %s: %s", txt_path, exc)
                     report["render_error"] = str(exc)
                     report["status"] = "failed_render"
-                    rejected_dir = TAILORED_DIR / "rejected"
+                    rejected_dir = run_dir / "rejected"
                     rejected_dir.mkdir(parents=True, exist_ok=True)
                     rejected_path = rejected_dir / f"{prefix}_REJECTED.txt"
                     txt_path.replace(rejected_path)
@@ -1795,10 +1811,11 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                     success = False
 
             # Persist the render verdict together with the content verdict.
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(
-                json.dumps(report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            report["tailored_resume_path"] = str(txt_path) if success else None
+            report["rejected_path"] = str(txt_path) if tailored and not success else None
+            report_path = finish_resume_run(
+                run_dir, report, source_text=resume_text,
+                supplemental_evidence=supplemental_evidence,
             )
 
             result = {
@@ -1820,12 +1837,17 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "resume_library_assignment_id": library_route["assignment_id"],
             }
         except Exception as e:
+            failed_report = None
+            if run_dir is not None and not (run_dir / "validation.json").exists():
+                failed_report = str(finish_resume_run(
+                    run_dir, {"status": "error", "error": str(e)}, source_text=resume_text,
+                ))
             result = {
                 "url": job["url"], "title": job["title"],
                 "company_name": job.get("company_name"),
                 "source_site": job.get("source_site") or job.get("site"),
                 "status": "error", "attempts": 0, "path": None, "pdf_path": None,
-                "rejected_path": None, "report_path": None,
+                "rejected_path": None, "report_path": failed_report,
                 "source_resume_path": None, "error": str(e),
                 "resume_library_decision": "error",
                 "resume_library_resolution": route_resolution,

@@ -333,6 +333,39 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     added_columns = ensure_columns(conn)
+    # Invalidate only the current projections; reports and artifact files remain history.
+    conn.execute("DROP TRIGGER IF EXISTS jobs_invalidate_changed_score_inputs")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS jobs_invalidate_changed_score_inputs
+        AFTER UPDATE OF url, application_url, title, company_name, location,
+                        full_description ON jobs
+        WHEN OLD.applied_at IS NULL AND NEW.applied_at IS NULL
+          AND COALESCE(OLD.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
+          AND COALESCE(NEW.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
+          AND NOT EXISTS (
+              SELECT 1 FROM application_attempts
+              WHERE job_url IN (OLD.url, NEW.url) AND submit_started = 1
+                AND status IN ('in_progress', 'applied', 'submitted', 'submission_uncertain')
+          )
+          AND (OLD.url IS NOT NEW.url
+            OR OLD.application_url IS NOT NEW.application_url
+            OR OLD.title IS NOT NEW.title
+            OR OLD.company_name IS NOT NEW.company_name
+            OR OLD.location IS NOT NEW.location
+            OR OLD.full_description IS NOT NEW.full_description)
+        BEGIN
+            UPDATE jobs SET fit_score=NULL, scored_at=NULL, score_reasoning=NULL,
+                score_evidence_json=NULL, score_status='stale', score_error=NULL,
+                tailored_resume_path=NULL, tailored_at=NULL, tailor_status='stale',
+                tailor_error=NULL,
+                cover_letter_path=NULL, cover_letter_status='stale', cover_letter_error=NULL,
+                cover_letter_approved_at=NULL, cover_letter_approved_by=NULL,
+                application_readiness_status=NULL, application_readiness_reason=NULL,
+                application_readiness_reviewed_at=NULL, application_readiness_reviewed_by=NULL,
+                application_readiness_fingerprint=NULL
+            WHERE url=NEW.url;
+        END
+    """)
     if "apply_retry_blocked" in added_columns:
         conn.execute("""
             UPDATE jobs

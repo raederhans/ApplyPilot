@@ -15,7 +15,7 @@ import logging
 import re
 from difflib import SequenceMatcher
 
-from applypilot.scoring.resume_plan import order_entries_by_recency
+from applypilot.scoring.resume_plan import entry_recency_key, order_entries_by_recency
 
 log = logging.getLogger(__name__)
 
@@ -165,17 +165,28 @@ def _source_role_for_company(original_text: str, company: str) -> str:
     return ""
 
 
+def _section_pattern(section: str) -> str:
+    """Return a regex pattern matching standard section names and their common variants."""
+    sec = section.strip().upper()
+    if sec == "EXPERIENCE":
+        return r"(?:(?:WORK|PROFESSIONAL|RELEVANT|SELECTED|KEY|EMPLOYMENT)\s+)?(?:EXPERIENCE|HISTORY)"
+    if sec == "PROJECTS":
+        return r"(?:(?:SELECTED|KEY|PERSONAL|ACADEMIC|RELEVANT)\s+)?PROJECTS"
+    if sec == "EDUCATION":
+        return r"(?:ACADEMIC\s+BACKGROUND|EDUCATION(?:\s+BACKGROUND)?)"
+    if sec in {"TECHNICAL SKILLS", "SKILLS"}:
+        return r"(?:TECHNICAL\s+SKILLS|CORE\s+SKILLS|SKILLS|TECH\s+STACK|TECHNOLOGIES)"
+    if sec == "SUMMARY":
+        return r"(?:(?:PROFESSIONAL|CAREER|EXECUTIVE)\s+)?SUMMARY"
+    return re.escape(section)
+
+
 def _section_entries(text: str, section: str) -> list[dict]:
     """Parse one structured resume section without assuming its current order is correct."""
-    match = re.search(
-        rf"(?ms)^\s*(?i:{re.escape(section)})\s*$\s*(.*?)(?=^\s*[A-Z][A-Z ]{{3,}}\s*$|\Z)",
-        text,
-    )
-    if not match:
-        return []
-    from applypilot.scoring.pdf import parse_entries
+    from applypilot.scoring.pdf import canonical_section_header, parse_entries, parse_resume
 
-    return parse_entries(match.group(1))
+    canonical = canonical_section_header(section) or section
+    return parse_entries(parse_resume(text)["sections"].get(canonical, ""))
 
 
 def _source_entry_headers(text: str, section: str) -> list[str]:
@@ -269,51 +280,91 @@ def _section_entry_bullet_counts(text: str, section: str) -> list[tuple[str, int
     ]
 
 
+def _entry_has_supplemental_evidence(header: str, original_text: str, section: str) -> bool:
+    """Check whether an entry header has evidence in supplemental original_text."""
+    if not original_text or not header.strip():
+        return False
+
+    from applypilot.scoring.pdf import parse_entries
+
+    matches = re.finditer(
+        rf"(?ms)^\s*(?i:{_section_pattern(section)})\s*$\s*(.*?)(?=^\s*[A-Z][A-Z ]{{3,}}\s*$|\Z)",
+        original_text,
+    )
+    for match in matches:
+        for entry in parse_entries(match.group(1)):
+            title = str(entry.get("title") or "").strip()
+            if title and _entry_matches_source(header, title):
+                return True
+
+    supp_match = re.search(
+        r"(?ms)^\s*SUPPLEMENTAL CANDIDATE EVIDENCE\s*$\s*(.*)",
+        original_text,
+        re.IGNORECASE,
+    )
+    if supp_match:
+        supp_text = supp_match.group(1)
+        for entry in _section_entries(supp_text, section):
+            title = str(entry.get("title") or "").strip()
+            if title and _entry_matches_source(header, title):
+                return True
+        for entry in parse_entries(supp_text):
+            title = str(entry.get("title") or "").strip()
+            if title and _entry_matches_source(header, title):
+                return True
+
+    return False
+
+
+def _duplicate_project_errors(headers: list[str]) -> list[str]:
+    seen: set[str] = set()
+    errors = []
+    for header in headers:
+        identity = " ".join(header.casefold().split())
+        if identity and identity in seen:
+            errors.append(f"Duplicate project entry: '{header}'. Consolidate its supported evidence.")
+        seen.add(identity)
+    return errors
+
+
+def _entry_allocation_warnings(
+    entry_counts: list[tuple[str, int]],
+    section: str,
+    *,
+    recent_minimum: int = 2,
+) -> list[str]:
+    """Flag advisory bullet count targets without blocking validation."""
+    if not entry_counts:
+        return []
+    warnings: list[str] = []
+    counts = [count for _header, count in entry_counts]
+    if any(count > 4 for count in counts):
+        warnings.append(
+            f"No {section.lower()} entry should ideally exceed four bullets; got {counts}."
+        )
+    if counts and counts[0] < recent_minimum:
+        warnings.append(
+            f"The leading {section.lower()} entry should ideally contain at least {recent_minimum} substantive bullets."
+        )
+    return warnings
+
+
 def _entry_allocation_errors(
     entry_counts: list[tuple[str, int]],
     source_headers: list[str],
     section: str,
     *,
-    recent_minimum: int,
+    recent_minimum: int = 2,
 ) -> list[str]:
-    """Validate source order and a non-increasing recency/detail hierarchy."""
-    if not entry_counts:
-        return []
-    label = section.title()
-    errors: list[str] = []
-    matched_indices = [
-        match
-        for match in _match_source_indices(
-            [header for header, _count in entry_counts], source_headers
-        )
-        if match is not None
-    ]
-    if matched_indices and matched_indices != sorted(matched_indices):
-        errors.append(
-            f"{label} entries must remain in source recency order; reorder bullets inside entries instead."
-        )
-    if source_headers and not _entry_matches_source(entry_counts[0][0], source_headers[0]):
-        errors.append(f"The most recent {section.lower()} entry must remain first.")
+    """Validate entry constraints.
 
-    counts = [count for _header, count in entry_counts]
-    if len(counts) >= 3 and counts[0] < recent_minimum:
-        errors.append(
-            f"The most recent {section.lower()} entry needs at least {recent_minimum} substantive "
-            "bullets when three or more entries are retained."
-        )
-    for index in range(1, len(counts)):
-        if counts[index] > counts[index - 1]:
-            errors.append(
-                f"{label} bullet allocation must not expand with age; got {counts}."
-            )
-            break
-    if len(counts) >= 3 and counts[-1] >= counts[0]:
-        errors.append(
-            f"The oldest retained {section.lower()} entry must be shorter than the newest; got {counts}."
-        )
-    if any(count > 4 for count in counts):
-        errors.append(f"No {section.lower()} entry may exceed four bullets; got {counts}.")
-    return errors
+    Experience entries must remain in reverse chronological order (newest first),
+    enforced by actual dates.
+    Projects may freely reorder by relevance.
+    Mere bullet count targets are advisory warnings; at least 1 substantive
+    bullet per retained entry is enforced by callers.
+    """
+    return []
 
 
 def _bullet_narrative_warnings(entries: list[dict], section: str) -> list[str]:
@@ -364,13 +415,16 @@ def validate_json_fields(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "education", "evidence_map"):
+    # Required keys — always checked regardless of mode (summary is optional)
+    for key in ("title", "skills", "experience", "education", "evidence_map"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
     selection_source = selection_source_text if selection_source_text is not None else original_text
     source_has_projects = bool(
-        re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", selection_source)
+        re.search(
+            r"(?im)^\s*(?:(?:selected|key|personal|academic|relevant)\s+)?projects\s*$",
+            selection_source,
+        )
     )
     if source_has_projects and not data.get("projects"):
         errors.append("Selected source contains projects, but the tailored output dropped all projects.")
@@ -391,8 +445,8 @@ def validate_json_fields(
             + ", ".join(invented_seniority)
         )
 
-    # Collect all text for bulk checks
-    all_text_parts: list[str] = [data["summary"]]
+    # Collect all text for bulk checks (summary is optional)
+    all_text_parts: list[str] = [str(data["summary"])] if data.get("summary") else []
 
     # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
@@ -440,6 +494,21 @@ def validate_json_fields(
             )
         if source_experience and source_experience[0] in dropped_experience:
             errors.append("The most recent experience entry cannot be retired.")
+
+        # Grounding: reject experience entries without evidence in selection source or supplemental evidence
+        for entry in data["experience"]:
+            header = str(entry.get("header", "")).strip()
+            if not header:
+                continue
+            is_in_source = any(_entry_matches_source(header, sh) for sh in source_experience)
+            is_in_supplemental = False
+            if original_text and (original_text != selection_source or "SUPPLEMENTAL CANDIDATE EVIDENCE" in original_text):
+                is_in_supplemental = _entry_has_supplemental_evidence(header, original_text, "EXPERIENCE")
+            if not is_in_source and not is_in_supplemental:
+                errors.append(
+                    f"Experience entry '{header}' has no evidence mapping to the selected source resume or supplemental evidence."
+                )
+
         for company in preserved_companies:
             if not any(company.casefold() in header.casefold() for header in source_experience):
                 continue
@@ -474,6 +543,21 @@ def validate_json_fields(
             if not bullets:
                 errors.append(f"Experience '{entry.get('header', '')}' must retain at least one bullet.")
             all_text_parts.extend(bullets)
+
+        # Experience entries must remain in reverse chronological order by actual date
+        dated_entries = [
+            (str(entry.get("header") or ""), entry_recency_key(entry))
+            for entry in data["experience"]
+            if isinstance(entry, dict) and entry_recency_key(entry) != (0, 0, 0)
+        ]
+        for i in range(len(dated_entries) - 1):
+            if dated_entries[i][1] < dated_entries[i + 1][1]:
+                errors.append(
+                    f"Experience entries must remain in reverse chronological order; "
+                    f"'{dated_entries[i][0]}' is older than '{dated_entries[i + 1][0]}'."
+                )
+                break
+
         experience_counts = [
             (
                 str(entry.get("header") or ""),
@@ -486,29 +570,46 @@ def validate_json_fields(
                 experience_counts,
                 source_experience,
                 "EXPERIENCE",
-                recent_minimum=3,
+            )
+        )
+        warnings.extend(
+            _entry_allocation_warnings(
+                experience_counts,
+                "EXPERIENCE",
             )
         )
         warnings.extend(_bullet_narrative_warnings(data["experience"], "EXPERIENCE"))
-        if data["experience"] and len(data["experience"][0].get("bullets", [])) < 2:
-            errors.append("The leading experience entry must contain at least two substantive bullets.")
 
     # Projects: collect bullets
     if isinstance(data["projects"], list):
         source_projects = _source_entry_headers(selection_source, "PROJECTS")
         output_project_headers = [str(entry.get("header", "")) for entry in data["projects"]]
+        errors.extend(_duplicate_project_errors(output_project_headers))
         matched_projects = set(_match_source_indices(output_project_headers, source_projects))
         dropped_projects = [
             header for index, header in enumerate(source_projects)
             if index not in matched_projects
         ]
         if len(dropped_projects) > 1:
-            errors.append(
-                "Projects may retire at most one source entry; dropped: "
+            warnings.append(
+                "Review project selection for relevance; omitted: "
                 + ", ".join(dropped_projects[:3])
             )
-        if source_projects and source_projects[0] in dropped_projects:
-            errors.append("The most recent project entry cannot be retired.")
+
+        # Grounding: reject project entries without evidence in selection source or supplemental evidence
+        for entry in data["projects"]:
+            header = str(entry.get("header", "")).strip()
+            if not header:
+                continue
+            is_in_source = any(_entry_matches_source(header, sh) for sh in source_projects)
+            is_in_supplemental = False
+            if original_text and (original_text != selection_source or "SUPPLEMENTAL CANDIDATE EVIDENCE" in original_text):
+                is_in_supplemental = _entry_has_supplemental_evidence(header, original_text, "PROJECTS")
+            if not is_in_source and not is_in_supplemental:
+                errors.append(
+                    f"Project entry '{header}' has no evidence mapping to the selected source resume or supplemental evidence."
+                )
+
         for entry in data["projects"]:
             bullets = [str(item).strip() for item in entry.get("bullets", []) if str(item).strip()]
             if not bullets:
@@ -526,12 +627,15 @@ def validate_json_fields(
                 project_counts,
                 source_projects,
                 "PROJECTS",
-                recent_minimum=2,
+            )
+        )
+        warnings.extend(
+            _entry_allocation_warnings(
+                project_counts,
+                "PROJECTS",
             )
         )
         warnings.extend(_bullet_narrative_warnings(data["projects"], "PROJECTS"))
-        if data["projects"] and len(data["projects"][0].get("bullets", [])) < 2:
-            errors.append("The leading project entry must contain at least two substantive bullets.")
 
     # The target employer may be named in a target-facing summary, but it
     # cannot appear inside prior experience/project history unless the source
@@ -708,6 +812,7 @@ def validate_json_fields(
         found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", all_text)]
         if found_banned:
             msg = f"Banned words: {', '.join(found_banned[:5])}"
+
             if mode == "strict":
                 errors.append(msg)
             else:  # normal
@@ -765,7 +870,8 @@ def current_profile_resume_fact_errors(text: str, profile: dict) -> list[str]:
     return errors
 
 
-def validate_tailored_resume(text: str, profile: dict, original_text: str = "") -> dict:
+def validate_tailored_resume(text: str, profile: dict, original_text: str = "", *,
+                             selection_source_text: str | None = None) -> dict:
     """Programmatic validation of a tailored resume against the user's profile.
 
     Args:
@@ -780,19 +886,22 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     warnings: list[str] = []
     text_lower = text.lower()
 
+    selection_source = original_text if selection_source_text is None else selection_source_text
     personal = profile.get("personal", {})
     resume_facts = profile.get("resume_facts", {})
 
-    # 1. Check required sections exist (flexible matching)
+    # 1. Check required sections exist (flexible matching, summary is optional)
     section_variants: dict[str, list[str]] = {
-        "SUMMARY": ["summary", "professional summary", "profile"],
         "TECHNICAL SKILLS": ["technical skills", "skills", "tech stack", "core skills", "technologies"],
         "EXPERIENCE": ["experience", "work experience", "professional experience"],
         "EDUCATION": ["education", "academic background"],
     }
-    if not original_text or re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", original_text):
+    if not selection_source or re.search(
+        r"(?im)^\s*(?:(?:selected|key|personal|academic|relevant)\s+)?projects\s*$",
+        selection_source,
+    ):
         section_variants["PROJECTS"] = [
-            "projects", "personal projects", "key projects", "selected projects"
+            "projects", "personal projects", "key projects", "selected projects", "academic projects", "relevant projects"
         ]
     for section, variants in section_variants.items():
         if not any(v in text_lower for v in variants):
@@ -808,8 +917,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         warnings.append(f"Name '{display_name}' missing -- will be injected")
 
     # 3-4. Apply the same bounded-retirement and density rules on revalidation.
-    source_experience = _source_entry_headers(original_text, "EXPERIENCE") if original_text else []
-    output_experience = _source_entry_headers(text, "EXPERIENCE")
+    source_experience = _source_entry_headers(selection_source, "EXPERIENCE") if selection_source else []
+    experience_entries = _section_entries(text, "EXPERIENCE")
+    output_experience = [str(e.get("title") or "") for e in experience_entries]
     matched_experience = set(_match_source_indices(output_experience, source_experience))
     dropped_experience = [
         header for index, header in enumerate(source_experience)
@@ -819,6 +929,36 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         errors.append("Experience retires more than one source entry.")
     if source_experience and source_experience[0] in dropped_experience:
         errors.append("The most recent experience entry cannot be retired.")
+
+    # Grounding: reject experience entries without evidence in selection source or supplemental evidence
+    if original_text:
+        for entry in experience_entries:
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+            is_in_source = any(_entry_matches_source(title, sh) for sh in source_experience)
+            is_in_supplemental = False
+            if "SUPPLEMENTAL CANDIDATE EVIDENCE" in original_text or original_text != text:
+                is_in_supplemental = _entry_has_supplemental_evidence(title, original_text, "EXPERIENCE")
+            if not is_in_source and not is_in_supplemental:
+                errors.append(
+                    f"Experience entry '{title}' has no evidence mapping to the selected source resume or supplemental evidence."
+                )
+
+    # Experience entries must remain in reverse chronological order by actual date
+    dated_entries = [
+        (str(entry.get("title") or ""), entry_recency_key(entry))
+        for entry in experience_entries
+        if entry_recency_key(entry) != (0, 0, 0)
+    ]
+    for i in range(len(dated_entries) - 1):
+        if dated_entries[i][1] < dated_entries[i + 1][1]:
+            errors.append(
+                f"Experience entries must remain in reverse chronological order; "
+                f"'{dated_entries[i][0]}' is older than '{dated_entries[i + 1][0]}'."
+            )
+            break
+
     experience_counts = _section_entry_bullet_counts(text, "EXPERIENCE")
     if any(count < 1 for _, count in experience_counts):
         errors.append("Every retained experience entry must contain at least one bullet.")
@@ -827,23 +967,41 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             experience_counts,
             source_experience,
             "EXPERIENCE",
-            recent_minimum=3,
         )
     )
-    if experience_counts and experience_counts[0][1] < 2:
-        errors.append("The leading experience entry must contain at least two substantive bullets.")
+    warnings.extend(
+        _entry_allocation_warnings(
+            experience_counts,
+            "EXPERIENCE",
+        )
+    )
 
-    source_projects = _source_entry_headers(original_text, "PROJECTS") if original_text else []
-    output_projects = _source_entry_headers(text, "PROJECTS")
+    source_projects = _source_entry_headers(selection_source, "PROJECTS") if selection_source else []
+    output_projects = [str(e.get("title") or "") for e in _section_entries(text, "PROJECTS")]
+    errors.extend(_duplicate_project_errors(output_projects))
     matched_projects = set(_match_source_indices(output_projects, source_projects))
     dropped_projects = [
         header for index, header in enumerate(source_projects)
         if index not in matched_projects
     ]
     if len(dropped_projects) > 1:
-        errors.append("Projects retire more than one source entry.")
-    if source_projects and source_projects[0] in dropped_projects:
-        errors.append("The most recent project entry cannot be retired.")
+        warnings.append("Review project selection for relevance; more than one source project omitted.")
+
+    # Grounding: reject project entries without evidence in selection source or supplemental evidence
+    if original_text:
+        for entry in _section_entries(text, "PROJECTS"):
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+            is_in_source = any(_entry_matches_source(title, sh) for sh in source_projects)
+            is_in_supplemental = False
+            if "SUPPLEMENTAL CANDIDATE EVIDENCE" in original_text or original_text != text:
+                is_in_supplemental = _entry_has_supplemental_evidence(title, original_text, "PROJECTS")
+            if not is_in_source and not is_in_supplemental:
+                errors.append(
+                    f"Project entry '{title}' has no evidence mapping to the selected source resume or supplemental evidence."
+                )
+
     project_counts = _section_entry_bullet_counts(text, "PROJECTS")
     if any(count < 1 for _, count in project_counts):
         errors.append("Every retained project entry must contain at least one bullet.")
@@ -852,12 +1010,14 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             project_counts,
             source_projects,
             "PROJECTS",
-            recent_minimum=2,
         )
     )
-    if project_counts and project_counts[0][1] < 2:
-        errors.append("The leading project entry must contain at least two substantive bullets.")
-
+    warnings.extend(
+        _entry_allocation_warnings(
+            project_counts,
+            "PROJECTS",
+        )
+    )
     # 5. Check school preserved
     preserved_school = resume_facts.get("preserved_school", "")
     for school in [school.strip() for school in preserved_school.split(";") if school.strip()]:
@@ -901,10 +1061,12 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     layout = profile.get("tailoring", {}).get("resume_layout", {})
     if layout.get("header_contact_immediately_after_name", False):
+        from applypilot.scoring.pdf import canonical_section_header
+
         header_lines: list[str] = []
         for line in text.splitlines():
             stripped = line.strip()
-            if stripped.upper() in REQUIRED_SECTIONS:
+            if canonical_section_header(stripped):
                 break
             if stripped:
                 header_lines.append(stripped)
@@ -991,17 +1153,20 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     words = len(text.split())
     enforce_content_floor = bool(layout)
-    if original_text and re.search(r"(?im)^\s*(?:selected\s+)?projects\s*$", original_text):
+    if original_text and re.search(
+        r"(?im)^\s*(?:(?:selected|key|personal|academic|relevant)\s+)?projects\s*$",
+        original_text,
+    ):
         if words > 950:
             warnings.append(f"Project resume is {words} words; review whether all content is decisive.")
         elif enforce_content_floor and words < int(layout.get("project_resume_min_words", 320) or 320):
-            errors.append(f"Project resume is under-evidenced ({words} words; minimum 320).")
+            warnings.append(f"Project resume is under-evidenced ({words} words; minimum 320).")
         elif words < 320:
             warnings.append(f"Project resume is only {words} words; verify that decisive evidence was retained.")
     elif words > 700:
         warnings.append(f"No-project resume is {words} words; review whether it still fits one readable page.")
     elif enforce_content_floor and words < int(layout.get("no_project_resume_min_words", 300) or 300):
-        errors.append(f"No-project resume is under-evidenced ({words} words; minimum 300).")
+        warnings.append(f"No-project resume is under-evidenced ({words} words; minimum 300).")
     elif words < 300:
         warnings.append(f"No-project resume is only {words} words; verify that it is not under-evidenced.")
 

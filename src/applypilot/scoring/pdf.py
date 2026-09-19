@@ -20,6 +20,25 @@ SECTION_HEADERS = {
     "PROJECTS",
     "EDUCATION",
 }
+
+
+def canonical_section_header(value: str) -> str | None:
+    """Share accepted section aliases between parsing and source ingestion."""
+    header = " ".join(value.upper().split())
+    if header in SECTION_HEADERS:
+        return header
+    for pattern, canonical in (
+        (r"(?:(?:WORK|PROFESSIONAL|RELEVANT|SELECTED|KEY|EMPLOYMENT) )?(?:EXPERIENCE|HISTORY)", "EXPERIENCE"),
+        (r"(?:SELECTED|KEY|PERSONAL|ACADEMIC|RELEVANT) PROJECTS", "PROJECTS"),
+        (r"ACADEMIC BACKGROUND|EDUCATION BACKGROUND", "EDUCATION"),
+        (r"CORE SKILLS|SKILLS|TECH STACK|TECHNOLOGIES", "TECHNICAL SKILLS"),
+        (r"(?:PROFESSIONAL|CAREER|EXECUTIVE) SUMMARY", "SUMMARY"),
+    ):
+        if re.fullmatch(pattern, header):
+            return canonical
+    return None
+
+
 SUMMARY_TAIL_MIN_WORDS = 5
 SKILL_TAIL_MIN_WORDS = 5
 
@@ -83,9 +102,15 @@ def _pdf_page_text_spans(pdf_path: str | Path) -> list[float]:
     for page in PdfReader(str(pdf_path)).pages:
         y_positions: list[float] = []
 
-        def collect_text_position(text, _cm, tm, _font, _font_size, positions=y_positions) -> None:
-            if text.strip():
-                positions.append(float(tm[5]))
+        def collect_text_position(text, cm, tm, _font, _font_size, positions=y_positions,
+                                  bottom=float(page.mediabox.bottom), top=float(page.mediabox.top)) -> None:
+            # Chromium uses a translated/flipped matrix for each printed page.
+            # pypdf may also flush a synthesized string after resetting tm to
+            # identity; that has no usable text baseline and inflated old spans.
+            if text.strip() and (tm[4] or tm[5]):
+                y = float(tm[4] * cm[1] + tm[5] * cm[3] + cm[5])
+                if bottom <= y <= top:
+                    positions.append(y)
 
         page.extract_text(visitor_text=collect_text_position)
         spans.append(
@@ -126,7 +151,7 @@ def parse_resume(text: str) -> dict:
     header_lines: list[str] = []
     body_start = len(lines)
     for i, line in enumerate(lines):
-        if line.strip().upper() in SECTION_HEADERS:
+        if canonical_section_header(line):
             body_start = i
             break
         if line.strip():
@@ -153,24 +178,23 @@ def parse_resume(text: str) -> dict:
 
     for line in lines[body_start:]:
         stripped = line.strip()
-        # Detect section headers (all caps, no leading dash/bullet, longer than 3 chars)
-        if (
-            stripped
-            and stripped == stripped.upper()
-            and not stripped.startswith("-")
-            and len(stripped) > 3
-            and not stripped.startswith("\u2022")
-        ):
+        header = canonical_section_header(stripped)
+        if header:
             if current_section:
-                sections[current_section] = "\n".join(current_lines).strip()
-            current_section = stripped
-            section_order.append(stripped)
+                sections[current_section] = "\n\n".join(filter(None, (
+                    sections.get(current_section, ""), "\n".join(current_lines).strip(),
+                )))
+            current_section = header
+            if header not in section_order:
+                section_order.append(header)
             current_lines = []
         else:
             current_lines.append(line)
 
     if current_section:
-        sections[current_section] = "\n".join(current_lines).strip()
+        sections[current_section] = "\n\n".join(filter(None, (
+            sections.get(current_section, ""), "\n".join(current_lines).strip(),
+        )))
 
     return {
         "name": name,
@@ -242,6 +266,16 @@ def parse_entries(text: str) -> list[dict]:
 
 # ── HTML Template ────────────────────────────────────────────────────────
 
+def _subtitle_html(value: str) -> str:
+    if not value:
+        return ""
+    parts = value.rsplit(" | ", 1)
+    if len(parts) == 2 and re.search(r"\b20\d{2}\b", parts[1]):
+        return ('<div class="entry-subtitle"><span>' + escape(parts[0])
+                + '</span><span class="entry-date">' + escape(parts[1]) + '</span></div>')
+    return f'<div class="entry-subtitle">{escape(value)}</div>'
+
+
 def build_html(resume: dict) -> str:
     """Build professional resume HTML from parsed data.
 
@@ -275,11 +309,7 @@ def build_html(resume: dict) -> str:
                 f'<li>{_format_bullet(bullet, emphasize_lead=index == 0)}</li>'
                 for index, bullet in enumerate(e["bullets"])
             )
-            subtitle = (
-                f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>'
-                if e["subtitle"]
-                else ""
-            )
+            subtitle = _subtitle_html(e["subtitle"])
             items += (
                 f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
                 f"{subtitle}<ul>{bullets}</ul></div>"
@@ -296,11 +326,7 @@ def build_html(resume: dict) -> str:
                 f'<li>{_format_bullet(bullet, emphasize_lead=index == 0)}</li>'
                 for index, bullet in enumerate(e["bullets"])
             )
-            subtitle = (
-                f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>'
-                if e["subtitle"]
-                else ""
-            )
+            subtitle = _subtitle_html(e["subtitle"])
             items += (
                 f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
                 f"{subtitle}<ul>{bullets}</ul></div>"
@@ -373,7 +399,7 @@ def build_html(resume: dict) -> str:
 <style>
 @page {{
     size: letter;
-    margin: 0.45in 0.5in;
+    margin: 0.5in;
 }}
 * {{
     margin: 0;
@@ -381,21 +407,21 @@ def build_html(resume: dict) -> str:
     box-sizing: border-box;
 }}
 body {{
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
-    font-size: 10pt;
-    line-height: 1.22;
+    font-family: Arial, sans-serif;
+    font-size: 10.5pt;
+    line-height: 1.35;
     color: #111827;
 }}
 .header {{
     text-align: center;
     margin-bottom: 3px;
     padding-bottom: 3px;
-    border-bottom: 1.25px solid #24364b;
+    border-bottom: none;
 }}
 .name {{
     font-size: 18pt;
     font-weight: 700;
-    color: #172033;
+    color: #111111;
     letter-spacing: 0.35px;
 }}
 .title {{
@@ -420,75 +446,85 @@ body {{
     margin-top: 4px;
 }}
 .section-title {{
-    font-size: 10.5pt;
+    font-size: 11.5pt;
     font-weight: 700;
-    color: #172033;
+    color: #111111;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    border-bottom: 1px solid #4b5563;
+    border-bottom: 0.6px solid #111;
     padding-bottom: 1px;
     margin-bottom: 3px;
     break-after: avoid;
 }}
 .summary {{
-    font-size: 10pt;
-    color: #1f2937;
-    line-height: 1.24;
-    text-wrap: pretty;
+    font-size: 10.5pt;
+    color: #111111;
+    line-height: 1.35;
+    text-wrap: balance;
 }}
 .skill-row {{
-    font-size: 10pt;
+    font-size: 10.5pt;
     margin: 0;
-    line-height: 1.22;
-    text-wrap: pretty;
+    line-height: 1.35;
+    text-wrap: balance;
 }}
 .skill-cat {{
     font-weight: 700;
-    color: #172033;
+    color: #111111;
 }}
 .entry {{
     margin-bottom: 3px;
-    break-inside: auto;
+    break-inside: avoid;
 }}
 .entry-title {{
-    font-weight: 600;
-    font-size: 10pt;
-    color: #172033;
+    break-after: avoid;
+    font-weight: 700;
+    font-size: 10.5pt;
+    color: #111111;
 }}
 .entry-subtitle {{
-    font-size: 9.5pt;
+    break-after: avoid;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 10.5pt;
     color: #374151;
-    font-style: normal;
+    font-style: italic;
     margin-bottom: 1px;
+}}
+.entry-date {{
+    font-style: normal;
+    white-space: nowrap;
 }}
 .bullet-lead,
 .metric {{
     font-weight: 700;
-    color: #172033;
+    color: #111111;
 }}
 ul {{
     margin-left: 14px;
     padding: 0;
 }}
 li {{
-    font-size: 10pt;
+    break-inside: avoid;
+    font-size: 10.5pt;
     margin-bottom: 0.5px;
-    line-height: 1.22;
+    line-height: 1.35;
 }}
 .edu {{
-    font-size: 10pt;
+    font-size: 10.5pt;
 }}
 .edu-entry {{
     line-height: 1.2;
     margin-bottom: 1px;
-    text-wrap: pretty;
+    text-wrap: balance;
 }}
 .edu-entry:last-child {{
     margin-bottom: 0;
 }}
 .edu-school {{
     font-weight: 700;
-    color: #172033;
+    color: #111111;
 }}
 </style>
 </head>
@@ -543,7 +579,7 @@ def render_pdf(
                 }
                 return Array.from(lines.values());
             }""",
-        )
+        ) if 'class="summary"' in html else []
         if not _summary_tail_is_dense(summary_line_word_counts, summary_tail_min_words):
             browser.close()
             raise ValueError(
@@ -619,19 +655,19 @@ def render_pdf(
             if _allow_compact_retry:
                 compact_override = """
 <style>
-@page { margin: 0.38in 0.44in; }
-body { font-size: 9.4pt; line-height: 1.15; }
+@page { margin: 0.5in; }
+body { font-size: 10pt; line-height: 1.25; }
 .header { margin-bottom: 2px; padding-bottom: 2px; }
 .name { font-size: 17pt; }
 .section { margin-top: 3px; }
 .section-title { font-size: 10pt; margin-bottom: 2px; }
-.summary { font-size: 9.4pt; line-height: 1.17; }
-.skill-row { font-size: 9.4pt; line-height: 1.15; }
+.summary { font-size: 10pt; line-height: 1.25; }
+.skill-row { font-size: 10pt; line-height: 1.25; }
 .entry { margin-bottom: 2px; }
-.entry-title { font-size: 9.4pt; }
-.entry-subtitle { font-size: 9pt; margin-bottom: 0; }
-li { font-size: 9.4pt; line-height: 1.15; margin-bottom: 0.5px; }
-.edu { font-size: 9.4pt; }
+.entry-title { font-size: 10pt; }
+.entry-subtitle { font-size: 10pt; margin-bottom: 0; }
+li { font-size: 10pt; line-height: 1.25; margin-bottom: 0.5px; }
+.edu { font-size: 10pt; }
 </style>
 """
                 compact_html = html.replace("</head>", compact_override + "</head>")
@@ -647,7 +683,7 @@ li { font-size: 9.4pt; line-height: 1.15; margin-bottom: 0.5px; }
                         if (!nodes.length) return 0;
                         const top = Math.min(...nodes.map(node => node.getBoundingClientRect().top));
                         const bottom = Math.max(...nodes.map(node => node.getBoundingClientRect().bottom));
-                        const printableHeight = 11 * 96 - 2 * 0.38 * 96;
+                        const printableHeight = 11 * 96 - 2 * 0.5 * 96;
                         return Math.max(0, (bottom - top) / printableHeight);
                     }"""
                 ))
@@ -721,9 +757,9 @@ def convert_to_pdf(
         layout.get("technical_skill_min_rendered_tail_words", SKILL_TAIL_MIN_WORDS)
         or SKILL_TAIL_MIN_WORDS
     )
-    last_page_min_fill_ratio = max(0.55, float(
+    last_page_min_fill_ratio = float(
         layout.get("multi_page_last_page_min_fill_ratio", 0.4) or 0.4
-    ))
+    )
     one_page_min_fill_ratio = float(
         layout.get("one_page_min_fill_ratio", 0.78) or 0.78
     )

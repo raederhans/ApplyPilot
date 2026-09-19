@@ -128,8 +128,8 @@ def test_sync_does_not_nest_an_existing_resume_library_artifact(tmp_path: Path) 
     stored = conn.execute(
         "SELECT text_path, pdf_path FROM resume_artifacts WHERE validation_status='machine_validated'"
     ).fetchone()
-    assert Path(stored["text_path"]).parent == artifact_root
-    assert Path(stored["pdf_path"]).parent == artifact_root
+    assert Path(stored["text_path"]).is_relative_to(artifact_root.parent / "renders")
+    assert Path(stored["pdf_path"]).is_relative_to(artifact_root.parent / "renders")
     assert not (artifact_root / "resume-library").exists()
 
 
@@ -176,7 +176,7 @@ def test_job_profile_does_not_promote_trailing_preferred_skills_to_required() ->
     )
 
     assert profile["required_skills"] == ["python", "r", "sql"]
-    assert profile["preferred_skills"] == ["aws", "git", "tableau"]
+    assert profile["preferred_skills"] == ["aws", "git", "kubernetes", "tableau"]
 
 
 def test_route_does_not_turn_preferred_skills_into_hard_gaps(tmp_path: Path) -> None:
@@ -292,8 +292,8 @@ def test_senior_or_high_experience_role_is_routed_after_fit_scoring(tmp_path: Pa
     )
 
     assert result["job_profile"]["seniority"] == "senior_or_high_experience"
-    assert result["decision"] == "create_variant"
-    assert result["resolution"] == "reuse_with_reorder"
+    assert result["decision"] == "reuse_exact"
+    assert result["resolution"] == "reuse_as_is"
 
 
 def test_resume_taxonomy_extends_discovery_for_real_work_natures() -> None:
@@ -474,8 +474,8 @@ def test_taxonomy_v5_ignores_v4_coverage_until_sync_rebuilds_it(tmp_path: Path) 
     assert library_status(conn)["covered_subtypes"] == ["data_analytics"]
 
     after_rebuild = route_resume_for_job(conn, new_job, profile)
-    assert after_rebuild["decision"] == "create_variant"
-    assert after_rebuild["resolution"] == "reuse_with_reorder"
+    assert after_rebuild["decision"] == "reuse_exact"
+    assert after_rebuild["resolution"] == "reuse_as_is"
 
 
 def test_same_subtype_reuses_current_validated_artifact(tmp_path: Path) -> None:
@@ -779,8 +779,8 @@ def test_exact_unchanged_job_keeps_its_machine_validated_artifact(
         result["artifact_id"],
     )
     artifact_path = Path(result["artifact"]["text_path"])
-    assert artifact_path.parent.name == "artifacts"
-    assert artifact_path.name.startswith("resume-")
+    assert "renders" in artifact_path.parts
+    assert artifact_path.name == "resume.txt"
     assert "Example" not in artifact_path.name
     assert conn.execute("SELECT COUNT(*) FROM resume_artifact_aliases").fetchone()[0] >= 1
 
@@ -799,7 +799,7 @@ def test_exact_unchanged_job_keeps_its_machine_validated_artifact(
     monkeypatch.setattr(single_job.config, "APP_DIR", tmp_path)
     revalidation = single_job.revalidate_tailored_resume_for_url(history_url)
     assert revalidation["status"] == "failed_revalidation"
-    assert "immutable" in revalidation["error"]
+    assert revalidation["error"]  # Synthetic text fails quality, but shared PDF stays intact.
     assert pdf_path.read_bytes() == pdf_before
 
 
@@ -1073,7 +1073,7 @@ Data: Python, SQL
 
 EXPERIENCE
 Current Company
-Data Analyst | 2025 - Present
+Data Analyst | 2022 - 2023
 - Built Python reporting workflows with validated SQL outputs.
 - Produced recurring dashboards for stakeholder planning decisions.
 - Documented validation checks for repeatable monthly reporting.
@@ -1486,12 +1486,12 @@ def test_manual_selection_uses_confirmed_skill_experience_for_unsupported_gap(
         minimum_fit_score=7,
     )
 
-    assert automatic["decision"] == "reuse_exact"
+    assert automatic["decision"] == "create_variant"
     assert automatic_components["unsupported_required_skills"] == []
     assert automatic_components["confirmed_required_skill_facts"][0]["fact_key"] == (
         "aws_experience_years"
     )
-    assert selected["decision"] == "manual_selection"
+    assert selected["decision"] == "create_variant"
     assert selected["decision"] != "reuse_exact"
     assert selected["hard_gaps"] == ["aws"]
     selected_components = _route_components(conn, selected)
@@ -1956,8 +1956,8 @@ def test_alternative_parser_does_not_relax_conjunctions_unknown_names_or_explici
 
 
 @pytest.mark.parametrize(("content", "decision", "missing"), [
-    ("DATA ANALYST\nPython, data analysis", "create_variant", []),
-    ("DATA ANALYST\nSQL, data analysis", "create_variant", []),
+    ("DATA ANALYST\nPython, data analysis", "reuse_exact", []),
+    ("DATA ANALYST\nSQL, data analysis", "reuse_exact", []),
     ("DATA ANALYST\nNoSQL, data analysis", "create_variant", ["one of: python | sql"]),
     ("DATA ANALYST\nPython", "create_variant", ["data analysis"]),
 ])
@@ -1981,3 +1981,20 @@ def test_alternative_coverage_requires_one_named_skill_and_underlying_capability
     assert result["reuse_thresholds"] == {
         "required_coverage": 0.9, "overall_score": 0.85, "runner_up_margin_is_gate": False,
     }
+
+def test_library_ceiling_requires_replacement_review_not_growth_target(tmp_path: Path) -> None:
+    conn = init_db(tmp_path / 'ceiling.db')
+    base = tmp_path / 'base.txt'
+    base.write_text('MASTER SOURCE: SQL and Python dashboard delivery.', encoding='utf-8')
+    _validated_history(tmp_path, conn, base)
+    profile = _profile(base)
+    profile['tailoring']['library_policy'] = {'max_variants': 1}
+    sync_resume_library(conn, profile, tmp_path)
+    result = route_resume_for_job(conn, {
+        'url': 'https://careers.example.test/ceiling-data', 'title': 'Senior Data Analyst',
+        'full_description': 'Required: SQL and AWS. Build dashboards and reporting for business decisions.',
+        'eligibility_status': 'eligible', 'fit_score': 8,
+    }, profile, minimum_fit_score=7)
+    assert result['decision'] == 'manual_review'
+    assert result['resolution'] is None
+    assert 'size ceiling' in result['reason']

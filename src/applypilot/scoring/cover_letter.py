@@ -210,9 +210,16 @@ def read_resume_source(path: Path) -> str:
                 parts.append("\t")
             elif node.tag in break_tags:
                 parts.append("\n")
+        is_list = paragraph.find(f"{word_ns}pPr/{word_ns}numPr") is not None
         for line in "".join(parts).splitlines():
             if line.strip():
-                paragraphs.append(line.strip())
+                value = line.strip()
+                from applypilot.scoring.pdf import canonical_section_header
+
+                value = canonical_section_header(value) or value
+                if is_list and not value.startswith(("- ", "• ")):
+                    value = "- " + value
+                paragraphs.append(value)
     return "\n".join(paragraphs)
 
 

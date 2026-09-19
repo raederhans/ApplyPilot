@@ -366,6 +366,35 @@ def list_portal_listings(portal: str | None = None, limit: int = 100) -> list[di
     return [dict(row) for row in rows]
 
 
+def _guard_score_write(conn, original: dict, score_evidence: dict, profile: dict) -> None:
+    """Lock the write and reject assessments superseded while the model ran."""
+    from applypilot.resume_library import _score_binding_error
+
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT * FROM jobs WHERE url=?", (original["url"],)).fetchone()
+        if row is None:
+            raise RuntimeError("The job was removed or its URL changed during scoring; rescore the current job.")
+        current = dict(row)
+        error = _score_binding_error({
+            **current, "score_evidence_json": json.dumps(score_evidence, ensure_ascii=False),
+        }, profile)
+        if error:
+            raise RuntimeError(error)
+        score_fields = (
+            "fit_score", "scored_at", "score_status", "score_attempts",
+            "score_evidence_json", "score_reasoning", "score_error", "tailor_source_resume_path",
+        )
+        if any(current.get(key) != original.get(key) for key in score_fields):
+            raise RuntimeError("The job's scoring state changed during scoring; newer results were preserved.")
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
 def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
     """Score one exact eligible job against one explicit resume evidence source."""
     conn = get_connection()
@@ -392,7 +421,15 @@ def score_exact_job_for_url(url: str, resume_path: str | None = None) -> dict:
     evidence_sources = load_evidence_sources(profile, selected_resume, resume_text)
     score_context = "\n\n".join(source["text"] for source in evidence_sources)
     score = score_job(score_context, job, profile=profile)
-    score_evidence = {**score.get("score_evidence", {}), "source_resume_path": str(selected_resume)}
+    from applypilot.scoring.scorer import build_score_input_binding
+
+    score_evidence = {
+        **score.get("score_evidence", {}),
+        "source_resume_path": str(selected_resume),
+        "input_binding": build_score_input_binding(job, selected_resume, resume_text,
+                                                   profile=profile, evidence_sources=evidence_sources),
+    }
+    _guard_score_write(conn, job, score_evidence, profile)
     now = datetime.now(UTC).isoformat()
     if score["score"] == 0:
         conn.execute(
@@ -467,6 +504,8 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
     previous_pdf: Path | None = None
     tailored_text: str | None = None
     shared_artifact = False
+    run_dir: Path | None = None
+    previous_report: dict = {}
     token = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     try:
         rows = conn.execute(
@@ -475,6 +514,9 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         if len(rows) != 1:
             raise ValueError(f"Expected one exact tailored job, found {len(rows)}: {url}")
         job = dict(rows[0])
+        if job.get("applied_at") or job.get("apply_status") in {"applied", "submitted", "submission_uncertain"}:
+            job = None
+            raise ValueError("Historical or uncertain submission is frozen; curate a separate library edition instead")
         raw_tailored_path = str(job.get("tailored_resume_path") or "").strip()
         raw_source_path = str(job.get("tailor_source_resume_path") or "").strip()
         if not raw_tailored_path:
@@ -487,24 +529,22 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
             }
             if raw_report_path and str(job.get("tailor_status") or "") in recoverable_statuses:
                 existing_report_path = Path(raw_report_path).expanduser().resolve()
+                recovery_report = {}
+                if existing_report_path.is_file():
+                    recovery_report = json.loads(existing_report_path.read_text(encoding="utf-8"))
                 report_stem = existing_report_path.name.removesuffix("_REPORT.json")
                 rejected_path = (
                     existing_report_path.parent
                     / "rejected"
                     / f"{report_stem}_REJECTED.txt"
                 )
+                if recovery_report.get("rejected_path"):
+                    rejected_path = Path(recovery_report["rejected_path"])
                 inferred_tailored_path = existing_report_path.with_name(
                     f"{report_stem}.txt"
                 )
                 if rejected_path.is_file():
-                    inferred_tailored_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(rejected_path, inferred_tailored_path)
-                    raw_tailored_path = str(inferred_tailored_path)
-                    conn.execute(
-                        "UPDATE jobs SET tailored_resume_path=? WHERE url=?",
-                        (raw_tailored_path, job["url"]),
-                    )
-                    conn.commit()
+                    raw_tailored_path = str(rejected_path)
             if not raw_tailored_path:
                 raise ValueError("tailored_resume_path is required for revalidation")
         if not raw_source_path:
@@ -517,24 +557,28 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
                 or tailored_path.with_name(tailored_path.stem + "_REPORT.json")
             )
         ).expanduser().resolve()
+        if report_path.is_file():
+            try:
+                previous_report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous_report = {}
+        supplemental_evidence = ""
+        generation_path = Path(str(previous_report.get("generation_record") or ""))
+        if generation_path.is_file():
+            previous_generation = json.loads(generation_path.read_text(encoding="utf-8"))
+            previous_report = {**previous_generation, **previous_report}
+            supplemental_path = generation_path.with_name("supplemental.txt")
+            if supplemental_path.is_file():
+                supplemental_evidence = supplemental_path.read_text(encoding="utf-8")
+        from applypilot.resume_versions import finish_resume_run, start_resume_run
+
+        run_dir = start_resume_run(config.APP_DIR, job, kind="revalidation")
+        original_tailored_path = tailored_path
+        previous_pdf = original_tailored_path.with_suffix(".pdf")
+        tailored_path = run_dir / original_tailored_path.name
+        shutil.copy2(original_tailored_path, tailored_path)
         final_pdf = tailored_path.with_suffix(".pdf")
-
-        shared_artifact_root = (config.APP_DIR / "resume-library" / "artifacts").resolve()
-        try:
-            tailored_path.relative_to(shared_artifact_root)
-        except ValueError:
-            pass
-        else:
-            shared_artifact = True
-            raise ValueError(
-                "A shared content-addressed resume artifact is immutable. "
-                "Create and validate a new job-specific variant instead of revalidating it in place."
-            )
-
-        # Remove the previously authorized bytes from the upload path first.
-        # A concurrent or stale manifest therefore cannot keep using them while
-        # the content is being re-audited.
-        previous_pdf = _quarantine_revalidation_pdf(final_pdf, "PRE_REVALIDATION", token)
+        report_path = run_dir / "validation.json"
         conn.execute(
             "UPDATE jobs SET tailor_status='revalidating', "
             "tailor_error='revalidation_in_progress', tailor_report_path=NULL, "
@@ -558,12 +602,10 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
 
         profile = load_profile()
         source_text = read_resume_source(source_path)
-        previous_report: dict = {}
-        if report_path.is_file():
-            try:
-                previous_report = json.loads(report_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                previous_report = {}
+        combined_evidence = source_text + (
+            "\n\nSUPPLEMENTAL CANDIDATE EVIDENCE\n" + supplemental_evidence
+            if supplemental_evidence else ""
+        )
         parsed = parse_resume(tailored_text)
         sections = parsed.get("sections", {})
         structured_data = {
@@ -598,7 +640,7 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
             structured_data,
             profile,
             mode=str(previous_report.get("validation_mode") or "normal"),
-            original_text=source_text,
+            original_text=combined_evidence,
             selection_source_text=source_text,
             job_description=str(job.get("full_description") or ""),
             job_title=str(job.get("title") or ""),
@@ -607,7 +649,8 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         deterministic = validate_tailored_resume(
             tailored_text,
             profile,
-            original_text=source_text,
+            original_text=combined_evidence,
+            selection_source_text=source_text,
         )
         judge = None
         status = "failed_validation"
@@ -617,7 +660,7 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         pdf_path = None
         if structured.get("passed") and deterministic.get("passed"):
             judge = judge_tailored_resume(
-                source_text,
+                combined_evidence,
                 tailored_text,
                 str(job.get("title") or ""),
                 profile,
@@ -667,12 +710,21 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
                 if error and status == "failed_render"
                 else None
             ),
-            "quarantined_previous_pdf_path": (
+            "preserved_previous_pdf_path": (
                 str(previous_pdf) if previous_pdf is not None else None
             ),
             "revalidated_at": datetime.now(UTC).isoformat(),
+            "tailored_resume_path": str(tailored_path),
         }
-        _write_json_atomic(report_path, report, token)
+        report_path = finish_resume_run(run_dir, report, source_text=source_text,
+                                        supplemental_evidence=supplemental_evidence)
+        if status == "machine_validated":
+            from applypilot.resume_library import register_tailored_artifact
+            register_tailored_artifact(
+                conn, job=job, text_path=tailored_path, source_resume_path=str(source_path),
+                report_path=str(report_path), profile=profile,
+                validation_kind="job_specific_revalidation",
+            )
         record_content_revalidation(
             conn,
             text=tailored_text,
@@ -687,14 +739,16 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
             },
         )
         now = datetime.now(UTC).isoformat()
+        promoted_path = str(tailored_path) if status == "machine_validated" else job.get("tailored_resume_path")
         conn.execute(
             "UPDATE jobs SET tailor_status=?, tailor_error=?, tailor_report_path=?, "
-            "tailored_at=? WHERE url=?",
+            "tailored_at=?, tailored_resume_path=? WHERE url=?",
             (
                 status,
                 error,
                 str(report_path),
                 now if status == "machine_validated" else None,
+                promoted_path,
                 job["url"],
             ),
         )
@@ -702,13 +756,24 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
         return {
             "url": job["url"],
             "status": status,
-            "tailored_resume_path": str(tailored_path),
+            "tailored_resume_path": promoted_path,
+            "candidate_text_path": str(tailored_path),
             "pdf_path": pdf_path,
             "report_path": str(report_path),
             "error": error,
         }
     except Exception as exc:  # noqa: BLE001 - revalidation boundary must fail closed
         error = f"Revalidation: {type(exc).__name__}: {exc}"
+        failure_report = None
+        if run_dir is not None and not (run_dir / "validation.json").exists():
+            try:
+                failure_report = str(finish_resume_run(run_dir, {
+                    "status": "failed_revalidation", "error": error,
+                    "source_resume_path": str(source_path) if source_path else None,
+                    "tailored_resume_path": str(tailored_path) if tailored_path else None,
+                }, source_text=locals().get("source_text", "")))
+            except (OSError, ValueError):
+                pass  # A storage failure must not authorize a PDF or hide the original error.
         if not shared_artifact and final_pdf is not None and final_pdf.is_file():
             try:
                 _quarantine_revalidation_pdf(final_pdf, "FAILED_REVALIDATION", token)
@@ -735,9 +800,9 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
                     )
                 conn.execute(
                     "UPDATE jobs SET tailor_status='failed_revalidation', "
-                    "tailor_error=?, tailor_report_path=NULL, tailored_at=NULL "
+                    "tailor_error=?, tailor_report_path=?, tailored_at=NULL "
                     "WHERE url=?",
-                    (error, job["url"]),
+                    (error, failure_report, job["url"]),
                 )
                 conn.commit()
             except Exception:  # noqa: BLE001 - preserve the original failure result
@@ -749,7 +814,7 @@ def revalidate_tailored_resume_for_url(url: str) -> dict:
                 str(tailored_path) if tailored_path is not None else None
             ),
             "pdf_path": None,
-            "report_path": None,
+            "report_path": failure_report,
             "error": error,
         }
     finally:
@@ -787,6 +852,15 @@ def prepare_cover_letter_for_url(
     job["company_name"] = company
     job["source_site"] = source_site
 
+    # Persist the final job identity before scoring, so JD invalidation cannot
+    # discard the new assessment in the same UPDATE that changes the employer.
+    conn.execute(
+        "UPDATE jobs SET company_name=?, source_site=? WHERE url=?",
+        (company, source_site, url),
+    )
+    conn.commit()
+    job = dict(conn.execute("SELECT * FROM jobs WHERE url=?", (url,)).fetchone())
+
     profile = load_profile()
     selected_resume = Path(resume_path).resolve() if resume_path else RESUME_PATH.resolve()
     if not selected_resume.exists():
@@ -796,7 +870,15 @@ def prepare_cover_letter_for_url(
 
     score_context = "\n\n".join(source["text"] for source in evidence_sources)
     score = score_job(score_context, job, profile=profile)
-    score_evidence = {**score.get("score_evidence", {}), "source_resume_path": str(selected_resume)}
+    from applypilot.scoring.scorer import build_score_input_binding
+
+    score_evidence = {
+        **score.get("score_evidence", {}),
+        "source_resume_path": str(selected_resume),
+        "input_binding": build_score_input_binding(job, selected_resume, resume_text,
+                                                   profile=profile, evidence_sources=evidence_sources),
+    }
+    _guard_score_write(conn, job, score_evidence, profile)
     if score["score"] == 0:
         conn.execute(
             "UPDATE jobs SET company_name=?, source_site=?, fit_score=NULL, scored_at=NULL, "

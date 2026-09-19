@@ -122,8 +122,11 @@ Validated resume variants can be inspected and routed independently:
 ```bash
 applypilot resume-library-sync
 applypilot resume-library-status
+applypilot resume-library-review
 applypilot resume-route --url <verified-job-url>
 ```
+
+See [resume library curation](docs/resume-library-curation.md) for content/render history, evidence freshness, and reviewed editorial updates.
 
 Run `applypilot --help` for the complete command list. Optional browser
 backends, interaction modes, provider behavior, and operating details belong

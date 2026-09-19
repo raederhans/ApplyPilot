@@ -1729,7 +1729,7 @@ def test_pdf_renderer_supports_contact_directly_below_name_and_source_section_or
     assert parsed["title"] == ""
     assert parsed["contact"].startswith("ryan@example.com")
     assert '<div class="title">' not in rendered
-    assert "text-wrap: pretty" in rendered
+    assert "text-wrap: balance" in rendered
     assert ".skill-row" in rendered
     assert "break-after: avoid" in rendered
     assert rendered.index("Education</div>") < rendered.index("Technical Skills</div>")
@@ -2417,6 +2417,7 @@ def test_score_exact_job_persists_explicit_resume_for_tailoring(
     monkeypatch, tmp_path: Path
 ) -> None:
     from applypilot import single_job
+    from applypilot.scoring import cover_letter
 
     conn = init_db(tmp_path / "jobs.db")
     url = "https://careers.example.test/jobs/data"
@@ -2430,6 +2431,7 @@ def test_score_exact_job_persists_explicit_resume_for_tailoring(
     conn.commit()
     monkeypatch.setattr(single_job, "get_connection", lambda: conn)
     monkeypatch.setattr(single_job, "load_profile", dict)
+    monkeypatch.setattr(cover_letter, "load_evidence_sources", lambda profile, path, text: [{"text": text}])
     monkeypatch.setattr(
         single_job,
         "load_evidence_sources",
@@ -5719,9 +5721,9 @@ def test_tailoring_failure_clears_db_path_and_quarantines_stale_output(
     quarantined = list((output_dir / "rejected").glob("*_PREVIOUSLY_VALIDATED_*.txt"))
     assert result["machine_validated"] == 0
     assert row == (None, None, "failed_judge", "Judge: unsupported claim")
-    assert not old_output.exists()
-    assert len(quarantined) == 1
-    assert quarantined[0].read_text(encoding="utf-8") == "previously accepted"
+    assert old_output.read_text(encoding="utf-8") == "previously accepted"
+    assert not quarantined
+    assert len(list((tmp_path / "resume-runs").glob("*/validation.json"))) == 1
 
 
 def test_tailoring_render_failure_never_becomes_machine_validated(
@@ -5788,7 +5790,8 @@ def test_tailoring_render_failure_never_becomes_machine_validated(
     assert result["machine_validated"] == 0
     assert result["failed"] == 1
     assert row == (None, "failed_render", "Render: underfilled summary tail")
-    assert (output_dir / "rejected" / "Target_Co_Data_Analyst_Intern_REJECTED.txt").exists()
+    rejected = list((tmp_path / "resume-runs").glob("*/rejected/Target_Co_Data_Analyst_Intern_REJECTED.txt"))
+    assert len(rejected) == 1
 
 
 @pytest.mark.parametrize(
@@ -5805,6 +5808,8 @@ def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
     from applypilot import single_job
     from applypilot.scoring import tailor as tailor_module
     from applypilot.scoring import validator as validator_module
+    from applypilot import resume_versions
+    monkeypatch.setattr(single_job.config, "APP_DIR", tmp_path)
 
     database_path = tmp_path / "jobs.db"
     conn = init_db(database_path)
@@ -5880,8 +5885,8 @@ def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
 
     if failure_stage == "report":
         monkeypatch.setattr(
-            single_job,
-            "_write_json_atomic",
+            resume_versions,
+            "finish_resume_run",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 OSError("report unavailable")
             ),
@@ -5890,7 +5895,7 @@ def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
     result = single_job.revalidate_tailored_resume_for_url(url)
     verify = sqlite3.connect(database_path)
     row = verify.execute(
-        "SELECT tailor_status, tailor_error, tailored_at, tailor_attempts "
+        "SELECT tailor_status, tailor_error, tailored_at, tailor_attempts, tailored_resume_path "
         "FROM jobs WHERE url=?",
         (url,),
     ).fetchone()
@@ -5901,8 +5906,9 @@ def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
     assert row[0] != "machine_validated"
     assert row[2] is None
     assert row[3] == 2
-    assert not old_pdf.exists()
-    assert list((tmp_path / "rejected").glob("tailored_PRE_REVALIDATION_*.pdf"))
+    assert row[4] == str(tailored_path)
+    assert old_pdf.read_bytes() == b"%PDF-previously-authorized"
+    assert not list((tmp_path / "rejected").glob("tailored_PRE_REVALIDATION_*.pdf"))
 
 
 def test_revalidation_recovers_edited_rejected_text_after_render_failure(
@@ -5911,6 +5917,7 @@ def test_revalidation_recovers_edited_rejected_text_after_render_failure(
     from applypilot import single_job
     from applypilot.scoring import tailor as tailor_module
     from applypilot.scoring import validator as validator_module
+    monkeypatch.setattr(single_job.config, "APP_DIR", tmp_path)
 
     database_path = tmp_path / "jobs.db"
     conn = init_db(database_path)
@@ -5958,7 +5965,7 @@ def test_revalidation_recovers_edited_rejected_text_after_render_failure(
     monkeypatch.setattr(pdf_renderer, "convert_to_pdf", render_to_requested_path)
 
     result = single_job.revalidate_tailored_resume_for_url(url)
-    recovered_path = tmp_path / "Target_Resume.txt"
+    recovered_path = Path(result["tailored_resume_path"])
     verify = sqlite3.connect(database_path)
     row = verify.execute(
         "SELECT tailored_resume_path, tailor_status FROM jobs WHERE url=?", (url,)
@@ -5967,5 +5974,7 @@ def test_revalidation_recovers_edited_rejected_text_after_render_failure(
 
     assert result["status"] == "machine_validated"
     assert recovered_path.read_text(encoding="utf-8") == "edited concise resume"
+    assert recovered_path.parent.parent == tmp_path / "resume-runs"
+    assert rejected_path.read_text(encoding="utf-8") == "edited concise resume"
     assert row == (str(recovered_path), "machine_validated")
     assert recovered_path.with_suffix(".pdf").read_bytes() == b"%PDF-recovered"

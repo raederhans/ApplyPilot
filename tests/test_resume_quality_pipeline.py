@@ -100,12 +100,16 @@ def test_short_evidence_quote_expands_to_exact_containing_source_line() -> None:
     assert normalized[0]["source_quote"] == evidence.removeprefix("- ")
 
 
-def test_artifact_health_quarantines_obvious_thin_leading_entry(tmp_path: Path) -> None:
+def test_artifact_health_quarantines_obvious_empty_entry(tmp_path: Path) -> None:
     text_path = tmp_path / "resume.txt"
-    text_path.write_text(_resume_text(leading_bullets=1), encoding="utf-8")
+    text = _resume_text().replace(
+        "Recent Company\nAI Engineer | 2025 - Present\n- Built Python workflow 0 for analytics reporting with validated outputs.\n- Built Python workflow 1 for analytics reporting with validated outputs.\n\nEarlier Company\nData Analyst | 2024\n- Built SQL dashboards for stakeholder reporting and planning decisions.",
+        "Recent Company\nAI Engineer | 2025 - Present",
+    )
+    text_path.write_text(text, encoding="utf-8")
     assessment = assess_resume_artifact_health(
         {
-            "artifact_id": "resume:thin",
+            "artifact_id": "resume:empty",
             "text_path": str(text_path),
             "validation_status": "source_only",
         },
@@ -118,30 +122,28 @@ def test_artifact_health_quarantines_obvious_thin_leading_entry(tmp_path: Path) 
 
     assert assessment["status"] == "repair_required"
     assert any(
-        "leading experience entry" in reason.casefold()
+        "retained experience entry" in reason.casefold()
         for reason in assessment["reasons"]
     )
 
 
-def test_artifact_health_requires_repair_for_recency_allocation_inversion(
+def test_artifact_health_requires_repair_for_experience_chronology_inversion(
     tmp_path: Path,
 ) -> None:
     text_path = tmp_path / "resume.txt"
     text_path.write_text(
         _resume_text().replace(
-            "\nPROJECTS\n",
-            "\nOldest Company\nLegacy Analyst | 2022\n"
+            "\nEXPERIENCE\n",
+            "\nEXPERIENCE\nOldest Company\nLegacy Analyst | 2022\n"
             "- Built a legacy reporting workflow with documented validation checks.\n"
-            "- Produced recurring planning outputs for stakeholder review and delivery.\n"
-            "- Coordinated source-data checks across a recurring reporting cycle.\n"
-            "\nPROJECTS\n",
+            "- Produced recurring planning outputs for stakeholder review and delivery.\n\n",
         ),
         encoding="utf-8",
     )
 
     assessment = assess_resume_artifact_health(
         {
-            "artifact_id": "resume:inverted-allocation",
+            "artifact_id": "resume:inverted-chronology",
             "text_path": str(text_path),
             "validation_status": "source_only",
         },
@@ -153,7 +155,7 @@ def test_artifact_health_requires_repair_for_recency_allocation_inversion(
     )
 
     assert assessment["status"] == "repair_required"
-    assert any("bullet allocation" in reason.casefold() for reason in assessment["reasons"])
+    assert any("experience entries must remain" in reason.casefold() for reason in assessment["reasons"])
 
 
 def test_cross_review_combines_independent_fact_and_quality_verdicts(monkeypatch) -> None:
@@ -241,7 +243,7 @@ def test_cross_review_combines_independent_fact_and_quality_verdicts(monkeypatch
     assert client.responses == []
 
 
-def test_content_plan_front_loads_detail_by_recency_even_when_old_entry_matches_jd() -> None:
+def test_content_plan_allocates_bullets_by_relevance_allowing_older_entry_more_bullets() -> None:
     resume = _resume_text().replace(
         "\nPROJECTS\n",
         "\nOldest Company\nLegacy Specialist | 2020\n"
@@ -260,10 +262,14 @@ def test_content_plan_front_loads_detail_by_recency_even_when_old_entry_matches_
         },
     )
 
+    # Experience ordering remains strictly reverse chronological
+    headers = [item["header"] for item in plan["experience"]]
+    assert headers == ["Recent Company", "Earlier Company", "Oldest Company"]
+
+    # Relevant older entry receives more bullets than less relevant earlier entry
     counts = [int(item["bullet_budget"]) for item in plan["experience"]]
-    assert counts == sorted(counts, reverse=True)
-    assert counts[0] > counts[-1]
-    assert plan["experience"][-1]["relevance_score"] > 0
+    assert counts[-1] > counts[1]
+    assert plan["experience"][-1]["relevance_score"] > plan["experience"][1]["relevance_score"]
 
 
 def test_entry_order_matching_prefers_exact_company_over_shared_planning_tokens() -> None:
@@ -385,17 +391,17 @@ School B, Degree B, 2024
                 ],
             },
             {
-                "header": "Middle Company",
-                "subtitle": "Analyst Intern | 2024",
-                "bullets": ["Prepared recurring planning reports from verified public datasets for project teams."],
-            },
-            {
                 "header": "Old Company",
                 "subtitle": "Assistant | 2021",
                 "bullets": [
                     "Cleaned multi-source records and produced a quality-checked dataset for analysis.",
                     "Built supporting charts that helped reviewers compare alternative planning scenarios.",
                 ],
+            },
+            {
+                "header": "Middle Company",
+                "subtitle": "Analyst Intern | 2024",
+                "bullets": ["Prepared recurring planning reports from verified public datasets for project teams."],
             },
         ],
         "projects": [],
@@ -424,7 +430,7 @@ School B, Degree B, 2024
     )
 
     assert result["passed"] is False
-    assert any("must not expand with age" in error for error in result["errors"])
+    assert any("reverse chronological order" in error for error in result["errors"])
     assert any("one separate item/line" in error for error in result["errors"])
 
 
@@ -523,6 +529,9 @@ Example University, Master of Computing, 2027
         },
         *base_data["projects"],
     ]
+    # Relevance-based omission of a newer project is now allowed. An invented
+    # project remains a structural grounding failure and must be repaired.
+    base_data["projects"] = [{**base_data["projects"][0], "header": "Unsupported Rocket Compiler"}]
 
     class FakeClient:
         def __init__(self) -> None:
