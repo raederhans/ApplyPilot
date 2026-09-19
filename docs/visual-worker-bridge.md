@@ -350,3 +350,143 @@ input or protection bypass was attempted after that stop. The in-app Browser
 visual API works independently; this does not repair native Windows Computer Use.
 The two focused host tests cover stale observation/interruption and rejecting
 an unobservable target before advertising readiness.
+
+## Attended application ledger
+
+The IAB adapter additionally reports `form_state`, `changed_fields`, and
+`post_upload_changes`. Bounded `fill_control`, `select_control`, and `set_checked`
+operations require a fresh observed field key and recheck identity before input.
+Native date/month inputs advance through keyboard segments until focus leaves
+the input (bounded to four Tabs), so blur validation is actually exercised.
+`control_result.persisted` is an immediate readback, not a guarantee against a
+later asynchronous parser or validator. Observe again after visible loading
+settles; upload baselines remain available across later observations. Changed
+values are untrusted observations requiring comparison with candidate facts.
+Visible top-document and open Shadow DOM controls are covered. Linked option
+lists resolve through ancestor open roots with unique matches, including slotted
+labels. `iframe_count` advertises the remaining inspection boundary. Protected credential/identity/consent controls
+are excluded from these generic operations. Supported IAB DOM snapshots supply
+live input values where the read-only DOM scope omits them; unavailable values
+are reported as unknown rather than empty. Anonymous controls in flattened/slotted
+shadow trees may still require independent semantic or screenshot readback.
+React Select's `selected_display` preserves its visible choice separately from
+the cleared search input; exact string persistence alone is not a semantic
+country/phone verification.
+
+`applypilot attended-application --db PATH --request-file request.json` connects an
+attending Codex operator's browser observations to the existing application ledger.
+It performs no browser action. It is a trusted operator ingestion seam, not an
+attestation service: the host must independently inspect the current tab; child
+worker prose and missing observations must not be translated into passing flags.
+Existing submission admission, authorization manifest, frozen materials, live
+snapshot validator, duplicate revalidation, SubmissionGate, rate/capacity policy,
+and exact-bound receipt reconciliation are reused.
+
+Duplicate revalidation covers evidence already recorded in the application ledger;
+an empty receipt table or a failed preparation attempt does not prove that the job
+was never submitted through another channel. Reconcile known employer receipts
+and recruiter outcomes, including relevant archived or deleted application mail,
+before retrying an ambiguous job. Match employer/ATS URL aliases as well as exact
+job URLs. Keep the historical submission separate from its later hiring outcome.
+
+Material freezing includes the resume version system's experience, project
+references, resume facts and skill boundaries, in addition to identity and
+education. Only categorized hashes are stored. Changing any of these facts
+invalidates active preparation and requires a fresh audit, even when an existing
+resume may still qualify for library reuse. Attempts frozen under an older fact
+binding must also be prepared again.
+
+Every request includes `action`, exact `job_url`, `host_session_id`, and `tab_id`.
+After `begin`, also include the returned `attempt_id`. Host identity values come
+from the current host session and target tab, never a stale browser handle.
+
+1. `begin`: add `manifest_path` pointing to an existing authorized exact-job
+   manifest. Returns the leased attempt and frozen material binding. In the same
+   transaction it acquires the existing jobs `in_progress` / `agent_id` /
+   `apply_task_id` ownership fields, so native queue workers cannot take the job.
+   Retrying begin with the same job, host/tab, and manifest recovers the existing
+   attempt through resume; it does not create a second attempt.
+2. `checkpoint`: add `source: "attending_host"`, timezone-aware `observed_at`,
+   nonempty `evidence_refs`, and an independently observed `snapshot`. Only its
+   digest and evidence references are stored; raw field values are not persisted.
+3. `resume`: validates identity/material bytes and renews a still-active lease.
+   A material change invalidates preparation; finalize that attempt and begin with
+   current materials/authorization. An expired lease is not silently revived.
+4. `claim`: add the same freshly observed `snapshot`. Existing audit and admission
+   must pass; returns `gate_id` and `checkpoint_digest`. Same-attempt claim replay
+   is idempotent. A claimed checkpoint is immutable.
+5. `submit-intent`: add that snapshot, `checkpoint_digest`, and fresh host
+   observation metadata. Only after this command succeeds may the attending host
+   perform the one authorized external submit action. Lost output is resolved by
+   `resume`, never by replaying the click. The durable latch intentionally favors
+   possible incomplete submission over duplicate submission after a crash.
+6. `receipt`: add fresh observation metadata and `receipt` containing the existing
+   receipt envelope (`source`, `receipt_id`, `company_name`, `job_title`, and
+   decisive `confirmation_text` or portal status). Exact attempt/gate/job binding
+   is injected and conflicting supplied binding is rejected. Submitted attempts
+   enter the existing uncertain gate/batch state before receipt admission; only
+   decisive admitted evidence closes them as applied. A rejected receipt rolls back
+   that tentative transition, leaving all prior ledger states intact. Use `fail`
+   when a completed submit action has no decisive receipt and must be recorded as
+   uncertain. Reconciliation also works
+   after a lease expires or an uncertain failure is finalized.
+7. `fail`: add `reason`. Before intent this terminates preparation; after intent
+   it preserves `submission_uncertain`. `resume` after intent permits only receipt
+   reconciliation, never another browser submission.
+
+Snapshot fields required for claim/intent are the existing validator's `url`,
+`required_unfilled`, `sensitive_required_unknown`, `file_fields`, `form_fields`,
+`text_fields`, `select_fields`, `full_name_values`, `email_values`,
+`captcha_visible`, `verification_visible`, `assessment_visible`,
+`resume_field_present`, `resume_uploaded`, and `submit_control_count`. Include
+other observed validator fields when applicable. Upload state must come from
+accepted attachment evidence; absence of a visible file input is not upload proof.
+All-page completeness and custom widget interpretation remain the attending
+operator's responsibility. Unsupported or unobserved fields must not be filled
+with empty arrays/false just to pass. Snapshot/evidence observations expire after
+five minutes. The CLI requires the fresh snapshot to match the prepared digest;
+changes before claim require a new checkpoint. Changes after claim require stopping
+that attempt. Browser/session migration is deliberately not implicit.
+
+The command does not grant authorization, lower eligibility/material requirements,
+handle credentials, or replace the native browser tool's safety boundaries. Request
+files may contain personal values: use controlled local temporary files and retain
+only necessary evidence references. Do not put passwords or verification codes in
+request files, snapshots, evidence references, or failure reasons.
+
+### Earlier-step resume evidence
+
+An attended multi-step form can use `upload-checkpoint` before its final review
+checkpoint. It accepts the common exact job/attempt/host/tab binding plus fresh
+`source`, `observed_at`, `evidence_refs`, and this `upload` object:
+
+```json
+{
+  "attempt_id": "the current attempt ID",
+  "page_url": "the actually observed upload page URL",
+  "field_label": "Resume",
+  "visible_filename": "resume.pdf",
+  "sha256": "the frozen resume digest",
+  "size": 90362,
+  "acceptance_marker": "attachment_card",
+  "accepted_attachment_text": "resume.pdf Remove attachment"
+}
+```
+
+`acceptance_marker` must describe an observed `attachment_card` or
+`uploaded_file_list`. A file-picker selection, bare success flag, or missing field
+is not acceptance evidence. The filename must match the bound PDF, bytes must
+match the frozen resume, and the observed page must remain in the same application
+flow (including embedded query job identifiers). Compact proof retains references,
+filename, material binding, and an accepted-text digest; raw attachment text is not
+stored. This is still trusted attending-host observation, not independent server
+verification of uploaded bytes.
+
+A valid proof is scoped to the original leased attempt and host/tab. It is usable
+on a later final page only when that page has no resume field. The seam constructs
+only the existing validator's small resume-upload proof from its accepted state;
+request dictionaries cannot inject arbitrary agent observations. Material changes
+invalidate it. An observed present-but-empty resume control removes the old proof.
+Capturing upload proof invalidates any prior final-page checkpoint; capture the
+final page again. Upload evidence cannot be changed after gate claim. Reusing an
+old upload object under another attempt is rejected.

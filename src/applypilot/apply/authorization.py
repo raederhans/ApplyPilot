@@ -55,6 +55,13 @@ _PROFILE_FACT_PATHS = {
         "work_authorization",
         "screening",
         "education",
+        # Freeze the same resume-relevant facts used by resume version health.
+        # Active preparation is stricter than library reuse: any change requires
+        # a fresh audit, even if an existing resume remains eligible for reuse.
+        "experience",
+        "project_references",
+        "resume_facts",
+        "skills_boundary",
     ),
     "sensitive": (
         "personal.email",

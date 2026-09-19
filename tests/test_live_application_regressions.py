@@ -46,6 +46,15 @@ def test_import_commits_and_reports_unicode_losslessly(tmp_path, monkeypatch, en
     ("Submission Successful?", False),
     ('Look for "Submission Successful"', False),
     ("Submission Successful after you click Submit", False),
+    ("Your application has been sent. Thank you!", True),
+    ("Application sent successfully!", True),
+    ("Your application was sent.\nThank you.", True),
+    ("Your application has been not sent. Thank you!", False),
+    ("Your application has been sent?", False),
+    ("Your application will be sent. Thank you!", False),
+    ("If your application has been sent. Thank you!", False),
+    ('Look for "Your application has been sent. Thank you!"', False),
+    ("Your application has been sent after you click Submit.", False),
 ])
 def test_linkedin_completed_sent_receipt(tmp_path, text, accepted):
     conn = init_db(tmp_path / "receipt.db")

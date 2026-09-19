@@ -1,0 +1,181 @@
+{
+  "schema_version": "applypilot-ats-journey/v1",
+  "claim_boundary": "deterministic local Chromium fixture with intercepted navigation only; no provider network, credentials, submission, ledger, or receipt authority",
+  "fixture_path": "tests/fixtures/apply/ats_journey.html",
+  "cases": [
+    {
+      "id": "upload_parser_overwrite",
+      "title": "Resume parsing overwrites contact fields",
+      "actions": [{"kind": "upload", "selector": "#resume", "filename": "resume.pdf"}],
+      "assertions": [
+        {"selector": "#upload-status", "attribute": "data-upload-state", "equals": "parsed"},
+        {"selector": "#full-name", "property": "value", "equals": "Parsed Candidate"},
+        {"selector": "#phone", "property": "value", "equals": "+65 9000 1111"},
+        {"selector": "#city", "property": "value", "equals": "Singapore"}
+      ]
+    },
+    {
+      "id": "delayed_upload_marker",
+      "title": "Upload marker settles after an asynchronous delay",
+      "actions": [{"kind": "upload", "selector": "#resume", "filename": "resume.pdf"}],
+      "assertions": [
+        {"selector": "#upload-status", "attribute": "data-upload-complete", "equals": "true"},
+        {"selector": "#upload-status", "attribute": "data-upload-state", "equals": "ready"}
+      ]
+    },
+    {
+      "id": "blur_date_validation",
+      "title": "Date validation appears on blur and clears for a valid date",
+      "actions": [
+        {"kind": "fill", "selector": "#start-date", "value": "2026-01-01"},
+        {"kind": "blur", "selector": "#start-date"},
+        {"kind": "fill", "selector": "#start-date", "value": "2026-11-10"},
+        {"kind": "blur", "selector": "#start-date"}
+      ],
+      "assertions": [
+        {"selector": "#date-error", "attribute": "data-invalid", "equals": "false"},
+        {"selector": "#start-date", "attribute": "aria-invalid", "equals": "false"}
+      ]
+    },
+    {
+      "id": "async_combobox",
+      "title": "Custom combobox options settle after input",
+      "actions": [
+        {"kind": "fill", "selector": "#department", "value": "platform"},
+        {"kind": "wait_for", "selector": "#department-options #platform", "state": "visible"},
+        {"kind": "click", "selector": "#department-options #platform"}
+      ],
+      "assertions": [
+        {"selector": "#department", "attribute": "aria-valuetext", "equals": "Platform Engineering"},
+        {"selector": "#department", "attribute": "data-selection-state", "equals": "selected"}
+      ]
+    },
+    {
+      "id": "repeat_education",
+      "title": "Repeated education entries retain independent controls",
+      "actions": [
+        {"kind": "fill", "selector": "#education-1-school", "value": "NTU"},
+        {"kind": "fill", "selector": "#education-2-school", "value": "NUS"}
+      ],
+      "assertions": [
+        {"selector": "#education-1-school", "property": "value", "equals": "NTU"},
+        {"selector": "#education-2-school", "property": "value", "equals": "NUS"},
+        {"selector": "#education-1", "attribute": "data-entry-key", "equals": "education-1"},
+        {"selector": "#education-2", "attribute": "data-entry-key", "equals": "education-2"}
+      ]
+    },
+    {
+      "id": "country_phone_coupled",
+      "title": "Country selection updates phone semantics",
+      "actions": [{"kind": "select", "selector": "#phone-country", "value": "sg"}],
+      "assertions": [
+        {"selector": "#phone", "attribute": "data-country", "equals": "SG"},
+        {"selector": "#phone", "attribute": "placeholder", "equals": "8-digit national number"},
+        {"selector": "#phone", "attribute": "aria-label", "equals": "Phone number for Singapore"}
+      ]
+    },
+    {
+      "id": "stale_rerender",
+      "title": "Country change replaces the phone node with a fresh epoch",
+      "actions": [{"kind": "select", "selector": "#rerender-country", "value": "sg"}],
+      "assertions": [
+        {"selector": "#rerender-phone", "attribute": "data-render-epoch", "equals": "2"},
+        {"selector": "#rerender-phone", "attribute": "data-page-epoch", "equals": "2"}
+      ]
+    },
+    {
+      "id": "selected_rejected_upload",
+      "title": "Selected file is explicitly rejected by upload validation",
+      "actions": [{"kind": "upload", "selector": "#resume", "filename": "rejected_resume.pdf"}],
+      "assertions": [
+        {"selector": "#upload-status", "attribute": "data-upload-state", "equals": "rejected"},
+        {"selector": "#upload-error", "attribute": "data-visible", "equals": "true"}
+      ]
+    },
+    {
+      "id": "optional_unknown",
+      "title": "Unknown optional question remains safely unanswered",
+      "actions": [],
+      "assertions": [
+        {"selector": "#optional-status", "attribute": "data-answer-state", "equals": "unanswered"},
+        {"selector": "#optional-question", "attribute": "required", "equals": null}
+      ]
+    },
+    {
+      "id": "mock_validation_prevents_submit",
+      "title": "Mock validation blocks Submit and records no submission",
+      "actions": [{"kind": "click", "selector": "#submit"}],
+      "assertions": [
+        {"selector": "#application", "attribute": "data-submit-count", "equals": "0"},
+        {"selector": "#validation-error", "attribute": "data-visible", "equals": "true"},
+        {"selector": "#confirmation", "attribute": "data-visible", "equals": "false"}
+      ]
+    },
+    {
+      "id": "matching_job_success",
+      "title": "Exact job identity reaches local confirmation",
+      "actions": [{"kind": "click", "selector": "#submit"}],
+      "assertions": [
+        {"selector": "#application", "attribute": "data-submit-count", "equals": "1"},
+        {"selector": "#confirmation", "attribute": "data-visible", "equals": "true"},
+        {"selector": "#confirmation", "attribute": "data-job-id", "equals": "ats-match-001"}
+      ]
+    },
+    {
+      "id": "wrong_job_rejected",
+      "title": "Wrong job identity cannot produce a success receipt",
+      "actions": [{"kind": "click", "selector": "#submit"}],
+      "assertions": [
+        {"selector": "#application", "attribute": "data-submit-count", "equals": "0"},
+        {"selector": "#confirmation", "attribute": "data-visible", "equals": "false"},
+        {"selector": "#validation-error", "attribute": "data-reason", "equals": "job_identity_mismatch"}
+      ]
+    },
+    {
+      "id": "pause_resume_same_page",
+      "title": "Pause and resume preserve the same page state",
+      "actions": [
+        {"kind": "fill", "selector": "#progress-note", "value": "checkpoint-one"},
+        {"kind": "click", "selector": "#pause"},
+        {"kind": "click", "selector": "#resume"}
+      ],
+      "assertions": [
+        {"selector": "#application", "attribute": "data-paused", "equals": "false"},
+        {"selector": "#progress-note", "property": "value", "equals": "checkpoint-one"},
+        {"selector": "#resume-status", "attribute": "data-page-preserved", "equals": "true"}
+      ]
+    },
+    {
+      "id": "conditional_question_after_selection",
+      "title": "Conditional question appears after an approved selection",
+      "actions": [{"kind": "select", "selector": "#work-authorization", "value": "yes"}],
+      "assertions": [
+        {"selector": "#sponsorship-question", "attribute": "data-visible", "equals": "true"},
+        {"selector": "#sponsorship", "attribute": "required", "equals": "true"}
+      ]
+    },
+    {
+      "id": "late_required_field_coverage",
+      "title": "A required field late in a long form remains observable",
+      "actions": [{"kind": "fill", "selector": "#field-95", "value": "late-answer"}],
+      "assertions": [
+        {"selector": "#field-95", "property": "value", "equals": "late-answer"},
+        {"selector": "#field-95", "attribute": "required", "equals": "true"},
+        {"selector": "#field-95", "attribute": "data-field-index", "equals": "95"}
+      ]
+    },
+    {
+      "id": "upload_parser_reparse_after_resume",
+      "title": "A second resume parse refreshes dependent contact fields",
+      "actions": [
+        {"kind": "upload", "selector": "#resume", "filename": "resume-v1.pdf"},
+        {"kind": "upload", "selector": "#resume", "filename": "resume-v2.pdf"}
+      ],
+      "assertions": [
+        {"selector": "#upload-status", "attribute": "data-parse-count", "equals": "2"},
+        {"selector": "#city", "property": "value", "equals": "Singapore"},
+        {"selector": "#parse-log", "attribute": "data-last-file", "equals": "resume-v2.pdf"}
+      ]
+    }
+  ]
+}

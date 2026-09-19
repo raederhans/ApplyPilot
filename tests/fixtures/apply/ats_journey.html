@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local ATS journey fixture</title>
+  <style>
+    body { font: 16px/1.45 system-ui, sans-serif; margin: 2rem; }
+    form { display: grid; gap: .8rem; max-width: 48rem; }
+    label, fieldset { display: grid; gap: .25rem; }
+    input, select, textarea, button { font: inherit; padding: .35rem; }
+    [data-visible="false"], [hidden] { display: none !important; }
+    [role="listbox"] { border: 1px solid #888; padding: .3rem; }
+    [role="option"] { cursor: pointer; padding: .25rem; }
+    .error { color: #a00; }
+    .status { min-height: 1.4rem; }
+  </style>
+</head>
+<body>
+  <main id="app" data-fixture="ats-journey"></main>
+  <script>
+    window.fixtureEvents = [];
+    window.fixtureMeta = {
+      schemaVersion: 'applypilot-ats-journey/v1',
+      executionBoundary: 'local-intercepted-only',
+      sideEffect: 'none'
+    };
+
+    const app = document.querySelector('#app');
+    const params = new URLSearchParams(location.search);
+    const scenario = params.get('case') || 'upload_parser_overwrite';
+    const record = (eventName, target) => {
+      window.fixtureEvents.push({eventName, id: target && target.id || ''});
+    };
+    document.addEventListener('input', event => record('input', event.target));
+    document.addEventListener('change', event => record('change', event.target));
+    document.addEventListener('click', event => record('click', event.target));
+    document.addEventListener('blur', event => record('blur', event.target), true);
+
+    const shell = (body) => {
+      app.innerHTML = `<form id="application" data-submit-count="0">${body}</form>`;
+      const form = document.querySelector('#application');
+      form.addEventListener('submit', event => event.preventDefault());
+      return form;
+    };
+    const status = (id, text = '', attrs = '') =>
+      `<output id="${id}" class="status" ${attrs}>${text}</output>`;
+    const option = (value, text = value) => `<option value="${value}">${text}</option>`;
+    const setData = (element, key, value) => element && element.setAttribute(`data-${key}`, String(value));
+    const show = (element, value) => setData(element, 'visible', value ? 'true' : 'false');
+
+    function uploadParser({reparse = false} = {}) {
+      const form = shell(`
+        <label>Full name <input id="full-name" name="full_name" value="Existing Candidate"></label>
+        <label>Phone <input id="phone" name="phone" type="tel" value="+65 8111 2222"></label>
+        <label>City <input id="city" name="city" value="Singapore"></label>
+        <label>Resume <input id="resume" name="resume" type="file" accept="application/pdf" required></label>
+        ${status('upload-status', 'Waiting', 'data-upload-state="pending" data-parse-count="0"')}
+        ${status('parse-log', '', 'data-last-file=""')}
+      `);
+      const input = form.querySelector('#resume');
+      const uploadStatus = form.querySelector('#upload-status');
+      input.addEventListener('change', () => {
+        const file = input.files && input.files[0];
+        setData(uploadStatus, 'upload-state', 'processing');
+        uploadStatus.textContent = 'Parsing resume…';
+        window.setTimeout(() => {
+          const count = Number(uploadStatus.getAttribute('data-parse-count') || 0) + 1;
+          setData(uploadStatus, 'parse-count', count);
+          setData(form.querySelector('#parse-log'), 'last-file', file ? file.name : '');
+          setData(uploadStatus, 'upload-state', 'parsed');
+          uploadStatus.textContent = 'Resume parsed';
+          form.querySelector('#full-name').value = 'Parsed Candidate';
+          form.querySelector('#phone').value = '+65 9000 1111';
+          form.querySelector('#city').value = 'Singapore';
+          if (reparse) setData(uploadStatus, 'upload-state', 'parsed');
+          input.dispatchEvent(new Event('input', {bubbles: true}));
+        }, 35);
+      });
+    }
+
+    function delayedUpload() {
+      const form = shell(`
+        <label>Resume <input id="resume" name="resume" type="file" accept="application/pdf" required></label>
+        ${status('upload-status', 'Waiting', 'data-upload-state="pending" data-upload-complete="false"')}
+      `);
+      form.querySelector('#resume').addEventListener('change', () => {
+        const marker = form.querySelector('#upload-status');
+        setData(marker, 'upload-state', 'processing');
+        marker.textContent = 'Uploading…';
+        window.setTimeout(() => {
+          setData(marker, 'upload-state', 'ready');
+          setData(marker, 'upload-complete', 'true');
+          marker.textContent = 'Upload complete';
+        }, 90);
+      });
+    }
+
+    function dateValidation() {
+      const form = shell(`
+        <label>Available start date <input id="start-date" name="start_date" type="date" required></label>
+        ${status('date-error', '', 'data-invalid="false"')}
+      `);
+      const date = form.querySelector('#start-date');
+      const error = form.querySelector('#date-error');
+      date.addEventListener('blur', () => {
+        const invalid = !date.value || date.value < '2026-11-10';
+        date.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+        setData(error, 'invalid', invalid ? 'true' : 'false');
+        error.textContent = invalid ? 'Choose a date on or after 2026-11-10' : '';
+      });
+    }
+
+    function asyncCombobox() {
+      const form = shell(`
+        <label>Department <input id="department" role="combobox" aria-controls="department-options" aria-expanded="true" autocomplete="off"></label>
+        <div id="department-options" role="listbox" aria-label="Department options">
+          <div id="loading-option" role="option">Loading departments…</div>
+        </div>
+      `);
+      const input = form.querySelector('#department');
+      const list = form.querySelector('#department-options');
+      input.addEventListener('input', () => {
+        list.innerHTML = '<div id="loading-option" role="option">Loading departments…</div>';
+        window.setTimeout(() => {
+          list.innerHTML = '<div id="platform" role="option">Platform Engineering</div><div id="product" role="option">Product Analytics</div>';
+          list.querySelector('#platform').addEventListener('click', () => {
+            input.setAttribute('aria-valuetext', 'Platform Engineering');
+            setData(input, 'selection-state', 'selected');
+            input.value = 'Platform Engineering';
+          });
+          list.querySelector('#product').addEventListener('click', () => {
+            input.setAttribute('aria-valuetext', 'Product Analytics');
+            setData(input, 'selection-state', 'selected');
+            input.value = 'Product Analytics';
+          });
+        }, 65);
+      });
+    }
+
+    function repeatedEducation() {
+      shell(`
+        <fieldset id="education-1" data-entry-key="education-1"><legend>Education 1</legend>
+          <label>School <input id="education-1-school" name="education[0][school]"></label>
+          <label>Degree <input id="education-1-degree" name="education[0][degree]"></label>
+        </fieldset>
+        <fieldset id="education-2" data-entry-key="education-2"><legend>Education 2</legend>
+          <label>School <input id="education-2-school" name="education[1][school]"></label>
+          <label>Degree <input id="education-2-degree" name="education[1][degree]"></label>
+        </fieldset>
+      `);
+    }
+
+    function countryPhone() {
+      const form = shell(`
+        <label>Phone country <select id="phone-country" name="phone_country">${option('', 'Choose')}${option('sg', 'Singapore')}${option('us', 'United States')}</select></label>
+        <label>Phone <input id="phone" name="phone" type="tel" aria-label="Phone number"></label>
+      `);
+      form.querySelector('#phone-country').addEventListener('change', event => {
+        const phone = form.querySelector('#phone');
+        const sg = event.target.value === 'sg';
+        phone.setAttribute('data-country', sg ? 'SG' : 'US');
+        phone.setAttribute('placeholder', sg ? '8-digit national number' : 'National number');
+        phone.setAttribute('aria-label', sg ? 'Phone number for Singapore' : 'Phone number for United States');
+      });
+    }
+
+    function staleRerender() {
+      const form = shell(`
+        <label>Country <select id="rerender-country" name="country">${option('', 'Choose')}${option('sg', 'Singapore')}</select></label>
+        <label>Phone <input id="rerender-phone" name="phone" type="tel" data-render-epoch="1" data-page-epoch="1"></label>
+      `);
+      form.querySelector('#rerender-country').addEventListener('change', () => {
+        const old = form.querySelector('#rerender-phone');
+        const replacement = old.cloneNode(true);
+        replacement.setAttribute('data-render-epoch', '2');
+        replacement.setAttribute('data-page-epoch', '2');
+        replacement.setAttribute('aria-label', 'Phone after country refresh');
+        old.replaceWith(replacement);
+      });
+    }
+
+    function rejectedUpload() {
+      const form = shell(`
+        <label>Resume <input id="resume" name="resume" type="file" accept="application/pdf" required></label>
+        ${status('upload-status', 'Waiting', 'data-upload-state="pending"')}
+        ${status('upload-error', '', 'data-visible="false"')}
+      `);
+      form.querySelector('#resume').addEventListener('change', event => {
+        const file = event.target.files && event.target.files[0];
+        const rejected = file && file.name === 'rejected_resume.pdf';
+        const marker = form.querySelector('#upload-status');
+        setData(marker, 'upload-state', rejected ? 'rejected' : 'accepted');
+        marker.textContent = rejected ? 'Resume rejected' : 'Resume accepted';
+        setData(form.querySelector('#upload-error'), 'visible', rejected ? 'true' : 'false');
+      });
+    }
+
+    function optionalUnknown() {
+      const form = shell(`
+        <label>Additional information <textarea id="optional-question" name="additional_information"></textarea></label>
+        ${status('optional-status', 'Optional question unanswered', 'data-answer-state="unanswered"')}
+      `);
+      form.querySelector('#optional-question').addEventListener('input', event => {
+        setData(form.querySelector('#optional-status'), 'answer-state', event.target.value ? 'answered' : 'unanswered');
+      });
+    }
+
+    function mockValidation() {
+      const form = shell(`
+        <label>Full name <input id="full-name" name="full_name" required></label>
+        <button id="submit" type="submit">Submit</button>
+        ${status('validation-error', '', 'data-visible="false" data-reason=""')}
+        ${status('confirmation', '', 'data-visible="false"')}
+      `);
+      form.noValidate = true;
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        setData(form.querySelector('#validation-error'), 'visible', 'true');
+        setData(form.querySelector('#validation-error'), 'reason', 'required_field_missing');
+        form.querySelector('#validation-error').textContent = 'Complete required fields before Submit';
+      });
+    }
+
+    function jobIdentity({match}) {
+      const form = shell(`
+        <label>Job identity <input id="job-id" name="job_id" value="${match ? 'ats-match-001' : 'other-job'}" required></label>
+        <button id="submit" type="submit">Submit</button>
+        ${status('validation-error', '', 'data-visible="false" data-reason=""')}
+        ${status('confirmation', '', 'data-visible="false" data-job-id=""')}
+      `);
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        const exact = form.querySelector('#job-id').value === 'ats-match-001';
+        if (exact) {
+          form.setAttribute('data-submit-count', '1');
+          const receipt = form.querySelector('#confirmation');
+          setData(receipt, 'visible', 'true');
+          setData(receipt, 'job-id', 'ats-match-001');
+          receipt.textContent = 'Local confirmation for ats-match-001';
+        } else {
+          const error = form.querySelector('#validation-error');
+          setData(error, 'visible', 'true');
+          setData(error, 'reason', 'job_identity_mismatch');
+          error.textContent = 'Job identity does not match the intended posting';
+        }
+      });
+    }
+
+    function pauseResume() {
+      const form = shell(`
+        <label>Progress note <input id="progress-note" name="progress_note"></label>
+        <label><input id="pause" type="checkbox"> Pause application</label>
+        <label><input id="resume" type="checkbox"> Resume application</label>
+        ${status('resume-status', 'Active', 'data-page-preserved="false"')}
+      `);
+      const pause = form.querySelector('#pause');
+      const resume = form.querySelector('#resume');
+      pause.addEventListener('change', () => {
+        form.setAttribute('data-paused', pause.checked ? 'true' : 'false');
+        resume.checked = false;
+      });
+      resume.addEventListener('change', () => {
+        if (resume.checked) {
+          pause.checked = false;
+          form.setAttribute('data-paused', 'false');
+          setData(form.querySelector('#resume-status'), 'page-preserved', 'true');
+          form.querySelector('#resume-status').textContent = 'Resumed on the same page';
+        }
+      });
+      form.setAttribute('data-paused', 'false');
+    }
+
+    function conditionalQuestion() {
+      const form = shell(`
+        <label>Work authorization <select id="work-authorization" name="work_authorization" required>${option('', 'Choose')}${option('yes', 'Yes')}${option('no', 'No')}</select></label>
+        <section id="sponsorship-question" data-visible="false" hidden>
+          <label>Future sponsorship needed?
+            <select id="sponsorship" name="sponsorship"><option value="">Choose</option><option value="no">No</option><option value="yes">Yes</option></select>
+          </label>
+        </section>
+      `);
+      form.querySelector('#work-authorization').addEventListener('change', event => {
+        const visible = event.target.value === 'yes';
+        const section = form.querySelector('#sponsorship-question');
+        section.hidden = !visible;
+        show(section, visible);
+        form.querySelector('#sponsorship').required = visible;
+      });
+    }
+
+    function lateRequired() {
+      let body = '';
+      for (let index = 1; index <= 100; index += 1) {
+        body += `<label>Question ${index} <input id="field-${index}" name="field-${index}" data-field-index="${index}"${index === 95 ? ' required' : ''}></label>`;
+      }
+      shell(body);
+    }
+
+    const renderers = {
+      upload_parser_overwrite: () => uploadParser(),
+      delayed_upload_marker: delayedUpload,
+      blur_date_validation: dateValidation,
+      async_combobox: asyncCombobox,
+      repeat_education: repeatedEducation,
+      country_phone_coupled: countryPhone,
+      stale_rerender: staleRerender,
+      selected_rejected_upload: rejectedUpload,
+      optional_unknown: optionalUnknown,
+      mock_validation_prevents_submit: mockValidation,
+      matching_job_success: () => jobIdentity({match: true}),
+      wrong_job_rejected: () => jobIdentity({match: false}),
+      pause_resume_same_page: pauseResume,
+      conditional_question_after_selection: conditionalQuestion,
+      late_required_field_coverage: lateRequired,
+      upload_parser_reparse_after_resume: () => uploadParser({reparse: true})
+    };
+    if (!renderers[scenario]) {
+      document.body.insertAdjacentHTML('beforeend', '<p>Unknown fixture scenario</p>');
+    } else {
+      renderers[scenario]();
+    }
+    window.fixtureMeta.scenario = scenario;
+    window.fixtureMeta.url = location.href;
+  </script>
+</body>
+</html>

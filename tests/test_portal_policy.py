@@ -38,6 +38,10 @@ def test_portal_policy_matches_domain_and_original_source_site() -> None:
     internsg = config.get_portal_policy("https://www.internsg.com/job-apply/123/")
     assert internsg is not None
     assert internsg["application_mode"] == "standing_authorized"
+    assert internsg["discovery_mode"] == "visible_agent_browse"
+    assert "bounded visible agent browsing" in config.portal_discovery_gate(
+        "https://www.internsg.com/job-apply/123/"
+    )
 
     career_axis = config.get_portal_policy(
         "https://careeraxis.ntu.edu.sg/students/jobs/882308"
@@ -125,6 +129,18 @@ def test_manual_ats_is_a_runtime_capability_hint_not_an_acquisition_block(
 
     assert acquired is not None
     assert acquired["_ats_capability_hint"] == "manual_boundary_likely"
+
+
+def test_historical_site_difficulty_does_not_exclude_batch_job(monkeypatch, tmp_path):
+    conn = init_db(tmp_path / "jobs.db")
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    url = "https://careers.accenture.com/job/123"
+    _store_ready_job(conn, url=url, source_site="AccentureCareers")
+    acquired = launcher.acquire_job(preview_only=True)
+    assert acquired is not None
+    assert acquired["url"] == url
+    assert "do not exclude" in config.browser_capability_hint(url, "AccentureCareers")
+    assert config.browser_capability_hint("https://example.test/job/123", "Example") == ""
 
 
 def test_authorised_portal_listing_csv_is_local_intake(monkeypatch, tmp_path: Path) -> None:

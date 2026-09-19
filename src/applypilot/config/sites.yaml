@@ -33,9 +33,9 @@ portal_policies:
       - "internsg.com"
     site_names:
       - "InternSG"
-    discovery_mode: "manual_only"
-    # Candidate-supplied exact listings may use the standing submission policy;
-    # discovery remains manual and visible CAPTCHA still requires the relay.
+    discovery_mode: "visible_agent_browse"
+    # The user's standing authority covers visible review, ordinary forms,
+    # final Submit and listing-authorized application email. No personal click.
     application_mode: "standing_authorized"
     assessment_mode: "employer_invited_manual_only"
     external_application_mode: "continue_when_authorized"
@@ -59,13 +59,18 @@ portal_policies:
     submitted_evidence: "exact job/company confirmation page or receipt"
 
 # ── Manual-Only ATS Domains ──────────────────────────────────────────────
-# These ATS platforms have unsolvable CAPTCHAs. Jobs routing through them
-# are flagged as "manual" during apply — bot skips, user applies by hand.
+# Historical challenge reports inform routing; they do not establish a current
+# challenge. Acquisition treats this legacy key as a capability hint. Inspect
+# the actual page before deciding whether an authentication handoff is needed.
 manual_ats:
-  - "ibegin.tcsapps.com"       # TCS iBegin — unsolvable CAPTCHA every time
+  - "ibegin.tcsapps.com"
 
-# ── Blocked sites — too problematic for automation ───────────────────────
+# Historical adapter difficulties are hints, not evidence of current inability.
+# Keep explicit user-configured exclusions separate from these defaults.
 blocked:
+  sites: []
+  url_patterns: []
+capability_hints:
   sites:
     - "glassdoor"
     - "google"

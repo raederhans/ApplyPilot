@@ -230,6 +230,16 @@ _SENT_SUBMISSION_RECEIPT = re.compile(
     re.IGNORECASE,
 )
 _SUCCESS_HEADING_RECEIPT = re.compile(r"submission successful[.!]?", re.IGNORECASE)
+# Standalone completed-action messages from an exact-job browser envelope.
+# Full matching deliberately excludes negations, questions, future/conditional
+# instructions and quoted examples. Email retains its separate evidence rules.
+_BROWSER_COMPLETED_RECEIPT = re.compile(
+    r"(?:your\s+)?application\s+"
+    r"(?:(?:was|has\s+been)\s+)?(?:successfully\s+)?"
+    r"(?:sent|submitted|received)(?:\s+successfully)?[.!]?"
+    r"(?:\s+thank\s+you[.!]?)?",
+    re.IGNORECASE,
+)
 
 
 def _sent_receipt_matches_company(text: str, company: str) -> bool:
@@ -347,6 +357,7 @@ def reconcile_submission_receipt(
     # instructions, quoted headings, or a generic email subject into receipts.
     if source == "browser_receipt":
         positive = positive or bool(_SUCCESS_HEADING_RECEIPT.fullmatch(confirmation_text))
+        positive = positive or bool(_BROWSER_COMPLETED_RECEIPT.fullmatch(confirmation_text))
     if source == "candidate_portal":
         positive = positive or portal_status in _PORTAL_SUBMITTED_STATES
     if not positive:

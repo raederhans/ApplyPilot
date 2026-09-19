@@ -546,32 +546,138 @@ def adapter_prompt_guidance(url: str, *, registry: AtsAdapterRegistry | None = N
     return (registry or default_ats_registry()).detect(url).guidance()
 
 
-def adapter_prompt_context(form: FormIR, plan: FillPlan | None = None) -> dict[str, Any]:
-    """Return a bounded JSON-safe context without field values or PII answers."""
-    visible_fields = form.fields[:MAX_PROMPT_FIELDS]
+def _window_parameter(value: object, *, name: str, default: int, maximum: int) -> int:
+    """Validate a bounded paging parameter without accepting booleans as integers."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < 0 or (name.endswith("limit") and value == 0) or value > maximum:
+        bound = f"0..{maximum}" if not name.endswith("limit") else f"1..{maximum}"
+        raise ValueError(f"{name} must be within {bound}")
+    return value
+
+
+def adapter_prompt_context(
+    form: FormIR,
+    plan: FillPlan | None = None,
+    *,
+    field_offset: int = 0,
+    field_limit: int = MAX_PROMPT_FIELDS,
+    field_keys: Iterable[str] | None = None,
+    option_offset: int = 0,
+    option_limit: int = MAX_PROMPT_OPTIONS_PER_FIELD,
+    include_paging: bool | None = None,
+) -> dict[str, Any]:
+    """Return a bounded JSON-safe context without field values or PII answers.
+
+    The default page preserves the historical first-80/first-20 shape. Callers
+    can traverse a larger observed form with explicit field pages and option
+    windows; every page remains bounded and follows the source field order.
+    """
+    field_offset = _window_parameter(
+        field_offset, name="field_offset", default=0, maximum=len(form.fields)
+    )
+    field_limit = _window_parameter(
+        field_limit, name="field_limit", default=MAX_PROMPT_FIELDS, maximum=MAX_PROMPT_FIELDS
+    )
+    option_offset = _window_parameter(
+        option_offset, name="option_offset", default=0, maximum=MAX_OPTIONS_PER_FIELD
+    )
+    option_limit = _window_parameter(
+        option_limit,
+        name="option_limit",
+        default=MAX_PROMPT_OPTIONS_PER_FIELD,
+        maximum=MAX_PROMPT_OPTIONS_PER_FIELD,
+    )
+
+    paging_requested = (
+        include_paging
+        if include_paging is not None
+        else bool(
+            field_offset
+            or field_limit != MAX_PROMPT_FIELDS
+            or field_keys is not None
+            or option_offset
+            or option_limit != MAX_PROMPT_OPTIONS_PER_FIELD
+        )
+    )
+
+    selected_fields = list(form.fields)
+    if field_keys is not None:
+        requested = [_text(key, limit=160) for key in field_keys]
+        if not requested or any(not key for key in requested):
+            raise ValueError("field_keys must contain at least one non-empty key")
+        if len(set(requested)) != len(requested):
+            raise ValueError("field_keys must not contain duplicates")
+        by_key = {item.field_key: item for item in form.fields}
+        unknown = [key for key in requested if key not in by_key]
+        if unknown:
+            raise ValueError("field_keys contains an unknown field key")
+        if any(sum(item.field_key == key for item in form.fields) != 1 for key in requested):
+            raise ValueError("field_keys must select unique field keys")
+        # Preserve observed/source order so repeated page traversal is stable.
+        selected_fields = [item for item in form.fields if item.field_key in set(requested)]
+
+    if field_offset > len(selected_fields):
+        raise ValueError("field_offset is beyond the selected field set")
+    field_end = min(field_offset + field_limit, len(selected_fields))
+    visible_fields = selected_fields[field_offset:field_end]
+    if visible_fields and option_offset > max(len(item.options) for item in visible_fields):
+        raise ValueError("option_offset is beyond the selected option sets")
+
+    def _field_context(item: FormFieldIR) -> dict[str, Any]:
+        option_end = min(option_offset + option_limit, len(item.options))
+        result: dict[str, Any] = {
+            "field_key": item.field_key,
+            "semantic": item.semantic,
+            "control": item.control,
+            "required": item.required,
+            "writable": not (item.disabled or item.readonly),
+            "option_count": len(item.options),
+            "options": [
+                _text(option, limit=MAX_PROMPT_OPTION_LENGTH)
+                for option in item.options[
+                    option_offset if paging_requested else 0 :
+                    option_end if paging_requested else MAX_PROMPT_OPTIONS_PER_FIELD
+                ]
+            ],
+            "options_truncated": (
+                option_offset > 0 or option_end < len(item.options)
+                if paging_requested
+                else len(item.options) > MAX_PROMPT_OPTIONS_PER_FIELD
+            ),
+        }
+        if paging_requested:
+            result.update(
+                {
+                    "options_offset": option_offset,
+                    "options_limit": option_limit,
+                    "options_has_more": option_end < len(item.options),
+                    "options_next_offset": option_end if option_end < len(item.options) else None,
+                }
+            )
+        return result
+
     context: dict[str, Any] = {
         "schema_version": form.schema_version,
         "adapter": form.adapter,
         "site": form.site,
         "field_count": len(form.fields),
         "truncated": form.truncated or len(form.fields) > MAX_PROMPT_FIELDS,
-        "fields": [
-            {
-                "field_key": item.field_key,
-                "semantic": item.semantic,
-                "control": item.control,
-                "required": item.required,
-                "writable": not (item.disabled or item.readonly),
-                "option_count": len(item.options),
-                "options": [
-                    _text(option, limit=MAX_PROMPT_OPTION_LENGTH)
-                    for option in item.options[:MAX_PROMPT_OPTIONS_PER_FIELD]
-                ],
-                "options_truncated": len(item.options) > MAX_PROMPT_OPTIONS_PER_FIELD,
-            }
-            for item in visible_fields
-        ],
+        "fields": [_field_context(item) for item in visible_fields],
     }
+    if paging_requested:
+        context["pagination"] = {
+            "field_offset": field_offset,
+            "field_limit": field_limit,
+            "field_returned": len(visible_fields),
+            "field_total": len(selected_fields),
+            "field_has_more": field_end < len(selected_fields),
+            "field_next_offset": field_end if field_end < len(selected_fields) else None,
+            "option_offset": option_offset,
+            "option_limit": option_limit,
+        }
     if plan is not None:
         allowed = {item.field_key for item in visible_fields}
         context["actions"] = [

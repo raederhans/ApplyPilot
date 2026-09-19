@@ -1972,6 +1972,28 @@ def dashboard(
         generate_dashboard(str(output) if output else None)
 
 
+@app.command("attended-application")
+def attended_application_command(
+    db: Path = typer.Option(..., "--db", exists=True, dir_okay=False),
+    request_file: Path = typer.Option(..., "--request-file", exists=True, dir_okay=False),
+) -> None:
+    """Persist trusted attending-host observations; never performs browser actions."""
+    from applypilot import config
+    from applypilot.apply.attended_application import execute
+    from applypilot.database import get_connection
+
+    try:
+        request = json.loads(request_file.read_text(encoding="utf-8-sig"))
+        if not isinstance(request, dict):
+            raise TypeError("request must be an object")
+        connection = get_connection(db)
+        result = execute(connection, request, config.load_profile())
+    except (TypeError, ValueError, OSError) as exc:
+        console.print(str(exc), markup=False)
+        raise typer.Exit(code=2) from exc
+    _print_json(data=result)
+
+
 @app.command("browser-work")
 def browser_work(
     bridge_dir: Path = typer.Option(..., "--bridge-dir", help="Live attended in-app browser host directory."),

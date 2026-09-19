@@ -5,6 +5,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { observeForm, changedFields, operateObservedControl, ControlNotReady } from './browser-form-state.mjs';
 
 const text = value => ({ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) });
 const activeTabs = new Set();
@@ -148,7 +149,8 @@ export async function createVisualHost({ directory, adapter, target, phase = 'pr
       } catch (error) {
         observationId = null;
         if (!claimed) throw error;
-        if (adapterStarted) {
+        const rejectedBeforeInput = error instanceof ControlNotReady;
+        if (adapterStarted && !rejectedBeforeInput) {
           // A runtime stop/disconnection is not permission to retry input.
           closed = true;
           await writeJson(path.join(root, 'host.json'), { ...binding, status: 'stopped', heartbeat_at: Date.now() / 1000 });
@@ -156,7 +158,7 @@ export async function createVisualHost({ directory, adapter, target, phase = 'pr
         const response = {
           schema_version: 1, request_id: requestId, session_id: binding.session_id,
           token_epoch: binding.token_epoch, ok: false,
-          outcome: inputStarted ? 'outcome_unknown' : 'failed',
+          outcome: inputStarted && !rejectedBeforeInput ? 'outcome_unknown' : 'failed',
           content: [text({ error: String(error.message), reobserve_before_retry: true })],
         };
         await writeJson(path.join(root, 'responses', `${requestId}.json`), response);
@@ -179,6 +181,9 @@ export function browserAdapter(tab, { artifacts = {} } = {}) {
   let observedLinks = new Set();
   let observedInputs = new Set();
   let observedNodes = new Set();
+  let formSnapshot = null;
+  let uploadBaseline = null;
+  let lastControlResult = null;
   return {
     surface: 'browser',
     tabId: tab.id,
@@ -190,6 +195,7 @@ export function browserAdapter(tab, { artifacts = {} } = {}) {
       observedInputs = new Set();
       observedNodes = new Set();
       if (mode === 'screenshot') {
+        formSnapshot = null;
         return [context, { type: 'image', mimeType: 'image/png', data: Buffer.from(await tab.screenshot({})).toString('base64') }];
       }
       const dom = await tab.dom_cua.get_visible_dom();
@@ -213,14 +219,32 @@ export function browserAdapter(tab, { artifacts = {} } = {}) {
           if (['http:', 'https:'].includes(link.protocol) && !link.username && !link.password) observedLinks.add(link.href);
         } catch { /* Non-web links are not navigation targets. */ }
       }
-      return [context, text(dom), text(snapshot)];
+      const content = [context, text(dom), text(snapshot)];
+      if (typeof tab.playwright.evaluate === 'function') {
+        const previous = formSnapshot;
+        formSnapshot = await observeForm(tab);
+        content.push(text({ form_state: formSnapshot,
+          changed_fields: changedFields(previous, formSnapshot),
+          post_upload_changes: changedFields(uploadBaseline, formSnapshot),
+          control_result: lastControlResult }));
+        lastControlResult = null;
+      }
+      return content;
     },
     async act(operation, args) {
+      if (['fill_control', 'select_control', 'set_checked'].includes(operation)) {
+        const result = await operateObservedControl(tab, formSnapshot, operation, args);
+        const { observation, ...report } = result;
+        lastControlResult = report;
+        // The next host observation reports all changes, including dependent fields.
+        return;
+      }
       if (operation === 'upload_artifact') {
         const file = artifactFiles.get(args.artifact_id);
         if (typeof file !== 'string' || !path.isAbsolute(file)) throw Error('Unknown artifact or non-absolute artifact path');
         if (!observedNodes.has(args.node_id)) throw Error('Upload requires a node from the current DOM observation');
         if (!(await fs.stat(file)).isFile()) throw Error('Artifact must be a regular file');
+        uploadBaseline = formSnapshot;
         const chooserPromise = tab.playwright.waitForEvent('filechooser', { timeoutMs: 10000 });
         // Click may fail first; the pending waiter must still have a rejection handler.
         chooserPromise.catch(() => {});

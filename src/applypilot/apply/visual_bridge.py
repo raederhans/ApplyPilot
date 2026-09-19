@@ -23,7 +23,8 @@ SCHEMA_VERSION = 1
 HOST_MAX_AGE_SECONDS = 120.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 45.0
 MAX_REQUEST_TIMEOUT_SECONDS = 120.0
-OPERATIONS = frozenset({"observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact"})
+OPERATIONS = frozenset({"observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact",
+                        "fill_control", "select_control", "set_checked"})
 SURFACES = frozenset({"computer_use", "browser"})
 PRESS_KEYS = frozenset(
     {
@@ -159,7 +160,7 @@ def request_visual_operation(
         raise VisualBridgeError("invalid_request", "Visual bridge timeout must be positive.")
     timeout_seconds = min(timeout_seconds, MAX_REQUEST_TIMEOUT_SECONDS)
     host = read_active_host(root, now=now())
-    if operation in {"navigate", "upload_artifact"} and host.surface != "browser":
+    if operation in {"navigate", "upload_artifact", "fill_control", "select_control", "set_checked"} and host.surface != "browser":
         raise VisualBridgeError("invalid_request", f"{operation} is only available on the browser surface.")
     if operation == "type_text" and "node_id" in args and host.surface != "browser":
         raise VisualBridgeError("invalid_request", "Targeted text entry is only available on the browser surface.")
@@ -349,6 +350,9 @@ def _validate_operation(
         "press_key": {"key", "keys"},
         "navigate": {"url"},
         "upload_artifact": {"artifact_id", "node_id"},
+        "fill_control": {"field_key", "value"},
+        "select_control": {"field_key", "value"},
+        "set_checked": {"field_key", "checked"},
     }
     if not set(arguments).issubset(allowed[operation]):
         raise VisualBridgeError(
@@ -363,7 +367,17 @@ def _validate_operation(
         return
     if not isinstance(observation_id, str) or not observation_id.strip():
         raise VisualBridgeError("invalid_request", f"{operation} requires observation_id.")
-    if operation == "navigate":
+    if operation in {"fill_control", "select_control", "set_checked"}:
+        value_key = "checked" if operation == "set_checked" else "value"
+        if set(arguments) != {"field_key", value_key} or not isinstance(arguments.get("field_key"), str) or not arguments["field_key"].strip():
+            raise VisualBridgeError("invalid_request", "Control operation requires an observed field_key and value.")
+        if value_key == "checked":
+            valid_value = isinstance(arguments[value_key], bool)
+        else:
+            valid_value = isinstance(arguments[value_key], str) and len(arguments[value_key]) <= 12000
+        if not valid_value:
+            raise VisualBridgeError("invalid_request", "Control value has an invalid type or length.")
+    elif operation == "navigate":
         if set(arguments) != {"url"} or not isinstance(arguments["url"], str):
             raise VisualBridgeError("invalid_request", "navigate requires an observed URL.")
         parsed = urlsplit(arguments["url"])

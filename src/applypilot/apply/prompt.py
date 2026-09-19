@@ -20,6 +20,18 @@ from applypilot.apply.submission_surfaces import classify_submission_surface
 logger = logging.getLogger(__name__)
 
 
+_FORM_CONTROL_RECOVERY = (
+    "Ordinary form-control recovery (including dates): choose the normal input, calendar, "
+    "segment, or selection controls supported by the current page. Use confirmed facts "
+    "and inspect the displayed format. If a value clears, focus moves, or validation fails, "
+    "inspect a current screenshot and DOM, then correct the affected field through supported "
+    "semantic or visual controls. Verify the settled value or review-page answer. "
+    "An input failure alone is not a human-review boundary: try a distinct evidence-led "
+    "approach before asking the user. Continue while observations show useful progress; "
+    "stop unchanged retries. Do not guess missing facts or repeat an uncertain final submission."
+)
+
+
 _STANDING_SCREENING_FACTS = (
     (
         "Government/public-agency employment in the last 5 years",
@@ -841,7 +853,7 @@ Cover-letter state: {'verified to have no cover-letter field' if job.get('cover_
 - Re-observe the current page and compare it with the frozen audit. A visible CAPTCHA, assessment, directly false identity/legal/credential answer, missing required authorized material, or changed page identity is a hard pause.
 - Ordinary identity/eligibility facts may be filled exactly from confirmed facts. Identity numbers require an exact secure source; document uploads require a verified explicitly authorized matching artifact.
 - After changing a select or radio that can rewrite dependent labels or options (for example nationality or country), re-observe every affected checkbox and radio and resolve it again from the confirmed facts. Never preserve a checkbox by position or its earlier label.
-- For an ordinary validation error, repair only the named field once. For a native dropdown, read bounded visible options, use resolve_answer if exposed, then call browser_select_option with the selected visible option text. For a controlled input, type sequentially once and verify visible persistence. Do not repeat unrelated work.
+- {_FORM_CONTROL_RECOVERY} Preserve the frozen audit boundary: report material answer/page changes for re-audit before submission.
 - Lever ordinary application form and similar ordinary forms: preserve completed fields; never declare progress without visible state change.
 - Click the authorized final control exactly once. Absence of a receipt never authorizes a second click, browser restart, runtime switch, or new Agent turn.
 - RESULT:APPLIED requires an independently visible receipt or Applied marker with non-empty confirmation text. Otherwise use RESULT:SUBMISSION_UNCERTAIN.
@@ -1997,7 +2009,7 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
     multipage_efficiency = (
         "- Multi-page form: snapshot each new page, fill all visible fields, then wait for a "
         "visible URL/heading/progress/field-set change after Next. Re-scan conditional fields. "
-        "If one corrective attempt leaves the same structural signature, stop with RESULT:FAILED:stuck."
+        "If progress stalls, use the ordinary form-control recovery guidance; a repeated structural signature alone does not require user intervention."
         if "ats_multipage" in selected_fragments
         else ""
     )
@@ -2067,13 +2079,14 @@ The RESULT marker must be one standalone plain-text line and appear exactly once
         if "ats_smartrecruiters" in selected_fragments
         else "- Prefer bulk filling ordinary fields when their current refs are reliable. "
         "Use individual clicks or field fills when the page changes or a control needs them. "
-        "Follow the Workday date guidance for segmented/composite controlled dates."
+        "Follow the ordinary form-control recovery guidance for controlled inputs."
     )
 
     prompt = f"""You are a job application assistant. {mission_instruction}
 
 == REQUIRED BROWSER CONTROL ==
 CONTROL_CONTRACT: {control_contract_json}
+{config.browser_capability_hint(str(job.get('application_url') or job.get('url') or ''), str(job.get('site') or job.get('source_site') or ''))}
 The primary driver is Playwright and the browser session is assigned by the launcher. Use attached playwright browser_* tools and any explicitly attached visual bridge for page interaction; applypilot_ats is read/proposal-only, and applypilot_control records the final report. Do not launch shell commands, Skills, browser CLIs or independent browsers. The launcher owns browser-session transitions.
 {visual_control_instruction}
 If Playwright can observe the page but one prepare-phase control is genuinely visual-only or native and has no stable browser ref, do not guess coordinates. {computer_use_handoff_instruction}
@@ -2208,7 +2221,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Lightweight phone check: for a genuinely separate country prefix use digits {phone_digits}; for a widget that parses an international number use the full profile number as the control requires. Check the rendered flag/prefix and number for a duplicated prefix or wrong inferred country, including after resume parsing or country changes. A screenshot can clarify inconclusive DOM values. This reminder adds no hard gate or mandatory extra tool call; correct observed mismatches only.
 - Date fields: {datetime.now().astimezone().strftime('%m/%d/%Y')}
-- Workday segmented/composite dates: never bulk-fill a segmented date or put a complete date into one segment. If an accessible calendar/date picker is available, it is mandatory: select the date only through that control and never use keyboard or per-segment typing. Only when no accessible calendar/date picker exists may you focus and type each segment separately, verifying focus and the visible value before moving to the next segment. If any segment loses focus, changes another segment, clears, or shows an unexpected value, stop immediately for manual review; never retry, patch, guess, refill, or loop over the date.
+- {_FORM_CONTROL_RECOVERY}
 - {form_validation_tip}
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
@@ -2216,7 +2229,7 @@ Only if a question remains unresolved after the answer-resolution order, put an 
 {captcha_section}
 
 == WHEN TO GIVE UP ==
-- Same page signature after one corrective attempt with no progress -> RESULT:FAILED:stuck
+- Same page signature after a corrective attempt: inspect current visual and DOM evidence and try a distinct supported recovery if available. A page signature alone does not prove that a field repair failed. Escalate as RESULT:FAILED:stuck only when useful agent recovery is exhausted or cannot verify a correct result; preserve prepared values and report the exact remaining obstacle.
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
 - Before submission, an explicit broken/500 page or a blank page that persists after the single bounded loading wait and fresh snapshot -> RESULT:FAILED:page_error. After submission, use RESULT:SUBMISSION_UNCERTAIN when confirmation is missing.
 For any failure, also emit a compact FAILURE_CONTEXT with category, recoverability, missing_capability or missing_material when applicable, next_action, visible_state, and bounded attempts. Never include secrets or full mailbox content. Stop immediately after the bounded attempt. Output your RESULT code. Do not loop."""

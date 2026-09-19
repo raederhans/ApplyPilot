@@ -32,6 +32,8 @@ from applypilot.apply.application_facts import (
 )
 from applypilot.apply.ats import (
     ATS_SCHEMA_VERSION,
+    MAX_PROMPT_FIELDS,
+    MAX_PROMPT_OPTIONS_PER_FIELD,
     adapter_prompt_context,
     adapter_prompt_guidance,
     build_form_ir,
@@ -167,7 +169,8 @@ def _tool_definitions() -> list[dict[str, object]]:
             "name": "build_fill_plan",
             "description": (
                 "Build a value-free semantic fill proposal from already-observed field metadata. "
-                "This does not fill controls or authorize actions."
+                "This does not fill controls or authorize actions. Large forms are traversed "
+                "with bounded field and option pages."
             ),
             "inputSchema": {
                 "type": "object",
@@ -182,6 +185,32 @@ def _tool_definitions() -> list[dict[str, object]]:
                         "type": "array",
                         "maxItems": MAX_FACT_NAMES,
                         "items": {"type": "string", "maxLength": 120},
+                    },
+                    "field_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 200,
+                    },
+                    "field_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_PROMPT_FIELDS,
+                    },
+                    "field_keys": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 200,
+                        "items": {"type": "string", "maxLength": 160},
+                    },
+                    "option_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                    },
+                    "option_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_PROMPT_OPTIONS_PER_FIELD,
                     },
                 },
                 "required": ["fields"],
@@ -593,7 +622,31 @@ def _call_tool(name: str, arguments: Mapping[str, object]) -> dict[str, object]:
         facts = allowed_facts if not requested_facts else allowed_facts.intersection(requested_facts)
         form = build_form_ir(url, fields)
         plan = propose_fill_plan(form, facts)
-        return adapter_prompt_context(form, plan)
+        field_keys = None
+        if "field_keys" in arguments:
+            field_keys = _bounded_strings(
+                arguments.get("field_keys"), limit=200, item_limit=160
+            )
+        paging_requested = bool(
+            {
+                "field_offset",
+                "field_limit",
+                "field_keys",
+                "option_offset",
+                "option_limit",
+            }
+            & set(arguments)
+        )
+        return adapter_prompt_context(
+            form,
+            plan,
+            field_offset=arguments.get("field_offset", 0),
+            field_limit=arguments.get("field_limit", MAX_PROMPT_FIELDS),
+            field_keys=field_keys,
+            option_offset=arguments.get("option_offset", 0),
+            option_limit=arguments.get("option_limit", MAX_PROMPT_OPTIONS_PER_FIELD),
+            include_paging=paging_requested,
+        )
     if name == "resolve_answer":
         allowed_arguments = {
             "field_semantic",

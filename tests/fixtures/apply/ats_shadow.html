@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Shadow ATS form fixture</title>
+<style>
+  body { font: 16px sans-serif; margin: 2rem; }
+  label, input, [role="combobox"] { display: block; margin: .4rem 0; }
+  spl-input, spl-dates, spl-autocomplete { display: block; margin: 1rem 0; }
+  [role="listbox"] { border: 1px solid #999; padding: .25rem; }
+  [role="option"] { padding: .2rem; }
+</style>
+
+<h1>Shadow ATS fixture</h1>
+<form id="shadow-application" aria-label="Shadow application">
+  <label>Application note <input id="top-note" value="visible"></label>
+  <!-- The host and the nested input intentionally share an id. -->
+  <spl-input id="duplicate-id" aria-label="Full name"></spl-input>
+  <spl-dates aria-label="Availability dates"></spl-dates>
+  <!-- The combobox input is nested below the listbox's ancestor shadow root. -->
+  <spl-autocomplete aria-label="Country"></spl-autocomplete>
+  <spl-react-select aria-label="Preferred country"></spl-react-select>
+  <label>Account password <input type="password" aria-label="Account password"></label>
+  <label>One-time code <input aria-label="One-time code"></label>
+</form>
+
+<script>
+  class SplInput extends HTMLElement {
+    connectedCallback() {
+      if (this.shadowRoot) return;
+      const shadow = this.attachShadow({ mode: 'open' });
+      shadow.innerHTML = this.hasAttribute('data-combobox')
+        ? '<input role="combobox" aria-label="Country" aria-controls="menu-spl-form-element_85" autocomplete="off">'
+        : '<label>Full name <input id="duplicate-id" aria-label="Full name" autocomplete="name"></label>';
+    }
+  }
+
+  class SplDates extends HTMLElement {
+    connectedCallback() {
+      if (this.shadowRoot) return;
+      const shadow = this.attachShadow({ mode: 'open' });
+      shadow.innerHTML = [
+        '<input type="date" aria-label="Start date">',
+        '<input type="date" aria-label="End date">',
+      ].join('');
+    }
+  }
+
+  class SplAutocomplete extends HTMLElement {
+    connectedCallback() {
+      if (this.shadowRoot) return;
+      const shadow = this.attachShadow({ mode: 'open' });
+      shadow.innerHTML = [
+        '<spl-input id="country-input" data-combobox aria-label="Country"></spl-input>',
+        '<div id="menu-spl-form-element_85" role="listbox" aria-label="Country options">',
+        '  <div role="option" aria-selected="false">Singapore</div>',
+        '  <div role="option" aria-selected="false">China</div>',
+        '</div>',
+      ].join('');
+    }
+  }
+
+  class SplReactSelect extends HTMLElement {
+    connectedCallback() {
+      if (this.shadowRoot) return;
+      const shadow = this.attachShadow({ mode: 'open' });
+      shadow.innerHTML = [
+        '<div class="select__value-container">',
+        '  <div class="select__single-value">China</div>',
+        '  <input id="react-country-input" role="combobox" aria-label="Preferred country" aria-controls="menu-react-country" value="" autocomplete="off">',
+        '</div>',
+        '<div id="menu-react-country" role="listbox">',
+        '  <div id="react-sg" role="option" aria-selected="false">Singapore</div>',
+        '  <div id="react-cn" role="option" aria-selected="true">China</div>',
+        '</div>',
+      ].join('');
+      const display = shadow.querySelector('.select__single-value');
+      for (const option of shadow.querySelectorAll('[role="option"]')) {
+        option.addEventListener('click', () => {
+          display.textContent = option.textContent;
+          shadow.querySelector('input').value = '';
+          for (const candidate of shadow.querySelectorAll('[role="option"]')) candidate.setAttribute('aria-selected', String(candidate === option));
+          shadow.querySelector('[role="listbox"]').remove();
+        });
+      }
+    }
+  }
+
+  customElements.define('spl-input', SplInput);
+  customElements.define('spl-dates', SplDates);
+  customElements.define('spl-autocomplete', SplAutocomplete);
+  customElements.define('spl-react-select', SplReactSelect);
+</script>

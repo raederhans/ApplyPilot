@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createVisualHost, createInAppBrowserHost, browserAdapter } from './visual-bridge-host.mjs';
+import { ControlNotReady } from './browser-form-state.mjs';
 
 test('an unobservable target is never advertised as an active host', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'applypilot-visual-probe-'));
@@ -97,6 +98,30 @@ test('targeted text entry focuses an observed input and refuses action controls'
   assert.deepEqual(actions, [['click', { node_id: '1' }], ['type', { text: 'Test' }]]);
   await assert.rejects(adapter.act('type_text', { node_id: '2', text: 'Test' }), /observed text input/);
   assert.equal(actions.length, 2);
+});
+
+test('a proven pre-input control rejection invalidates observation but allows recovery', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'applypilot-control-recovery-'));
+  const host = await createVisualHost({ directory, target: { tab_id: 'recovery' }, adapter: {
+    surface: 'browser', observe: async () => [{ type: 'text', text: 'fixture' }],
+    act: async () => { throw new ControlNotReady('Options changed; observe again'); },
+  } });
+  t.after(async () => { await host.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  async function request(operation, observation_id) {
+    const request_id = randomUUID();
+    await fs.writeFile(path.join(directory, 'pending', `${request_id}.json`), JSON.stringify({
+      ...host.binding, request_id, operation, observation_id, arguments: {}, deadline_at: Date.now() / 1000 + 30,
+    }));
+    return host.execute(request_id);
+  }
+  const observed = await request('observe');
+  const rejected = await request('select_control', observed.observation_id);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.outcome, 'failed');
+  assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'host.json'))).status, 'active');
+  const fresh = await request('observe');
+  assert.equal(fresh.ok, true);
+  assert.notEqual(fresh.observation_id, observed.observation_id);
 });
 
 test('submit attachment requires explicit authorization and inspection preserves it', async () => {

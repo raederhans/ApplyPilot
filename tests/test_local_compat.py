@@ -2760,7 +2760,7 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert "Otherwise use `failed` or `failed:<failure.code>`" in built
     assert "`captcha_required` may use `captcha`" in built
     assert "`expired` may use `expired`" in built
-    assert "Same page signature after one corrective attempt" in built
+    assert "Same page signature after a corrective attempt" in built
     assert "a first blank, Loading..., or cookie-only snapshot is not a page failure" in real_prepare
     assert "one bounded condition wait (up to 10 seconds)" in real_prepare
     assert "Do not reload, loop, or change application identity" in real_prepare
@@ -2769,14 +2769,10 @@ def test_apply_prompt_hides_secrets_and_isolates_worker_attachments(
     assert (
         "Prefer bulk filling ordinary fields when their current refs are reliable." in built
     )
-    assert "Workday segmented/composite dates" in built
-    assert "never bulk-fill a segmented date or put a complete date into one segment" in built
-    assert "If an accessible calendar/date picker is available, it is mandatory" in built
-    assert "never use keyboard or per-segment typing" in built
-    assert "Only when no accessible calendar/date picker exists" in built
-    assert "verifying focus and the visible value before moving to the next segment" in built
-    assert "stop immediately for manual review" in built
-    assert "never retry, patch, guess, refill, or loop over the date" in built
+    assert "Ordinary form-control recovery (including dates)" in built
+    assert "inspect a current screenshot and DOM" in built
+    assert "try a distinct evidence-led approach before asking the user" in built
+    assert "it is mandatory: select the date only" not in built
     assert "A field labelled optional becomes conditionally required" in built
     assert "RESULT:APPLIED with a note that this was a dry run" not in built
     assert "launcher normally opens the exact job URL" in built
@@ -3062,7 +3058,8 @@ def test_submission_prompt_blocks_uncertain_or_missing_resume_state(
     assert "hard submission pause" in built
     assert "Prior local application state: submission_uncertain" in built
     assert "must never trigger another submit click" in built
-    assert "call browser_select_option with the selected visible option text" in built
+    assert "Verify the settled value or review-page answer" in built
+    assert "report material answer/page changes for re-audit before submission" in built
     assert "Lever ordinary application form" in built
     assert "declare progress without visible state change" in built
 
@@ -5805,10 +5802,9 @@ def test_tailoring_render_failure_never_becomes_machine_validated(
 def test_revalidation_revokes_old_machine_validated_state_on_any_failure(
     tmp_path: Path, monkeypatch, failure_stage: str, expected_status: str
 ) -> None:
-    from applypilot import single_job
+    from applypilot import resume_versions, single_job
     from applypilot.scoring import tailor as tailor_module
     from applypilot.scoring import validator as validator_module
-    from applypilot import resume_versions
     monkeypatch.setattr(single_job.config, "APP_DIR", tmp_path)
 
     database_path = tmp_path / "jobs.db"

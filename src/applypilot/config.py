@@ -520,6 +520,26 @@ def load_blocked_sites() -> tuple[set[str], list[str]]:
     return sites, patterns
 
 
+def browser_capability_hint(url: str, site: str = "") -> str:
+    """Return advisory recovery guidance for historically difficult adapters."""
+    from fnmatch import fnmatchcase
+
+    hints = load_sites_config().get("capability_hints", {})
+    matches = site.casefold() in {str(name).casefold() for name in hints.get("sites", [])}
+    matches = matches or any(
+        fnmatchcase(url.casefold(), str(pattern).casefold().replace("%", "*"))
+        for pattern in hints.get("url_patterns", [])
+    )
+    if not matches:
+        return ""
+    return (
+        "Historical adapter difficulty only; do not exclude this job or assume a human is required. "
+        "Inspect the live page and allow more effort for distinct, evidence-led recovery while "
+        "progress continues. Prefer the supported in-app browser at orchestration time when useful. "
+        "Actual authentication challenges and uncertain submissions still require their normal handling."
+    )
+
+
 def load_blocked_sso() -> list[str]:
     """Load blocked SSO domains from sites.yaml."""
     cfg = load_sites_config()

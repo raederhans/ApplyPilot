@@ -65,6 +65,11 @@ def _tool() -> dict[str, object]:
         "minItems": 1,
         "maxItems": 8,
     }
+    argument_properties.update({
+        "field_key": {"type": "string", "minLength": 1},
+        "value": {"type": "string", "maxLength": 12000},
+        "checked": {"type": "boolean"},
+    })
     return {
         "name": TOOL_NAME,
         "description": (
@@ -72,6 +77,9 @@ def _tool() -> dict[str, object]:
             "Actions after observe must reference the returned observation_id. "
             "navigate opens a currently observed link in the same tab; it is browser-only. "
             "upload_artifact selects one host-provided artifact through an observed upload control node_id. "
+            "fill_control replaces ordinary text/date values and commits blur; select_control selects an observed native option; "
+            "set_checked sets an ordinary checkbox state. These use field_key from form_state, never a guessed selector. "
+            "Check control_result and post_upload_changes; changed values are observations requiring fact review, not approved answers. "
             "Passwords and OTPs must never be placed in this tool; request secure host authentication instead."
         ),
         "inputSchema": {
@@ -79,7 +87,8 @@ def _tool() -> dict[str, object]:
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact"],
+                    "enum": ["observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact",
+                             "fill_control", "select_control", "set_checked"],
                 },
                 "observation_id": {"type": "string", "minLength": 1},
                 "arguments": {
