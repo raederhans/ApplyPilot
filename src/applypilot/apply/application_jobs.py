@@ -236,12 +236,11 @@ def acquire_job(
                   {url_clauses}
                 ORDER BY fit_score DESC, url
             """, [max_apply_attempts] + params).fetchall()
-            from applypilot.discovery.diversity import (
-                rank_company_diverse,
-                recent_handled_companies,
-            )
+            from applypilot.discovery.company_priority import rank_with_company_priority
+            from applypilot.discovery.diversity import recent_handled_companies
 
-            rows = rank_company_diverse(
+            rows = rank_with_company_priority(
+                conn,
                 [dict(candidate) for candidate in rows],
                 recent_companies=recent_handled_companies(conn),
             )

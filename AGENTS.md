@@ -112,3 +112,9 @@
   is a reason to inspect duties, not reject. Prefer another company among
   equally suitable jobs; fit evidence and explicit user targets take priority.
 - See `docs/multisource-radar.md` for the bounded search and verification contract.
+- Company priority uses the two-week soft policy in `docs/company-priority.md`.
+  Before a batch, import reviewed recruiting feedback with
+  `company-priority-import`, then inspect `company-priority-preview`. Record only
+  confirmed submissions and explicit outcomes with canonical requisition IDs.
+  Never interpret unavailable/incomplete feedback as silence. Preserve fit and
+  eligibility; inspect the best penalized opportunities before final selection.

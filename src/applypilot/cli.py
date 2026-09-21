@@ -61,6 +61,51 @@ console = Console()
 log = logging.getLogger(__name__)
 
 
+@app.command("company-priority-import")
+def company_priority_import(file: Path = typer.Option(..., "--file", exists=True)) -> None:
+    """Import reviewed recruiting feedback/scopes. Does not submit applications."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.discovery.company_priority import import_events
+
+    try:
+        count = import_events(get_connection(), json.loads(file.read_text(encoding="utf-8-sig")))
+    except (ValueError, TypeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _print_json(data={"imported": count})
+
+
+@app.command("company-priority-preview")
+def company_priority_preview(
+    at: str | None = typer.Option(None, "--at", help="Timezone-aware simulation date; no writes."),
+    limit: int = typer.Option(20, "--limit", min=1),
+) -> None:
+    """Show adjusted priority, evidence and expiry without changing fit or status."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.discovery.company_priority import rank_with_company_priority, timestamp
+    from applypilot.discovery.diversity import recent_handled_companies
+
+    conn = get_connection()
+    try:
+        current = timestamp(at) if at else datetime.now(UTC)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    jobs = [dict(row) for row in conn.execute(
+        "SELECT * FROM jobs WHERE fit_score IS NOT NULL "
+        "AND (apply_status IS NULL OR apply_status IN ('failed', 'previewed')) "
+        "AND COALESCE(eligibility_status, 'eligible') != 'ineligible' ORDER BY url"
+    )]
+    ranked = rank_with_company_priority(conn, jobs, now=current,
+                                        recent_companies=recent_handled_companies(conn))
+    _print_json(data={"as_of": current.isoformat(), "candidate_count": len(jobs),
+                      "note": "Priority only; application readiness and authorization still apply.",
+                      "jobs": [{key: job.get(key) for key in (
+                          "url", "company_name", "title", "fit_score",
+                          "application_priority_score", "company_priority")}
+                               for job in ranked[:limit]]})
+
+
 def _print_json(*, data: Any) -> None:
     """Keep structured output lossless on Windows legacy-encoded streams.
 
@@ -153,14 +198,12 @@ def _build_standing_authorization_manifest(
                 "enrichment, scoring, and material-readiness steps before retrying `apply --url`."
             )
     else:
-        from applypilot.discovery.diversity import (
-            rank_company_diverse,
-            recent_handled_companies,
-        )
+        from applypilot.discovery.company_priority import rank_with_company_priority
+        from applypilot.discovery.diversity import recent_handled_companies
 
-        # Scan a bounded superset so a portal/manual exclusion cannot consume
-        # a standing-authorization slot.  The decision gate below remains the
-        # single source of truth for final readiness.
+        # Rank all eligible candidates before limiting the authorization set;
+        # a raw-fit SQL limit could hide better adjusted-priority candidates.
+        # The decision gate remains the source of truth for final readiness.
         rows = conn.execute(
             """
             SELECT * FROM jobs
@@ -169,11 +212,11 @@ def _build_standing_authorization_manifest(
               AND COALESCE(eligibility_status, 'eligible') != 'ineligible'
               AND COALESCE(fit_score, -1) >= ?
             ORDER BY fit_score DESC, url
-            LIMIT ?
             """,
-            (minimum_fit_score, min(candidate_cap * 8, 80)),
+            (minimum_fit_score,),
         ).fetchall()
-        rows = rank_company_diverse(
+        rows = rank_with_company_priority(
+            conn,
             [dict(row) for row in rows],
             recent_companies=recent_handled_companies(conn),
         )
