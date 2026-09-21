@@ -39,9 +39,37 @@ matched to the exact job can create a durable submitted record.
   CAPTCHA or MFA, assessments, identity or financial documents, account
   recovery, security changes, and uncertain submission outcomes stop for
   review.
-- **CapyPilot v0.5.1** introduces our independent product brand, with a capybara
-  identity and a calm, deliberate approach to career progress. Existing commands
-  and local data remain compatible.
+- **CapyPilot v0.5.2** strengthens evidence-based resume reuse, supervised ATS
+  preparation, application prioritization, and browser-host diagnostics. Existing
+  commands and local data remain compatible; CAPTCHA, external-browser routing,
+  and production-concurrency policy are unchanged.
+
+## v0.5.2 highlights
+
+- **Stronger resume evidence.** Resume content, renders, generation runs, and
+  validation runs have separate immutable histories. Routing prefers healthy,
+  evidence-dense variants and rejects stale score or source bindings.
+- **Safer attended applications.** Browser observations, reviewed materials,
+  authorization, the single-submit intent latch, and receipt outcomes stay bound
+  to the same application attempt. Complex controls, open Shadow DOM, upload
+  changes, and selected-display verification receive explicit checks.
+- **Evidence-backed prioritization.** Confirmed recent rejections or a complete
+  reviewed no-progress cohort can temporarily lower a company's broad-application
+  priority without changing fit, eligibility, exact-job requests, or submission
+  authorization.
+- **Less duplicate browser work.** A validated immediate form readback can be
+  reused once during in-app-browser preparation. In the fixed five-write offline
+  Chromium fixture, form reads fell from 16 to 11 and additional full snapshots
+  from 6 to 1 while visible-DOM reads and final values remained unchanged.
+- **Inspectable performance boundaries.** `host.metrics()` separates queue,
+  action, observation, and host-service time without retaining applicant values.
+  Together, these changes reduce redundant browser work while preserving current
+  page feedback and improve the efficiency of attended preparation.
+
+See the [v0.5.2 changelog](CHANGELOG.md),
+[resume library curation](docs/resume-library-curation.md),
+[company priority policy](docs/company-priority.md), and
+[attended observation performance](docs/attended-observation-performance.md).
 
 ## Product workflow
 
@@ -71,10 +99,10 @@ There is currently no `applypilot-local` release on PyPI. Install from the
 directly from the repository:
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.1"
+pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.2"
 ```
 
-For a reproducible local deployment, download the v0.5.1 bundle and
+For a reproducible local deployment, download the v0.5.2 bundle and
 `SHA256SUMS` from the release page, verify the archive checksum, then extract
 the bundle and run the guided installer:
 

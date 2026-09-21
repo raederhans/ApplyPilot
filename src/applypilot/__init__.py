@@ -1,3 +1,3 @@
 """ApplyPilot Local — a local-first, evidence-driven application workspace."""
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"

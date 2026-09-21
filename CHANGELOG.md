@@ -4,8 +4,32 @@ All notable changes to CapyPilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-21
+
+### Added
+
+- Immutable resume content, render, generation, and validation histories, with
+  guarded curation, rollback, and exact input bindings for scoring and routing.
+- A supervised attended-application path that binds browser observations,
+  reviewed materials, authorization, single-submit intent, and receipt outcomes
+  to the same durable application attempt.
+- Evidence-backed two-week company prioritization with bounded penalties,
+  recovery, progress resets, and explicit coverage requirements. Eligibility,
+  fit scores, and submission gates remain unchanged.
+- Bounded, value-free attended-host queue/action/observation diagnostics through
+  `host.metrics()`, with explicit unavailable measurements and inspection coverage.
+- Node contract tests and offline Chromium form checks in the existing Python
+  core, browser, and Windows CI tiers. See
+  [attended observation performance](docs/attended-observation-performance.md).
+
 ### Changed
 
+- Resume routing now prefers healthy, evidence-dense reusable variants, preserves
+  current-first experience ordering, and uses source-grounded targeted repairs
+  instead of repeatedly regenerating complete documents.
+- Attended form preparation now handles complex controls, open Shadow DOM,
+  upload deltas, bounded form pagination, and selected-display verification while
+  retaining fresh identity and submission-safety checks.
 - Reuse one immediate, validated form readback in attended in-app-browser prepare
   replies while retaining current visible DOM. Explicit observations, uploads,
   screenshots, structural changes and submit-phase observations stay on the full
@@ -21,6 +45,9 @@ All notable changes to CapyPilot will be documented in this file.
 
 ### Fixed
 
+- Job-description, selected-source, profile-fact, and supplemental-evidence
+  changes now invalidate stale unsubmitted scoring and preparation projections
+  without rewriting submitted or uncertain application history.
 - Do not report an earlier control's persistence as current after a full refresh
   observes a changed value; explicit refreshes do not carry old control results.
 
