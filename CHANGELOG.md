@@ -4,6 +4,26 @@ All notable changes to CapyPilot will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse one immediate, validated form readback in attended in-app-browser prepare
+  replies while retaining current visible DOM. Explicit observations, uploads,
+  screenshots, structural changes and submit-phase observations stay on the full
+  path. No CAPTCHA, external-browser or production-concurrency policy changes.
+
+### Added
+
+- Bounded, value-free attended-host queue/action/observation diagnostics through
+  `host.metrics()`, with explicit unavailable measurements and inspection coverage.
+- Node contract tests and offline Chromium form checks in the existing Python
+  core, browser and Windows CI tiers. See
+  [attended observation performance](docs/attended-observation-performance.md).
+
+### Fixed
+
+- Do not report an earlier control's persistence as current after a full refresh
+  observes a changed value; explicit refreshes do not carry old control results.
+
 ## [0.5.1] - 2026-09-06
 
 ### Fixed
