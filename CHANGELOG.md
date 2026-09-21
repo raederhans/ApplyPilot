@@ -1,8 +1,19 @@
 # Changelog
 
-All notable changes to CapyPilot will be documented in this file.
+All notable changes to Job Apply Pilot will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- Renamed the public product identity from **CapyPilot** to **Job Apply Pilot**
+  for clearer search visibility and immediate product recognition. Technical
+  identifiers and runtime contracts remain unchanged.
+- Replaced the mascot-led identity with a direct job-card, application-route,
+  and verified-receipt system across the README and read-only dashboard.
+- Rewrote the bilingual project overview around concrete capabilities, the
+  Discover → Decide → Prepare → Verify workflow, and the product-contract
+  differences from the original Pickle-Pixel/ApplyPilot project.
 
 ## [0.5.2] - 2026-09-21
 

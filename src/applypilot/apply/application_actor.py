@@ -470,7 +470,7 @@ def human_request_for_decision(decision: DecisionEnvelope) -> HumanRequest | Non
         return None
     prompt_by_type = {
         "captcha": (
-            "Waiting for the visible CAPTCHA to be cleared on the bound CapyPilot "
+            "Waiting for the visible CAPTCHA to be cleared on the bound Job Apply Pilot "
             "page; the launcher will re-observe and resume automatically."
         ),
         "security_challenge": (
@@ -482,7 +482,7 @@ def human_request_for_decision(decision: DecisionEnvelope) -> HumanRequest | Non
             "routine application authorization is already recorded."
         ),
         "sensitive_identity_or_financial_material": (
-            "The application requires identity or financial material that CapyPilot "
+            "The application requires identity or financial material that Job Apply Pilot "
             "cannot supply automatically."
         ),
         "unsupported_legal_declaration": (

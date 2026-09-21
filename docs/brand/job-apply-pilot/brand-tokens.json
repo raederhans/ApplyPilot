@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "brand": {
+    "displayName": "Job Apply Pilot",
+    "direction": "editorial-application-operations",
+    "selectedOn": "2026-09-21",
+    "workflow": ["Discover", "Decide", "Prepare", "Verify"]
+  },
+  "technicalIdentifiers": {
+    "immutable": [
+      "applypilot",
+      "applypilot-local",
+      "APPLYPILOT_*",
+      "src/applypilot",
+      "applypilot.db"
+    ]
+  },
+  "color": {
+    "signalInk": "#0B1F3A",
+    "flightBlue": "#175CD3",
+    "routeOrange": "#FF5A36",
+    "actionOrange": "#D83A12",
+    "receiptGreen": "#20B486",
+    "successGreen": "#0D7A60",
+    "canvas": "#F3F6FA",
+    "surface": "#FFFFFF",
+    "textMuted": "#526176",
+    "border": "#CBD5E1"
+  },
+  "accessibility": {
+    "minimumBodyContrast": 4.5,
+    "minimumInteractiveTargetPx": 44,
+    "reducedMotion": true,
+    "colorAloneDoesNotConveyState": true
+  }
+}

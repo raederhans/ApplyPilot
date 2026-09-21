@@ -1,5 +1,7 @@
 {
   "schemaVersion": 1,
+  "status": "superseded",
+  "supersededBy": "../job-apply-pilot/BRAND.md",
   "brand": {
     "displayName": "CapyPilot",
     "direction": "quiet-copilot-warm-light",

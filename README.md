@@ -1,117 +1,91 @@
-# CapyPilot
+# Job Apply Pilot — local-first job application automation with proof
 
 <p align="center">
-  <img src="src/applypilot/frontend/assets/capypilot/capypilot-lockup-light.png" alt="CapyPilot" width="560">
+  <img src="docs/brand/job-apply-pilot/assets/readme-hero.svg" alt="Job Apply Pilot — discover, decide, prepare, verify" width="100%">
 </p>
 
-[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=CapyPilot)](https://github.com/raederhans/ApplyPilot/releases/latest)
+[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/ApplyPilot/releases/latest)
 [![CI](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.11–3.13-0B1F3A)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-20B486)](LICENSE)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**Your next chapter, one confident step at a time.**
+**Find real jobs. Choose with evidence. Prepare truthful materials. Apply under your control. Prove what was submitted.**
 
-A local-first career workspace: discover opportunities, prepare truthful
-applications, and keep a clear record of every outcome.
+Job Apply Pilot is a local-first operations workspace for the entire job-application loop. It combines official-source discovery, fit and eligibility review, evidence-backed resume routing, truthful tailoring, supervised browser assistance, application history, and receipt reconciliation in one auditable workflow.
 
-CapyPilot helps one job seeker discover verifiable openings, compare fit,
-prepare truthful materials, complete supported application forms under explicit
-authorization, and confirm what was actually submitted. Profiles, resumes,
-credentials, browser sessions, receipts, and runtime logs stay on the user's
-machine by default.
+It is built for people who want more leverage without surrendering judgment. Your profile, resumes, credentials, browser sessions, receipts, and runtime logs stay on your machine by default.
 
-CapyPilot is built for supervised execution, not blind bulk submission. A
-clicked **Submit** button is not counted as success; only decisive evidence
-matched to the exact job can create a durable submitted record.
+## What it actually does
+
+| Need | Job Apply Pilot capability | Evidence boundary |
+| --- | --- | --- |
+| Find opportunities | Collect official openings, optional job-board results, and manually reviewed leads | A search result is not treated as a verified job |
+| Choose what to pursue | Check eligibility, enrich job descriptions, score fit, and prioritize the queue | A high score is not permission to apply |
+| Build the application | Route validated resumes, identify evidence gaps, tailor without inventing facts, and validate PDFs | Generated content is not automatically trusted |
+| Work through the form | Prepare and fill supported application surfaces after explicit authorization | CAPTCHA, MFA, assessments, sensitive documents, and unsupported answers stop for review |
+| Prove the outcome | Bind the exact job, authorization, browser observations, and receipt to one attempt | Clicking **Submit** is not proof that the employer received it |
+
+## The workflow
+
+```text
+DISCOVER                 DECIDE                    PREPARE                    VERIFY
+official jobs     →      eligibility       →      resume routing     →      exact-job receipt
+board/manual leads       fit evidence              truthful tailoring        durable history
+source state             readiness                 PDF + form prep            no blind retry
+```
+
+The guarded application path is:
+
+```text
+prepare → audit → authorize → submit → observe → reconcile receipt
+```
+
+If acceptance cannot be proved, the attempt remains `submission_uncertain`. Job Apply Pilot does not silently count it as success or automatically submit the same application again.
+
+## Why this is not the original ApplyPilot
+
+This repository is an independent continuation of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), but its product contract is intentionally different.
+
+| | Original ApplyPilot | Job Apply Pilot |
+| --- | --- | --- |
+| Product promise | High-volume autonomous application | Evidence-led, supervised application operations |
+| Success model | Browser-driven submission | Exact-job receipt or an explicit uncertain state |
+| Human role | Hands-off automation | Review and authorization at consequential boundaries |
+| Data model | Pipeline output | Durable source, material, authorization, attempt, and receipt history |
+| Privacy posture | Local open-source agent | Local-first workspace with no hosted account or cloud sync |
+| Dashboard | Application progress | Read-only evidence workbench; no hidden writes or submissions |
+
+The public product name is **Job Apply Pilot**. Compatibility identifiers remain unchanged: the CLI and Python package are `applypilot`, the distribution is `applypilot-local`, environment variables use `APPLYPILOT_*`, and the default workspace is `~/.applypilot/`.
+
+This project is not affiliated with applypilot.app, useapplypilot.com, or other similarly named services.
 
 ## Current status
 
-- **Beta, local-first, and CLI-first.** The product runs on the user's machine;
-  there is no hosted CapyPilot service, account system, or cloud sync.
-- **Useful end to end today.** The current code supports official-source
-  discovery and manual imports, fit scoring, validated resume reuse, truthful
-  tailoring, cover-letter and PDF preparation, authorized browser assistance,
-  application history, and receipt reconciliation.
-- **The browser dashboard is read-only.** It presents the same four stages—
-  Discover, Decide, Prepare, and Verify—without mutating the database or
-  executing commands.
-- **Human review remains part of the product.** Unsupported material answers,
-  CAPTCHA or MFA, assessments, identity or financial documents, account
-  recovery, security changes, and uncertain submission outcomes stop for
-  review.
-- **CapyPilot v0.5.2** strengthens evidence-based resume reuse, supervised ATS
-  preparation, application prioritization, and browser-host diagnostics. Existing
-  commands and local data remain compatible; CAPTCHA, external-browser routing,
-  and production-concurrency policy are unchanged.
-
-## v0.5.2 highlights
-
-- **Stronger resume evidence.** Resume content, renders, generation runs, and
-  validation runs have separate immutable histories. Routing prefers healthy,
-  evidence-dense variants and rejects stale score or source bindings.
-- **Safer attended applications.** Browser observations, reviewed materials,
-  authorization, the single-submit intent latch, and receipt outcomes stay bound
-  to the same application attempt. Complex controls, open Shadow DOM, upload
-  changes, and selected-display verification receive explicit checks.
-- **Evidence-backed prioritization.** Confirmed recent rejections or a complete
-  reviewed no-progress cohort can temporarily lower a company's broad-application
-  priority without changing fit, eligibility, exact-job requests, or submission
-  authorization.
-- **Less duplicate browser work.** A validated immediate form readback can be
-  reused once during in-app-browser preparation. In the fixed five-write offline
-  Chromium fixture, form reads fell from 16 to 11 and additional full snapshots
-  from 6 to 1 while visible-DOM reads and final values remained unchanged.
-- **Inspectable performance boundaries.** `host.metrics()` separates queue,
-  action, observation, and host-service time without retaining applicant values.
-  Together, these changes reduce redundant browser work while preserving current
-  page feedback and improve the efficiency of attended preparation.
-
-See the [v0.5.2 changelog](CHANGELOG.md),
-[resume library curation](docs/resume-library-curation.md),
-[company priority policy](docs/company-priority.md), and
-[attended observation performance](docs/attended-observation-performance.md).
-
-## Product workflow
-
-| Stage | What CapyPilot does | What it does not assume |
-| --- | --- | --- |
-| Discover | Collects official openings, optional board results, and manual leads with source state | A lead is not automatically a verified job |
-| Decide | Checks eligibility, enriches descriptions, scores fit, and records readiness | A high score is not authorization to apply |
-| Prepare | Routes validated resumes, identifies evidence gaps, tailors content, and validates PDFs | Missing facts are not invented |
-| Verify | Separates authorization, browser observations, platform state, and durable receipts | A preview or final click is not proof of acceptance |
-
-The safe application path is:
-
-```text
-prepare -> audit -> authorize -> submit -> observe -> reconcile receipt
-```
-
-If acceptance cannot be proved, the application remains
-`submission_uncertain` and is not submitted again automatically.
+- **Beta, local-first, and CLI-first.** There is no hosted Job Apply Pilot service, account system, telemetry dashboard, or cloud sync.
+- **End-to-end workflow available.** The source supports discovery, enrichment, scoring, resume-library routing, truthful tailoring, cover letters and PDF preparation, supervised application assistance, history, and receipt reconciliation.
+- **Read-only browser dashboard.** The workbench presents Discover, Decide, Prepare, and Verify without mutating the database or executing commands.
+- **Human review is a feature.** Unsupported claims, CAPTCHA or MFA, assessments, identity or financial documents, account recovery, security changes, and uncertain results remain explicit handoff points.
+- **Current release: v0.5.2.** Existing commands, local data, and compatibility identifiers remain unchanged by this brand redesign.
 
 ## Install
 
-Python 3.11 or 3.12 is recommended for the full workflow. Core commands and
-the official-source radar also support Python 3.13.
+Python 3.11 or 3.12 is recommended for the full workflow. Core commands and the official-source radar also support Python 3.13.
 
-There is currently no `applypilot-local` release on PyPI. Install from the
-[latest GitHub release](https://github.com/raederhans/ApplyPilot/releases) or
-directly from the repository:
+There is no `applypilot-local` release on PyPI. Install from the [latest GitHub release](https://github.com/raederhans/ApplyPilot/releases) or directly from this repository:
 
 ```bash
 pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.2"
 ```
 
-For a reproducible local deployment, download the v0.5.2 bundle and
-`SHA256SUMS` from the release page, verify the archive checksum, then extract
-the bundle and run the guided installer:
+For a reproducible local deployment, download the release bundle and `SHA256SUMS`, verify the checksum, extract it, and run:
 
 ```bash
 python install.py
 ```
 
-Third-party job-board discovery is optional and currently intended for Python
-3.11–3.12:
+Optional third-party job-board discovery is currently intended for Python 3.11–3.12:
 
 ```bash
 python install.py --with-jobboards
@@ -119,7 +93,7 @@ python install.py --with-jobboards
 
 ## Quick start
 
-Initialize the local workspace and check available capabilities:
+Initialize the workspace, check capabilities, and open the read-only dashboard:
 
 ```bash
 applypilot init
@@ -145,7 +119,7 @@ applypilot apply --authorization-file <batch-manifest.json>
 applypilot reconcile-receipts --file <receipt.json>
 ```
 
-Validated resume variants can be inspected and routed independently:
+Inspect and route validated resume variants:
 
 ```bash
 applypilot resume-library-sync
@@ -154,31 +128,15 @@ applypilot resume-library-review
 applypilot resume-route --url <verified-job-url>
 ```
 
-See [resume library curation](docs/resume-library-curation.md) for content/render history, evidence freshness, and reviewed editorial updates.
+Run `applypilot --help` for the full command list.
 
-Run `applypilot --help` for the complete command list. Optional browser
-backends, interaction modes, provider behavior, and operating details belong
-in the command help and product documentation rather than this overview.
+## Safety and local data
 
-## Compatibility and local data
+Do not commit or share the local workspace. It may contain profile data, resumes, generated documents, SQLite databases, API keys, browser profiles, screenshots, receipts, logs, or verification codes.
 
-The public product name is **CapyPilot**, while these technical identifiers
-remain unchanged during the migration:
+Job Apply Pilot does not endorse CAPTCHA bypass, hidden submission, identity-document automation, or account-recovery automation. See [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 
-- distribution: `applypilot-local`
-- Python package and CLI: `applypilot`
-- environment variables: `APPLYPILOT_*`
-- default workspace: `~/.applypilot/`
-- database schema, storage keys, entry points, and repository URL
-
-Do not commit or share the local workspace. It may contain profile data,
-resumes, generated documents, SQLite databases, API keys, browser profiles,
-screenshots, receipts, logs, or verification codes. CapyPilot does not endorse
-CAPTCHA bypass, hidden submission, identity-document automation, or account
-recovery automation. See [SECURITY.md](SECURITY.md) before reporting a
-vulnerability.
-
-## Development and documentation
+## Development
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -188,13 +146,10 @@ python scripts/build_release.py
 ```
 
 - [Product and frontend boundaries](docs/product-core.md)
+- [Resume library curation](docs/resume-library-curation.md)
+- [Company priority policy](docs/company-priority.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
 - [License and provenance](NOTICE.md)
 
-CapyPilot is licensed under [GNU AGPL-3.0-only](LICENSE). It is an independent
-continuation of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot);
-the original authors retain copyright in the upstream work. This repository is
-not affiliated with applypilot.app, useapplypilot.com, or similarly named
-products.
+Job Apply Pilot is licensed under [GNU AGPL-3.0-only](LICENSE). The original ApplyPilot authors retain copyright in the upstream work.

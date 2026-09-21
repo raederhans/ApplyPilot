@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit CapyPilot release artifacts.
+"""Build and audit Job Apply Pilot release artifacts.
 
 Outputs:
 
@@ -162,7 +162,7 @@ def create_bundle(
         shutil.copy2(root / "install.py", staging / "install.py")
         shutil.copy2(root / "LICENSE", staging / "LICENSE")
         (staging / "README.txt").write_text(
-            "CapyPilot verified release bundle\n"
+            "Job Apply Pilot verified release bundle\n"
             "========================================\n\n"
             "Python 3.11 or 3.12 is recommended. From this directory run:\n\n"
             "    python install.py\n\n"

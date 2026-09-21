@@ -1,5 +1,7 @@
 # CapyPilot P0 selected direction
 
+> **Superseded on 2026-09-21.** This direction is retained for provenance. See the current [Job Apply Pilot brand system](../job-apply-pilot/BRAND.md).
+
 Status: selected and revised on 2026-09-02.
 
 ## Decision

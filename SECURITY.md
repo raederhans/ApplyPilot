@@ -1,4 +1,4 @@
-# CapyPilot security policy
+# Job Apply Pilot security policy
 
 Do not publish suspected vulnerabilities, exposed credentials, or personal data in a public issue.
 
@@ -13,6 +13,6 @@ The optional CloakBrowser backend executes a third-party, source-patched
 Chromium binary. Use only the pinned, signature-verified upstream distribution;
 do not use `CLOAKBROWSER_SKIP_CHECKSUM`, custom mirrors, or the `cloakserve`
 proxy. Keep its CDP endpoint on `127.0.0.1`, store profiles only under the
-CapyPilot data directory, and never place a license key in the repository.
+Job Apply Pilot data directory, and never place a license key in the repository.
 Browser selection does not weaken portal policy, authorization, CAPTCHA/MFA,
 assessment, identity-document, account-recovery, or receipt-admission gates.

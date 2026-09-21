@@ -1,6 +1,6 @@
-# CapyPilot provenance and license notice
+# Job Apply Pilot provenance and license notice
 
-CapyPilot is an independent continuation of
+Job Apply Pilot is an independent continuation of
 [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), based on
 upstream commit `4a8d521f67f5139811c0a910ef37410f8e6d836a` and subsequent fork
 work.
@@ -12,14 +12,14 @@ work.
   license text is retained in [LICENSE](LICENSE).
 - This fork is not endorsed by or operated by the inactive upstream project,
   applypilot.app, useapplypilot.com, or other similarly named services. The
-  product identity is CapyPilot; technical identifiers and repository URLs
+  product identity is Job Apply Pilot; technical identifiers and repository URLs
   retain their existing names for compatibility.
 
 ## Network deployment boundary
 
 GNU AGPLv3 section 13 requires a modified version that supports remote user
 interaction over a network to prominently offer those users the corresponding
-source code at no charge. A future hosted CapyPilot interface must
+source code at no charge. A future hosted Job Apply Pilot interface must
 therefore include a visible source link for the exact deployed version.
 
 The current product is local-first and does not provide a hosted service. This

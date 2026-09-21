@@ -1,1 +1,1 @@
-"""Developer and release automation for CapyPilot."""
+"""Developer and release automation for Job Apply Pilot."""

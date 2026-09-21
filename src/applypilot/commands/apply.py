@@ -455,7 +455,7 @@ def run_apply(
             )
         else:
             console.print(
-                "\n[dim]Codex MCP isolation is assembled by CapyPilot at runtime; "
+                "\n[dim]Codex MCP isolation is assembled by Job Apply Pilot at runtime; "
                 "use apply --dry-run --url URL instead of copying a partial command.[/dim]"
             )
         return

@@ -4,30 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#F7F2E8">
-  <link rel="icon" href="assets/capypilot/favicon.ico" sizes="any">
-  <link rel="icon" type="image/png" sizes="16x16" href="assets/capypilot/favicon-16.png">
-  <link rel="icon" type="image/png" sizes="32x32" href="assets/capypilot/favicon-32.png">
-  <link rel="icon" type="image/png" sizes="48x48" href="assets/capypilot/favicon-48.png">
-  <link rel="apple-touch-icon" sizes="192x192" href="assets/capypilot/app-icon-192.png">
-  <link rel="icon" type="image/png" sizes="512x512" href="assets/capypilot/app-icon-512.png">
-  <title>CapyPilot — Opportunity Workbench</title>
+  <meta name="theme-color" content="#0B1F3A">
+  <link rel="icon" href="assets/job-apply-pilot/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/job-apply-pilot/job-apply-pilot-16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/job-apply-pilot/job-apply-pilot-32.png">
+  <link rel="icon" type="image/png" sizes="48x48" href="assets/job-apply-pilot/job-apply-pilot-48.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="assets/job-apply-pilot/job-apply-pilot-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="assets/job-apply-pilot/job-apply-pilot-512.png">
+  <title>Job Apply Pilot — Opportunity Workbench</title>
   <style>
     :root {
-      --canvas: #f7f2e8;
-      --surface-raised: #fffcf6;
-      --surface-sand: #eee4d3;
-      --text-primary: #2b241f;
-      --text-muted: #6f635a;
-      --border-subtle: #d8cec0;
-      --brand-primary: #a95f3d;
-      --brand-secondary: #5c3a2a;
-      --brand-illustration-taupe: #b88962;
-      --success: #2f7a55;
-      --warning: #965f12;
-      --error: #b4473e;
-      --link: #2e68a0;
-      --focus: #2e68a0;
+      --canvas: #f3f6fa;
+      --surface-raised: #ffffff;
+      --surface-sand: #e8eef6;
+      --text-primary: #0b1f3a;
+      --text-muted: #526176;
+      --border-subtle: #cbd5e1;
+      --brand-primary: #d83a12;
+      --brand-secondary: #0b1f3a;
+      --brand-illustration-taupe: #175cd3;
+      --success: #0d7a60;
+      --warning: #9a6700;
+      --error: #c33c36;
+      --link: #175cd3;
+      --focus: #175cd3;
       --success-surface: #e6f1ea;
       --warning-surface: #f7ecd5;
       --error-surface: #f7e3e0;
@@ -36,7 +36,7 @@
       --panel: var(--surface-raised);
       --panel-raised: var(--surface-sand);
       --line: var(--border-subtle);
-      --line-soft: #e8dfd2;
+      --line-soft: #dbe3ed;
       --text: var(--text-primary);
       --muted: var(--text-muted);
       --quiet: var(--text-muted);
@@ -104,8 +104,8 @@
       display: flex;
       flex-direction: column;
       padding: 28px 24px 22px;
-      border-right: 1px solid var(--border-subtle);
-      background: color-mix(in srgb, var(--surface-raised) 78%, var(--canvas));
+      border-right: 1px solid #173b66;
+      background: #0b1f3a;
     }
     .brand {
       display: flex;
@@ -118,21 +118,21 @@
     .brand picture { display: block; line-height: 0; }
     .brand-lockup {
       display: block;
-      width: 154px;
+      width: 176px;
       height: auto;
     }
     .brand-name-compact { display: none; }
     .brand-local {
       align-self: end;
       margin-bottom: 6px;
-      color: var(--text-muted);
+      color: #b8c7da;
       font: 10px/1.2 var(--mono);
       letter-spacing: .08em;
       text-transform: uppercase;
     }
     .rail-label {
       margin: 0 0 14px;
-      color: var(--quiet);
+      color: #8fa6c0;
       font: 10px/1 var(--mono);
       letter-spacing: .16em;
       text-transform: uppercase;
@@ -141,7 +141,7 @@
     .workflow li {
       position: relative;
       border-radius: 9px;
-      color: var(--muted);
+      color: #b8c7da;
     }
     .workflow button {
       display: grid;
@@ -158,7 +158,7 @@
       cursor: pointer;
     }
     .workflow button:disabled { cursor: default; }
-    .workflow li.active { background: var(--surface-sand); color: var(--text); }
+    .workflow li.active { background: #173b66; color: #fff; }
     .workflow li.active::before {
       content: "";
       position: absolute;
@@ -166,33 +166,33 @@
       width: 2px;
       background: var(--brand-primary);
     }
-    .step-number { padding-top: 2px; color: var(--quiet); font: 11px/1.4 var(--mono); }
+    .step-number { padding-top: 2px; color: #8fa6c0; font: 11px/1.4 var(--mono); }
     .workflow strong { display: block; font-size: 13px; font-weight: 650; }
-    .workflow button > span:nth-child(2) > span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+    .workflow button > span:nth-child(2) > span { display: block; margin-top: 2px; color: #8fa6c0; font-size: 11px; }
     .stage-count {
       align-self: center;
       justify-self: end;
       min-width: 24px;
       padding: 4px 6px;
-      border: 1px solid var(--line);
+      border: 1px solid #355577;
       border-radius: 999px;
-      color: var(--quiet);
+      color: #b8c7da;
       font: 10px/1 var(--mono);
       text-align: center;
     }
     .workflow li.active .step-number,
-    .workflow li.active .stage-count { border-color: color-mix(in srgb, var(--brand-primary) 55%, var(--border-subtle)); color: var(--brand-primary); }
+    .workflow li.active .stage-count { border-color: var(--brand-primary); color: #ff8a70; }
     .rail-note {
       margin-top: 14px;
       padding-top: 18px;
-      border-top: 1px solid var(--line-soft);
-      color: var(--quiet);
+      border-top: 1px solid #29496b;
+      color: #8fa6c0;
       font-size: 11px;
     }
     .rail-note strong {
       display: block;
       margin-bottom: 4px;
-      color: var(--muted);
+      color: #b8c7da;
       font: 600 10px/1.2 var(--mono);
       letter-spacing: .08em;
       text-transform: uppercase;
@@ -203,7 +203,7 @@
       align-items: center;
       gap: 10px;
       margin-top: auto;
-      color: var(--quiet);
+      color: #8fa6c0;
       font: 10px/1 var(--mono);
       letter-spacing: .08em;
       text-transform: uppercase;
@@ -211,7 +211,7 @@
     .language-options {
       display: inline-flex;
       padding: 2px;
-      border: 1px solid var(--line);
+      border: 1px solid #355577;
       border-radius: 8px;
       background: var(--surface-raised);
     }
@@ -221,12 +221,12 @@
       border: 0;
       border-radius: 5px;
       background: transparent;
-      color: var(--quiet);
+      color: #b8c7da;
       font: 650 10px/1 var(--mono);
       cursor: pointer;
     }
     .language-option { min-height: 44px; }
-    .language-option[aria-pressed="true"] { background: var(--surface-sand); color: var(--brand-secondary); }
+    .language-option[aria-pressed="true"] { background: var(--brand-primary); color: #fff; }
 
     main { min-width: 0; padding: 40px clamp(24px, 4vw, 64px) 70px; }
     .page-head {
@@ -267,8 +267,8 @@
     .mascot {
       display: block;
       align-self: end;
-      width: min(210px, 12vw);
-      height: min(150px, 10vw);
+      width: min(360px, 25vw);
+      height: auto;
       object-fit: contain;
       object-position: center bottom;
       animation: companion-enter .4s both ease-out;
@@ -283,7 +283,7 @@
       border: 1px solid var(--line);
       border-radius: var(--radius);
       background: var(--panel);
-      box-shadow: 0 18px 46px rgba(92, 58, 42, .07);
+      box-shadow: 0 18px 46px rgba(11, 31, 58, .09);
     }
     .system-panel {
       display: grid;
@@ -704,11 +704,11 @@
     <aside class="rail" aria-label="Product workflow">
       <div class="brand">
         <picture>
-          <source media="(max-width: 980px)" srcset="assets/capypilot/capypilot-mark-compact-master.png">
-          <img class="brand-lockup" src="assets/capypilot/capypilot-lockup-light.png" alt="CapyPilot">
+          <source media="(max-width: 980px)" srcset="assets/job-apply-pilot/job-apply-pilot-mark.svg">
+          <img class="brand-lockup" src="assets/job-apply-pilot/job-apply-pilot-lockup-inverse.svg" alt="Job Apply Pilot">
         </picture>
-        <span class="brand-name-compact" aria-hidden="true">CapyPilot</span>
-        <span class="brand-local">Local</span>
+        <span class="brand-name-compact" aria-hidden="true">Job Apply Pilot</span>
+        <span class="brand-local">Local-first</span>
       </div>
       <p class="rail-label">Core workflow</p>
       <ol class="workflow" role="tablist" aria-label="Workbench stage">
@@ -735,7 +735,7 @@
           <p class="head-copy" id="page-copy">Review eligible roles, compare fit evidence, and open verified application paths without turning a preview into a submission claim.</p>
         </div>
         <div class="head-aside">
-          <img class="mascot" src="assets/capypilot/capypilot-mascot-companion.png" alt="" aria-hidden="true">
+          <img class="mascot" src="assets/job-apply-pilot/workflow-signal.svg" alt="Discover, decide, prepare, verify">
           <div class="local-status snapshot-note" id="workspace-status"><span class="status-dot" id="status-dot" aria-hidden="true"></span><span id="status-label">LOCAL SNAPSHOT · NO SYNC</span></div>
         </div>
       </header>
@@ -1205,7 +1205,7 @@
         "Every shortlisted role has a current resume route, a validated PDF binding, no recorded hard gap, and a resolved cover-letter requirement.": "每个入围岗位都有当前简历路由、已验证的 PDF 绑定、无已记录硬性缺口，且求职信要求已解决。",
         "Review the recorded gaps before running any preparation command. Nothing is generated or changed from this page.": "运行准备命令前请审核已记录的缺口。本页面不会生成或更改任何内容。",
         "Unable to read the local workspace": "无法读取本地工作区",
-        "Your data was not changed. Run the read-only diagnostic; CapyPilot will not repair or replace the database automatically.": "数据未被更改。请运行只读诊断；CapyPilot 不会自动修复或替换数据库。",
+        "Your data was not changed. Run the read-only diagnostic; Job Apply Pilot will not repair or replace the database automatically.": "数据未被更改。请运行只读诊断；Job Apply Pilot 不会自动修复或替换数据库。",
         "Run diagnostic": "运行诊断",
         "No persisted resume route is available for this job version.": "此岗位版本没有已保存的简历路由。",
         "The recorded resume route belongs to an older version of this job.": "已记录的简历路由属于此岗位的旧版本。",
@@ -1243,7 +1243,7 @@
       const translateRuntimeText = (value) => {
         let source = String(value || "");
         if (source === "Your data was not changed. Run the read-only diagnostic; ApplyPilot will not repair or replace the database automatically.") {
-          source = "Your data was not changed. Run the read-only diagnostic; CapyPilot will not repair or replace the database automatically.";
+          source = "Your data was not changed. Run the read-only diagnostic; Job Apply Pilot will not repair or replace the database automatically.";
         }
         if (locale !== "zh") return source;
         let match = source.match(/^(\d+) opportunities still need fit evidence$/);
@@ -2024,7 +2024,7 @@
         document.getElementById("page-eyebrow").textContent = t(copy.eyebrow);
         document.getElementById("page-title").textContent = t(copy.title);
         document.getElementById("page-copy").textContent = t(copy.copy);
-        document.title = `CapyPilot — ${t(copy.eyebrow)}`;
+        document.title = `Job Apply Pilot — ${t(copy.eyebrow)}`;
         if (updateHash && location.hash !== `#${stage}`) {
           try { history.replaceState(null, "", `#${stage}`); }
           catch { location.hash = stage; }

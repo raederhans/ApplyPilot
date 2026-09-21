@@ -137,7 +137,7 @@ def _setup_resume() -> None:
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell CapyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell Job Apply Pilot about yourself. This powers scoring, tailoring, and auto-fill."))
 
     profile: dict = {}
 
@@ -263,7 +263,7 @@ def _setup_searches() -> None:
 
     # Build YAML content
     lines = [
-        "# CapyPilot search configuration",
+        "# Job Apply Pilot search configuration",
         "# Edit this file to refine your job search queries.",
         "",
         "defaults:",
@@ -309,7 +309,7 @@ def _setup_ai_features() -> None:
         default="gemini",
     )
 
-    env_lines = ["# CapyPilot configuration", ""]
+    env_lines = ["# Job Apply Pilot configuration", ""]
 
     if provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
@@ -340,12 +340,12 @@ def _setup_auto_apply() -> None:
     """Configure autonomous job application (Codex is the default agent)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
-        "CapyPilot can autonomously fill and submit job applications\n"
+        "Job Apply Pilot can fill and submit authorized job applications\n"
         "using Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
-        console.print("[dim]You can apply manually using the tailored resumes CapyPilot generates.[/dim]")
+        console.print("[dim]You can apply manually using the tailored resumes Job Apply Pilot generates.[/dim]")
         return
 
     # Check for the default Codex CLI
@@ -373,7 +373,7 @@ def run_wizard() -> None:
     console.print()
     console.print(
         Panel.fit(
-            "[bold green]CapyPilot Setup Wizard[/bold green]\n\n"
+            "[bold green]Job Apply Pilot Setup Wizard[/bold green]\n\n"
             "This will create your configuration at:\n"
             f"  [cyan]{APP_DIR}[/cyan]\n\n"
             "You can re-run this anytime with [bold]applypilot init[/bold].",

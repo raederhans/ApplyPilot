@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">Job Apply Pilot</title>
+  <desc id="desc">Local-first job application operations from verified discovery to durable receipt.</desc>
+  <rect width="1200" height="420" rx="32" fill="#0B1F3A"/>
+  <path d="M0 350C210 310 302 397 480 346s290-110 431-70 190 16 289-26v170H0z" fill="#102C50"/>
+  <g transform="translate(64 58)">
+    <rect width="108" height="108" rx="23" fill="#F7F9FC"/>
+    <rect x="25" y="18" width="58" height="72" rx="8" fill="#0B1F3A"/>
+    <path d="M37 39h33M37 51h22" stroke="#F7F9FC" stroke-width="6" stroke-linecap="round"/>
+    <path d="M8 83c18-18 32-3 44-17s22-27 43-22" fill="none" stroke="#FF5A36" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="95" cy="44" r="13" fill="#20B486"/>
+    <path d="m89 44 4 4 8-9" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g font-family="Aptos Display, Bahnschrift, Segoe UI, sans-serif">
+    <text x="200" y="112" fill="#fff" font-size="64" font-weight="760" letter-spacing="-2">Job Apply Pilot</text>
+    <text x="64" y="214" fill="#fff" font-size="42" font-weight="700">Run the whole application loop.</text>
+    <text x="64" y="258" fill="#B8C7DA" font-size="23">Verified jobs → truthful materials → supervised application → durable receipt</text>
+  </g>
+  <g transform="translate(64 310)" font-family="Aptos, Segoe UI, sans-serif" font-size="17" font-weight="700">
+    <g fill="#fff"><rect width="202" height="54" rx="27" fill="#173B66"/><text x="101" y="34" text-anchor="middle">01 · DISCOVER</text></g>
+    <path d="M214 27h22" stroke="#FF5A36" stroke-width="5" stroke-linecap="round"/>
+    <g transform="translate(248)" fill="#fff"><rect width="202" height="54" rx="27" fill="#173B66"/><text x="101" y="34" text-anchor="middle">02 · DECIDE</text></g>
+    <path d="M462 27h22" stroke="#FF5A36" stroke-width="5" stroke-linecap="round"/>
+    <g transform="translate(496)" fill="#fff"><rect width="202" height="54" rx="27" fill="#FF5A36"/><text x="101" y="34" text-anchor="middle">03 · PREPARE</text></g>
+    <path d="M710 27h22" stroke="#20B486" stroke-width="5" stroke-linecap="round"/>
+    <g transform="translate(744)" fill="#fff"><rect width="202" height="54" rx="27" fill="#168E70"/><text x="101" y="34" text-anchor="middle">04 · VERIFY</text></g>
+  </g>
+  <text x="1134" y="73" fill="#FF5A36" font-family="Aptos, Segoe UI, sans-serif" font-size="16" font-weight="700" text-anchor="end">LOCAL-FIRST · EVIDENCE-DRIVEN</text>
+</svg>

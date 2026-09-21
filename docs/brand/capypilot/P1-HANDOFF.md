@@ -1,5 +1,7 @@
 # CapyPilot P1 Dashboard and perimeter handoff
 
+> **Historical handoff only.** The implemented CapyPilot direction was superseded by [Job Apply Pilot](../job-apply-pilot/BRAND.md) on 2026-09-21.
+
 This handoff translates the selected P0 brand direction into a bounded P1 migration. P0 did not edit runtime product files.
 
 ## Source of truth

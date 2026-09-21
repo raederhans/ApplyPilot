@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" role="img" aria-labelledby="title desc">
+  <title id="title">Job Apply Pilot</title>
+  <desc id="desc">Job Apply Pilot wordmark with a job card, four-stage route and verified check.</desc>
+  <g transform="translate(10 10)">
+    <rect width="200" height="200" rx="42" fill="#0B1F3A"/>
+    <rect x="40" y="34" width="106" height="132" rx="15" fill="#F7F9FC"/>
+    <path d="M65 69h56M65 91h40" fill="none" stroke="#0B1F3A" stroke-width="11" stroke-linecap="round"/>
+    <path d="M23 145c31-30 56-4 77-28s38-48 76-39" fill="none" stroke="#FF5A36" stroke-width="12" stroke-linecap="round"/>
+    <circle cx="23" cy="145" r="9" fill="#F7F9FC" stroke="#FF5A36" stroke-width="7"/>
+    <circle cx="81" cy="125" r="9" fill="#F7F9FC" stroke="#FF5A36" stroke-width="7"/>
+    <circle cx="127" cy="91" r="9" fill="#F7F9FC" stroke="#FF5A36" stroke-width="7"/>
+    <circle cx="176" cy="78" r="20" fill="#20B486"/>
+    <path d="m166 78 7 7 13-16" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g fill="#0B1F3A" font-family="Aptos Display, Bahnschrift, Segoe UI, sans-serif">
+    <text x="245" y="100" font-size="74" font-weight="760" letter-spacing="-2">Job Apply</text>
+    <text x="245" y="171" font-size="74" font-weight="760" letter-spacing="-2">Pilot</text>
+  </g>
+  <path d="M699 153h155" stroke="#FF5A36" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="854" cy="153" r="9" fill="#FF5A36"/>
+</svg>

@@ -33,11 +33,11 @@ def test_dashboard_is_local_self_contained_and_script_safe() -> None:
     assert "</script><script>alert('x')</script>" not in html
     assert "\\u003c/script\\u003e" in html
     assert "https://fonts." not in html
-    assert "CapyPilot — Opportunity Workbench" in html
+    assert "Job Apply Pilot — Opportunity Workbench" in html
     assert "Private by default" in html
 
 
-def test_dashboard_uses_capypilot_brand_assets_and_accessible_warm_tokens() -> None:
+def test_dashboard_uses_job_apply_pilot_brand_assets_and_accessible_tokens() -> None:
     html = render_dashboard(
         {
             "stats": {"total": 0, "ready": 0, "scored": 0, "highFit": 0},
@@ -49,28 +49,28 @@ def test_dashboard_uses_capypilot_brand_assets_and_accessible_warm_tokens() -> N
     )
 
     assert '<meta name="color-scheme" content="light">' in html
-    assert '<meta name="theme-color" content="#F7F2E8">' in html
-    assert 'href="assets/capypilot/favicon.ico"' in html
-    assert 'href="assets/capypilot/app-icon-192.png"' in html
-    assert 'href="assets/capypilot/app-icon-512.png"' in html
-    assert 'src="assets/capypilot/capypilot-lockup-light.png" alt="CapyPilot"' in html
-    assert 'srcset="assets/capypilot/capypilot-mark-compact-master.png"' in html
-    assert '<span class="brand-name-compact" aria-hidden="true">CapyPilot</span>' in html
-    assert 'src="assets/capypilot/capypilot-mascot-companion.png" alt="" aria-hidden="true"' in html
-    assert 'document.title = `CapyPilot — ${t(copy.eyebrow)}`;' in html
+    assert '<meta name="theme-color" content="#0B1F3A">' in html
+    assert 'href="assets/job-apply-pilot/favicon.ico"' in html
+    assert 'href="assets/job-apply-pilot/job-apply-pilot-192.png"' in html
+    assert 'href="assets/job-apply-pilot/job-apply-pilot-512.png"' in html
+    assert 'src="assets/job-apply-pilot/job-apply-pilot-lockup-inverse.svg" alt="Job Apply Pilot"' in html
+    assert 'srcset="assets/job-apply-pilot/job-apply-pilot-mark.svg"' in html
+    assert '<span class="brand-name-compact" aria-hidden="true">Job Apply Pilot</span>' in html
+    assert 'src="assets/job-apply-pilot/workflow-signal.svg" alt="Discover, decide, prepare, verify"' in html
+    assert 'document.title = `Job Apply Pilot — ${t(copy.eyebrow)}`;' in html
     assert "ApplyPilot Local —" not in html
     assert "Happy Pilot" not in html
 
     for token in (
-        "--canvas: #f7f2e8;",
-        "--surface-raised: #fffcf6;",
-        "--surface-sand: #eee4d3;",
-        "--brand-primary: #a95f3d;",
-        "--success: #2f7a55;",
-        "--warning: #965f12;",
-        "--error: #b4473e;",
-        "--link: #2e68a0;",
-        "--focus: #2e68a0;",
+        "--canvas: #f3f6fa;",
+        "--surface-raised: #ffffff;",
+        "--surface-sand: #e8eef6;",
+        "--brand-primary: #d83a12;",
+        "--success: #0d7a60;",
+        "--warning: #9a6700;",
+        "--error: #c33c36;",
+        "--link: #175cd3;",
+        "--focus: #175cd3;",
     ):
         assert token in html
     assert "outline: 2px solid var(--focus);" in html
@@ -79,21 +79,22 @@ def test_dashboard_uses_capypilot_brand_assets_and_accessible_warm_tokens() -> N
     assert "@media (max-width: 660px)" in html
     assert "@media (max-width: 390px)" in html
     assert "@media (prefers-reduced-motion: reduce)" in html
-    assert "width: min(210px, 12vw);" in html
+    assert "width: min(360px, 25vw);" in html
     assert 'const LOCALE_KEY = "applypilot.locale";' in html
     assert "applypilot reconcile-receipts --file" in html
 
-    asset_root = Path(view.__file__).parent / "frontend" / "assets" / "capypilot"
+    asset_root = Path(view.__file__).parent / "frontend" / "assets" / "job-apply-pilot"
     for name in (
-        "capypilot-lockup-light.png",
-        "capypilot-mark-compact-master.png",
-        "capypilot-mascot-companion.png",
+        "job-apply-pilot-lockup.svg",
+        "job-apply-pilot-lockup-inverse.svg",
+        "job-apply-pilot-mark.svg",
+        "workflow-signal.svg",
         "favicon.ico",
-        "favicon-16.png",
-        "favicon-32.png",
-        "favicon-48.png",
-        "app-icon-192.png",
-        "app-icon-512.png",
+        "job-apply-pilot-16.png",
+        "job-apply-pilot-32.png",
+        "job-apply-pilot-48.png",
+        "job-apply-pilot-192.png",
+        "job-apply-pilot-512.png",
     ):
         assert (asset_root / name).is_file()
 
@@ -286,7 +287,7 @@ def test_generation_renders_recoverable_database_error(tmp_path, monkeypatch) ->
     assert "DatabaseError: file is not a database" in html
 
 
-def test_generation_publishes_approved_capypilot_assets_beside_output(
+def test_generation_publishes_job_apply_pilot_assets_beside_output(
     tmp_path, monkeypatch
 ) -> None:
     db_path = tmp_path / "not-created.db"
@@ -297,7 +298,7 @@ def test_generation_publishes_approved_capypilot_assets_beside_output(
     assert not output.parent.exists()
     view.generate_dashboard(str(output))
 
-    packaged_root = Path(view.__file__).parent / "frontend" / "assets" / "capypilot"
+    packaged_root = Path(view.__file__).parent / "frontend" / "assets" / "job-apply-pilot"
     assert output.is_file()
     assert asset_root.is_dir()
     for name in view.DASHBOARD_ASSET_NAMES:

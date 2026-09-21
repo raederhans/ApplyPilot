@@ -1,5 +1,7 @@
 # CapyPilot brand system
 
+> **Superseded on 2026-09-21.** This document is retained as brand history. Current product surfaces use the [Job Apply Pilot brand system](../job-apply-pilot/BRAND.md).
+
 CapyPilot is a reliable, relaxed, cautious and patient job-search copilot. It helps the user understand evidence and take the next safe step. It never promises an interview, offer or successful submission.
 
 ## 1. Naming

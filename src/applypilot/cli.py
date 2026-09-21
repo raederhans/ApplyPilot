@@ -1,4 +1,4 @@
-"""CapyPilot CLI — the main entry point (``applypilot`` compatible)."""
+"""Job Apply Pilot CLI — the main entry point (``applypilot`` compatible)."""
 
 from __future__ import annotations
 
@@ -335,7 +335,7 @@ def _assert_discovery_storage_path(path: Path, root: Path, label: str) -> None:
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"[bold]CapyPilot[/bold] {__version__}")
+        console.print(f"[bold]Job Apply Pilot[/bold] {__version__}")
         raise typer.Exit()
 
 
@@ -475,7 +475,7 @@ def main(
         is_eager=True,
     ),
 ) -> None:
-    """CapyPilot — evidence-driven discovery, preparation, and application."""
+    """Job Apply Pilot — evidence-driven discovery, preparation, application, and verification."""
     if workspace is not None:
         os.environ["APPLYPILOT_DIR"] = str(workspace)
     _assert_discovery_only_command(ctx.invoked_subcommand, {"sync-linkedin-applied", "radar"})
@@ -1546,7 +1546,7 @@ def browser_session(
         console.print(f"[red]Browser backend unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from None
 
-    console.print("\n[bold blue]Opening persistent CapyPilot browser session[/bold blue]")
+    console.print("\n[bold blue]Opening persistent Job Apply Pilot browser session[/bold blue]")
     console.print(f"  Worker:  {worker}")
     console.print(f"  Backend: {effective_browser_backend}")
     console.print(f"  URL:     {url}")
@@ -1590,7 +1590,7 @@ def status() -> None:
         profile=app_config.load_profile(),
     )
 
-    console.print("\n[bold]CapyPilot Pipeline Status[/bold]\n")
+    console.print("\n[bold]Job Apply Pilot Pipeline Status[/bold]\n")
 
     # Summary table
     summary = Table(title="Pipeline Overview", show_header=True, header_style="bold cyan")
@@ -1736,7 +1736,7 @@ def rekey_email_job_command(
     reference: str = typer.Option(
         ...,
         "--reference",
-        help="Stable lowercase role/date slug used only for CapyPilot tracking.",
+        help="Stable lowercase role/date slug used only for Job Apply Pilot tracking.",
     ),
     title: str = typer.Option(..., "--title", help="Verified job title."),
     company: str = typer.Option(..., "--company", help="Verified employer name."),

@@ -337,7 +337,7 @@ def _job(task: Mapping[str, object], *, attempt_id: str) -> dict[str, object]:
         "site": provider,
         "source_site": provider,
         "title": "Synthetic Data Intern",
-        "company_name": "CapyPilot Fixture",
+        "company_name": "Job Apply Pilot Fixture",
         "full_description": "Deterministic local no-submit benchmark role",
         "tailored_resume_sha256": "b" * 64,
         "_bound_submission_materials": {"materials": [{"kind": "resume", "sha256": "b" * 64, "state": "bound"}]},

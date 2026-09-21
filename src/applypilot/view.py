@@ -1,4 +1,4 @@
-"""Generate the local ApplyPilot opportunity workbench.
+"""Generate the local Job Apply Pilot opportunity workbench.
 
 The database queries remain the read-only adapter for the existing product
 contracts. Presentation and interaction live in the packaged frontend template
@@ -30,17 +30,18 @@ from applypilot.frontend.contracts import (
 
 console = Console()
 DATA_PLACEHOLDER = "__APPLYPILOT_DASHBOARD_DATA__"
-DASHBOARD_ASSET_DIRECTORY = Path("assets") / "capypilot"
+DASHBOARD_ASSET_DIRECTORY = Path("assets") / "job-apply-pilot"
 DASHBOARD_ASSET_NAMES = (
-    "capypilot-lockup-light.png",
-    "capypilot-mark-compact-master.png",
-    "capypilot-mascot-companion.png",
+    "job-apply-pilot-lockup.svg",
+    "job-apply-pilot-lockup-inverse.svg",
+    "job-apply-pilot-mark.svg",
+    "workflow-signal.svg",
     "favicon.ico",
-    "favicon-16.png",
-    "favicon-32.png",
-    "favicon-48.png",
-    "app-icon-192.png",
-    "app-icon-512.png",
+    "job-apply-pilot-16.png",
+    "job-apply-pilot-32.png",
+    "job-apply-pilot-48.png",
+    "job-apply-pilot-192.png",
+    "job-apply-pilot-512.png",
 )
 ACTIVE_APPLICATION_SQL = (
     "(apply_status IS NULL OR apply_status NOT IN ('applied', 'submission_uncertain')) "
@@ -471,7 +472,7 @@ def render_dashboard(data: dict[str, Any]) -> str:
 
 def _publish_dashboard_assets(output: Path) -> None:
     """Publish approved package assets beside a generated Dashboard."""
-    source = resource_files("applypilot.frontend").joinpath("assets", "capypilot")
+    source = resource_files("applypilot.frontend").joinpath("assets", "job-apply-pilot")
     target = output.parent / DASHBOARD_ASSET_DIRECTORY
     target.mkdir(parents=True, exist_ok=True)
     for name in DASHBOARD_ASSET_NAMES:
@@ -492,7 +493,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             _system_state(
                 "error",
                 "Unable to read the local workspace",
-                "Your data was not changed. Run the read-only diagnostic; CapyPilot will not repair or replace the database automatically.",
+                "Your data was not changed. Run the read-only diagnostic; Job Apply Pilot will not repair or replace the database automatically.",
                 ("Run diagnostic", "applypilot doctor"),
                 detail=f"{type(exc).__name__}: {exc}"[:240],
             )

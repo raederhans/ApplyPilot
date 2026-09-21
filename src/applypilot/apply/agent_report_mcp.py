@@ -63,7 +63,7 @@ def _report_tool_definition() -> dict[str, object]:
     return {
         "name": "report_agent_turn",
         "description": (
-            "Record the final structured result for the active CapyPilot Agent turn. "
+            "Record the final structured result for the active Job Apply Pilot turn. "
             "This is reporting only and never changes or submits the application. "
             "Legacy/open failure labels omit the optional typed failure object."
         ),

@@ -45,35 +45,36 @@ def test_public_brand_metadata_preserves_compatibility_identifiers() -> None:
     version = CliRunner().invoke(cli.app, ["--version"])
 
     assert version.exit_code == 0
-    assert "CapyPilot" in version.stdout
-    assert metadata["description"].startswith("CapyPilot:")
-    assert metadata["authors"] == [{"name": "Pickle-Pixel and CapyPilot contributors"}]
+    assert "Job Apply Pilot" in version.stdout
+    assert metadata["description"].startswith("Job Apply Pilot:")
+    assert metadata["authors"] == [{"name": "Pickle-Pixel and Job Apply Pilot contributors"}]
     assert metadata["name"] == "applypilot-local"
     assert metadata["scripts"] == {"applypilot": "applypilot.cli:app"}
     assert metadata["urls"]["Repository"] == "https://github.com/raederhans/ApplyPilot"
     assert cli.app.info.name == "applypilot"
 
 
-def test_capypilot_dashboard_assets_are_included_in_build_artifacts() -> None:
+def test_job_apply_pilot_dashboard_assets_are_included_in_build_artifacts() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     artifacts = project["tool"]["hatch"]["build"]["artifacts"]
-    asset_root = Path("src/applypilot/frontend/assets/capypilot")
+    asset_root = Path("src/applypilot/frontend/assets/job-apply-pilot")
 
-    assert "src/applypilot/frontend/assets/capypilot/*" in artifacts
+    assert "src/applypilot/frontend/assets/job-apply-pilot/*" in artifacts
     assert {path.name for path in asset_root.iterdir() if path.is_file()} >= {
-        "capypilot-lockup-light.png",
-        "capypilot-mark-compact-master.png",
-        "capypilot-mascot-companion.png",
+        "job-apply-pilot-lockup.svg",
+        "job-apply-pilot-lockup-inverse.svg",
+        "job-apply-pilot-mark.svg",
+        "workflow-signal.svg",
         "favicon.ico",
-        "favicon-16.png",
-        "favicon-32.png",
-        "favicon-48.png",
-        "app-icon-192.png",
-        "app-icon-512.png",
+        "job-apply-pilot-16.png",
+        "job-apply-pilot-32.png",
+        "job-apply-pilot-48.png",
+        "job-apply-pilot-192.png",
+        "job-apply-pilot-512.png",
     }
 
 
-def test_installer_displays_capy_pilot_and_keeps_applypilot_command(
+def test_installer_displays_job_apply_pilot_and_keeps_applypilot_command(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -83,7 +84,7 @@ def test_installer_displays_capy_pilot_and_keeps_applypilot_command(
     install.install("applypilot-local", include_jobboards=False, ensure_path=False, dry_run=False)
 
     output = capsys.readouterr().out
-    assert "CapyPilot is installed." in output
+    assert "Job Apply Pilot is installed." in output
     assert "applypilot init" in output
     assert "applypilot doctor" in output
     assert install.DIST_NAME == "applypilot-local"
