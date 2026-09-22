@@ -1,6 +1,6 @@
 [project]
 name = "applypilot-local"
-version = "0.5.2"
+version = "0.6.0"
 description = "Job Apply Pilot: local-first, evidence-driven job application automation"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -56,10 +56,10 @@ dev = [
 applypilot = "applypilot.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/raederhans/ApplyPilot"
-Repository = "https://github.com/raederhans/ApplyPilot"
-Issues = "https://github.com/raederhans/ApplyPilot/issues"
-Changelog = "https://github.com/raederhans/ApplyPilot/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/raederhans/AutoJobApply"
+Repository = "https://github.com/raederhans/AutoJobApply"
+Issues = "https://github.com/raederhans/AutoJobApply/issues"
+Changelog = "https://github.com/raederhans/AutoJobApply/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

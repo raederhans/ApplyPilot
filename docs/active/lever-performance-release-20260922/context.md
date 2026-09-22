@@ -38,4 +38,4 @@
 
 ## Next step
 
-Run the release-package smoke gate, then commit and integrate the performance PR. Treat IAB as the normal operator browser surface and preserve the Greenhouse/SmartRecruiters compatibility observations as bounded open evidence.
+Verify and integrate the v0.6.0 release-preparation PR, create the annotated tag at its exact merge commit, and verify the resulting GitHub Release artifacts. Treat IAB as the normal operator browser surface and preserve the Greenhouse/SmartRecruiters compatibility observations as bounded open evidence.

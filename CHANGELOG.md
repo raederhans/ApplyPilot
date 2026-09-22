@@ -4,6 +4,19 @@ All notable changes to Job Apply Pilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-22
+
+### Added
+
+- Ordered, atomic top-level database migrations with explicit version checks,
+  legacy upgrades, newer-schema fail-closed behavior, and rollback coverage.
+- Shared transaction ownership and savepoint helpers across job, runtime,
+  semantic-write, task-journal, and submission-ledger storage paths.
+- Explicit runtime authority boundaries for preflight, application facts, job
+  acquisition/results, agent processes, submission authority, and worker cells.
+- Privacy-safe browser-tool duration samples and per-tool aggregates for
+  diagnosing interaction latency without persisting field values or page data.
+
 ### Changed
 
 - Renamed the public product identity from **CapyPilot** to **Job Apply Pilot**
@@ -14,6 +27,19 @@ All notable changes to Job Apply Pilot will be documented in this file.
 - Rewrote the bilingual project overview around concrete capabilities, the
   Discover → Decide → Prepare → Verify workflow, and the product-contract
   differences from the original Pickle-Pixel/ApplyPilot project.
+- Moved retired candidate facts into explicit user-owned lineage policy and
+  shortened CI feedback while retaining Python 3.11/3.12/3.13, Chromium, and
+  Windows clean-install coverage.
+- Reduced redundant Lever browser round trips by grouping independent native
+  selects behind one shared verification readback, while retaining individual
+  handling for custom, conditional, multi-select, rerendered, or failed fields.
+
+### Fixed
+
+- Expired browser scope leases are reaped before exact-scope release, avoiding
+  stale ownership that could block later application attempts.
+- Preserved submission, receipt, duplicate, stale-attempt, and stale-page
+  fail-closed behavior across the extracted runtime modules.
 
 ## [0.5.2] - 2026-09-21
 

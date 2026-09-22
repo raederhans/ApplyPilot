@@ -2,7 +2,7 @@
 
 ## Current status
 
-Stages 1-3 complete; Stage 4 in progress.
+Stages 1-4 complete; Stage 5 in progress.
 
 ## Checklist
 
@@ -12,7 +12,7 @@ Stages 1-3 complete; Stage 4 in progress.
 - [x] Remove conflicting Lever/native-select observation guidance.
 - [x] Run focused and full local verification.
 - [x] Run repeated real Lever plus multi-site no-submit verification in the in-app browser under one owner.
-- [ ] Commit, push, open and merge the performance PR.
+- [x] Commit, push, open and merge the performance PR.
 - [ ] Prepare and merge v0.6.0 release metadata.
 - [ ] Tag and verify the GitHub Release and public artifacts.
 
@@ -27,6 +27,8 @@ Stages 1-3 complete; Stage 4 in progress.
 | Full verification | First run exposed 42 missing-Playwright-runtime failures; after installing the matching Chromium runtime, all 42 reran successfully and the complete suite passed: 2899 tests in 196.60s |
 | Release build | `scripts/build_release.py` built wheel, sdist, bundle and `SHA256SUMS` for the current 0.5.2 branch state |
 | Clean install smoke | `scripts/smoke_release.py` passed wheel install, `resume-route --help`, version, init, doctor and dashboard generation |
+| Performance integration | PR #13 passed all five CI jobs and merged as `6ae3e715e53d911ac1903e55fedaf1e7d9ee2ebd` |
+| v0.6.0 local release gates | 2899 tests passed; 21 release/distribution contract tests passed; `ruff check src` and stale-identifier scan passed; wheel, sdist, bundle, checksums, and clean-wheel smoke passed |
 | Browser routing | IAB navigation and live Lever form discovery passed; external warm-up was cancelled and cleaned with zero submit/gate/receipt |
 | Repeated Lever IAB direct cycles | 225ms / 193ms / 189ms for five synthetic text writes, three native selects and one grouped readback; final reload cleared the page |
 | Attended Lever IAB worker | Exit 0; 12/12 host operations completed; 7 form readbacks reused; action p50 152.4ms, p95/max 221.9ms; observation p50 15.1ms, p95/max 148.4ms; 7/8 requested values verified; location autocomplete correctly reported non-persistence |

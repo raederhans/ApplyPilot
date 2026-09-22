@@ -4,8 +4,8 @@
   <img src="docs/brand/job-apply-pilot/assets/readme-hero.svg" alt="Job Apply Pilot：发现、判断、准备、核验" width="100%">
 </p>
 
-[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/ApplyPilot/releases/latest)
-[![CI](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/raederhans/AutoJobApply?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/AutoJobApply/releases/latest)
+[![CI](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11–3.13-0B1F3A)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-20B486)](LICENSE)
 
@@ -67,16 +67,16 @@ Job Apply Pilot 是覆盖完整求职申请闭环的本地工作台。它把官�
 - **端到端流程已经可用。** 当前代码支持发现、补全、评分、简历库路由、忠于事实的定制、求职信与 PDF 准备、受监督的申请协助、历史记录和回执核验。
 - **浏览器工作台只读。** 它呈现“发现、判断、准备、核验”四个阶段，不会修改数据库或执行命令。
 - **人工复核是功能，不是缺陷。** 无事实依据的回答、CAPTCHA 或 MFA、测评、身份或财务文件、账户恢复、安全设置变化和不确定结果都会成为明确的交接点。
-- **当前版本为 v0.5.2。** 这次品牌重设计不改变原有命令、本地数据和兼容标识。
+- **当前版本为 v0.6.0。** 本次发布不改变原有命令、本地数据和兼容标识。
 
 ## 安装
 
 完整工作流推荐 Python 3.11 或 3.12。核心命令和官方来源职位雷达也支持 Python 3.13。
 
-PyPI 暂无 `applypilot-local` 发行包。请从[最新 GitHub Release](https://github.com/raederhans/ApplyPilot/releases)安装，或直接安装当前仓库：
+PyPI 暂无 `applypilot-local` 发行包。请从[最新 GitHub Release](https://github.com/raederhans/AutoJobApply/releases)安装，或直接安装当前仓库：
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.2"
+pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.6.0"
 ```
 
 需要可复现的本地部署时，请下载 release bundle 与 `SHA256SUMS`，校验后解压并运行：

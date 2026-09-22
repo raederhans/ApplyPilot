@@ -22,7 +22,7 @@ Reduce unnecessary Lever browser-agent round trips, prove the result with repeat
 - [x] Stage 1: Attribute the observed Lever variance and select the lowest-risk optimization.
 - [x] Stage 2: Implement bounded timing plus consistent Lever interaction guidance.
 - [x] Stage 3: Run focused, full, and repeated real-site no-submit verification.
-- [ ] Stage 4: Review, commit, push, open and merge the performance PR.
+- [x] Stage 4: Review, commit, push, open and merge the performance PR.
 - [ ] Stage 5: Prepare, verify, merge, tag, and verify Job Apply Pilot v0.6.0.
 
 ## Acceptance criteria

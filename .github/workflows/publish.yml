@@ -1,4 +1,4 @@
-name: Publish CapyPilot
+name: Publish Job Apply Pilot
 
 on:
   push:
@@ -91,5 +91,5 @@ jobs:
             dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "CapyPilot $GITHUB_REF_NAME" \
+            --title "Job Apply Pilot $GITHUB_REF_NAME" \
             --generate-notes
