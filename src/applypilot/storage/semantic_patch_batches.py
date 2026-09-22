@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from applypilot.storage.transactions import write_transaction
+
 SCHEMA_VERSION = 2
 _STATES = {
     "shadow",
@@ -185,24 +187,8 @@ def _reason(value: str) -> str:
 
 @contextmanager
 def _write(connection: sqlite3.Connection, name: str) -> Iterator[None]:
-    nested = connection.in_transaction
-    if nested:
-        connection.execute(f"SAVEPOINT {name}")
-    else:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(connection, prefix=name):
         yield
-        if nested:
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-        else:
-            connection.commit()
-    except Exception:
-        if nested:
-            connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-        elif connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:

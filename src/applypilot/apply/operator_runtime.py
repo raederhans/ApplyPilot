@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +31,7 @@ from applypilot.apply.operator_commands import (
     semantic_exception_groups,
 )
 from applypilot.storage import agent_control, runtime_control
+from applypilot.storage.transactions import write_transaction
 
 _RECEIPT_KEYS = frozenset(
     {
@@ -88,20 +88,8 @@ class RequestedResumeExpiry:
 
 @contextmanager
 def _atomic(connection: sqlite3.Connection, prefix: str):
-    owns_transaction = not connection.in_transaction
-    name = f"{prefix}_{uuid.uuid4().hex}"
-    connection.execute(f"SAVEPOINT {name}")
-    try:
+    with write_transaction(connection, prefix=prefix):
         yield
-        connection.execute(f"RELEASE SAVEPOINT {name}")
-        if owns_transaction:
-            connection.commit()
-    except Exception:
-        connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-        connection.execute(f"RELEASE SAVEPOINT {name}")
-        if owns_transaction:
-            connection.rollback()
-        raise
 
 
 def _sha256(value: bytes) -> str:

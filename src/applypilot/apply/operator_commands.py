@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -13,6 +12,7 @@ from typing import Literal, Protocol
 
 from applypilot.apply.contracts import ApplicationException, application_actor_id
 from applypilot.storage import agent_control
+from applypilot.storage.transactions import write_transaction
 
 OperatorAction = Literal["resolve", "resume", "reconcile"]
 _ACTIONS = frozenset({"resolve", "resume", "reconcile"})
@@ -173,20 +173,8 @@ class OperatorScopeResolver(Protocol):
 
 @contextmanager
 def _savepoint(connection: sqlite3.Connection, prefix: str):
-    owns_transaction = not connection.in_transaction
-    name = f"{prefix}_{uuid.uuid4().hex}"
-    connection.execute(f"SAVEPOINT {name}")
-    try:
+    with write_transaction(connection, prefix=prefix):
         yield
-        connection.execute(f"RELEASE SAVEPOINT {name}")
-        if owns_transaction:
-            connection.commit()
-    except Exception:
-        connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-        connection.execute(f"RELEASE SAVEPOINT {name}")
-        if owns_transaction:
-            connection.rollback()
-        raise
 
 
 def _result_values(

@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from applypilot.storage.transactions import write_transaction
+
 OperationState = Literal[
     "started",
     "effect_observed",
@@ -185,46 +187,14 @@ def _reason(value: str) -> str:
 
 @contextmanager
 def _migration(connection: sqlite3.Connection) -> Iterator[None]:
-    nested = connection.in_transaction
-    if nested:
-        connection.execute("SAVEPOINT semantic_write_migration")
-    else:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(connection, prefix="semantic_write_migration"):
         yield
-        if nested:
-            connection.execute("RELEASE SAVEPOINT semantic_write_migration")
-        else:
-            connection.commit()
-    except Exception:
-        if nested:
-            connection.execute("ROLLBACK TO SAVEPOINT semantic_write_migration")
-            connection.execute("RELEASE SAVEPOINT semantic_write_migration")
-        elif connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 @contextmanager
 def _write(connection: sqlite3.Connection) -> Iterator[None]:
-    nested = connection.in_transaction
-    if nested:
-        connection.execute("SAVEPOINT semantic_write_cas")
-    else:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(connection, prefix="semantic_write_cas"):
         yield
-        if nested:
-            connection.execute("RELEASE SAVEPOINT semantic_write_cas")
-        else:
-            connection.commit()
-    except Exception:
-        if nested:
-            connection.execute("ROLLBACK TO SAVEPOINT semantic_write_cas")
-            connection.execute("RELEASE SAVEPOINT semantic_write_cas")
-        elif connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:

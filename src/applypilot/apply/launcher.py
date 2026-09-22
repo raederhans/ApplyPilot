@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from rich.console import Console
@@ -44,6 +45,7 @@ from applypilot.apply import application_actor as application_actor_mod
 from applypilot.apply import application_jobs as application_jobs_mod
 from applypilot.apply import application_plan as application_plan_mod
 from applypilot.apply import application_plan_runtime as application_plan_runtime_mod
+from applypilot.apply import application_preflight as application_preflight_mod
 from applypilot.apply import application_supervisor_loop as supervisor_loop_mod
 from applypilot.apply import ats as ats_mod
 from applypilot.apply import ats_tools_mcp as ats_tools_mcp_mod
@@ -60,6 +62,7 @@ from applypilot.apply import resume_authorization as resume_authorization_mod
 from applypilot.apply import runtime_cell as runtime_cell_mod
 from applypilot.apply import runtime_cell_coordinator as runtime_cell_coordinator_mod
 from applypilot.apply import semantic_batch_runtime as semantic_batch_runtime_mod
+from applypilot.apply import submission_authority as submission_authority_mod
 from applypilot.apply import submission_surfaces as submission_surfaces_mod
 from applypilot.apply import successfactors_binding as successfactors_binding_mod
 from applypilot.apply import worker_orchestration as worker_orchestration_mod
@@ -3380,468 +3383,34 @@ def _resolve_ats_application_binding(
 
 
 def _run_read_only_preflight(job: Mapping[str, object]) -> dict[str, object]:
-    """Run system-seeded deterministic reads before browser/Agent work."""
-    provider = ats_mod.detect_ats_site(
-        str(job.get("application_url") or job.get("url") or "")
+    """Compatibility facade resolving launcher dependencies at call time."""
+    dependencies = SimpleNamespace(
+        BackgroundWorkerPool=BackgroundWorkerPool,
+        READ_ONLY_SPECIALIST_AUTHORITY=READ_ONLY_SPECIALIST_AUTHORITY,
+        ResourceClaim=ResourceClaim,
+        SpecialistCancelled=SpecialistCancelled,
+        SpecialistDeadlineExceeded=SpecialistDeadlineExceeded,
+        TaskResult=TaskResult,
+        TaskSpec=TaskSpec,
+        _resolve_ats_application_binding=_resolve_ats_application_binding,
+        application_jobs_mod=application_jobs_mod,
+        ats_mod=ats_mod,
+        config=config,
+        get_connection=get_connection,
+        normalize_specialist_mode=normalize_specialist_mode,
+        orchestration_mod=orchestration_mod,
+        production_specialist_runners=production_specialist_runners,
+        production_specialist_spec=production_specialist_spec,
+        run_durable_material_specialist=run_durable_material_specialist,
+        run_system_specialist=run_system_specialist,
+        successfactors_binding_mod=successfactors_binding_mod,
+        task_journal=task_journal,
     )
-    successfactors_probe = bool(
-        provider == "generic"
-        and successfactors_binding_mod.successfactors_probe_candidate(job)
+    return application_preflight_mod.run_read_only_preflight(
+        dependencies,
+        job,
     )
-    ats_identity_provider = (
-        "successfactors" if successfactors_probe else provider
-    )
-    try:
-        profile = config.load_profile()
-    except FileNotFoundError:
-        # Library-level/static preflight remains usable before local profile
-        # initialization; production runs already require a profile upstream.
-        profile = {}
-    runtime = profile.get("agent_runtime", {}) if isinstance(profile, Mapping) else {}
-    orchestration = (
-        runtime.get("orchestration", {}) if isinstance(runtime, Mapping) else {}
-    )
-    configured_mode = (
-        orchestration.get("material_specialist_mode", "shadow")
-        if isinstance(orchestration, Mapping)
-        else "shadow"
-    )
-    mode = normalize_specialist_mode(
-        str(job.get("_material_specialist_mode") or configured_mode)
-    )
-    configured_specialist_modes = (
-        orchestration.get("production_specialist_modes", {})
-        if isinstance(orchestration, Mapping)
-        else {}
-    )
-    configured_specialist_modes = (
-        configured_specialist_modes
-        if isinstance(configured_specialist_modes, Mapping)
-        else {}
-    )
-    material_job = dict(job)
-    submission_policy = (
-        profile.get("submission_policy", {}) if isinstance(profile, Mapping) else {}
-    )
-    if isinstance(submission_policy, Mapping):
-        material_job.setdefault(
-            "_allow_runtime_cover_letter",
-            bool(
-                submission_policy.get(
-                    "allow_runtime_cover_letter_discovery",
-                    False,
-                )
-            ),
-        )
 
-    tasks = [
-        TaskSpec(
-            task_id="material-readiness",
-            kind="material-readiness",
-            objective="Consume the deterministic system-seeded material result.",
-            inputs={"specialist": "material-readiness-v1", "mode": mode},
-            effect_class="read",
-            authority_scope=READ_ONLY_SPECIALIST_AUTHORITY,
-            resource_claims=(ResourceClaim("local-read"),),
-            retry_budget=0,
-            retry_categories=("specialist_timeout", "specialist_transient"),
-            deadline_at=datetime.now(UTC) + timedelta(seconds=5),
-            partial_allowed=False,
-        )
-    ]
-    work_authorization = profile.get("work_authorization", {})
-    work_authorization = (
-        work_authorization if isinstance(work_authorization, Mapping) else {}
-    )
-    context_snapshots: dict[str, dict[str, object]] = {
-        "provider-classifier-v1": {
-            "url": str(job.get("application_url") or job.get("url") or "")
-        },
-        "application-facts-v1": {
-            key: job[key]
-            for key in ("title", "company", "location", "employment_type")
-            if isinstance(job.get(key), (str, bool, int, float))
-        },
-        "work-authorization-v1": {
-            key: work_authorization[key]
-            for key in (
-                "legally_authorized_to_work",
-                "requires_sponsorship",
-                "require_sponsorship",
-                "visa_status",
-            )
-            if isinstance(work_authorization.get(key), (str, bool))
-        },
-    }
-    context_modes = {
-        specialist_id: normalize_specialist_mode(
-            str(configured_specialist_modes.get(specialist_id, "shadow"))
-        )
-        for specialist_id in (
-            "provider-classifier-v1",
-            "application-facts-v1",
-            "work-authorization-v1",
-            "field-semantic-v1",
-            "page-failure-v1",
-        )
-    }
-    for specialist_id, snapshot in context_snapshots.items():
-        specialist_mode = context_modes[specialist_id]
-        if specialist_mode == "off":
-            continue
-        spec = production_specialist_spec(specialist_id)
-        if "preflight" not in spec.phases:
-            continue
-        tasks.append(
-            TaskSpec(
-                task_id=f"context:{specialist_id}",
-                kind=specialist_id,
-                objective="Produce bounded read-only preflight context.",
-                inputs={"snapshot": snapshot, "mode": specialist_mode},
-                effect_class="read",
-                authority_scope=spec.authority_scope,
-                resource_claims=(ResourceClaim("local-read"),),
-                retry_budget=0,
-                retry_categories=spec.retry_categories,
-                deadline_at=datetime.now(UTC)
-                + timedelta(seconds=spec.execution_budget_seconds),
-                cancellation_mode="cooperative",
-                partial_allowed=False,
-            )
-        )
-    background_pool = BackgroundWorkerPool(
-        lambda: get_connection(),
-        production_specialist_runners(),
-        worker_id="preflight-context-read-1",
-        max_workers=1,
-        coalesce_wait_seconds=2.0,
-    )
-    if provider == "smartrecruiters":
-        tasks.append(
-            TaskSpec(
-                task_id="duplicate-snapshot",
-                kind="duplicate-check",
-                objective="Read the durable application ledger for an exact duplicate.",
-                inputs={"job_url": str(job.get("url") or "")},
-                effect_class="read",
-                resource_claims=(ResourceClaim("database-read"),),
-            )
-        )
-    if provider == "smartrecruiters" or successfactors_probe:
-        tasks.append(
-            TaskSpec(
-                task_id="ats-identity",
-                kind="ats-identity",
-                objective="Resolve the immutable public posting identity.",
-                inputs={"provider": ats_identity_provider},
-                effect_class="read",
-                resource_claims=(ResourceClaim("network-read"),),
-            )
-        )
-
-    def runner(task: TaskSpec, context: orchestration_mod.TaskExecutionContext) -> TaskResult:
-        started = time.perf_counter()
-        context.heartbeat({"stage": "started"})
-        if task.task_id == "material-readiness":
-            if context.cancelled() or context.remaining_seconds() == 0:
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="cancelled" if context.cancelled() else "timed_out",
-                    failure_category=(
-                        "specialist_cancelled" if context.cancelled() else "specialist_timeout"
-                    ),
-                )
-            attempt_id = str(
-                job.get("_attempt_id")
-                or f"preflight-{hashlib.sha256(str(job.get('url') or '').encode()).hexdigest()[:16]}"
-            )
-            workflow_id = f"{attempt_id}:material-preflight"
-            connection = get_connection()
-            try:
-                if isinstance(connection, sqlite3.Connection):
-                    material_run = run_durable_material_specialist(
-                        connection,
-                        material_job,
-                        mode=mode,
-                        attempt_id=attempt_id,
-                        workflow_id=workflow_id,
-                        cancelled=context.cancelled,
-                        timeout_seconds=context.remaining_seconds(),
-                    )
-                else:
-                    # Compatibility for injected read-only test ports. Real
-                    # database connections always use the durable path above.
-                    material_run = run_system_specialist(
-                        "material-readiness-v1",
-                        material_job,
-                        mode=mode,
-                        timeout_seconds=context.remaining_seconds(),
-                        cancelled=context.cancelled,
-                    )
-            except SpecialistDeadlineExceeded:
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="timed_out",
-                    failure_category="specialist_timeout",
-                    retryable=True,
-                )
-            except SpecialistCancelled:
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="cancelled",
-                    failure_category="specialist_cancelled",
-                )
-            finally:
-                close = getattr(connection, "close", None)
-                if callable(close):
-                    close()
-            output = {
-                "material_readiness": None if material_run is None else material_run.result,
-                "mode": mode,
-                "enforced": False if material_run is None else material_run.enforced,
-                "proposal_feedback": (
-                    [] if material_run is None else list(material_run.telemetry)
-                ),
-                "replay": False if material_run is None else material_run.replay,
-                "task_id": None if material_run is None else material_run.task_id,
-                "proposal_id": None if material_run is None else material_run.proposal_id,
-            }
-            if context.cancelled() or context.remaining_seconds() == 0:
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="timed_out",
-                    failure_category="specialist_timeout",
-                    retryable=True,
-                )
-            context.checkpoint({"stage": "material-evaluated"})
-            return TaskResult(task_id=task.task_id, status="completed", output=output)
-        if task.task_id.startswith("context:"):
-            specialist_id = task.kind
-            if context.cancelled() or context.remaining_seconds() == 0:
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="timed_out",
-                    failure_category="specialist_timeout",
-                    retryable=True,
-                )
-            snapshot = context_snapshots[specialist_id]
-            specialist_mode = context_modes[specialist_id]
-            durable_identity = hashlib.sha256(
-                json.dumps(
-                    {
-                        "kind": specialist_id,
-                        "mode": specialist_mode,
-                        "snapshot": snapshot,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            durable_task_id = f"preflight-context:{specialist_id}:{durable_identity[:24]}"
-            durable_spec = TaskSpec(
-                task_id=durable_task_id,
-                kind=specialist_id,
-                objective="Produce bounded durable read-only preflight context.",
-                inputs={"snapshot": snapshot, "mode": specialist_mode},
-                effect_class="read",
-                authority_scope=production_specialist_spec(specialist_id).authority_scope,
-                retry_budget=0,
-                retry_categories=production_specialist_spec(specialist_id).retry_categories,
-                cancellation_mode="cooperative",
-                partial_allowed=False,
-                idempotency_key=durable_task_id,
-            )
-            connection = get_connection()
-            try:
-                task_journal.register(connection, durable_spec)
-            finally:
-                close = getattr(connection, "close", None)
-                if callable(close):
-                    close()
-            worker_outcome = background_pool.run_task(durable_task_id)
-            connection = get_connection()
-            try:
-                durable_entry = task_journal.load(connection, durable_task_id)
-            finally:
-                close = getattr(connection, "close", None)
-                if callable(close):
-                    close()
-            if (
-                worker_outcome is None
-                or durable_entry is None
-                or durable_entry.status != "completed"
-                or not isinstance(durable_entry.result, Mapping)
-            ):
-                return TaskResult(
-                    task_id=task.task_id,
-                    status=(
-                        "failed" if durable_entry is None else durable_entry.status
-                    ),
-                    failure_category="background_specialist_unavailable",
-                )
-            durable_output = durable_entry.result.get("output")
-            if not isinstance(durable_output, Mapping):
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    failure_category="background_specialist_result_invalid",
-                )
-            return TaskResult(
-                task_id=task.task_id,
-                status="completed",
-                output=dict(durable_output),
-                authority_scope=production_specialist_spec(
-                    specialist_id
-                ).authority_scope,
-            )
-        if task.task_id == "ats-identity":
-            binding = _resolve_ats_application_binding(job)
-            return TaskResult(
-                task_id=task.task_id,
-                status="completed",
-                output={"ats_binding": binding},
-                metrics={
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 3)
-                },
-            )
-        connection = get_connection()
-        try:
-            if connection.in_transaction:
-                raise RuntimeError("duplicate snapshot connection is already in a transaction")
-            connection.execute("BEGIN")
-            duplicate = application_jobs_mod.revalidate_duplicate_before_submit(
-                connection,
-                str(job.get("url") or ""),
-            )
-            connection.rollback()
-            return TaskResult(
-                task_id=task.task_id,
-                status="completed",
-                output={"duplicate": duplicate},
-                metrics={
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 3)
-                },
-            )
-        finally:
-            if getattr(connection, "in_transaction", False):
-                connection.rollback()
-            close = getattr(connection, "close", None)
-            if callable(close):
-                close()
-
-    def reducer(
-        state: dict[str, object],
-        task: TaskSpec,
-        task_result: TaskResult,
-    ) -> None:
-        if task.task_id == "material-readiness":
-            return
-        status_group = (
-            "specialist_task_statuses"
-            if task.task_id.startswith("context:")
-            else "task_statuses"
-        )
-        statuses = state.setdefault(status_group, {})
-        if isinstance(statuses, dict):
-            statuses[task.task_id] = {
-                "status": task_result.status,
-                "failure_category": task_result.failure_category,
-                "metrics": dict(task_result.metrics),
-            }
-
-    try:
-        outcome = orchestration_mod.execute_task_graph(
-            tasks,
-            runner,
-            reducer,
-            max_workers=len(tasks),
-            resource_capacities={
-                "local-read": 1,
-                "database-read": 1,
-                "network-read": 1,
-            },
-        )
-    finally:
-        background_pool.shutdown()
-    result: dict[str, object] = {
-        "provider": provider,
-        "ats_identity_provider": ats_identity_provider,
-        "task_statuses": outcome.reduced_state.get("task_statuses", {}),
-        "specialist_task_statuses": outcome.reduced_state.get(
-            "specialist_task_statuses", {}
-        ),
-    }
-    specialist_statuses = result["specialist_task_statuses"]
-    if isinstance(specialist_statuses, dict):
-        for specialist_id in ("field-semantic-v1", "page-failure-v1"):
-            specialist_statuses[f"context:{specialist_id}"] = {
-                "status": "skipped",
-                "failure_category": "not_applicable_in_preflight",
-                "metrics": {},
-            }
-    material_result = outcome.results["material-readiness"]
-    material_readiness = material_result.output.get("material_readiness")
-    normalized_mode = normalize_specialist_mode(mode)
-    fail_closed_mode = normalized_mode == "required"
-    if not material_result.succeeded:
-        material_readiness = {
-            "state": "blocked",
-            "ready": False,
-            "missing_kinds": ["material_specialist_unavailable"],
-            "failure_category": material_result.failure_category,
-            "error_type": material_result.output.get("error_type"),
-        }
-    result["material_readiness"] = (
-        material_readiness if normalized_mode in {"advisory", "required"} else None
-    )
-    result["specialist_advisories"] = (
-        [{"kind": "material-readiness-v1", "result": material_readiness}]
-        if normalized_mode in {"advisory", "required"} and material_result.succeeded
-        else []
-    )
-    required_context_failures: list[str] = []
-    for specialist_id, specialist_mode in context_modes.items():
-        context_result = outcome.results.get(f"context:{specialist_id}")
-        if context_result is None:
-            continue
-        context_output = context_result.output.get("result")
-        if specialist_mode in {"advisory", "required"} and isinstance(
-            context_output, Mapping
-        ):
-            result["specialist_advisories"].append(
-                {"kind": specialist_id, "result": dict(context_output)}
-            )
-        if specialist_mode == "required" and (
-            not context_result.succeeded
-            or bool(context_result.output.get("enforced"))
-        ):
-            required_context_failures.append(specialist_id)
-    result["material_specialist_mode"] = mode
-    result["material_enforced_block"] = bool(
-        material_result.output.get("enforced")
-        or (
-            fail_closed_mode
-            and (
-                not material_result.succeeded
-                or material_result.partial
-                or bool(material_result.conflict_keys)
-            )
-        )
-    )
-    result["specialist_required_block"] = bool(required_context_failures)
-    result["required_specialist_failures"] = required_context_failures
-    result["proposal_feedback"] = material_result.output.get("proposal_feedback", [])
-    result["material_specialist_replay"] = bool(material_result.output.get("replay"))
-    result["material_task_id"] = material_result.output.get("task_id")
-    result["material_proposal_id"] = material_result.output.get("proposal_id")
-    duplicate_result = outcome.results.get("duplicate-snapshot")
-    if duplicate_result is not None and duplicate_result.succeeded:
-        result["duplicate"] = duplicate_result.output.get("duplicate")
-    binding_result = outcome.results.get("ats-identity")
-    if binding_result is not None and binding_result.succeeded:
-        result["ats_binding"] = binding_result.output.get("ats_binding")
-    return result
 
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
@@ -3869,18 +3438,15 @@ def _acquire_cloak_lane(worker_id: int) -> bool:
 
 
 def _acquire_submit_writer_lane(worker_id: int) -> bool:
-    """Wait interruptibly for the sole final-submit/receipt ownership lane."""
-    update_state(
+    """Compatibility facade for the shared final-submit writer lane."""
+    return submission_authority_mod.acquire_submit_writer_lane(
+        SimpleNamespace(
+            update_state=update_state,
+            stop_event=_stop_event,
+            submit_writer_lane=_submit_writer_lane,
+        ),
         worker_id,
-        status="waiting",
-        last_action="waiting for final submit lane",
     )
-    while not _stop_event.is_set():
-        if _submit_writer_lane.acquire(timeout=0.5):
-            return True
-    return False
-
-
 def _route_for_phase(
     route: ControlRoute,
     phase: str,
@@ -4618,110 +4184,26 @@ def _reserve_manifest_submission(
     *,
     success_target: int | None = None,
 ) -> tuple[bool, str]:
-    """Re-authorize bytes and atomically claim final submission authority."""
-    if manifest is None:
-        return False, "authorization_manifest_required"
-    try:
-        expires_at = datetime.fromisoformat(str(manifest.get("expires_at") or ""))
-        if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at:
-            return False, "authorization_manifest_expired"
-        from applypilot.apply.authorization import authorize_job, freeze_submission_materials
-        from applypilot.database import claim_submission_gate, reserve_batch_submission
-
-        profile = config.load_profile()
-        if authorize_job(manifest, job) is None:
-            if not isinstance(job.get("_linkedin_runtime_route_binding"), Mapping):
-                return False, "authorization_manifest_job_mismatch"
-            route_authorized, route_authorization_reason = (
-                _authorize_linkedin_runtime_route(manifest, job, profile)
-            )
-            if not route_authorized:
-                return False, route_authorization_reason
-        runtime_route_allowed, runtime_route_reason = _runtime_linkedin_route_gate(
-            job,
-            audit_report,
-            profile,
-        )
-        if not runtime_route_allowed:
-            return False, runtime_route_reason
-        material_binding = freeze_submission_materials(job, profile)
-        job["_bound_submission_materials"] = material_binding
-        plan = job.get("_application_plan")
-        if isinstance(plan, application_plan_mod.ApplicationPlan):
-            job["_application_plan_shadow"] = (
-                application_plan_runtime_mod.application_plan_shadow_result(
-                    plan,
-                    job,
-                    profile,
-                    audit_report if isinstance(audit_report, Mapping) else {},
-                    issuer=_application_plan_audit_issuer,
-                )
-            )
-        attempt_id = str(job.get("_attempt_id") or "").strip()
-        if attempt_id:
-            policy = profile.get("submission_policy", {})
-            if not isinstance(policy, Mapping):
-                policy = {}
-            fingerprint = _submission_audit_fingerprint(job, audit_report)
-            connection = get_connection()
-            if connection.in_transaction:
-                return False, "submission_gate_transaction_busy"
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                duplicate_check = application_jobs_mod.revalidate_duplicate_before_submit(
-                    connection,
-                    str(job.get("url") or ""),
-                )
-                job["_duplicate_revalidation"] = dict(duplicate_check)
-                if duplicate_check.get("clear") is not True:
-                    connection.rollback()
-                    return False, str(
-                        duplicate_check.get("reason") or "duplicate_revalidation_failed"
-                    )
-                claim = claim_submission_gate(
-                    str(manifest.get("batch_id") or ""),
-                    str(job.get("url") or ""),
-                    int(manifest.get("max_submissions") or 0),
-                    attempt_id,
-                    success_target=success_target,
-                    hourly_maximum=int(
-                        policy.get("maximum_verified_submissions_per_rolling_hour", 15)
-                    ),
-                    minimum_gap_seconds=float(
-                        policy.get("minimum_seconds_between_verified_submissions", 20)
-                    ),
-                    audit_fingerprint=fingerprint,
-                    conn=connection,
-                )
-                job["_submission_gate"] = dict(claim)
-                if claim.get("claimed") is not True:
-                    connection.rollback()
-                    return False, str(claim.get("reason") or "submission_gate_denied")
-                job["_submission_gate_binding"] = {
-                    "gate_id": str(claim.get("gate_id") or ""),
-                    "batch_id": str(manifest.get("batch_id") or ""),
-                    "job_url": str(job.get("url") or ""),
-                    "attempt_id": attempt_id,
-                }
-                connection.commit()
-            except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
-                raise
-            return True, str(claim.get("reason") or "submission_gate_claimed")
-        reserved = reserve_batch_submission(
-            str(manifest.get("batch_id") or ""),
-            str(job.get("url") or ""),
-            int(manifest.get("max_submissions") or 0),
-        )
-        if reserved is not True:
-            return False, "authorization_batch_reservation_denied"
-        return True, "reserved"
-    except Exception as exc:
-        logger.exception("Batch submission reservation failed")
-        return False, f"authorization_batch_reservation_error:{type(exc).__name__}"
-
-
+    """Compatibility facade for the single submission authority."""
+    dependencies = SimpleNamespace(
+        application_jobs_mod=application_jobs_mod,
+        application_plan_mod=application_plan_mod,
+        application_plan_runtime_mod=application_plan_runtime_mod,
+        application_plan_audit_issuer=_application_plan_audit_issuer,
+        authorize_linkedin_runtime_route=_authorize_linkedin_runtime_route,
+        runtime_linkedin_route_gate=_runtime_linkedin_route_gate,
+        submission_audit_fingerprint=_submission_audit_fingerprint,
+        config=config,
+        get_connection=get_connection,
+        logger=logger,
+    )
+    return submission_authority_mod.reserve_manifest_submission(
+        dependencies,
+        manifest,
+        job,
+        audit_report,
+        success_target=success_target,
+    )
 def _repair_requires_resume_upload(observation: Mapping[str, object]) -> bool:
     """Expose file upload only for a visible, repairable Resume/CV error."""
     if observation.get("repair_mode") is not True:
@@ -4755,76 +4237,31 @@ def _update_submission_ledger(
     status: str,
     evidence: dict | None = None,
 ) -> bool:
-    if manifest is None:
-        return True
-    try:
-        from applypilot.database import (
-            update_batch_submission_status,
-            update_submission_gate_state,
-        )
-
-        ledger_evidence = dict(evidence or {})
-        if job.get("_bound_submission_materials"):
-            ledger_evidence["material_binding"] = job["_bound_submission_materials"]
-        update_batch_submission_status(
-            str(manifest.get("batch_id") or ""),
-            str(job.get("url") or ""),
-            status,
-            evidence=ledger_evidence,
-        )
-        attempt_id = str(job.get("_attempt_id") or "").strip()
-        if attempt_id:
-            update_submission_gate_state(
-                attempt_id,
-                status,
-                {
-                    "receipt_confirmed": status == "applied",
-                    "submit_started": bool(
-                        isinstance(evidence, Mapping)
-                        and evidence.get("submit_started", True)
-                    ),
-                },
-            )
-        return True
-    except Exception:
-        logger.exception("Batch submission ledger update failed")
-        return False
+    """Compatibility facade for terminal submission ledger updates."""
+    return submission_authority_mod.update_submission_ledger(
+        SimpleNamespace(logger=logger),
+        manifest,
+        job,
+        status,
+        evidence,
+    )
 
 
 def _has_admitted_submission_receipt(
     manifest: Mapping[str, object] | None,
     job: Mapping[str, object],
 ) -> bool:
-    """Check durable receipt admission for this exact authorized attempt."""
-    if not isinstance(manifest, Mapping):
-        return False
-    from applypilot.database import has_admitted_submission_receipt
-
-    return has_admitted_submission_receipt(
-        str(manifest.get("batch_id") or ""),
-        str(job.get("url") or ""),
-        str(job.get("_attempt_id") or ""),
-        conn=get_connection(),
+    """Compatibility facade for exact-attempt receipt admission."""
+    return submission_authority_mod.has_admitted_submission_receipt(
+        SimpleNamespace(get_connection=get_connection),
+        manifest,
+        job,
     )
 
 
 def _admit_direct_email_receipt(job: dict, receipt: object) -> dict[str, object]:
-    """Admit one provider message id before a direct-email success is recorded."""
-    if not isinstance(receipt, dict):
-        return {"status": "rejected", "reason": "sent_receipt_required"}
-    from applypilot.database import admit_direct_email_sent_receipt
-
-    return admit_direct_email_sent_receipt(
-        str(job.get("url") or ""),
-        receipt,
-        gate_binding=(
-            job.get("_submission_gate_binding")
-            if isinstance(job.get("_submission_gate_binding"), Mapping)
-            else None
-        ),
-    )
-
-
+    """Compatibility facade for direct-email provider receipt admission."""
+    return submission_authority_mod.admit_direct_email_receipt(job, receipt)
 def _reported_sent_receipt(
     output: str,
     structured_result: AgentTurnResult | None,
