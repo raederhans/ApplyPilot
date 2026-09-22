@@ -222,3 +222,17 @@ def test_prompt_keeps_auth_handoff_and_missing_facts_local_to_one_job(phase):
         assert "submission_uncertain" in prompt
     else:
         assert "Do not make a final submission" in prompt
+def test_worker_lease_excludes_duplicate_and_foreign_batch(tmp_path):
+    from applypilot.apply.browser_worker import _worker_lease
+    from applypilot.apply.visual_bridge import VisualBridgeError
+    with _worker_lease(tmp_path, {}):
+        with pytest.raises(VisualBridgeError, match="already has a worker"):
+            with _worker_lease(tmp_path, {}):
+                pass
+    assert not (tmp_path / ".worker-owner").exists()
+    (tmp_path / ".batch_lease").write_text("parent-token", encoding="utf-8")
+    with pytest.raises(VisualBridgeError, match="reserved"):
+        with _worker_lease(tmp_path, {}):
+            pass
+    with _worker_lease(tmp_path, {"APPLYPILOT_BROWSER_BATCH_LEASE": "parent-token"}):
+        assert (tmp_path / ".worker-owner").exists()

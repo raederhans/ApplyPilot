@@ -4,6 +4,34 @@ All notable changes to Job Apply Pilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-22
+
+### Added
+
+- Attended `browser-batch` preparation for CLI workers bound to separate in-app
+  browser tabs: default concurrency 2, configurable 1-4, per-hostname admission,
+  available-memory reserve, exclusive worker leases, isolated failures and progress.
+- IAB `fill_batch` for up to four observed text/native-select fields, with
+  per-field verification and explicit partial progress when a form changes.
+- Read-only `attended-plan` projection of existing attempts, materials, blockers
+  and exact admitted receipts, without another executor or submission authority.
+- Public real ATS test results and usage guidance. Three Lever rounds exercised
+  1/2/4 workers and independently verified 32 contact-field values; these are
+  preparation samples, not full applications or a long-run capacity guarantee.
+
+### Fixed
+
+- Batch workers launch from the installed package instead of relying on a source
+  checkout's scripts directory. Clean-install smoke checks cover the new entries.
+- POSIX batch cancellation forwards termination so workers clean up their isolated
+  CLI/MCP descendants; spawn registration defers signals until ownership is recorded.
+
+### Changed
+
+- Extracted browser command handlers from the CLI module. App Server and the older
+  external runtime/recipe experiments remain disabled; submissions retain the
+  existing attended review, reservation, gate and receipt path.
+
 ## [0.6.0] - 2026-09-22
 
 ### Added

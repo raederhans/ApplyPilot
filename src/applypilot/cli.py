@@ -2045,16 +2045,30 @@ def browser_work(
     timeout_seconds: float = typer.Option(600, "--timeout-seconds", help="Total worker deadline."),
 ) -> None:
     """Run one goal on an attached in-app tab, serviced by the current Codex task."""
-    from applypilot.apply.browser_worker import run_browser_worker
-    from applypilot.apply.visual_bridge import VisualBridgeError
+    return _command_module("browser").run_browser_work(
+        sys.modules[__name__], bridge_dir=bridge_dir, task_file=task_file,
+        phase=phase, timeout_seconds=timeout_seconds)
 
-    try:
-        code = run_browser_worker(bridge_dir=bridge_dir, task_file=task_file,
-                                  phase=phase, timeout_seconds=timeout_seconds)
-    except (ValueError, OSError, VisualBridgeError) as exc:
-        console.print(str(exc), markup=False)
-        raise typer.Exit(code=2) from exc
-    raise typer.Exit(code=code)
+
+@app.command("browser-batch")
+def browser_batch(
+    manifest: Path = typer.Option(..., "--manifest", exists=True, dir_okay=False),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Fresh directory for per-job logs/status."),
+    min_ram_mb: float = typer.Option(1024, "--min-ram-mb", help="Available RAM reserve in MiB."),
+) -> None:
+    """Prepare several attended IAB tabs with bounded CLI concurrency; no submission."""
+    return _command_module("browser").run_browser_batch(
+        sys.modules[__name__], manifest=manifest, output_dir=output_dir, min_ram_mb=min_ram_mb)
+
+
+@app.command("attended-plan")
+def attended_plan(
+    db: Path = typer.Option(..., "--db", exists=True, dir_okay=False),
+    attempt_id: str = typer.Option(..., "--attempt-id"),
+) -> None:
+    """Read the current application plan from existing attended ledger evidence."""
+    return _command_module("browser").run_attended_plan(
+        sys.modules[__name__], db=db, attempt_id=attempt_id)
 
 
 @app.command()

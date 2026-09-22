@@ -79,6 +79,7 @@ def smoke_release(wheel: Path) -> None:
         child_env = os.environ.copy()
         child_env["APPLYPILOT_DIR"] = str(workspace)
         child_env["PYTHONUTF8"] = "1"
+        child_env.pop("PYTHONPATH", None)
         for secret_name in (
             "GEMINI_API_KEY",
             "OPENAI_API_KEY",
@@ -91,6 +92,9 @@ def smoke_release(wheel: Path) -> None:
         _run([str(python), "-m", "pip", "install", str(wheel)], cwd=root, env=child_env)
         applypilot = environment / ("Scripts/applypilot.exe" if os.name == "nt" else "bin/applypilot")
         _run([str(applypilot), "resume-route", "--help"], cwd=root, env=child_env)
+        _run([str(applypilot), "browser-batch", "--help"], cwd=root, env=child_env)
+        _run([str(applypilot), "attended-plan", "--help"], cwd=root, env=child_env)
+        _run([str(python), "-m", "applypilot.apply.browser_worker", "--help"], cwd=root, env=child_env)
         base = [str(python), "-m", "applypilot.cli"]
         _run([*base, "--version"], cwd=root, env=child_env)
         _run(

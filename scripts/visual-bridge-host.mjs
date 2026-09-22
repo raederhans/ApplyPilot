@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { observeForm, changedFields, operateObservedControl, ControlNotReady } from './browser-form-state.mjs';
+import { operateFieldBatch } from './browser-field-batch.mjs';
 import { BridgeMetrics, canReuseActionReadback, observationCoverage, observationSizes,
   queueWaitMs } from './browser-observation-feedback.mjs';
 
@@ -25,7 +26,7 @@ export async function createInAppBrowserHost({ directory, tab, phase = 'prepare'
   activeTabs.add(tab.id);
   try {
     const host = await createVisualHost({ directory,
-      adapter: browserAdapter(tab, { artifacts, reuseFormObservations: phase === 'prepare' && reuseFormObservations }),
+      adapter: browserAdapter(tab, { artifacts, allowFieldBatch: phase === 'prepare', reuseFormObservations: phase === 'prepare' && reuseFormObservations }),
       phase, submission_authorized,
       target: { runtime: 'iab', tab_id: tab.id, application_url: await tab.url() } });
     const close = host.close;
@@ -142,6 +143,9 @@ export async function createVisualHost({ directory, adapter, target, phase = 'pr
           throw Error('Stale observation; observe again before input');
         }
         if (request.deadline_at <= Date.now() / 1000) throw Error('Expired before execution');
+        if (request.operation === 'fill_batch' && (phase !== 'prepare' || target.runtime !== 'iab')) {
+          throw new ControlNotReady('Field batch requires an IAB prepare host');
+        }
         observationId = null;
         adapterStarted = true;
         sample.outcome = 'failed';
@@ -202,7 +206,7 @@ export async function createVisualHost({ directory, adapter, target, phase = 'pr
   };
 }
 
-export function browserAdapter(tab, { artifacts = {}, reuseFormObservations = false } = {}) {
+export function browserAdapter(tab, { artifacts = {}, reuseFormObservations = false, allowFieldBatch = false } = {}) {
   if (typeof reuseFormObservations !== 'boolean') throw new TypeError('reuseFormObservations must be boolean');
   // Only the trusted host supplies paths. Workers select opaque references.
   const artifactFiles = new Map(Object.entries(artifacts));
@@ -213,6 +217,8 @@ export function browserAdapter(tab, { artifacts = {}, reuseFormObservations = fa
   let formSnapshot = null;
   let uploadBaseline = null;
   let lastControlResult = null;
+  let lastBatchResult = null;
+  let lastBatchObservation = null;
   let pendingReadback = null;
   return {
     surface: 'browser',
@@ -275,10 +281,22 @@ export function browserAdapter(tab, { artifacts = {}, reuseFormObservations = fa
               invalid: current?.invalid ?? null, validation_message: current?.validation_message || '' };
           }
         }
+        if (lastBatchResult?.status === 'verified' && lastBatchObservation) {
+          const state = f => JSON.stringify([f?.selector, f?.label, f?.control, f?.value, f?.options]);
+          const stable = lastBatchObservation.page_url === formSnapshot.page_url &&
+            lastBatchResult.results.every(r => {
+              const current = formSnapshot.fields.find(f => f.field_key === r.field_key);
+              return current && current.value_source !== 'unavailable' &&
+                state(current) === state(lastBatchObservation.fields.find(f => f.field_key === r.field_key));
+            });
+          if (!stable) lastBatchResult = { ...lastBatchResult, status: 'parked',
+            reason: 'delayed_readback_changed', reobserve_required: true };
+        }
         content.push(text({ form_state: formSnapshot,
           changed_fields: changedFields(previous, formSnapshot),
           post_upload_changes: changedFields(uploadBaseline, formSnapshot),
           control_result: lastControlResult,
+          batch_result: lastBatchResult,
           ...(reuseFormObservations ? { observation_feedback: {
             kind: reuse ? 'action_readback_with_visible_dom' : 'full_dom', form_readback_reused: reuse,
             full_observation_available: true, coverage: observationCoverage(formSnapshot),
@@ -286,11 +304,22 @@ export function browserAdapter(tab, { artifacts = {}, reuseFormObservations = fa
             immediate_readback_only: true,
           } } : {}) }));
         lastControlResult = null;
+        lastBatchResult = null;
+        lastBatchObservation = null;
       }
       return content;
     },
     async act(operation, args) {
       pendingReadback = null;
+      lastBatchResult = null;
+      if (operation === 'fill_batch') {
+        if (!allowFieldBatch) throw new ControlNotReady('Field batch is not enabled on this host');
+        const result = await operateFieldBatch(tab, formSnapshot, args.steps);
+        lastBatchResult = result.batch_result;
+        lastBatchObservation = result.observation;
+        lastControlResult = null;
+        return;
+      }
       if (['fill_control', 'select_control', 'set_checked'].includes(operation)) {
         const result = await operateObservedControl(tab, formSnapshot, operation, args);
         const { observation, ...report } = result;

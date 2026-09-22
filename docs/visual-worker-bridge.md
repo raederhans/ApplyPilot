@@ -490,3 +490,9 @@ invalidate it. An observed present-but-empty resume control removes the old proo
 Capturing upload proof invalidates any prior final-page checkpoint; capture the
 final page again. Upload evidence cannot be changed after gate claim. Reusing an
 old upload object under another attempt is rejected.
+# Concurrent preparation
+
+For the integrated CLI + IAB queue, bounded routine field batches and read-only
+application state view, see [Attended runtime batch](attended-runtime-batch.md).
+Default preparation concurrency is two; the attending Codex task still reviews
+and services requests, and submission retains the existing single authority.

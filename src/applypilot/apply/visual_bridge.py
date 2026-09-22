@@ -24,7 +24,7 @@ HOST_MAX_AGE_SECONDS = 120.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 45.0
 MAX_REQUEST_TIMEOUT_SECONDS = 120.0
 OPERATIONS = frozenset({"observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact",
-                        "fill_control", "select_control", "set_checked"})
+                        "fill_control", "select_control", "set_checked", "fill_batch"})
 SURFACES = frozenset({"computer_use", "browser"})
 PRESS_KEYS = frozenset(
     {
@@ -160,7 +160,9 @@ def request_visual_operation(
         raise VisualBridgeError("invalid_request", "Visual bridge timeout must be positive.")
     timeout_seconds = min(timeout_seconds, MAX_REQUEST_TIMEOUT_SECONDS)
     host = read_active_host(root, now=now())
-    if operation in {"navigate", "upload_artifact", "fill_control", "select_control", "set_checked"} and host.surface != "browser":
+    if operation == "fill_batch" and (host.phase != "prepare" or host.target.get("runtime") != "iab"):
+        raise VisualBridgeError("invalid_request", "Field batch requires an IAB prepare host.")
+    if operation in {"navigate", "upload_artifact", "fill_control", "select_control", "set_checked", "fill_batch"} and host.surface != "browser":
         raise VisualBridgeError("invalid_request", f"{operation} is only available on the browser surface.")
     if operation == "type_text" and "node_id" in args and host.surface != "browser":
         raise VisualBridgeError("invalid_request", "Targeted text entry is only available on the browser surface.")
@@ -353,6 +355,7 @@ def _validate_operation(
         "fill_control": {"field_key", "value"},
         "select_control": {"field_key", "value"},
         "set_checked": {"field_key", "checked"},
+        "fill_batch": {"steps"},
     }
     if not set(arguments).issubset(allowed[operation]):
         raise VisualBridgeError(
@@ -367,7 +370,19 @@ def _validate_operation(
         return
     if not isinstance(observation_id, str) or not observation_id.strip():
         raise VisualBridgeError("invalid_request", f"{operation} requires observation_id.")
-    if operation in {"fill_control", "select_control", "set_checked"}:
+    if operation == "fill_batch":
+        steps = arguments.get("steps")
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 4:
+            raise VisualBridgeError("invalid_request", "Field batch requires one to four steps.")
+        seen = set()
+        for step in steps:
+            if not isinstance(step, dict) or step.get("operation") not in {"fill_control", "select_control"}:
+                raise VisualBridgeError("invalid_request", "Only routine text and native selects may be batched.")
+            _validate_operation(step["operation"], observation_id, {k: v for k, v in step.items() if k != "operation"})
+            if step["field_key"] in seen:
+                raise VisualBridgeError("invalid_request", "Duplicate batch field.")
+            seen.add(step["field_key"])
+    elif operation in {"fill_control", "select_control", "set_checked"}:
         value_key = "checked" if operation == "set_checked" else "value"
         if set(arguments) != {"field_key", value_key} or not isinstance(arguments.get("field_key"), str) or not arguments["field_key"].strip():
             raise VisualBridgeError("invalid_request", "Control operation requires an observed field_key and value.")
