@@ -109,7 +109,6 @@ jobs:
   windows-install-smoke:
     name: Windows 3.12 tests and clean install smoke
     runs-on: windows-latest
-    needs: [core, compatibility, browser-chromium]
     timeout-minutes: 30
     env:
       PYTHONUTF8: "1"

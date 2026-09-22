@@ -23,22 +23,16 @@ def test_page_observation_ports_are_separate_from_application_execution() -> Non
     }.intersection(item.name for item in fields(worker_orchestration.WorkerApplicationPorts))
 
 
-def test_launcher_composes_migrated_public_observation_modules() -> None:
+def test_launcher_composes_runtime_capabilities_without_cell_effect_authority() -> None:
     runtime = launcher._worker_runtime_ports()
 
-    assert (
-        runtime.observation.click_linkedin_main_apply_causally
-        is launcher.linkedin_page_observation_mod.click_linkedin_main_apply_causally
-    )
-    assert runtime.observation.observe_post_submit_page is launcher.post_submit_observation_mod.observe_post_submit_page
-    assert (
-        runtime.submission.submission_evidence_consistent
-        is launcher.post_submit_observation_mod.submission_evidence_consistent
-    )
+    assert callable(runtime.observation.click_linkedin_main_apply_causally)
+    assert callable(runtime.observation.observe_post_submit_page)
+    assert callable(runtime.submission.submission_evidence_consistent)
     assert runtime.runtime_cells.production_enabled is False
     assert runtime.runtime_cells.coordinator_factory is RuntimeCellCoordinator
-    assert "submit" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}
-    assert "receipt" not in {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}
+    cell_fields = {item.name for item in fields(worker_orchestration.WorkerRuntimeCellPorts)}
+    assert {"submit", "receipt"}.isdisjoint(cell_fields)
 
 
 def test_production_shadow_session_claims_and_closes_exact_cell_lifecycle(

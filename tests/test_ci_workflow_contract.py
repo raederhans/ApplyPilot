@@ -91,7 +91,7 @@ def test_ci_exposes_all_required_checks() -> None:
         step for step in windows_steps if step.get("name") == "Test Windows tier"
     )
     assert windows_test["run"] == "python -m pytest -q -m windows"
-    assert windows["needs"] == ["core", "compatibility", "browser-chromium"]
+    assert "needs" not in windows
 
     bind_step = next(step for step in windows["steps"] if step.get("name") == "Bind isolated ApplyPilot workspace")
     assert bind_step["shell"] == "pwsh"
