@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from applypilot.apply import agent_runtime
@@ -13,7 +16,14 @@ def test_selects_newer_verified_install(monkeypatch, tmp_path, npm_version, expe
     monkeypatch.delenv("APPLYPILOT_CODEX_EXECUTABLE", raising=False)
     monkeypatch.setattr(agent_runtime.platform, "system", lambda: "Windows")
     monkeypatch.setattr(agent_runtime.shutil, "which", lambda name: str(npm) if name == "codex.exe" else None)
-    monkeypatch.setattr(agent_runtime, "_codex_executable_version", lambda p: (0, 153, 4) if p == app else npm_version)
+    def version_output(command, **kwargs):
+        version = (0, 153, 4) if Path(command[0]) == app else npm_version
+        return subprocess.CompletedProcess(
+            command, 0, "codex-cli " + ".".join(map(str, version)) + "\n", ""
+        )
+
+    # Exercise the real version parser; fake only the operating-system I/O.
+    monkeypatch.setattr(subprocess, "run", version_output)
     assert agent_runtime.resolve_codex_command() == [str(app if expected == "app" else npm)]
 
 
