@@ -23,7 +23,6 @@ from applypilot.apply.job_results import (
     restore_preview_state,
 )
 
-
 __all__ = [
     "acquire_job",
     "mark_job",
