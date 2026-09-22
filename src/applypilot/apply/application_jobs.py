@@ -15,13 +15,25 @@ from datetime import UTC, datetime
 from applypilot import config
 from applypilot.apply import job_acquisition
 from applypilot.apply.job_results import (
-    mark_job as mark_job,
-    mark_result as mark_result,
-    mark_runtime_cover_not_required as mark_runtime_cover_not_required,
-    release_lock as release_lock,
-    reset_failed as reset_failed,
-    restore_preview_state as restore_preview_state,
+    mark_job,
+    mark_result,
+    mark_runtime_cover_not_required,
+    release_lock,
+    reset_failed,
+    restore_preview_state,
 )
+
+
+__all__ = [
+    "acquire_job",
+    "mark_job",
+    "mark_result",
+    "mark_runtime_cover_not_required",
+    "release_lock",
+    "reset_failed",
+    "restore_preview_state",
+    "revalidate_duplicate_before_submit",
+]
 
 
 def revalidate_duplicate_before_submit(

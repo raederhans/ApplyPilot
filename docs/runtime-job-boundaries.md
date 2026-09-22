@@ -29,8 +29,8 @@ monkeypatches dynamically. New consumers should import the relevant owner.
 `application_jobs.py` retains its existing call signatures and resolves mutable
 profile/environment/clock dependencies at invocation. Its final-submit duplicate
 predicate is unchanged and still requires the submission claim transaction.
-The facade shrinks from 857 to 126 lines; `agent_runtime.py` shrinks from 1,305 to
-46 lines. These are facade sizes, not claims of equivalent total-code reduction.
+The old modules now expose thin compatibility facades with explicit exports.
+Implementation moves are not claims of equivalent total-code reduction.
 
 ## Queue acquisition
 
