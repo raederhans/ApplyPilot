@@ -808,6 +808,11 @@ def release_browser_resource_scope(
     ensure_schema(connection)
     now_text = _iso(now or datetime.now(UTC))
     with _write(connection):
+        connection.execute(
+            "UPDATE browser_resource_leases SET status='expired',released_at=? "
+            "WHERE scope_id=? AND status='active' AND expires_at<=?",
+            (now_text, scope_id, now_text),
+        )
         active_rows = tuple(
             _lease(row)
             for row in connection.execute(
@@ -827,10 +832,6 @@ def release_browser_resource_scope(
                 expected_process_birth_time,
             )
             for row in active:
-                if row.expires_at <= now_text:
-                    raise ResourceLeaseExpiredError(
-                        f"scope contains expired lease: {row.lease_id}"
-                    )
                 persisted_authority = (
                     row.owner_id,
                     row.actor_id,
