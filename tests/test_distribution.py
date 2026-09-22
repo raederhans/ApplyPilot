@@ -50,7 +50,7 @@ def test_public_brand_metadata_preserves_compatibility_identifiers() -> None:
     assert metadata["authors"] == [{"name": "Pickle-Pixel and Job Apply Pilot contributors"}]
     assert metadata["name"] == "applypilot-local"
     assert metadata["scripts"] == {"applypilot": "applypilot.cli:app"}
-    assert metadata["urls"]["Repository"] == "https://github.com/raederhans/ApplyPilot"
+    assert metadata["urls"]["Repository"] == "https://github.com/raederhans/AutoJobApply"
     assert cli.app.info.name == "applypilot"
 
 

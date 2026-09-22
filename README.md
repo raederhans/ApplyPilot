@@ -4,8 +4,8 @@
   <img src="docs/brand/job-apply-pilot/assets/readme-hero.svg" alt="Job Apply Pilot — discover, decide, prepare, verify" width="100%">
 </p>
 
-[![Release](https://img.shields.io/github/v/release/raederhans/ApplyPilot?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/ApplyPilot/releases/latest)
-[![CI](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/ApplyPilot/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/raederhans/AutoJobApply?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/AutoJobApply/releases/latest)
+[![CI](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11–3.13-0B1F3A)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-20B486)](LICENSE)
 
@@ -67,16 +67,16 @@ This project is not affiliated with applypilot.app, useapplypilot.com, or other 
 - **End-to-end workflow available.** The source supports discovery, enrichment, scoring, resume-library routing, truthful tailoring, cover letters and PDF preparation, supervised application assistance, history, and receipt reconciliation.
 - **Read-only browser dashboard.** The workbench presents Discover, Decide, Prepare, and Verify without mutating the database or executing commands.
 - **Human review is a feature.** Unsupported claims, CAPTCHA or MFA, assessments, identity or financial documents, account recovery, security changes, and uncertain results remain explicit handoff points.
-- **Current release: v0.5.2.** Existing commands, local data, and compatibility identifiers remain unchanged by this brand redesign.
+- **Current release: v0.6.0.** Existing commands, local data, and compatibility identifiers remain unchanged by this release.
 
 ## Install
 
 Python 3.11 or 3.12 is recommended for the full workflow. Core commands and the official-source radar also support Python 3.13.
 
-There is no `applypilot-local` release on PyPI. Install from the [latest GitHub release](https://github.com/raederhans/ApplyPilot/releases) or directly from this repository:
+There is no `applypilot-local` release on PyPI. Install from the [latest GitHub release](https://github.com/raederhans/AutoJobApply/releases) or directly from this repository:
 
 ```bash
-pipx install "git+https://github.com/raederhans/ApplyPilot.git@v0.5.2"
+pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.6.0"
 ```
 
 For a reproducible local deployment, download the release bundle and `SHA256SUMS`, verify the checksum, extract it, and run:
