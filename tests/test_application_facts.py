@@ -10,6 +10,7 @@ import pytest
 from applypilot.apply.application_facts import (
     FactResolution,
     current_profile_facts,
+    current_visible_fact_mappings,
     resolve_application_fact,
 )
 
@@ -39,6 +40,30 @@ def test_current_profile_is_authority_and_false_and_zero_are_preserved() -> None
 
     assert [fact.value for fact in facts] == [False, 0]
     assert {fact.fact_ref for fact in facts} == {"false", "zero"}
+
+
+def test_visible_fact_projection_exposes_only_current_application_facts() -> None:
+    current = _fact("answer:v2", "Current answer")
+    profile = {
+        "application_facts": [current],
+        "application_fact_retirements": [
+            {
+                "fact_ref": "answer:v1",
+                "superseded_by": "answer:v2",
+                "keys": ["legacy_answer"],
+                "normalized_values": ["retired answer"],
+                "retired_at": "2026-09-01",
+                "reason": "user_correction",
+            }
+        ],
+        "application_fact_revisions": [_fact("history", "must-not-be-authority")],
+    }
+
+    visible = current_visible_fact_mappings(profile)
+
+    assert [fact["fact_ref"] for fact in visible] == ["answer:v2"]
+    assert visible[0]["value"] == "Current answer"
+    assert all(fact["fact_ref"] not in {"answer:v1", "history"} for fact in visible)
 
 
 def test_redacted_fact_fixture_preserves_false_and_zero() -> None:

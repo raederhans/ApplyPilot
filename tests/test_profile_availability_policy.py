@@ -6,6 +6,7 @@ import pytest
 
 from applypilot import config
 from applypilot.apply import page_observation, prompt
+from applypilot.apply.application_facts import validate_profile_fact_policy
 from applypilot.services import application
 
 
@@ -41,11 +42,80 @@ def _full_time_profile() -> dict:
         },
         "application_facts": [
             {
+                "fact_ref": "availability:full-time-window:v2",
                 "key": "full_time_internship_availability",
                 "value": "Full-time from 2026-11-10 through 2027-06-30",
+                "source": "profile.json",
+                "scope": "application:internship",
+                "confirmed_at": "2026-09-09T00:00:00Z",
+                "expires_at": "2027-06-30T00:00:00Z",
             }
         ],
     }
+
+
+def _profile_with_retired_availability() -> dict:
+    profile = _full_time_profile()
+    profile["application_fact_retirements"] = [
+        {
+            "fact_ref": "availability:non-credit-hours:v1",
+            "superseded_by": "availability:full-time-window:v2",
+            "keys": ["non_credit_internship_hours_per_week_max"],
+            "normalized_values": ["available for 16 hours per week"],
+            "normalized_fragments": ["available for 16 hours per week"],
+            "retired_at": "2026-09-09",
+            "reason": "user_correction",
+        }
+    ]
+    return profile
+
+
+def test_generic_profile_can_legitimately_declare_sixteen_hours_per_week() -> None:
+    profile = _full_time_profile()
+    profile["availability"]["hours_per_week"] = 16
+    profile["availability"]["schedule_note"] = (
+        "Candidate is available for 16 hours per week during the academic term."
+    )
+
+    validate_profile_fact_policy(profile)
+
+
+def test_profile_owned_retired_fragment_is_rejected_inside_longer_text() -> None:
+    profile = _profile_with_retired_availability()
+    profile["screening"] = {
+        "nested": {
+            "legacy_note": (
+                "Candidate is AVAILABLE   FOR 16 HOURS PER WEEK during the academic term."
+            )
+        }
+    }
+
+    with pytest.raises(ValueError, match="retired"):
+        validate_profile_fact_policy(profile)
+
+
+def test_retired_legacy_implicit_fact_ref_cannot_be_revived() -> None:
+    profile = _profile_with_retired_availability()
+    profile["application_fact_retirements"].append(
+        {
+            "fact_ref": "profile:legacy_weekly_limit:1",
+            "superseded_by": "availability:full-time-window:v2",
+            "retired_at": "2026-09-09",
+            "reason": "user_correction",
+        }
+    )
+    profile["application_facts"].append(
+        {
+            "key": "legacy_weekly_limit",
+            "value": 16,
+            "source": "profile.json",
+            "scope": "application:internship",
+            "confirmed_at": "2026-08-01T00:00:00Z",
+        }
+    )
+
+    with pytest.raises(ValueError, match="retired"):
+        validate_profile_fact_policy(profile)
 
 
 @pytest.mark.parametrize(
@@ -53,42 +123,88 @@ def _full_time_profile() -> dict:
     [
         {"availability": {"non_credit_internship_hours_per_week_max": 16}},
         {
-            "application_facts": [
-                {
-                    "key": "non_credit_internship_availability",
-                    "value": "Immediately, maximum 16 hours per week",
-                }
-            ]
-        },
-        {
             "screening": {
-                "available_for_full_time_3_6_month_internship_starting_september": False
+                "nested": {"legacy_note": "  AVAILABLE   FOR 16 HOURS PER WEEK  "}
             }
         },
+        {
+            "application_facts": [
+                {
+                    "fact_ref": "availability:non-credit-hours:v1",
+                    "key": "other_availability_note",
+                    "value": "Retired value must not return",
+                    "source": "profile.json",
+                    "scope": "application:internship",
+                    "confirmed_at": "2026-08-01T00:00:00Z",
+                },
+                *_full_time_profile()["application_facts"],
+            ]
+        },
     ],
+    ids=("retired-key", "normalized-nested-value", "retired-fact-ref"),
 )
-def test_profile_validation_rejects_retired_availability_facts(
+def test_profile_fact_policy_rejects_retired_fact_revival(
     legacy_fragment: dict,
 ) -> None:
-    profile = _full_time_profile()
+    profile = _profile_with_retired_availability()
     profile.update(legacy_fragment)
 
-    with pytest.raises(ValueError, match="retired candidate availability facts"):
-        config.validate_profile_availability(profile)
+    with pytest.raises(ValueError, match="retired"):
+        validate_profile_fact_policy(profile)
 
 
-def test_service_profile_loader_applies_the_same_guard(tmp_path) -> None:
+@pytest.mark.parametrize("loader_name", ["config", "service"])
+def test_profile_loaders_apply_the_same_retirement_policy(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, loader_name: str
+) -> None:
     path = tmp_path / "profile.json"
-    profile = _full_time_profile()
+    profile = _profile_with_retired_availability()
     profile["availability"]["legacy_note"] = "Available for 16 hours per week"
     path.write_text(json.dumps(profile), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="retired candidate availability facts"):
-        application.load_profile(path)
+    if loader_name == "config":
+        monkeypatch.setattr(config, "PROFILE_PATH", path)
+        loader = config.load_profile
+    else:
+        loader = lambda: application.load_profile(path)
+
+    with pytest.raises(ValueError, match="retired"):
+        loader()
+
+
+@pytest.mark.parametrize(
+    "policy_mutation",
+    [
+        lambda profile: profile["application_fact_retirements"][0].update(
+            superseded_by="availability:missing"
+        ),
+        lambda profile: profile["application_facts"].append(
+            dict(profile["application_facts"][0])
+        ),
+        lambda profile: profile["application_fact_retirements"].append(
+            dict(profile["application_fact_retirements"][0])
+        ),
+        lambda profile: profile["application_fact_retirements"][0].pop(
+            "retired_at"
+        ),
+    ],
+    ids=(
+        "missing-current-target",
+        "duplicate-current-ref",
+        "duplicate-retired-ref",
+        "missing-retired-at",
+    ),
+)
+def test_profile_fact_policy_fails_closed_on_invalid_lineage(policy_mutation) -> None:
+    profile = _profile_with_retired_availability()
+    policy_mutation(profile)
+
+    with pytest.raises(ValueError):
+        validate_profile_fact_policy(profile)
 
 
 def test_full_time_profile_renders_without_retired_schedule_branch() -> None:
-    profile = _full_time_profile()
+    profile = _profile_with_retired_availability()
 
     rendered = "\n".join(
         (
@@ -102,9 +218,14 @@ def test_full_time_profile_renders_without_retired_schedule_branch() -> None:
     assert "2026-11-10" in rendered
     assert "2027-06-30" in rendered
     assert "Confirmed full-time internship availability" in rendered
+    assert "full_time_internship_availability" in rendered
+    assert "Full-time from 2026-11-10 through 2027-06-30" in rendered
     assert "Non-credit internship" not in rendered
     assert "16 hours" not in rendered
     assert "part-time eligibility" not in rendered
+    assert "availability:non-credit-hours:v1" not in rendered
+    assert "available for 16 hours per week" not in rendered.casefold()
+    assert "user_correction" not in rendered
 
 
 def test_part_time_job_does_not_fall_back_to_full_time_authorization_branch() -> None:

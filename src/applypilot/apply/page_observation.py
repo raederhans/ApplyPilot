@@ -20,6 +20,7 @@ from applypilot.apply import page_surfaces as page_surfaces_mod
 from applypilot.apply import post_submit_observation as post_submit_observation_mod
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.answer_provenance import audit_pre_submit_answer_provenance
+from applypilot.apply.application_facts import current_visible_fact_mappings
 from applypilot.apply.identity_materials import classify_identity_requirement
 from applypilot.apply.prepared_state import current_prepared_observations
 from applypilot.apply.provider_recipe_shadow import observe_prepare_recipe_shadow
@@ -348,7 +349,7 @@ def _same_exact_application_path(expected_url: str, actual_url: str) -> bool:
 
 def _application_fact_value(profile: dict, key: str) -> object | None:
     """Return the newest confirmed profile fact for one stable key."""
-    for fact in reversed(profile.get("application_facts", [])):
+    for fact in reversed(current_visible_fact_mappings(profile)):
         if isinstance(fact, dict) and str(fact.get("key") or "").strip() == key:
             return fact.get("value")
     return None
@@ -359,7 +360,7 @@ def _contextual_application_fact_value(
 ) -> object | None:
     """Return an exact confirmed option scoped to one semantic context."""
     expected_context = " ".join(str(context or "").casefold().split())
-    for fact in reversed(profile.get("application_facts", [])):
+    for fact in reversed(current_visible_fact_mappings(profile)):
         if not isinstance(fact, dict) or str(fact.get("key") or "").strip() != key:
             continue
         fact_context = " ".join(str(fact.get("context") or "").casefold().split())

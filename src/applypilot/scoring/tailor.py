@@ -18,6 +18,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from applypilot.apply.application_facts import current_visible_fact_mappings
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -365,7 +366,7 @@ def _build_judge_profile_evidence(profile: dict) -> tuple[str, set[str]]:
             f"User-confirmed skill experience: {_display_skill_name(skill)} ({years} {unit})."
         )
 
-    facts = profile.get("application_facts", [])
+    facts = current_visible_fact_mappings(profile)
     if isinstance(facts, list):
         for fact in facts:
             if not isinstance(fact, dict):

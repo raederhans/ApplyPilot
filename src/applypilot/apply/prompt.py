@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from applypilot import config
+from applypilot.apply.application_facts import current_visible_fact_mappings
 from applypilot.apply.authentication_policy import authentication_capability
 from applypilot.apply.submission_surfaces import classify_submission_surface
 
@@ -373,7 +374,7 @@ def _linkedin_resume_preference(profile: dict, job: dict) -> str:
 
 def _build_application_facts_section(profile: dict) -> str:
     """Render a deliberately small, context-aware confirmed-facts registry."""
-    facts = profile.get("application_facts", [])
+    facts = current_visible_fact_mappings(profile)
     if not facts:
         return "== CONFIRMED APPLICATION FACTS ==\nNo additional contextual facts are registered."
 
