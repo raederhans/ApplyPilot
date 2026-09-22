@@ -34,6 +34,10 @@ from applypilot.storage import runtime_control as _runtime_control
 from applypilot.storage import semantic_browser_writes as _semantic_browser_writes
 from applypilot.storage import submission_receipts as _submission_receipts
 from applypilot.storage import task_journal as _task_journal
+from applypilot.storage.database_migrations import (
+    require_supported_database_path,
+    run_database_migrations,
+)
 
 canonicalize_job_url = _job_identity.canonicalize_job_url
 extract_platform_job_id = _job_identity.extract_platform_job_id
@@ -163,7 +167,7 @@ _local = threading.local()
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
-    """Get a thread-local cached SQLite connection with WAL mode enabled.
+    """Get a thread-local cached SQLite connection with a bounded busy timeout.
 
     Each thread gets its own connection (required for SQLite thread safety).
     Connections are cached and reused within the same thread.
@@ -172,7 +176,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
         db_path: Override the default DB_PATH. Useful for testing.
 
     Returns:
-        sqlite3.Connection configured with WAL mode and row factory.
+        sqlite3.Connection configured with a busy timeout and row factory.
     """
     path = str(db_path or DB_PATH)
 
@@ -188,7 +192,6 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             pass
 
     conn = sqlite3.connect(path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
     _local.connections[path] = conn
@@ -202,6 +205,167 @@ def close_connection(db_path: Path | str | None = None) -> None:
         conn = _local.connections.pop(path, None)
         if conn is not None:
             conn.close()
+
+
+def _establish_current_schema_baseline(connection: sqlite3.Connection) -> None:
+    """Build and version the legacy additive schema as one atomic migration."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            url                   TEXT PRIMARY KEY,
+            title                 TEXT,
+            salary                TEXT,
+            description           TEXT,
+            location              TEXT,
+            company_name          TEXT,
+            source_site           TEXT,
+            site                  TEXT,
+            strategy              TEXT,
+            discovered_at         TEXT,
+            last_seen_at          TEXT,
+            platform_job_id       TEXT,
+            canonical_job_url     TEXT,
+            dedupe_status         TEXT,
+            possible_repost_of    TEXT,
+            full_description      TEXT,
+            application_url       TEXT,
+            detail_scraped_at     TEXT,
+            detail_error          TEXT,
+            fit_score             INTEGER,
+            score_reasoning       TEXT,
+            score_evidence_json   TEXT,
+            scored_at             TEXT,
+            tailored_resume_path  TEXT,
+            tailored_at           TEXT,
+            tailor_attempts       INTEGER DEFAULT 0,
+            tailor_status         TEXT,
+            tailor_error          TEXT,
+            tailor_source_resume_path TEXT,
+            tailor_report_path    TEXT,
+            cover_letter_path     TEXT,
+            cover_letter_at       TEXT,
+            cover_attempts        INTEGER DEFAULT 0,
+            cover_letter_status   TEXT,
+            cover_letter_error    TEXT,
+            cover_letter_approved_at TEXT,
+            cover_letter_approved_by TEXT,
+            cover_letter_source_resume_path TEXT,
+            cover_letter_evidence_sources TEXT,
+            applied_at            TEXT,
+            apply_status          TEXT,
+            apply_error           TEXT,
+            apply_attempts        INTEGER DEFAULT 0,
+            apply_retry_blocked   INTEGER DEFAULT 0,
+            apply_retry_reason    TEXT,
+            agent_id              TEXT,
+            last_attempted_at     TEXT,
+            apply_duration_ms     INTEGER,
+            apply_task_id         TEXT,
+            verification_confidence TEXT,
+            application_evidence TEXT,
+            application_recorded_at TEXT,
+            submission_observation_json TEXT,
+            submission_observed_at TEXT,
+            unanswered_questions_json TEXT,
+            unanswered_questions_updated_at TEXT,
+            application_readiness_status TEXT,
+            application_readiness_reason TEXT,
+            application_readiness_reviewed_at TEXT,
+            application_readiness_reviewed_by TEXT,
+            application_readiness_fingerprint TEXT
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS application_fact_revisions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_key       TEXT NOT NULL,
+            old_value_json TEXT,
+            new_value_json TEXT NOT NULL,
+            context        TEXT,
+            source         TEXT,
+            confirmed_at   TEXT,
+            note           TEXT,
+            recorded_at    TEXT NOT NULL
+        )
+    """)
+    ensure_application_batch_schema(connection)
+    ensure_radar_schema(connection)
+    from applypilot.resume_library import ensure_resume_library_schema
+
+    ensure_resume_library_schema(connection)
+
+    added_columns = ensure_columns(connection)
+    connection.execute("DROP TRIGGER IF EXISTS jobs_invalidate_changed_score_inputs")
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS jobs_invalidate_changed_score_inputs
+        AFTER UPDATE OF url, application_url, title, company_name, location,
+                        full_description ON jobs
+        WHEN OLD.applied_at IS NULL AND NEW.applied_at IS NULL
+          AND COALESCE(OLD.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
+          AND COALESCE(NEW.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
+          AND NOT EXISTS (
+              SELECT 1 FROM application_attempts
+              WHERE job_url IN (OLD.url, NEW.url) AND submit_started = 1
+                AND status IN ('in_progress', 'applied', 'submitted', 'submission_uncertain')
+          )
+          AND (OLD.url IS NOT NEW.url
+            OR OLD.application_url IS NOT NEW.application_url
+            OR OLD.title IS NOT NEW.title
+            OR OLD.company_name IS NOT NEW.company_name
+            OR OLD.location IS NOT NEW.location
+            OR OLD.full_description IS NOT NEW.full_description)
+        BEGIN
+            UPDATE jobs SET fit_score=NULL, scored_at=NULL, score_reasoning=NULL,
+                score_evidence_json=NULL, score_status='stale', score_error=NULL,
+                tailored_resume_path=NULL, tailored_at=NULL, tailor_status='stale',
+                tailor_error=NULL,
+                cover_letter_path=NULL, cover_letter_status='stale', cover_letter_error=NULL,
+                cover_letter_approved_at=NULL, cover_letter_approved_by=NULL,
+                application_readiness_status=NULL, application_readiness_reason=NULL,
+                application_readiness_reviewed_at=NULL, application_readiness_reviewed_by=NULL,
+                application_readiness_fingerprint=NULL
+            WHERE url=NEW.url;
+        END
+    """)
+    if "apply_retry_blocked" in added_columns:
+        connection.execute("""
+            UPDATE jobs
+            SET apply_retry_blocked = CASE
+                    WHEN apply_status != 'applied' AND apply_attempts >= 99 THEN 1
+                    ELSE 0
+                END,
+                apply_retry_reason = CASE
+                    WHEN apply_status != 'applied' AND apply_attempts >= 99
+                    THEN COALESCE(apply_error, 'legacy_permanent_failure')
+                    ELSE NULL
+                END,
+                apply_attempts = CASE
+                    WHEN apply_attempts >= 99 THEN apply_attempts - 99
+                    ELSE apply_attempts
+                END
+        """)
+    connection.execute(
+        "UPDATE jobs SET source_site = site "
+        "WHERE (source_site IS NULL OR source_site = '') AND site IS NOT NULL"
+    )
+    _backfill_job_identities(connection)
+
+    required = {"jobs", "application_fact_revisions"}
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    missing = sorted(required - present)
+    if missing:
+        raise RuntimeError(
+            "cannot establish ApplyPilot schema baseline; missing tables: "
+            + ", ".join(missing)
+        )
+
+
+_DATABASE_MIGRATIONS = (_establish_current_schema_baseline,)
+DATABASE_SCHEMA_VERSION = len(_DATABASE_MIGRATIONS)
 
 
 def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -234,163 +398,21 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     # Ensure parent directory exists
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    conn = get_connection(path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            -- Discovery stage (smart_extract / job_search)
-            url                   TEXT PRIMARY KEY,
-            title                 TEXT,
-            salary                TEXT,
-            description           TEXT,
-            location              TEXT,
-            company_name          TEXT,
-            source_site           TEXT,
-            site                  TEXT,
-            strategy              TEXT,
-            discovered_at         TEXT,
-            last_seen_at          TEXT,
-            platform_job_id       TEXT,
-            canonical_job_url     TEXT,
-            dedupe_status         TEXT,
-            possible_repost_of    TEXT,
-
-            -- Enrichment stage (detail_scraper)
-            full_description      TEXT,
-            application_url       TEXT,
-            detail_scraped_at     TEXT,
-            detail_error          TEXT,
-
-            -- Scoring stage (job_scorer)
-            fit_score             INTEGER,
-            score_reasoning       TEXT,
-            score_evidence_json   TEXT,
-            scored_at             TEXT,
-
-            -- Tailoring stage (resume tailor)
-            tailored_resume_path  TEXT,
-            tailored_at           TEXT,
-            tailor_attempts       INTEGER DEFAULT 0,
-            tailor_status         TEXT,
-            tailor_error          TEXT,
-            tailor_source_resume_path TEXT,
-            tailor_report_path    TEXT,
-
-            -- Cover letter stage
-            cover_letter_path     TEXT,
-            cover_letter_at       TEXT,
-            cover_attempts        INTEGER DEFAULT 0,
-            cover_letter_status   TEXT,
-            cover_letter_error    TEXT,
-            cover_letter_approved_at TEXT,
-            cover_letter_approved_by TEXT,
-            cover_letter_source_resume_path TEXT,
-            cover_letter_evidence_sources TEXT,
-
-            -- Application stage
-            applied_at            TEXT,
-            apply_status          TEXT,
-            apply_error           TEXT,
-            apply_attempts        INTEGER DEFAULT 0,
-            apply_retry_blocked   INTEGER DEFAULT 0,
-            apply_retry_reason    TEXT,
-            agent_id              TEXT,
-            last_attempted_at     TEXT,
-            apply_duration_ms     INTEGER,
-            apply_task_id         TEXT,
-            verification_confidence TEXT,
-            application_evidence TEXT,
-            application_recorded_at TEXT,
-            submission_observation_json TEXT,
-            submission_observed_at TEXT,
-            unanswered_questions_json TEXT,
-            unanswered_questions_updated_at TEXT,
-            application_readiness_status TEXT,
-            application_readiness_reason TEXT,
-            application_readiness_reviewed_at TEXT,
-            application_readiness_reviewed_by TEXT,
-            application_readiness_fingerprint TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS application_fact_revisions (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            fact_key       TEXT NOT NULL,
-            old_value_json TEXT,
-            new_value_json TEXT NOT NULL,
-            context        TEXT,
-            source         TEXT,
-            confirmed_at   TEXT,
-            note           TEXT,
-            recorded_at    TEXT NOT NULL
-        )
-    """)
-    ensure_application_batch_schema(conn)
-    ensure_radar_schema(conn)
-    from applypilot.resume_library import ensure_resume_library_schema
-
-    ensure_resume_library_schema(conn)
-    conn.commit()
-
-    # Run migrations for any columns added after initial schema
-    added_columns = ensure_columns(conn)
-    # Invalidate only the current projections; reports and artifact files remain history.
-    conn.execute("DROP TRIGGER IF EXISTS jobs_invalidate_changed_score_inputs")
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS jobs_invalidate_changed_score_inputs
-        AFTER UPDATE OF url, application_url, title, company_name, location,
-                        full_description ON jobs
-        WHEN OLD.applied_at IS NULL AND NEW.applied_at IS NULL
-          AND COALESCE(OLD.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
-          AND COALESCE(NEW.apply_status, '') NOT IN ('applied', 'submitted', 'submission_uncertain')
-          AND NOT EXISTS (
-              SELECT 1 FROM application_attempts
-              WHERE job_url IN (OLD.url, NEW.url) AND submit_started = 1
-                AND status IN ('in_progress', 'applied', 'submitted', 'submission_uncertain')
-          )
-          AND (OLD.url IS NOT NEW.url
-            OR OLD.application_url IS NOT NEW.application_url
-            OR OLD.title IS NOT NEW.title
-            OR OLD.company_name IS NOT NEW.company_name
-            OR OLD.location IS NOT NEW.location
-            OR OLD.full_description IS NOT NEW.full_description)
-        BEGIN
-            UPDATE jobs SET fit_score=NULL, scored_at=NULL, score_reasoning=NULL,
-                score_evidence_json=NULL, score_status='stale', score_error=NULL,
-                tailored_resume_path=NULL, tailored_at=NULL, tailor_status='stale',
-                tailor_error=NULL,
-                cover_letter_path=NULL, cover_letter_status='stale', cover_letter_error=NULL,
-                cover_letter_approved_at=NULL, cover_letter_approved_by=NULL,
-                application_readiness_status=NULL, application_readiness_reason=NULL,
-                application_readiness_reviewed_at=NULL, application_readiness_reviewed_by=NULL,
-                application_readiness_fingerprint=NULL
-            WHERE url=NEW.url;
-        END
-    """)
-    if "apply_retry_blocked" in added_columns:
-        conn.execute("""
-            UPDATE jobs
-            SET apply_retry_blocked = CASE
-                    WHEN apply_status != 'applied' AND apply_attempts >= 99 THEN 1
-                    ELSE 0
-                END,
-                apply_retry_reason = CASE
-                    WHEN apply_status != 'applied' AND apply_attempts >= 99
-                    THEN COALESCE(apply_error, 'legacy_permanent_failure')
-                    ELSE NULL
-                END,
-                apply_attempts = CASE
-                    WHEN apply_attempts >= 99 THEN apply_attempts - 99
-                    ELSE apply_attempts
-                END
-        """)
-    # ``site`` historically stored the discovery board. Preserve that value as
-    # source metadata, but never guess an employer name from it.
-    conn.execute(
-        "UPDATE jobs SET source_site = site "
-        "WHERE (source_site IS NULL OR source_site = '') AND site IS NOT NULL"
+    require_supported_database_path(
+        path,
+        latest_version=DATABASE_SCHEMA_VERSION,
     )
-    _backfill_job_identities(conn)
-    conn.commit()
+    conn = get_connection(path)
+    try:
+        run_database_migrations(conn, _DATABASE_MIGRATIONS)
+        # Preserve the historical multi-connection WAL contract only after the
+        # schema has been accepted and migrated. Unknown newer databases return
+        # above without any persistent pragma or cached writer.
+        if str(path) != ":memory:":
+            conn.execute("PRAGMA journal_mode=WAL")
+    except BaseException:
+        close_connection(path)
+        raise
 
     return conn
 
@@ -498,6 +520,7 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     if conn is None:
         conn = get_connection()
 
+    owns_transaction = not conn.in_transaction
     existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     added = []
 
@@ -510,7 +533,7 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}")
             added.append(col)
 
-    if added:
+    if added and owns_transaction:
         conn.commit()
 
     return added

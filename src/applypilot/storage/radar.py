@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 
 from applypilot.storage import job_identity
+from applypilot.storage.transactions import execute_transactional_script
 
 canonicalize_job_url = job_identity.canonicalize_job_url
 _normalized_identity_text = job_identity._normalized_identity_text
@@ -67,7 +68,8 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
     in ``jobs``.  Official listings may link to a job row, while social and
     forum observations remain leads until an official listing is verified.
     """
-    conn.executescript("""
+    was_in_transaction = conn.in_transaction
+    execute_transactional_script(conn, """
         CREATE TABLE IF NOT EXISTS radar_sources (
             source_id       TEXT PRIMARY KEY,
             company_id      TEXT,
@@ -225,7 +227,8 @@ def ensure_radar_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_radar_runs_source_type_started "
         "ON radar_fetch_runs(source_id, source_type, started_at DESC)"
     )
-    conn.commit()
+    if not was_in_transaction:
+        conn.commit()
 
 
 def register_radar_source(conn: sqlite3.Connection, source: dict) -> None:

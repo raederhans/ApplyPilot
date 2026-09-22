@@ -38,6 +38,7 @@ from applypilot.scoring.validator import (
     current_profile_resume_fact_errors,
     validate_tailored_resume,
 )
+from applypilot.storage.transactions import execute_transactional_script
 
 TAXONOMY_VERSION = "resume-library-v8"
 POLICY_VERSION = "reuse-policy-v5"
@@ -629,7 +630,8 @@ def _score_binding_error(job: Mapping[str, object], profile: Mapping[str, object
 
 def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
     """Create the additive resume-library schema without changing job rows."""
-    conn.executescript(
+    execute_transactional_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS resume_artifacts (
             artifact_id             TEXT PRIMARY KEY,
@@ -756,7 +758,7 @@ def ensure_resume_library_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_resume_artifact_health_lookup
             ON resume_artifact_health_checks(artifact_id, policy_version, checked_at);
-        """
+        """,
     )
 
     ensure_version_schema(conn)
