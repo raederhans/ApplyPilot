@@ -1,6 +1,6 @@
 [project]
 name = "applypilot-local"
-version = "0.6.0"
+version = "0.7.0"
 description = "Job Apply Pilot: local-first, evidence-driven job application automation"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -74,6 +74,9 @@ only-include = [
     "scripts",
     "install.py",
     "docs/product-core.md",
+    "docs/attended-runtime-batch.md",
+    "docs/attended-runtime-results.md",
+    "docs/visual-worker-bridge.md",
     ".env.example",
     "CHANGELOG.md",
     "CONTRIBUTING.md",

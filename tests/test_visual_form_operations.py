@@ -19,3 +19,14 @@ def test_form_operations_require_fresh_observation_and_typed_arguments(operation
     with pytest.raises(VisualBridgeError):
         _validate_operation(operation, "fresh", {**args, value_key: 1})
     assert operation in _tool()["inputSchema"]["properties"]["operation"]["enum"]
+
+
+def test_field_batch_validates_entire_bounded_plan():
+    step = {"operation": "fill_control", "field_key": "observed", "value": "known fact"}
+    _validate_operation("fill_batch", "fresh", {"steps": [step]})
+    for steps in ([], [step] * 5, [step, step], [{**step, "operation": "click"}],
+                  [{**step, "selector": "guessed"}], [{**step, "value": 1}]):
+        with pytest.raises(VisualBridgeError):
+            _validate_operation("fill_batch", "fresh", {"steps": steps})
+    with pytest.raises(VisualBridgeError):
+        _validate_operation("fill_batch", None, {"steps": [step]})

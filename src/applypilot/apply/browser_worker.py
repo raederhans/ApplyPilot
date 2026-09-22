@@ -6,6 +6,7 @@ the visual bridge for the fixed in-app-browser tab while this process runs.
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -13,8 +14,12 @@ import platform
 import signal
 import subprocess
 import sys
+import threading
 import tomllib
+import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from functools import wraps
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -96,6 +101,86 @@ def build_browser_worker_command(
     ]
 
 
+@contextmanager
+def _worker_lease(bridge_dir: Path, environment: Mapping[str, str]):
+    root = Path(bridge_dir).expanduser().resolve()
+    owner_file = root / ".worker-owner"
+    token = str(uuid.uuid4())
+    try:
+        with owner_file.open("x", encoding="utf-8") as stream:
+            stream.write(token)
+    except FileExistsError as exc:
+        raise VisualBridgeError("worker_busy", "This bridge already has a worker; reconcile before restarting.") from exc
+    try:
+        batch_token = environment.get("APPLYPILOT_BROWSER_BATCH_LEASE")
+        batch_file = root / ".batch_lease"
+        if batch_file.exists():
+            if not batch_token or batch_file.read_text(encoding="utf-8") != batch_token:
+                raise VisualBridgeError("worker_busy", "This bridge is reserved by another batch.")
+        elif batch_token:
+            raise VisualBridgeError("worker_busy", "Batch lease is no longer active.")
+        yield
+    finally:
+        if owner_file.exists() and owner_file.read_text(encoding="utf-8") == token:
+            owner_file.unlink()
+
+
+def _exclusive_worker(function):
+    @wraps(function)
+    def run(*, bridge_dir, **kwargs):
+        environment = kwargs.get("environment")
+        with _worker_lease(bridge_dir, os.environ if environment is None else environment), _termination_guard():
+            return function(bridge_dir=bridge_dir, **kwargs)
+    return run
+
+
+@contextmanager
+def _termination_guard():
+    """Let a batch's SIGTERM unwind communicate and stop the isolated CLI tree."""
+    if platform.system() == "Windows" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
+def _defer_spawn_signals():
+    """Record termination until the newly spawned process has an owned handle.
+
+    Python handlers are deferred, not OS signal masks (children must not inherit
+    blocked signals). Only the short Popen/registration section uses this guard.
+    """
+    if platform.system() == "Windows" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending = []
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    for sig in previous:
+        signal.signal(sig, lambda signum, _frame: pending.append(signum))
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if pending:
+            sig = pending[0]
+            handler = previous[sig]
+            if callable(handler):
+                handler(sig, None)
+            elif handler != signal.SIG_IGN:
+                raise SystemExit(128 + sig)
+
+
+@_exclusive_worker
 def run_browser_worker(
     *,
     bridge_dir: Path,
@@ -139,15 +224,17 @@ def run_browser_worker(
         process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         process_options["start_new_session"] = True
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=env,
-        **process_options,
-    )
+    process = None
     try:
+        with _defer_spawn_signals():
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                **process_options,
+            )
         process.communicate(input=prompt, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         _stop_process(process)
@@ -156,6 +243,10 @@ def run_browser_worker(
             file=sys.stderr,
         )
         return TIMEOUT_EXIT_CODE
+    except BaseException:
+        if process is not None:
+            _stop_process(process)
+        raise
     return int(process.returncode or 0)
 
 
@@ -229,6 +320,12 @@ def _read_task(path: Path) -> str:
 
 def _worker_prompt(*, task: str, phase: str) -> str:
     encoded_goal = json.dumps(task, ensure_ascii=False)
+    batch_rule = (
+        "Prefer fill_batch for 2-4 independent observed text/native-select fields with authoritative values. "
+        "Inspect batch_result; parked can contain partial writes. Reobserve and review, never replay. "
+        "Batch verification is immediate readback, not final review.\n"
+        if phase == "prepare" else ""
+    )
     submission_rule = (
         "This submit phase has explicit host authorization for the bound application. Before final submission, have the host confirm the exact job, duplicate check, reviewed answers and accepted attachments. Submit once, then verify a matching receipt; an uncertain result is submission_uncertain, never success or permission to resubmit."
         if phase == "submit"
@@ -245,6 +342,7 @@ Use authoritative materials; never invent personal facts. For missing required f
 Use upload_artifact only when exposed by the host, with its artifact reference and observed input. Verify acceptance; missing DOM filenames can be inconclusive, so consider screenshot/final review before reuploading. Ask the host for an inaccessible native chooser.
 After uploads or reactive changes, inspect settled values, preserving correct answers and accepted attachments. Repair observed errors only. Review names, employer/title, education and project/employment boundaries against materials. Check actual options/checkbox state, not click success; consider labels or another supported interaction when unclear.
 Use form_state field_key for fill_control/select_control/set_checked. Inspect control_result and post_upload_changes; restore changed fields only from authoritative facts.
+{batch_rule}\
 Soft phone check: verify the rendered flag/prefix and number. Separate prefixes usually take national digits; international widgets may need the full number. Recheck after parsing/country changes when useful; no extra hard gate.
 Passive CAPTCHA badges/frames alone need not block ordinary entry or an authorized final click. Let normal verification settle; never submit to probe it. For a blocking challenge or rejection, preserve values and visible error, report whether Submit was clicked, and hand off to the host. Never solve challenges, inject tokens or use solvers. Check receipts before any alternate route; ambiguous post-submit results remain submission_uncertain. After manual clearance, reobserve whether submission already completed before resuming; never replay the click automatically.
 Report visible, reposted or unknown dates; reposts remain eligible. Retain duplicate checks. Never infer an 8-hour result from a 24-hour filter.
@@ -304,3 +402,24 @@ __all__: Sequence[str] = (
     "build_browser_worker_command",
     "run_browser_worker",
 )
+
+
+def main() -> None:
+    """Installed-package entry point; also used by the source compatibility script."""
+    parser = argparse.ArgumentParser(description="Run one supervised goal on an attached IAB tab.")
+    parser.add_argument("--bridge-dir", type=Path, required=True)
+    parser.add_argument("--task-file", type=Path, required=True)
+    parser.add_argument("--phase", choices=sorted(ALLOWED_PHASES), required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--model")
+    parser.add_argument("--codex-executable", type=Path)
+    args = parser.parse_args()
+    try:
+        result = run_browser_worker(**vars(args))
+    except (ValueError, FileNotFoundError, VisualBridgeError) as exc:
+        parser.error(str(exc))
+    raise SystemExit(result)
+
+
+if __name__ == "__main__":
+    main()

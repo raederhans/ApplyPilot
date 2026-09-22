@@ -69,6 +69,13 @@ def _tool() -> dict[str, object]:
         "field_key": {"type": "string", "minLength": 1},
         "value": {"type": "string", "maxLength": 12000},
         "checked": {"type": "boolean"},
+        "steps": {"type": "array", "minItems": 1, "maxItems": 4, "items": {
+            "type": "object", "properties": {
+                "operation": {"type": "string", "enum": ["fill_control", "select_control"]},
+                "field_key": {"type": "string", "minLength": 1},
+                "value": {"type": "string", "maxLength": 12000},
+            }, "required": ["operation", "field_key", "value"], "additionalProperties": False,
+        }},
     })
     return {
         "name": TOOL_NAME,
@@ -79,6 +86,9 @@ def _tool() -> dict[str, object]:
             "upload_artifact selects one host-provided artifact through an observed upload control node_id. "
             "fill_control replaces ordinary text/date values and commits blur; select_control selects an observed native option; "
             "set_checked sets an ordinary checkbox state. These use field_key from form_state, never a guessed selector. "
+            "fill_batch prepares up to four ordinary text/native-select fields in one supervised request, using steps. "
+            "Only prepare supports batches. Each field is rechecked and read back; inspect batch_result. "
+            "A parked batch may have partial writes: reobserve and review before any further action, never replay the batch. "
             "Check control_result and post_upload_changes; changed values are observations requiring fact review, not approved answers. "
             "Passwords and OTPs must never be placed in this tool; request secure host authentication instead."
         ),
@@ -88,7 +98,7 @@ def _tool() -> dict[str, object]:
                 "operation": {
                     "type": "string",
                     "enum": ["observe", "click", "scroll", "type_text", "press_key", "navigate", "upload_artifact",
-                             "fill_control", "select_control", "set_checked"],
+                             "fill_control", "select_control", "set_checked", "fill_batch"],
                 },
                 "observation_id": {"type": "string", "minLength": 1},
                 "arguments": {
