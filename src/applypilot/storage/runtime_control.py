@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from applypilot.apply.contracts import application_actor_id
+from applypilot.storage.transactions import write_transaction
 
 
 class ResourceLeaseConflictError(RuntimeError):
@@ -159,24 +160,8 @@ def _write(connection: sqlite3.Connection) -> Iterator[None]:
 
 @contextmanager
 def _migration(connection: sqlite3.Connection) -> Iterator[None]:
-    nested = connection.in_transaction
-    if nested:
-        connection.execute("SAVEPOINT runtime_control_migration")
-    else:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(connection, prefix="runtime_control_migration"):
         yield
-        if nested:
-            connection.execute("RELEASE SAVEPOINT runtime_control_migration")
-        else:
-            connection.commit()
-    except Exception:
-        if nested:
-            connection.execute("ROLLBACK TO SAVEPOINT runtime_control_migration")
-            connection.execute("RELEASE SAVEPOINT runtime_control_migration")
-        elif connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 def _migration_v1(connection: sqlite3.Connection) -> None:

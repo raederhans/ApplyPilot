@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from applypilot.storage.transactions import write_transaction
+
 RUNTIME_CELL_SCHEMA_VERSION = 3
 _CELL_ACTIVE = {"active", "suspect", "draining"}
 _LEASE_ACTIVE = {"open", "suspect", "draining"}
@@ -106,24 +108,8 @@ def normalize_hostname(value: object) -> str:
 
 @contextmanager
 def _write(connection: sqlite3.Connection, name: str) -> Iterator[None]:
-    owns = not connection.in_transaction
-    if owns:
-        connection.execute("BEGIN IMMEDIATE")
-    else:
-        connection.execute(f"SAVEPOINT {name}")
-    try:
+    with write_transaction(connection, prefix=name):
         yield
-        if owns:
-            connection.commit()
-        else:
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-    except Exception:
-        if owns and connection.in_transaction:
-            connection.rollback()
-        elif not owns:
-            connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-        raise
 
 
 def _migration_v1(connection: sqlite3.Connection) -> None:

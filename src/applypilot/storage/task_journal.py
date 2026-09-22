@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from applypilot.apply.contracts import TaskResult, TaskSpec, contract_json, ensure_persistable
+from applypilot.storage.transactions import write_transaction
 
 _TERMINAL = {"completed", "failed", "blocked", "cancelled", "timed_out", "dead_letter"}
 _MAX_STATE_BYTES = 16 * 1024
@@ -175,17 +176,8 @@ def _entry(row: sqlite3.Row | tuple[object, ...] | None) -> JournalEntry | None:
 
 @contextmanager
 def _write_transaction(connection: sqlite3.Connection):
-    owns = not connection.in_transaction
-    if owns:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(connection, prefix="task_journal_write"):
         yield
-        if owns:
-            connection.commit()
-    except Exception:
-        if owns and connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 def _event(
