@@ -1,8 +1,4 @@
-# Job Apply Pilot — 本地优先、结果可核验的求职申请自动化
-
-<p align="center">
-  <img src="docs/brand/job-apply-pilot/assets/readme-hero.svg" alt="Job Apply Pilot：发现、判断、准备、核验" width="100%">
-</p>
+# Job Apply Pilot
 
 [![Release](https://img.shields.io/github/v/release/raederhans/AutoJobApply?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/AutoJobApply/releases/latest)
 [![CI](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml)
@@ -11,145 +7,107 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**找到真实职位，用证据做选择，准备可信材料，在你的控制下投递，并证明究竟提交了什么。**
+**把找岗位、选简历、填申请和追踪结果，放进一个本地工作流。**
 
-Job Apply Pilot 是覆盖完整求职申请闭环的本地工作台。它把官方来源职位发现、资格与匹配判断、基于证据的简历路由、忠于事实的材料定制、受监督的浏览器协助、申请历史和回执核验放进同一套可审计流程。
+Job Apply Pilot 是一个开源求职助手：用 AI 发现和筛选岗位、定制简历与求职信，并通过 Codex 或 Claude 浏览器代理填写申请。你可以在终端运行任务，在中英文 GUI 工作台查看岗位、材料和申请进度。
 
-它服务于“提高效率，但不交出判断权”的求职者。个人资料、简历、凭据、浏览器会话、回执和运行日志默认都留在本机。
+## 先看它怎么工作
 
-## 它具体能做什么
+![CLI、GUI 与浏览器表单填写演示](docs/assets/demo/workflow-zh.gif)
 
-| 需求 | Job Apply Pilot 的能力 | 证据边界 |
-| --- | --- | --- |
-| 找到机会 | 收集官方职位、可选招聘平台结果和人工审核线索 | 搜索结果不自动等于已核验职位 |
-| 判断是否值得投 | 检查资格、补全职位描述、评估匹配度、安排申请优先级 | 高分不等于已经获得投递授权 |
-| 生成申请材料 | 路由已验证简历、识别事实缺口、不编造经历地定制内容、校验 PDF | AI 生成内容不自动视为可信 |
-| 完成申请表 | 在明确授权后准备并填写受支持的申请页面 | CAPTCHA、MFA、测评、敏感文件和无依据问题会停下复核 |
-| 确认真实结果 | 将具体职位、授权、浏览器观察和回执绑定到同一次尝试 | 点击 **Submit** 不等于雇主已经收到 |
+*在工作台搜索岗位，查看 ShopBack 的真实职位，并在 Codex 浏览器中准备申请表。候选人资料与匹配分使用示例数据，演示停在提交前。*
 
-## 工作流
+[查看工作台大图](docs/assets/demo/workbench-zh.png) · [演示复现说明](docs/readme-demo.md) · [完整上手指南](docs/getting-started.md)
 
-```text
-发现 DISCOVER             判断 DECIDE               准备 PREPARE              核验 VERIFY
-官方职位           →      资格检查            →      简历路由           →      具体职位回执
-平台/人工线索             匹配证据                   可信定制                  持久申请历史
-来源状态                  准备程度                   PDF + 表单准备             不盲目重投
-```
+## 开始使用
 
-受控申请链路是：
-
-```text
-准备 → 审核 → 授权 → 提交 → 观察 → 核验回执
-```
-
-如果无法证明平台已经接收申请，该尝试会保留为 `submission_uncertain`。Job Apply Pilot 不会把它悄悄算作成功，也不会自动重复提交同一个申请。
-
-## 它为什么不是原版 ApplyPilot
-
-本仓库是 [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot) 的独立延续项目，但产品契约已经明确不同。
-
-| | 原版 ApplyPilot | Job Apply Pilot |
-| --- | --- | --- |
-| 产品承诺 | 高并发、全自动海量投递 | 以证据为基础、受监督的申请执行 |
-| 成功标准 | 浏览器完成提交动作 | 获得具体职位回执，或明确保留不确定状态 |
-| 人的角色 | 尽量无人值守 | 在关键边界复核与授权 |
-| 数据模型 | 流水线输出 | 持久记录来源、材料、授权、尝试与回执 |
-| 隐私模式 | 本地开源代理 | 无托管账户、无云同步的本地优先工作台 |
-| 工作台 | 申请进度 | 只读证据界面，不暗中写库或提交 |
-
-对外产品名是 **Job Apply Pilot**。为了兼容已有用户，技术标识保持不变：CLI 与 Python 包仍为 `applypilot`，发行包仍为 `applypilot-local`，环境变量仍使用 `APPLYPILOT_*`，默认工作区仍为 `~/.applypilot/`。
-
-本项目与 applypilot.app、useapplypilot.com 或其他近似名称的服务没有关联。
-
-## 当前状态
-
-- **Beta、本地优先、以 CLI 为主。** 目前没有 Job Apply Pilot 托管服务、在线账户、遥测看板或云同步。
-- **端到端流程已经可用。** 当前代码支持发现、补全、评分、简历库路由、忠于事实的定制、求职信与 PDF 准备、受监督的申请协助、历史记录和回执核验。
-- **浏览器工作台只读。** 它呈现“发现、判断、准备、核验”四个阶段，不会修改数据库或执行命令。
-- **人工复核是功能，不是缺陷。** 无事实依据的回答、CAPTCHA 或 MFA、测评、身份或财务文件、账户恢复、安全设置变化和不确定结果都会成为明确的交接点。
-- **当前版本为 v0.6.0。** 本次发布不改变原有命令、本地数据和兼容标识。
-
-## 安装
-
-完整工作流推荐 Python 3.11 或 3.12。核心命令和官方来源职位雷达也支持 Python 3.13。
-
-PyPI 暂无 `applypilot-local` 发行包。请从[最新 GitHub Release](https://github.com/raederhans/AutoJobApply/releases)安装，或直接安装当前仓库：
+**1. 安装并完成一次配置。** 推荐 Python 3.11–3.12，并先安装 `pipx`。
 
 ```bash
-pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.6.0"
-```
-
-需要可复现的本地部署时，请下载 release bundle 与 `SHA256SUMS`，校验后解压并运行：
-
-```bash
-python install.py
-```
-
-可选的第三方招聘平台发现功能目前建议在 Python 3.11–3.12 使用：
-
-```bash
-python install.py --with-jobboards
-```
-
-## 快速开始
-
-初始化工作区、检查能力并打开只读工作台：
-
-```bash
+pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.7.0"
 applypilot init
 applypilot doctor
-applypilot dashboard
 ```
 
-发现职位并准备材料：
+初始化向导会引导你导入简历、填写个人资料和求职偏好、配置 AI。评分和材料生成需要一个 LLM 服务；浏览器投递需要已登录的 Codex 或 Claude CLI，以及 Edge、Chrome 或 Chromium。`doctor` 会列出已就绪与待配置的组件。
+
+![导入简历、填写资料与配置求职偏好](docs/assets/demo/setup-zh.gif)
+
+*回放一次成功运行的 `applypilot init` 关键步骤，配有中文引导；CLI 提示保留原文。*
+
+**2. 找到岗位，打开工作台。**
 
 ```bash
 applypilot radar collect
-applypilot radar report --hours 24
-applypilot run discover enrich score tailor cover pdf
+applypilot run enrich score
+applypilot dashboard
 ```
 
-对一个具体职位进行提交前审核：
+在工作台里搜索岗位、按匹配度筛选，查看职位描述和申请入口。雷达默认配置面向新加坡；其他地区可在工作区的 `searches.yaml` / `radar.yaml` 调整。
+
+**3. 准备材料，再预览一个申请。**
 
 ```bash
-applypilot review-readiness
-applypilot apply --dry-run --url <verified-job-url>
-applypilot authorize-batch --url <verified-job-url>
-applypilot apply --authorization-file <batch-manifest.json>
-applypilot reconcile-receipts --file <receipt.json>
+applypilot run tailor cover pdf
+applypilot apply --dry-run --url "https://employer.example/jobs/123"
 ```
 
-检查并路由已验证的简历版本：
+把示例地址替换为工作台中选定的真实岗位。前一条命令为符合条件的队列准备简历、求职信和 PDF；后一条运行该岗位的申请预览。审核完成后，按[上手指南中的投递步骤](docs/getting-started.md#review-and-submit-one-job)记录审核、授权并提交。
 
-```bash
-applypilot resume-library-sync
-applypilot resume-library-status
-applypilot resume-library-review
-applypilot resume-route --url <verified-job-url>
-```
+![查看材料清单、生成 PDF 并打开简历预览](docs/assets/demo/materials-zh.gif)
 
-运行 `applypilot --help` 查看完整命令列表。
+*检查材料清单，再查看 `applypilot run pdf` 实际生成的简历排版。*
 
-## 安全与本地数据
+## 一个工作台，查看整个申请流程
 
-不要提交或分享本地工作区。其中可能包含个人资料、简历、生成文档、SQLite 数据库、API 密钥、浏览器配置、截图、回执、日志或验证码。
+![Job Apply Pilot 中文工作台](docs/assets/demo/workbench-zh.png)
 
-Job Apply Pilot 不支持绕过 CAPTCHA、隐藏提交、自动处理身份证明文件或自动恢复账户。报告安全问题前请阅读 [SECURITY.md](SECURITY.md)。
+运行 `applypilot dashboard` 就能在浏览器打开本地 GUI：
 
-## 开发
+| 页面 | 你可以看到什么 |
+| --- | --- |
+| **发现** | 岗位来源、收集结果、待跟进线索和来源状态 |
+| **判断** | 岗位匹配分、匹配理由、搜索、排序和申请入口 |
+| **准备** | 简历版本、求职信、材料缺口和简历路由结果 |
+| **核验** | 申请历史、执行状态、待处理事项和回执 |
+
+工作台支持中英文切换、筛选与命令复制。它以只读快照展示本地数据；执行任务使用 CLI，更新后重新运行 `applypilot dashboard` 即可刷新。
+
+## 主要功能
+
+- **多来源找岗**：官方招聘页面与 ATS、可选招聘平台搜索、手动导入线索。
+- **AI 匹配与排序**：补全职位描述，结合个人背景评估匹配度、资格和申请优先级。
+- **简历与求职信**：从简历库选择合适版本，按岗位定制内容，生成求职信和 PDF。
+- **浏览器申请**：Codex / Claude 代理填写表单、上传材料、处理申请步骤；支持预览与授权投递。
+- **多任务准备**：v0.7 支持在 Codex 内置浏览器中并行准备多个岗位，查看各任务进度。[使用说明](docs/attended-runtime-batch.md)
+- **申请追踪**：保存岗位、材料、申请尝试及回执，集中跟进待处理事项。
+
+## 更多用法
+
+| 想做什么 | 命令 / 指南 |
+| --- | --- |
+| 查看当前进度 | `applypilot status` |
+| 查看近期发现 | `applypilot radar report --hours 24` |
+| 同步和检查简历库 | `applypilot resume-library-sync` / `applypilot resume-library-status` |
+| 为一个岗位选择简历 | `applypilot resume-route --url "<job-url>"` |
+| 安装可选招聘平台连接器 | [安装选项](docs/getting-started.md#installation-options) |
+| 使用 Codex 内置浏览器执行任务 | [浏览器协作指南](docs/visual-worker-bridge.md) |
+| 查看所有命令 | `applypilot --help` |
+
+## 基本注意事项
+
+投递前确认资料与材料准确，并遵守招聘网站规则；遇到验证码、身份验证或测评时由本人接手。个人资料、密钥和浏览器会话请保留在本机。使用在线模型时，相关任务内容会发送到你配置的服务，费用按该服务计。
+
+## 开发与项目来源
+
+当前版本 **v0.7.0 · Beta**。公开产品名为 **Job Apply Pilot**，仓库名为 **AutoJobApply**，CLI 命令为 `applypilot`。
 
 ```bash
 python -m pip install -e ".[dev]"
 ruff check src
 pytest -q
-python scripts/build_release.py
 ```
 
-- [产品与前端边界](docs/product-core.md)
-- [简历库整理说明](docs/resume-library-curation.md)
-- [公司优先级策略](docs/company-priority.md)
-- [更新日志](CHANGELOG.md)
-- [贡献指南](CONTRIBUTING.md)
-- [许可证与来源](NOTICE.md)
+[更新日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全问题](SECURITY.md) · [产品说明](docs/product-core.md)
 
-Job Apply Pilot 使用 [GNU AGPL-3.0-only](LICENSE) 许可证。原版 ApplyPilot 作者继续保留其上游代码的版权。
+本项目是 [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot) 的独立延续项目，采用 [AGPL-3.0-only](LICENSE) 许可证。原作者版权与来源说明见 [NOTICE.md](NOTICE.md)。与 applypilot.app、useapplypilot.com 无关联。

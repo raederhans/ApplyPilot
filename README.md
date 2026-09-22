@@ -1,8 +1,4 @@
-# Job Apply Pilot — local-first job application automation with proof
-
-<p align="center">
-  <img src="docs/brand/job-apply-pilot/assets/readme-hero.svg" alt="Job Apply Pilot — discover, decide, prepare, verify" width="100%">
-</p>
+# Job Apply Pilot
 
 [![Release](https://img.shields.io/github/v/release/raederhans/AutoJobApply?label=Job%20Apply%20Pilot&color=175CD3)](https://github.com/raederhans/AutoJobApply/releases/latest)
 [![CI](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml/badge.svg)](https://github.com/raederhans/AutoJobApply/actions/workflows/ci.yml)
@@ -11,145 +7,107 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**Find real jobs. Choose with evidence. Prepare truthful materials. Apply under your control. Prove what was submitted.**
+**Find jobs, prepare your resume, fill applications, and track the results — in one local workflow.**
 
-Job Apply Pilot is a local-first operations workspace for the entire job-application loop. It combines official-source discovery, fit and eligibility review, evidence-backed resume routing, truthful tailoring, supervised browser assistance, application history, and receipt reconciliation in one auditable workflow.
+Job Apply Pilot is an open-source job-search assistant. It discovers and ranks opportunities, tailors resumes and cover letters, and uses Codex or Claude browser agents to work through applications. Run tasks in the terminal and review your pipeline in a bilingual browser workbench.
 
-It is built for people who want more leverage without surrendering judgment. Your profile, resumes, credentials, browser sessions, receipts, and runtime logs stay on your machine by default.
+## See it in action
 
-## What it actually does
+![Real CLI, GUI and browser form preparation](docs/assets/demo/workflow-en.gif)
 
-| Need | Job Apply Pilot capability | Evidence boundary |
-| --- | --- | --- |
-| Find opportunities | Collect official openings, optional job-board results, and manually reviewed leads | A search result is not treated as a verified job |
-| Choose what to pursue | Check eligibility, enrich job descriptions, score fit, and prioritize the queue | A high score is not permission to apply |
-| Build the application | Route validated resumes, identify evidence gaps, tailor without inventing facts, and validate PDFs | Generated content is not automatically trusted |
-| Work through the form | Prepare and fill supported application surfaces after explicit authorization | CAPTCHA, MFA, assessments, sensitive documents, and unsupported answers stop for review |
-| Prove the outcome | Bind the exact job, authorization, browser observations, and receipt to one attempt | Clicking **Submit** is not proof that the employer received it |
+*Search the workbench, inspect a real ShopBack vacancy, and prepare its application form in Codex’s browser. Candidate details and fit scores use sample data; the recording stops before submission.*
 
-## The workflow
+[Full-size workbench](docs/assets/demo/workbench-en.png) · [Reproduce the demo](docs/readme-demo.md) · [Getting started](docs/getting-started.md)
 
-```text
-DISCOVER                 DECIDE                    PREPARE                    VERIFY
-official jobs     →      eligibility       →      resume routing     →      exact-job receipt
-board/manual leads       fit evidence              truthful tailoring        durable history
-source state             readiness                 PDF + form prep            no blind retry
-```
+## Get started
 
-The guarded application path is:
-
-```text
-prepare → audit → authorize → submit → observe → reconcile receipt
-```
-
-If acceptance cannot be proved, the attempt remains `submission_uncertain`. Job Apply Pilot does not silently count it as success or automatically submit the same application again.
-
-## Why this is not the original ApplyPilot
-
-This repository is an independent continuation of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), but its product contract is intentionally different.
-
-| | Original ApplyPilot | Job Apply Pilot |
-| --- | --- | --- |
-| Product promise | High-volume autonomous application | Evidence-led, supervised application operations |
-| Success model | Browser-driven submission | Exact-job receipt or an explicit uncertain state |
-| Human role | Hands-off automation | Review and authorization at consequential boundaries |
-| Data model | Pipeline output | Durable source, material, authorization, attempt, and receipt history |
-| Privacy posture | Local open-source agent | Local-first workspace with no hosted account or cloud sync |
-| Dashboard | Application progress | Read-only evidence workbench; no hidden writes or submissions |
-
-The public product name is **Job Apply Pilot**. Compatibility identifiers remain unchanged: the CLI and Python package are `applypilot`, the distribution is `applypilot-local`, environment variables use `APPLYPILOT_*`, and the default workspace is `~/.applypilot/`.
-
-This project is not affiliated with applypilot.app, useapplypilot.com, or other similarly named services.
-
-## Current status
-
-- **Beta, local-first, and CLI-first.** There is no hosted Job Apply Pilot service, account system, telemetry dashboard, or cloud sync.
-- **End-to-end workflow available.** The source supports discovery, enrichment, scoring, resume-library routing, truthful tailoring, cover letters and PDF preparation, supervised application assistance, history, and receipt reconciliation.
-- **Read-only browser dashboard.** The workbench presents Discover, Decide, Prepare, and Verify without mutating the database or executing commands.
-- **Human review is a feature.** Unsupported claims, CAPTCHA or MFA, assessments, identity or financial documents, account recovery, security changes, and uncertain results remain explicit handoff points.
-- **Current release: v0.6.0.** Existing commands, local data, and compatibility identifiers remain unchanged by this release.
-
-## Install
-
-Python 3.11 or 3.12 is recommended for the full workflow. Core commands and the official-source radar also support Python 3.13.
-
-There is no `applypilot-local` release on PyPI. Install from the [latest GitHub release](https://github.com/raederhans/AutoJobApply/releases) or directly from this repository:
+**1. Install and set up once.** Use Python 3.11–3.12 for the full workflow, with `pipx` installed.
 
 ```bash
-pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.6.0"
-```
-
-For a reproducible local deployment, download the release bundle and `SHA256SUMS`, verify the checksum, extract it, and run:
-
-```bash
-python install.py
-```
-
-Optional third-party job-board discovery is currently intended for Python 3.11–3.12:
-
-```bash
-python install.py --with-jobboards
-```
-
-## Quick start
-
-Initialize the workspace, check capabilities, and open the read-only dashboard:
-
-```bash
+pipx install "git+https://github.com/raederhans/AutoJobApply.git@v0.7.0"
 applypilot init
 applypilot doctor
-applypilot dashboard
 ```
 
-Discover and prepare opportunities:
+The wizard guides you through your resume, profile, search preferences, and AI configuration. Scoring and writing use your chosen LLM service. Browser applications use an authenticated Codex or Claude CLI and Edge, Chrome, or Chromium. `doctor` shows which components are ready and what to configure next.
+
+![Resume import, profile and search configuration](docs/assets/demo/setup-en.gif)
+
+*Selected steps replayed from a successful `applypilot init` run.*
+
+**2. Find opportunities and open the workbench.**
 
 ```bash
 applypilot radar collect
-applypilot radar report --hours 24
-applypilot run discover enrich score tailor cover pdf
+applypilot run enrich score
+applypilot dashboard
 ```
 
-Review one exact job before any submission:
+Search and filter roles, compare fit, and inspect the job description and application link. Radar defaults target Singapore; adjust `searches.yaml` / `radar.yaml` in your workspace for your own market.
+
+**3. Prepare materials and preview one application.**
 
 ```bash
-applypilot review-readiness
-applypilot apply --dry-run --url <verified-job-url>
-applypilot authorize-batch --url <verified-job-url>
-applypilot apply --authorization-file <batch-manifest.json>
-applypilot reconcile-receipts --file <receipt.json>
+applypilot run tailor cover pdf
+applypilot apply --dry-run --url "https://employer.example/jobs/123"
 ```
 
-Inspect and route validated resume variants:
+Replace the example URL with a real role from your workbench. The first command prepares resumes, cover letters, and PDFs for eligible queued jobs; the second previews the selected application. When you are ready, follow the [review and submission steps](docs/getting-started.md#review-and-submit-one-job).
 
-```bash
-applypilot resume-library-sync
-applypilot resume-library-status
-applypilot resume-library-review
-applypilot resume-route --url <verified-job-url>
-```
+![Inspect materials, generate a PDF and open the resume preview](docs/assets/demo/materials-en.gif)
 
-Run `applypilot --help` for the full command list.
+*Review the material checklist, then inspect an actual PDF generated by `applypilot run pdf`.*
 
-## Safety and local data
+## Your pipeline, at a glance
 
-Do not commit or share the local workspace. It may contain profile data, resumes, generated documents, SQLite databases, API keys, browser profiles, screenshots, receipts, logs, or verification codes.
+![Job Apply Pilot opportunity workbench](docs/assets/demo/workbench-en.png)
 
-Job Apply Pilot does not endorse CAPTCHA bypass, hidden submission, identity-document automation, or account-recovery automation. See [SECURITY.md](SECURITY.md) before reporting a vulnerability.
+Run `applypilot dashboard` to open the local GUI:
 
-## Development
+| View | What you can explore |
+| --- | --- |
+| **Discover** | Job sources, collected opportunities, leads, and source health |
+| **Decide** | Fit scores, matching reasons, search, sorting, and application links |
+| **Prepare** | Resume versions, cover letters, material gaps, and routing decisions |
+| **Verify** | Application history, execution status, action items, and receipts |
+
+Switch between English and Chinese, filter your queue, and copy useful commands. The workbench is a read-only snapshot of your local data; run tasks in the CLI and regenerate it with `applypilot dashboard` to see updates.
+
+## What you can do
+
+- **Discover across sources.** Official careers pages and ATS feeds, optional job-board search, and imported leads.
+- **Find your strongest matches.** Enrich descriptions and assess fit, eligibility, and application priority against your background.
+- **Reuse and tailor materials.** Route an appropriate resume from your library, adapt it to the role, and generate cover letters and PDFs.
+- **Work through applications.** Codex / Claude agents fill forms, upload materials, and navigate application steps, with preview and authorized submission modes.
+- **Prepare multiple applications.** v0.7 adds concurrent preparation in Codex's in-app browser, with per-job progress. [Batch guide](docs/attended-runtime-batch.md)
+- **Keep the history together.** Track jobs, materials, application attempts, receipts, and outstanding follow-ups.
+
+## More ways to use it
+
+| Task | Command / guide |
+| --- | --- |
+| Check your pipeline | `applypilot status` |
+| Review recent discoveries | `applypilot radar report --hours 24` |
+| Sync and inspect your resume library | `applypilot resume-library-sync` / `applypilot resume-library-status` |
+| Choose a resume for one role | `applypilot resume-route --url "<job-url>"` |
+| Add optional job-board connectors | [Installation options](docs/getting-started.md#installation-options) |
+| Work inside Codex's in-app browser | [Browser worker guide](docs/visual-worker-bridge.md) |
+| Explore all commands | `applypilot --help` |
+
+## A few essentials
+
+Review your information and materials before applying and follow each site's rules. Handle CAPTCHAs, identity checks, and assessments yourself. Keep personal workspaces, credentials, and browser sessions private. Online models receive the task content needed for their work and may charge according to your provider's plan.
+
+## Development and credits
+
+**v0.7.0 · Beta.** The product is **Job Apply Pilot**, the repository is **AutoJobApply**, and the command is `applypilot`.
 
 ```bash
 python -m pip install -e ".[dev]"
 ruff check src
 pytest -q
-python scripts/build_release.py
 ```
 
-- [Product and frontend boundaries](docs/product-core.md)
-- [Resume library curation](docs/resume-library-curation.md)
-- [Company priority policy](docs/company-priority.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [License and provenance](NOTICE.md)
+[Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Product notes](docs/product-core.md)
 
-Job Apply Pilot is licensed under [GNU AGPL-3.0-only](LICENSE). The original ApplyPilot authors retain copyright in the upstream work.
+An independent continuation of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), licensed under [AGPL-3.0-only](LICENSE). See [NOTICE.md](NOTICE.md) for upstream credits. Not affiliated with applypilot.app or useapplypilot.com.
