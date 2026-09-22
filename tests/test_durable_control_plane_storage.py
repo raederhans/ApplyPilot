@@ -534,6 +534,41 @@ def test_scope_release_is_one_exact_batch_and_rolls_back_on_stale_member() -> No
     assert {lease.status for lease in released} == {"released"}
 
 
+def test_scope_release_ignores_expired_lease_from_previous_runtime() -> None:
+    connection = _connection()
+    previous = _acquire(
+        connection,
+        lease_id="lease-previous",
+        profile_id="profile-previous",
+        page_target_id="page-previous",
+        owner_id="owner-previous",
+    )
+    current = _acquire(
+        connection,
+        lease_id="lease-current",
+        now=NOW + timedelta(seconds=61),
+    )
+
+    released = runtime_control.release_browser_resource_scope(
+        connection,
+        scope_id="scope-1",
+        owner_id="owner-1",
+        expected_actor_id="application:attempt-1",
+        expected_attempt_id="attempt-1",
+        expected_runtime_id="runtime-owner-1",
+        expected_process_id=1234,
+        expected_process_birth_time=100_000,
+        expected_tokens=(_token(current),),
+        now=NOW + timedelta(seconds=62),
+    )
+
+    assert [lease.status for lease in released] == ["released"]
+    assert connection.execute(
+        "SELECT status FROM browser_resource_leases WHERE lease_id=?",
+        (previous.lease_id,),
+    ).fetchone()[0] == "expired"
+
+
 def test_two_connections_allow_only_one_running_root_for_an_actor(tmp_path) -> None:
     path = tmp_path / "runtime-root-contention.db"
     setup = _connection(path)
