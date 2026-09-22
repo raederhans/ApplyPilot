@@ -530,4 +530,3 @@ class SubprocessAgentRuntime:
                     "close could not prove subprocess termination: "
                     + ", ".join(quarantined)
                 )
-

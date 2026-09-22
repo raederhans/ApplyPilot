@@ -642,4 +642,3 @@ def build_agent_command(
         "-",
     ])
     return command, final_message_path
-

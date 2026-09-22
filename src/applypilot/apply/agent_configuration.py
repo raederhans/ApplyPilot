@@ -152,4 +152,3 @@ def resolve_agent_runtime_configuration(
             environ=environ,
         ),
     )
-
