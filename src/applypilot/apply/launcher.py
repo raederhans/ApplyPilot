@@ -5975,6 +5975,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     browser_tool_names: dict[str, str] = {}
     browser_tool_outcomes: dict[str, bool | None] = {}
     browser_tool_failure_reasons: dict[str, str] = {}
+    tool_started_at: dict[str, float] = {}
+    browser_tool_durations_ms: dict[str, float] = {}
     report_tool_outcomes: dict[str, bool | None] = {}
     prepare_search_events: list[tuple[object, object]] = []
     progress_sequence = 0
@@ -6026,7 +6028,31 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         previous = outcomes.get(key)
         outcomes[key] = succeeded if previous is None else previous and succeeded
 
-    def runtime_tool_metrics() -> dict[str, int]:
+    def record_tool_started(raw_id: object, started_at: float) -> None:
+        event_id = str(raw_id or "").strip()
+        if event_id:
+            tool_started_at.setdefault(event_id, started_at)
+
+    def record_browser_tool_duration(
+        raw_id: object,
+        key: str,
+        completed_at: float,
+    ) -> None:
+        if key in browser_tool_durations_ms:
+            return
+        event_id = str(raw_id or "").strip()
+        started_at = tool_started_at.pop(event_id, None) if event_id else None
+        if started_at is None:
+            return
+        duration_ms = max(0.0, (completed_at - started_at) * 1000)
+        browser_tool_durations_ms[key] = round(duration_ms, 3)
+
+    def runtime_tool_metrics() -> dict[str, int | float]:
+        duration_samples = [
+            duration
+            for key, duration in browser_tool_durations_ms.items()
+            if key in browser_tool_outcomes
+        ]
         metrics = {
             "tool_call_count": tool_call_count,
             "unique_tool_count": len(unique_tools),
@@ -6040,6 +6066,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "browser_tool_unresolved_count": sum(
                 outcome is None for outcome in browser_tool_outcomes.values()
             ),
+            "browser_tool_duration_sample_count": len(duration_samples),
+            "browser_tool_duration_unavailable_count": max(
+                0,
+                len(browser_tool_outcomes) - len(duration_samples),
+            ),
+            "browser_tool_duration_ms_sum": round(sum(duration_samples), 3),
+            "browser_tool_duration_ms_max": round(max(duration_samples, default=0.0), 3),
+            "browser_tool_duration_ms_avg": round(
+                sum(duration_samples) / len(duration_samples),
+                3,
+            ) if duration_samples else 0.0,
             "report_tool_call_count": len(report_tool_outcomes),
             "report_tool_success_count": sum(
                 outcome is True for outcome in report_tool_outcomes.values()
@@ -6061,6 +6098,20 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             )
             metrics[f"{safe_name}_failure_count"] = sum(
                 outcome is False for outcome in outcomes
+            )
+            tool_durations = [
+                browser_tool_durations_ms[key]
+                for key, name in browser_tool_names.items()
+                if name == tool_name and key in browser_tool_durations_ms
+            ]
+            metrics[f"{safe_name}_duration_sample_count"] = len(tool_durations)
+            metrics[f"{safe_name}_duration_ms_sum"] = round(
+                sum(tool_durations),
+                3,
+            )
+            metrics[f"{safe_name}_duration_ms_max"] = round(
+                max(tool_durations, default=0.0),
+                3,
             )
         for reason in sorted(set(browser_tool_failure_reasons.values()))[:12]:
             safe_reason = re.sub(r"[^a-z0-9_]+", "_", reason.casefold())[:48]
@@ -6732,6 +6783,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 tool_key = record_tool_call(
                                     block.get("id"), str(raw_name)
                                 )
+                                record_tool_started(block.get("id"), now_tool)
                                 raw_supervisor_input = block.get("input")
                                 supervisor_input = (
                                     dict(raw_supervisor_input)
@@ -6834,6 +6886,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 )
                             if tool_use_id in pending_browser_tools:
                                 browser_key = pending_browser_tools.pop(tool_use_id)
+                                record_browser_tool_duration(
+                                    tool_use_id,
+                                    browser_key,
+                                    time.perf_counter(),
+                                )
                                 settle_tool_outcome(
                                     browser_tool_outcomes,
                                     browser_key,
@@ -6882,6 +6939,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         item = msg.get("item", {})
                         item_type = item.get("type")
                         if item_type in {"mcp_tool_call", "tool_call"}:
+                            record_tool_started(item.get("id"), time.perf_counter())
                             server = item.get("server", "playwright")
                             tool = item.get("tool", item.get("name", "tool"))
                             raw_supervisor_input = item.get(
@@ -6990,6 +7048,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if browser_tool:
                                 browser_tool_names[tool_key] = str(tool)
                                 browser_tool_outcomes.setdefault(tool_key, None)
+                                record_browser_tool_duration(
+                                    item.get("id"),
+                                    tool_key,
+                                    now_tool,
+                                )
                                 succeeded = _tool_result_succeeded(
                                     item,
                                     terminal_event=True,
