@@ -70,6 +70,7 @@ from applypilot.apply.agent_report_mcp import REPORT_PATH_ENV, RUN_ID_ENV
 from applypilot.apply.answer_policy import field_risk
 from applypilot.apply.application_facts import (
     current_profile_facts,
+    current_visible_fact_mappings,
     resolve_application_fact_ref,
 )
 from applypilot.apply.application_sessions import ApplicationSupervisor, ContextBundle
@@ -4903,7 +4904,7 @@ def _available_semantic_fact_names(profile: Mapping[str, object], job: Mapping[s
         facts.add("cover_letter")
     if isinstance(profile.get("work_authorization"), Mapping):
         facts.update({"work_authorization", "sponsorship"})
-    application_facts = profile.get("application_facts")
+    application_facts = current_visible_fact_mappings(profile)
     if isinstance(application_facts, list):
         for fact in application_facts:
             if not isinstance(fact, Mapping):

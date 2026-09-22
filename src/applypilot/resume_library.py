@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from applypilot.apply.application_facts import current_visible_fact_mappings
 from applypilot.apply.authorization import compute_file_binding, compute_job_fingerprint
 from applypilot.config import CONFIG_DIR, TAILORED_DIR
 from applypilot.radar import SUBTRACK_TO_TRACK, classify_job_subtracks
@@ -421,7 +422,7 @@ def _confirmed_experience_skill_facts(
     factual record, allowing a new tailored variant to be attempted. They do
     not change the skill coverage of any existing resume artifact.
     """
-    facts = profile.get("application_facts", [])
+    facts = current_visible_fact_mappings(profile)
     if not isinstance(facts, list):
         return {}
     known_skills = _profile_skills(profile)
