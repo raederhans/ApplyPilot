@@ -2993,7 +2993,10 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "FULL-TIME salaried positions only" not in built
     assert "internships or full-time employment" in built
     assert 'aria-label is exactly or starts with "Easy Apply to this job"' not in built
-    assert "Lever: select native comboboxes" in built
+    assert "Lever: after the resume upload settles" in built
+    assert "issue all visible native-select operations before taking one shared verification snapshot" in built
+    assert "Do not re-snapshot between successful independent native selects" in built
+    assert "custom/autocomplete controls, multi-selects" in built
     assert "Do not click an \"Easy Apply\" job-type chip" not in built
     assert "openSDUIApplyFlow=true" not in built
     assert "goal is always the same: submit" not in built
@@ -3002,6 +3005,14 @@ def test_preview_prompt_allows_no_cover_and_pauses_for_visible_captcha(
     assert "RESULT:APPLIED" not in built
     assert "try sign up" not in built
     assert "no human-approved cover letter" in built
+
+    non_lever_job = {**job, "source_site": "greenhouse"}
+    non_lever_built = prompt.build_prompt(
+        non_lever_job,
+        "Verified resume",
+        dry_run=True,
+    )
+    assert "Lever: after the resume upload settles" not in non_lever_built
 
 
 def test_captcha_helper_fails_closed_for_manual_review() -> None:

@@ -1618,6 +1618,108 @@ def test_codex_completed_browser_error_payload_is_not_counted_as_success(
     assert status == "ready_to_submit"
     assert payload["metrics"]["browser_tool_call_count"] == 1
     assert payload["metrics"]["browser_tool_success_count"] == 0
+    assert payload["metrics"]["browser_tool_duration_sample_count"] == 0
+    assert payload["metrics"]["browser_tool_duration_unavailable_count"] == 1
+
+
+def test_codex_browser_tool_duration_pairs_started_and_completed_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = [0.0]
+
+    def perf_counter() -> float:
+        clock[0] += 0.1
+        return clock[0]
+
+    monkeypatch.setattr(launcher.time, "perf_counter", perf_counter)
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "browser-timed-1",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_snapshot",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "browser-timed-1",
+                    "type": "mcp_tool_call",
+                    "server": "playwright",
+                    "tool": "browser_snapshot",
+                    "status": "completed",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ],
+    )
+
+    assert status == "ready_to_submit"
+    metrics = payload["metrics"]
+    assert metrics["browser_tool_call_count"] == 1
+    assert metrics["browser_tool_duration_sample_count"] == 1
+    assert metrics["browser_tool_duration_unavailable_count"] == 0
+    assert metrics["browser_tool_duration_ms_sum"] > 0
+    assert metrics["browser_snapshot_duration_sample_count"] == 1
+    assert metrics["browser_snapshot_duration_ms_sum"] > 0
+
+
+def test_codex_overlapping_browser_tool_durations_are_reported_as_a_sum(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = [0.0]
+
+    def perf_counter() -> float:
+        clock[0] += 0.1
+        return clock[0]
+
+    monkeypatch.setattr(launcher.time, "perf_counter", perf_counter)
+    events = [
+        {
+            "type": "item.started",
+            "item": {
+                "id": tool_id,
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_select_option",
+            },
+        }
+        for tool_id in ("browser-overlap-1", "browser-overlap-2")
+    ]
+    events.extend(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": tool_id,
+                "type": "mcp_tool_call",
+                "server": "playwright",
+                "tool": "browser_select_option",
+                "status": "completed",
+            },
+        }
+        for tool_id in ("browser-overlap-1", "browser-overlap-2")
+    )
+    events.append({"type": "turn.completed", "usage": {}})
+
+    status, payload = _run_codex_event_fixture(
+        monkeypatch,
+        tmp_path,
+        messages=events,
+    )
+
+    assert status == "ready_to_submit"
+    metrics = payload["metrics"]
+    assert metrics["browser_tool_duration_sample_count"] == 2
+    assert metrics["browser_select_option_duration_sample_count"] == 2
+    assert metrics["browser_tool_duration_ms_sum"] >= metrics["browser_tool_duration_ms_max"]
+    assert "browser_tool_duration_ms_total" not in metrics
 
 
 def test_codex_user_camel_case_tool_error_is_not_counted_as_success(
@@ -1660,6 +1762,7 @@ def test_codex_user_camel_case_tool_error_is_not_counted_as_success(
     assert status == "ready_to_submit"
     assert payload["metrics"]["browser_tool_call_count"] == 1
     assert payload["metrics"]["browser_tool_success_count"] == 0
+    assert payload["metrics"]["browser_tool_duration_sample_count"] == 1
 
 
 def test_codex_duplicate_tool_id_across_event_shapes_is_counted_once(
@@ -1712,6 +1815,8 @@ def test_codex_duplicate_tool_id_across_event_shapes_is_counted_once(
     assert status == "ready_to_submit"
     assert payload["metrics"]["browser_tool_call_count"] == 1
     assert payload["metrics"]["browser_tool_success_count"] == 1
+    assert payload["metrics"]["browser_tool_duration_sample_count"] == 1
+    assert payload["metrics"]["browser_tool_duration_unavailable_count"] == 0
 
 
 def test_durable_completed_event_classifies_status_conflict_without_raw_contracts(
