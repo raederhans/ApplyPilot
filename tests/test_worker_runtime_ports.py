@@ -10,9 +10,11 @@ from applypilot.storage import runtime_cells
 
 
 def test_page_observation_ports_are_separate_from_application_execution() -> None:
-    assert len(fields(worker_orchestration.WorkerApplicationPorts)) == 15
-    assert len(fields(worker_orchestration.WorkerPageObservationPorts)) == 6
-    assert "try_semantic_batch_fill" in {item.name for item in fields(worker_orchestration.WorkerApplicationPorts)}
+    runtime = launcher._worker_runtime_ports()
+    assert callable(runtime.application.run_job)
+    assert callable(runtime.application.try_semantic_batch_fill)
+    assert callable(runtime.observation.audit_live_pre_submit_page)
+    assert callable(runtime.observation.observe_post_submit_page)
     assert not {
         "audit_live_pre_submit_page",
         "classify_post_submit_observation",
